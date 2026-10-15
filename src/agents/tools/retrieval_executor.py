@@ -21,6 +21,8 @@ from typing import Any, Callable, Sequence
 
 from src.observability import submit_with_current_context
 
+_WORKER_CONTEXT = threading.local()
+
 
 class RetrievalSaturated(RuntimeError):
     """Raised/recorded when the bounded retrieval queue cannot admit work."""
@@ -35,7 +37,7 @@ class RetrievalCallResult:
     index: int
     value: Any = None
     error: Exception | None = None
-    status: str = "ok"  # ok | failed | cancelled | saturated
+    status: str = "ok"  # ok | failed | cancelled | saturated | timeout
 
 
 class RetrievalExecutor:
@@ -133,12 +135,22 @@ class RetrievalExecutor:
 
     def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
         """Submit one call with ContextVar/OTel propagation."""
-        executor = self._ensure_executor()
-        with self._condition:
-            self._pending += 1
-            self._high_water = max(self._high_water, self._pending)
+        if not self._admit(time.monotonic()):
+            raise RetrievalSaturated("retrieval queue is full or closed")
+        return self._submit_admitted(fn, *args, **kwargs)
+
+    def _submit_admitted(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
+        def invoke():
+            previous = getattr(_WORKER_CONTEXT, "executor", None)
+            _WORKER_CONTEXT.executor = self
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _WORKER_CONTEXT.executor = previous
+
         try:
-            future = submit_with_current_context(executor, fn, *args, **kwargs)
+            executor = self._ensure_executor()
+            future = submit_with_current_context(executor, invoke)
         except Exception:
             self._release()
             raise
@@ -151,14 +163,18 @@ class RetrievalExecutor:
         self._discard_future(future)
         self._release()
 
-    def _admit(self, deadline: float) -> bool:
-        """Wait for a queue slot; returns False when the deadline passed."""
+    def _admit(self, deadline: float, cancel_check: Callable[[], bool] | None = None) -> bool:
+        """Atomically reserve a slot; completion releases it, including late calls."""
         with self._condition:
             while self._pending >= self.queue_max_depth:
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if remaining <= 0 or self._closed or (cancel_check is not None and cancel_check()):
                     return False
-                self._condition.wait(timeout=min(remaining, 0.2))
+                self._condition.wait(timeout=min(remaining, 0.05))
+            if self._closed or (cancel_check is not None and cancel_check()):
+                return False
+            self._pending += 1
+            self._high_water = max(self._high_water, self._pending)
             return True
 
     def map_bounded(
@@ -169,12 +185,15 @@ class RetrievalExecutor:
         fanout: int | None = None,
         deadline: float | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        execution_deadline_at: float | None = None,
     ) -> list[RetrievalCallResult]:
         """Run ``fn`` over ``items`` with bounded fan-out, queue and deadline.
 
         Results keep the input order.  Cancelled, failed and saturated calls are
         reported per item instead of failing the whole batch.
         """
+        if getattr(_WORKER_CONTEXT, "executor", None) is self:
+            raise RuntimeError("nested_retrieval_wait")
         fanout = max(1, int(fanout or self.per_request_fanout))
         wait_budget = self.queue_max_wait_seconds if deadline is None else max(0.0, float(deadline))
         deadline_at = time.monotonic() + wait_budget
@@ -188,16 +207,34 @@ class RetrievalExecutor:
         def cancelled() -> bool:
             return bool(cancel_check is not None and cancel_check())
 
+        def expired() -> bool:
+            return execution_deadline_at is not None and time.monotonic() >= execution_deadline_at
+
+        def abandon(status: str) -> None:
+            for future, index in futures.items():
+                future.cancel()
+                results[index].status = status
+            for index in range(next_index, len(items)):
+                results[index].status = status
+            futures.clear()
+
         while next_index < len(items) or futures:
             if cancelled():
-                for future, index in futures.items():
-                    if future.cancel():
-                        results[index].status = "cancelled"
-                futures.clear()
+                abandon("cancelled")
+                break
+            if expired():
+                abandon("timeout")
                 break
             while next_index < len(items) and len(futures) < fanout:
+                if cancelled() or expired():
+                    break
                 admit_started = time.monotonic()
-                if not self._admit(deadline_at):
+                admission_deadline = min(deadline_at, execution_deadline_at) if execution_deadline_at is not None else deadline_at
+                if not self._admit(admission_deadline, cancel_check=cancel_check):
+                    if cancelled() or expired():
+                        abandon("cancelled" if cancelled() else "timeout")
+                        next_index = len(items)
+                        break
                     self._record_admission("saturated", time.monotonic() - admit_started)
                     for index in range(next_index, len(items)):
                         results[index].status = "saturated"
@@ -205,12 +242,24 @@ class RetrievalExecutor:
                     next_index = len(items)
                     break
                 self._record_admission("admitted", time.monotonic() - admit_started)
-                future = self.submit(fn, items[next_index])
+                try:
+                    future = self._submit_admitted(fn, items[next_index])
+                except Exception as exc:
+                    results[next_index].status = "saturated" if isinstance(exc, RetrievalSaturated) else "failed"
+                    results[next_index].error = exc
+                    next_index += 1
+                    continue
                 futures[future] = next_index
                 next_index += 1
             if not futures:
                 break
-            done, _pending = wait(list(futures), timeout=0.1, return_when=FIRST_COMPLETED)
+            wait_seconds = 0.05
+            if execution_deadline_at is not None:
+                wait_seconds = min(wait_seconds, max(0.0, execution_deadline_at - time.monotonic()))
+            done, _pending = wait(list(futures), timeout=wait_seconds, return_when=FIRST_COMPLETED)
+            if cancelled() or expired():
+                abandon("cancelled" if cancelled() else "timeout")
+                break
             for future in done:
                 index = futures.pop(future)
                 result = results[index]

@@ -539,6 +539,11 @@ SHARED_RETRIEVAL_EXECUTOR_ENABLED = _env_bool("SHARED_RETRIEVAL_EXECUTOR_ENABLED
 # R3: independent rollout switch; scope/API acceptance is still required.
 MULTI_KB_CHAT_ENABLED = _env_bool("MULTI_KB_CHAT_ENABLED", False)
 MULTI_KB_MAX_SOURCES = int(os.getenv("MULTI_KB_MAX_SOURCES", "4"))
+MULTI_KB_PER_SOURCE_TOP_K = int(os.getenv("MULTI_KB_PER_SOURCE_TOP_K", "8"))
+MULTI_KB_MAX_CALLS_PER_TURN = int(os.getenv("MULTI_KB_MAX_CALLS_PER_TURN", "24"))
+MULTI_KB_RETRIEVAL_DEADLINE_SECONDS = float(os.getenv("MULTI_KB_RETRIEVAL_DEADLINE_SECONDS", "30"))
+MULTI_KB_EVIDENCE_MAX_ITEMS = int(os.getenv("MULTI_KB_EVIDENCE_MAX_ITEMS", "24"))
+MULTI_KB_CONTEXT_MAX_TOKENS = int(os.getenv("MULTI_KB_CONTEXT_MAX_TOKENS", "8000"))
 RETRIEVAL_EXECUTOR_MAX_WORKERS = int(os.getenv("RETRIEVAL_EXECUTOR_MAX_WORKERS", "8"))
 RETRIEVAL_QUEUE_MAX_DEPTH = int(os.getenv("RETRIEVAL_QUEUE_MAX_DEPTH", "256"))
 RETRIEVAL_PER_REQUEST_FANOUT = int(os.getenv("RETRIEVAL_PER_REQUEST_FANOUT", "4"))
@@ -1030,6 +1035,11 @@ DEFAULT_VALUES = {
     "SHARED_RETRIEVAL_EXECUTOR_ENABLED": "false",
     "MULTI_KB_CHAT_ENABLED": "false",
     "MULTI_KB_MAX_SOURCES": "4",
+    "MULTI_KB_PER_SOURCE_TOP_K": "8",
+    "MULTI_KB_MAX_CALLS_PER_TURN": "24",
+    "MULTI_KB_RETRIEVAL_DEADLINE_SECONDS": "30",
+    "MULTI_KB_EVIDENCE_MAX_ITEMS": "24",
+    "MULTI_KB_CONTEXT_MAX_TOKENS": "8000",
     "RETRIEVAL_EXECUTOR_MAX_WORKERS": "8",
     "RETRIEVAL_QUEUE_MAX_DEPTH": "256",
     "RETRIEVAL_PER_REQUEST_FANOUT": "4",
@@ -1272,6 +1282,8 @@ def _reload_settings():
     global SHARED_RETRIEVAL_EXECUTOR_ENABLED, RETRIEVAL_EXECUTOR_MAX_WORKERS
     global MULTI_KB_CHAT_ENABLED
     global MULTI_KB_MAX_SOURCES
+    global MULTI_KB_PER_SOURCE_TOP_K, MULTI_KB_MAX_CALLS_PER_TURN
+    global MULTI_KB_RETRIEVAL_DEADLINE_SECONDS, MULTI_KB_EVIDENCE_MAX_ITEMS, MULTI_KB_CONTEXT_MAX_TOKENS
     global RETRIEVAL_QUEUE_MAX_DEPTH, RETRIEVAL_PER_REQUEST_FANOUT, RETRIEVAL_QUEUE_MAX_WAIT_SECONDS
     global RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS
     global ACTION_DAG_PARALLEL_ENABLED, ACTION_EXECUTOR_MAX_PARALLEL
@@ -1607,6 +1619,11 @@ def _reload_settings():
     SHARED_RETRIEVAL_EXECUTOR_ENABLED = _env_bool("SHARED_RETRIEVAL_EXECUTOR_ENABLED", False)
     MULTI_KB_CHAT_ENABLED = _env_bool("MULTI_KB_CHAT_ENABLED", False)
     MULTI_KB_MAX_SOURCES = int(os.getenv("MULTI_KB_MAX_SOURCES", "4"))
+    MULTI_KB_PER_SOURCE_TOP_K = int(os.getenv("MULTI_KB_PER_SOURCE_TOP_K", "8"))
+    MULTI_KB_MAX_CALLS_PER_TURN = int(os.getenv("MULTI_KB_MAX_CALLS_PER_TURN", "24"))
+    MULTI_KB_RETRIEVAL_DEADLINE_SECONDS = float(os.getenv("MULTI_KB_RETRIEVAL_DEADLINE_SECONDS", "30"))
+    MULTI_KB_EVIDENCE_MAX_ITEMS = int(os.getenv("MULTI_KB_EVIDENCE_MAX_ITEMS", "24"))
+    MULTI_KB_CONTEXT_MAX_TOKENS = int(os.getenv("MULTI_KB_CONTEXT_MAX_TOKENS", "8000"))
     RETRIEVAL_EXECUTOR_MAX_WORKERS = int(os.getenv("RETRIEVAL_EXECUTOR_MAX_WORKERS", "8"))
     RETRIEVAL_QUEUE_MAX_DEPTH = int(os.getenv("RETRIEVAL_QUEUE_MAX_DEPTH", "256"))
     RETRIEVAL_PER_REQUEST_FANOUT = int(os.getenv("RETRIEVAL_PER_REQUEST_FANOUT", "4"))
@@ -2008,6 +2025,10 @@ _INT_SETTING_KEYS = frozenset({
     "SANDBOX_MAX_INPUT_BYTES",
     "RETRIEVAL_EXECUTOR_MAX_WORKERS",
     "MULTI_KB_MAX_SOURCES",
+    "MULTI_KB_PER_SOURCE_TOP_K",
+    "MULTI_KB_MAX_CALLS_PER_TURN",
+    "MULTI_KB_EVIDENCE_MAX_ITEMS",
+    "MULTI_KB_CONTEXT_MAX_TOKENS",
     "RETRIEVAL_QUEUE_MAX_DEPTH",
     "RETRIEVAL_PER_REQUEST_FANOUT",
     "ACTION_EXECUTOR_MAX_PARALLEL",
@@ -2052,6 +2073,7 @@ _INT_SETTING_KEYS = frozenset({
     "MEMORY_ITEM_MAX_TOKENS",
 })
 _FLOAT_SETTING_KEYS = frozenset({
+    "MULTI_KB_RETRIEVAL_DEADLINE_SECONDS",
     "RAGFLOW_SIMILARITY_THRESHOLD",
     "RAGFLOW_VECTOR_WEIGHT",
     "AGENT_TEMPERATURE",
@@ -2094,13 +2116,22 @@ def validate_settings_values(settings_dict: dict) -> None:
                 "SANDBOX_MAX_OUTPUT_BYTES",
                 "SANDBOX_MAX_INPUT_BYTES",
                 "MULTI_KB_MAX_SOURCES",
+                "MULTI_KB_PER_SOURCE_TOP_K",
+                "MULTI_KB_MAX_CALLS_PER_TURN",
+                "MULTI_KB_EVIDENCE_MAX_ITEMS",
+                "MULTI_KB_CONTEXT_MAX_TOKENS",
             } and parsed_int <= 0:
                 raise ValueError(f"{key} 必须大于 0，当前值: {text!r}")
         elif key in _FLOAT_SETTING_KEYS:
             try:
-                float(text)
+                parsed_float = float(text)
             except ValueError as exc:
                 raise ValueError(f"{key} 必须是数字，当前值: {text!r}") from exc
+            if key == "MULTI_KB_RETRIEVAL_DEADLINE_SECONDS":
+                import math
+
+                if not math.isfinite(parsed_float) or parsed_float <= 0:
+                    raise ValueError(f"{key} 必须为大于 0 的有限数字")
         elif key == "MEMORY_MIN_SCORE" and text.strip():
             try:
                 float(text)

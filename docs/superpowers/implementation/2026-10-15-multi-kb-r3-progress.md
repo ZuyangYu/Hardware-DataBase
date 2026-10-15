@@ -9,7 +9,7 @@
 - [x] T1：范围模型、稳定 KB ID 授权与独立上下文。
 - [x] T2：会话/轮次范围、SQLite/PG 持久化与增量迁移。
 - [ ] T3：API/Worker/Agent、历史依赖、记忆与撤权隔离。
-- [ ] T4：scoped outcome、检索调度、预算、真实截止与错误语义。
+- [ ] T4：scoped outcome、检索调度、预算、真实截止与错误语义（核心已完成，工具接线随 T3/T5）。
 - [ ] T5：证据复合身份、融合、覆盖与质量门槛。
 - [ ] T6：前端选库、范围变化恢复、引用与端到端验收。
 - [ ] T7：结构化来源严格范围适配。
@@ -80,3 +80,15 @@ HDB_TEST_POSTGRES_DSN=<一次性PG> uv run python -m pytest -q \
   tests/test_control_plane_memory_enqueue_postgres.py tests/test_chat_attachment_scopes.py \
   tests/test_control_plane_factory.py tests/test_knowledge_scope.py tests/test_conversation_wiring.py
 ```
+
+## T4 检索核心交付与验证
+
+- 新增 `DocumentRetrievalContract`、真实版本戳、结构化 outcome，沿用旧 retrieve 的台账/远端请求/回读实现，旧 list 返回契约继续兼容。
+- 普通及 strict 回读补齐台账记录 ID、真实 KB/部门、源文件哈希、原片段文本哈希、定位、版本及索引代次；远端同名身份字段被服务器覆盖。
+- chat 远端过滤拒绝可有限回退，始终受本地白名单约束；frozen 禁止宽回退，范围能力/台账映射/文件变化/权限问题不伪装为零命中。检索结束再次验证来源版本。
+- `RetrievalBudget` 原子预留每次实际内容 HTTP 调用；回退、零命中重试共享同一预算，HTTP timeout 不超过剩余总时间。
+- 多查询 × 多库只展开一次，由已有进程池调度；相同池内嵌套 map 明确拒绝。队列准入改为原子预留，直接 submit 也受队列容量控制。
+- 执行截止与旧排队截止分开；超时返回后不合入迟到结果，真实运行结束前不释放槽位。默认无执行截止的旧调用保持原行为。
+- 选库授权在调度、逐库调用和主线程合入边界复查；失权终止整次范围。显式空 frozen 映射不转为全库 chat。
+
+回归：**81 passed**，包括新增 scoped outcome/多库调度/截止、既有 RAGFlow 过滤回退与取消、共享池生命周期和文档证据提供器。工具委托、runtime 失效标志和证据融合继续在 T3/T5 接通；P0 尚未对外开放。

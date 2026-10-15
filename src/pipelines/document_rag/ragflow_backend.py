@@ -40,6 +40,9 @@ from src.pipelines.document_rag.schemas import (
     ParsedChunk,
     ParseResult,
     RequestContext,
+    DocumentRetrievalContract,
+    ScopedDocumentRetrievalOutcome,
+    ScopedRetrievalError,
     TASK_STATUS_CANCELLED,
     TASK_STATUS_COMPLETED,
     TASK_STATUS_DEAD_LETTER,
@@ -168,7 +171,8 @@ def _is_ragflow_document_scope_rejection(exc: Exception) -> bool:
     远端报错形如 "The datasets don't own the document <id>"；命中后调用方
     去掉预过滤重试一次，结果仍由本地记录过滤兜底。
     """
-    return "own the document" in str(exc).lower()
+    text = str(exc).lower()
+    return "own the document" in text or ("document_ids" in text and any(word in text for word in ("unsupported", "not supported", "unknown", "invalid")))
 
 
 def _ragflow_status_unavailable_message(document_name: str) -> str:
@@ -704,6 +708,8 @@ class RAGFlowClient:
         metadata_condition: dict | None = None,
         document_ids: list[str] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        before_request: Callable[[], None] | None = None,
+        remaining_seconds: Callable[[], float] | None = None,
     ) -> list[dict]:
         # document_ids 预过滤：RAGFlow 0.19 起支持，作用与 0.21+ 的
         # metadata_condition 等价（新版本源码本身也是先转成 doc_ids 再检索），
@@ -726,18 +732,32 @@ class RAGFlowClient:
         from src.core.concurrency import governor_acquire
         from src.observability.metrics import incr_active, record_rag_call, record_rag_zero_hit
 
-        with governor_acquire("rag", interactive=True):
+        remaining = remaining_seconds() if remaining_seconds is not None else None
+        if remaining is not None and remaining <= 0:
+            raise ScopedRetrievalError("timeout")
+        with governor_acquire("rag", interactive=True, timeout=remaining):
+            if should_cancel is not None and should_cancel():
+                raise QueryCancelled()
+            if before_request is not None:
+                before_request()
+            request_options = {}
+            if remaining_seconds is not None:
+                remaining = remaining_seconds()
+                if remaining <= 0:
+                    raise ScopedRetrievalError("timeout")
+                request_options["timeout"] = min(float(self.timeout), remaining)
             record_rag_call()
             incr_active("hdb.rag.active_requests", "Concurrent RAG retrieval calls", 1)
             try:
                 if should_cancel is None:
-                    data = self.request("POST", "/api/v1/retrieval", json=payload)
+                    data = self.request("POST", "/api/v1/retrieval", json=payload, **request_options)
                 else:
                     data = self.request_cancellable(
                         "POST",
                         "/api/v1/retrieval",
                         json=payload,
                         should_cancel=should_cancel,
+                        **request_options,
                     )
             finally:
                 incr_active("hdb.rag.active_requests", "Concurrent RAG retrieval calls", -1)
@@ -1197,7 +1217,83 @@ class RAGFlowBackend(RAGBackend):
                 updated += 1
         return updated
 
+    def _validate_retrieval_contract(self, kb_name: str, ctx: RequestContext, contract: DocumentRetrievalContract) -> None:
+        self._check_kb_access(kb_name, ctx, "read")
+        scope = _scope_for_kb(kb_name, ctx).require_department("retrieve from")
+        if not scope.kb_id or contract.mode not in {"chat", "frozen"}:
+            raise ScopedRetrievalError("source_unavailable", "source_identity_missing")
+        allowed = contract.allowed_record_ids
+        if contract.mode == "frozen" and (not allowed or set(contract.expected_source_stamps) != set(allowed)):
+            raise ScopedRetrievalError("source_unavailable", "incomplete_frozen_source_set")
+        records = self.store.list_documents(kb_name, department_id=scope.department_id)
+        indexed = {r.id: r for r in records if r.processor_kind == PROCESSOR_KIND_RAGFLOW and r.document_id and normalize_parse_status(r.status, r.processor_kind) == TASK_STATUS_COMPLETED}
+        if allowed is not None and any(record_id not in indexed for record_id in allowed):
+            raise ScopedRetrievalError("source_unavailable", "source_record_missing")
+        for record_id, stamp in contract.expected_source_stamps.items():
+            record = indexed.get(record_id)
+            if record is None:
+                raise ScopedRetrievalError("source_unavailable", "source_record_missing")
+            if stamp.kb_id != scope.kb_id or stamp.local_record_id != record_id:
+                raise ScopedRetrievalError("source_unavailable", "source_identity_mismatch")
+            expected = {
+                "content_hash": stamp.source_content_hash, "document_id": stamp.remote_document_id,
+                "index_revision": stamp.index_revision, "source_version_id": stamp.source_version_id,
+                "revision": stamp.revision, "processing_artifact_id": stamp.processing_artifact_id,
+                "processor_version": stamp.processor_version,
+            }
+            if any(str(getattr(record, key, 0 if key == "index_revision" else "") or "") != str(value or "") for key, value in expected.items()):
+                raise ScopedRetrievalError("source_changed")
+        for record in indexed.values():
+            if (allowed is None or record.id in allowed) and record.kb_id not in (0, None, scope.kb_id):
+                raise ScopedRetrievalError("source_unavailable", "source_identity_mismatch")
+
+    def retrieve_with_scope(
+        self, kb_name: str, query: str, *, contract: DocumentRetrievalContract,
+        top_k: int, ctx: RequestContext, filters: dict | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        before_request: Callable[[], None] | None = None,
+        remaining_seconds: Callable[[], float] | None = None,
+    ) -> ScopedDocumentRetrievalOutcome:
+        diagnostics = {"remote_scope_fallback": False, "discarded_chunks": 0}
+        try:
+            if should_cancel is not None and should_cancel():
+                raise ScopedRetrievalError("cancelled")
+            self._validate_retrieval_contract(kb_name, ctx, contract)
+            if contract.allowed_record_ids == ():
+                return ScopedDocumentRetrievalOutcome("success_empty", diagnostics=diagnostics)
+            scoped_filters = dict(filters or {})
+            if contract.allowed_record_ids is not None:
+                scoped_filters["allowed_record_ids"] = list(contract.allowed_record_ids)
+            if contract.mode == "frozen":
+                scoped_filters["balanced_route"] = True
+            evidence = self._retrieve(kb_name, query, top_k=top_k, ctx=ctx, filters=scoped_filters,
+                                      should_cancel=should_cancel, _contract=contract,
+                                      _before_request=before_request, _remaining_seconds=remaining_seconds,
+                                      _diagnostics=diagnostics)
+            self._validate_retrieval_contract(kb_name, ctx, contract)
+            if should_cancel is not None and should_cancel():
+                raise ScopedRetrievalError("cancelled")
+            return ScopedDocumentRetrievalOutcome("success_with_hits" if evidence else "success_empty", evidence=evidence, diagnostics=diagnostics)
+        except ScopedRetrievalError as exc:
+            return ScopedDocumentRetrievalOutcome(exc.status, error_code=exc.error_code, diagnostics=diagnostics)
+        except PermissionError:
+            return ScopedDocumentRetrievalOutcome("access_denied", error_code="access_denied", diagnostics=diagnostics)
+        except QueryCancelled:
+            return ScopedDocumentRetrievalOutcome("cancelled", error_code="cancelled", diagnostics=diagnostics)
+        except (httpx.TimeoutException, TimeoutError):
+            return ScopedDocumentRetrievalOutcome("timeout", error_code="timeout", diagnostics=diagnostics)
+        except Exception as exc:
+            diagnostics["error_type"] = type(exc).__name__
+            return ScopedDocumentRetrievalOutcome("retrieval_failed", error_code="retrieval_failed", diagnostics=diagnostics)
+
     def retrieve(
+        self, kb_name: str, query: str, top_k: int | None = None,
+        ctx: RequestContext | None = None, filters: dict | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[Evidence]:
+        return self._retrieve(kb_name, query, top_k=top_k, ctx=ctx, filters=filters, should_cancel=should_cancel)
+
+    def _retrieve(
         self,
         kb_name: str,
         query: str,
@@ -1205,6 +1301,11 @@ class RAGFlowBackend(RAGBackend):
         ctx: RequestContext | None = None,
         filters: dict | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        *,
+        _contract: DocumentRetrievalContract | None = None,
+        _before_request: Callable[[], None] | None = None,
+        _remaining_seconds: Callable[[], float] | None = None,
+        _diagnostics: dict | None = None,
     ) -> list[Evidence]:
         self._check_kb_access(kb_name, ctx, "read")
         scope = _scope_for_kb(kb_name, ctx).require_department("retrieve from")
@@ -1315,6 +1416,9 @@ class RAGFlowBackend(RAGBackend):
         # 同等作用域翻译成本地台账的 document_ids 预过滤（0.19 起支持），隔离与
         # 召回不再依赖远端元数据能力；关闭开关或超限时退回旧行为。
         doc_scope_enabled = bool(getattr(src.settings, "RAGFLOW_RETRIEVAL_DOC_SCOPE_ENABLED", True))
+        frozen = _contract is not None and _contract.mode == "frozen"
+        if frozen:
+            doc_scope_enabled = True
         doc_ids_max = int(getattr(src.settings, "RAGFLOW_RETRIEVAL_DOC_IDS_MAX", 2000) or 0)
 
         def _scope_records(narrowed: bool) -> list | None:
@@ -1337,6 +1441,8 @@ class RAGFlowBackend(RAGBackend):
             if not records:
                 return None
             if doc_ids_max and len(records) > doc_ids_max:
+                if frozen:
+                    raise ScopedRetrievalError("filter_unsupported", "frozen_document_scope_too_large")
                 log(
                     "RAGFlow document-scope fallback: "
                     f"{len(records)} scoped documents exceed RAGFLOW_RETRIEVAL_DOC_IDS_MAX={doc_ids_max}."
@@ -1355,7 +1461,10 @@ class RAGFlowBackend(RAGBackend):
             ]
             return ids or None
 
+        scoped_request_count = 0
+
         def retrieve_chunks(condition: dict | None, scope_records: list | None = None) -> list[dict]:
+            nonlocal scoped_request_count
             chunks: list[dict] = []
             for retrieval_dataset_ids in retrieval_dataset_groups:
                 retrieve_kwargs = {
@@ -1366,13 +1475,24 @@ class RAGFlowBackend(RAGBackend):
                 call_doc_ids = _document_scope_ids(scope_records, retrieval_dataset_ids)
                 if call_doc_ids:
                     retrieve_kwargs["document_ids"] = call_doc_ids
+                elif frozen:
+                    continue
                 if should_cancel is not None:
                     retrieve_kwargs["should_cancel"] = should_cancel
+                if _before_request is not None:
+                    retrieve_kwargs["before_request"] = _before_request
+                if _remaining_seconds is not None:
+                    retrieve_kwargs["remaining_seconds"] = _remaining_seconds
                 try:
+                    scoped_request_count += 1
                     chunks.extend(self._client().retrieve(query, **retrieve_kwargs))
                 except RAGFlowAPIError as exc:
                     if not retrieve_kwargs.get("document_ids") or not _is_ragflow_document_scope_rejection(exc):
                         raise
+                    if frozen:
+                        raise ScopedRetrievalError("filter_unsupported", "frozen_document_scope_rejected") from exc
+                    if _diagnostics is not None:
+                        _diagnostics["remote_scope_fallback"] = True
                     # 台账与远端漂移（如远端手工删过文档）时不允许把查询打死：
                     # 去掉预过滤重试一次，结果仍由本地记录过滤兜底。
                     log(f"RAGFlow document-scope rejected by remote; retrying without document_ids: {exc}")
@@ -1392,7 +1512,9 @@ class RAGFlowBackend(RAGBackend):
         scoped_doc_records = _scope_records(narrowed=True)
         base_doc_records = _scope_records(narrowed=False)
         chunks = retrieve_chunks(metadata_condition, scoped_doc_records)
-        if strict_allowed:
+        if frozen and not scoped_request_count:
+            raise ScopedRetrievalError("source_unavailable", "frozen_dataset_mapping_missing")
+        if strict_allowed and (_contract is None or frozen):
             # The strict linked-record path never widens: no unconditioned
             # retry, no filename fallback, no route-based group widening.
             apply_routed_source_groups = False
@@ -1471,8 +1593,24 @@ class RAGFlowBackend(RAGBackend):
                     "source_group": record_source_group,
                     "original_file_name": canonical_source_name,
                     "ragflow_document_id": remote_document_id,
+                    "remote_document_id": remote_document_id,
+                    "local_record_id": record.id,
+                    "kb_id": scope.kb_id or record.kb_id,
+                    "source_content_hash": record.content_hash,
+                    "source_version_id": record.source_version_id,
+                    "revision": record.revision,
+                    "approval_status": record.approval_status,
+                    "processor_kind": record.processor_kind,
+                    "index_revision": int(getattr(record, "index_revision", 0)),
+                    "processing_artifact_id": str(getattr(record, "processing_artifact_id", "") or ""),
+                    "processor_version": str(getattr(record, "processor_version", "") or ""),
                 })
                 content = chunk.get("content") or chunk.get("text") or ""
+                locator = str(chunk.get("id") or chunk.get("chunk_id") or "")
+                metadata["chunk_or_structured_locator"] = locator
+                metadata["evidence_text_hash"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                if _contract is not None and (not record.content_hash or not locator):
+                    raise ScopedRetrievalError("source_unavailable", "evidence_identity_incomplete")
                 score = chunk.get("similarity") or chunk.get("score") or chunk.get("vector_similarity") or 0.0
                 evidences.append(
                     Evidence(
@@ -1496,6 +1634,10 @@ class RAGFlowBackend(RAGBackend):
             return evidences, skipped_counts
 
         evidences, skipped_counts = _filter_chunks()
+        if _diagnostics is not None:
+            _diagnostics["discarded_chunks"] = sum(skipped_counts.values())
+        if frozen and any(skipped_counts.values()):
+            raise ScopedRetrievalError("filter_unsupported", "unverified_frozen_chunk")
         if not evidences and source_names and not source_name_fallback and skipped_counts["source_name"]:
             chunks = retrieve_chunks(None, base_doc_records)
             source_name_fallback = True

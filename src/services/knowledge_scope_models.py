@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass, field as data_field
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from src.pipelines.document_rag.schemas import Evidence, ScopedRetrievalStatus
 
 import src.settings as settings
 
@@ -89,3 +91,23 @@ def selection_hash(
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+@dataclass
+class KnowledgeSourceRetrievalOutcome:
+    kb_id: int
+    query: str
+    retriever_kind: str
+    status: ScopedRetrievalStatus
+    evidence: list[Evidence] = data_field(default_factory=list)
+    error_code: str | None = None
+    diagnostics: dict = data_field(default_factory=dict)
+
+
+@dataclass
+class MultiKnowledgeRetrievalOutcome:
+    evidence: list[Evidence]
+    source_outcomes: list[KnowledgeSourceRetrievalOutcome]
+    selection_hash: str
+    coverage: dict[int, bool] = data_field(default_factory=dict)
+    partial: bool = False
