@@ -4,8 +4,11 @@ from types import SimpleNamespace
 from src.document_authoring.conflicts.models import ConflictDecision
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.work_order_store import DocumentAuthoringStore
+from src.document_authoring.planning.models import DocumentPlan
+from src.document_authoring.planning.task_graph import TaskGraphCompiler
 from src.document_authoring.writers.provider import WriterRequest
 from tests.test_grounded_claim_extraction import evidence
+from tests.test_document_planning_contracts import _plan_payload
 
 
 def test_review_blocks_before_writer_and_resolution_changes_writer_input(tmp_path):
@@ -51,6 +54,39 @@ def test_repeated_fact_keeps_one_case_and_links_all_units(tmp_path):
     cases = service.conflict_store.list_cases(tenant_id="default", work_order_id="wo")
     assert len(cases) == 1
     assert set(cases[0].affected_unit_ids) == {"field:power", "field:test"}
+
+
+def test_review_hash_invalidates_only_affected_units_and_dependencies(tmp_path):
+    service = DocumentGenerationService(store=DocumentAuthoringStore(str(tmp_path / "a.db")))
+    order = SimpleNamespace(work_order_id="wo", tenant_id="default", kb_scope_snapshot={"purpose": "compose"})
+    snapshot = SimpleNamespace(content_hash="frozen")
+    request = WriterRequest(
+        work_order_id="wo", run_id="run", unit_id="field:cover", unit_label="输入电压",
+        prompt_version="1", evidence=[
+            evidence("输入电压5V。", identity="a"),
+            evidence("输入电压12V。", identity="b"),
+        ],
+    )
+    service.prepare_conflict_writer_request(order, snapshot, request)
+    graph = TaskGraphCompiler().compile(
+        DocumentPlan.model_validate(_plan_payload(status="accepted")),
+    )
+    before = service.harness_runtime._plan_review_hashes(graph, order)
+    case = service.conflict_store.list_cases(tenant_id="default", work_order_id="wo")[0]
+    service.conflict_store.submit_decision(
+        case.conflict_id, tenant_id="default", actor_id="engineer",
+        expected_fingerprint=case.fingerprint, expected_version=case.row_version,
+        expected_snapshot_hash=case.snapshot_hash, expected_evidence_set_hash=case.evidence_set_hash,
+        decision=ConflictDecision(
+            conflict_id=case.conflict_id, action="choose_claim",
+            selected_claim_id=case.claims[0].claim_id, requires_human=True, blocking=False,
+        ),
+        idempotency_key="review-hash",
+    )
+    after = service.harness_runtime._plan_review_hashes(graph, order)
+    assert before["unit:task-cover"] != after["unit:task-cover"]
+    assert before["unit:task-pins"] == after["unit:task-pins"]
+    assert before["preflight"] == after["preflight"]
 
 
 def test_missing_primary_cannot_turn_reference_value_into_target_requirement(tmp_path, monkeypatch):

@@ -22,6 +22,7 @@ from src.document_authoring.models import (
     WorkbookTableColumnSchema,
     WorkbookTableSchema,
 )
+from src.document_authoring.conflicts.models import ConflictDecision
 from src.document_authoring.planning.models import DocumentPlan, OutputSpec
 from src.document_authoring.service import DocumentGenerationService
 from src.document_authoring.work_order_store import DocumentAuthoringStore
@@ -75,7 +76,10 @@ def _fixture_plan(snapshot: KnowledgeBaseSourceSnapshot, template_hash: str) -> 
     return spec, DocumentPlan.model_validate(payload)
 
 
-def _make_fixture(tmp_path, monkeypatch, *, missing_second_row: bool = False):
+def _make_fixture(
+    tmp_path, monkeypatch, *, missing_second_row: bool = False,
+    with_dependency: bool = False,
+):
     monkeypatch.setattr(src.settings, "DOCUMENT_PLAN_DAG_EXECUTION_ENABLED", True)
     monkeypatch.setattr(src.settings, "DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS", {"tenant-a"}, raising=False)
     monkeypatch.setattr(src.settings, "DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES", {"icd"}, raising=False)
@@ -150,6 +154,14 @@ def _make_fixture(tmp_path, monkeypatch, *, missing_second_row: bool = False):
     )
     authoring_store.create_knowledge_base_source_snapshot(snapshot)
     spec, plan = _fixture_plan(snapshot, template_hash)
+    if with_dependency:
+        plan_payload = plan.model_dump(mode="json")
+        plan_payload["dependency_edges"] = [
+            {"upstream_task_id": "task-cover", "downstream_task_id": "task-pins"},
+        ]
+        plan_payload["unit_tasks"][1]["dependencies"] = ["task-cover"]
+        plan_payload["plan_hash"] = None
+        plan = DocumentPlan.model_validate(plan_payload)
     authoring_store.planning.create_output_spec(
         spec, tenant_id="tenant-a", user_id="author",
     )
@@ -384,3 +396,117 @@ def test_plan_route_fails_closed_when_scope_is_not_allowlisted(tmp_path, monkeyp
         service.run_internal_harness(ctx, order.work_order_id, retrieve=retrieve)
 
     assert store.list_harness_runs(order.work_order_id) == []
+
+
+def test_conflict_decision_invalidates_affected_and_downstream_receipts_on_resume(
+    tmp_path, monkeypatch,
+):
+    """A decision changes the review input, so a restarted worker recomputes its closure."""
+    service, ctx, store, order, _plan, retrieve = _make_fixture(
+        tmp_path, monkeypatch, with_dependency=True,
+    )
+    writer = ManagedWriter(DeterministicEvidenceWriter())
+    writer_calls: list[str] = []
+    original_generate = writer.generate
+
+    def counting_generate(request):
+        writer_calls.append(request.unit_id)
+        return original_generate(request)
+
+    writer.generate = counting_generate
+
+    def conflicting_retrieve(requirement, attempt, query_override=None):
+        if requirement.semantic_unit_id == "field:cover":
+            return RetrievalOutcome(
+                requirement_id=requirement.requirement_id,
+                status="success_with_hits",
+                evidences=[
+                    EvidenceEnvelope(
+                        id="ev-cover-5v", content="Cover title: ADAS ICD", source_name="design.pdf",
+                        metadata={
+                            "knowledge_base_name": "ADAS",
+                            "knowledge_source": {"kb_id": 1, "role": "primary"},
+                            "effective_scope": "project:ADAS",
+                            "source_content_hash": "sha256:cover-a",
+                            "source_version_id": "cover-a",
+                            "normalized_claim": {
+                                "claim_id": "cover-voltage-a", "field_key": "input_voltage",
+                                "subject": "power module", "predicate": "requires",
+                                "value": "5", "unit": "V", "scope_key": "project:ADAS",
+                            },
+                        },
+                    ),
+                    EvidenceEnvelope(
+                        id="ev-cover-12v", content="Cover title: ADAS ICD", source_name="design.pdf",
+                        metadata={
+                            "knowledge_base_name": "ADAS",
+                            "knowledge_source": {"kb_id": 2, "role": "reference"},
+                            "effective_scope": "project:ADAS",
+                            "source_content_hash": "sha256:cover-b",
+                            "source_version_id": "cover-b",
+                            "normalized_claim": {
+                                "claim_id": "cover-voltage-b", "field_key": "input_voltage",
+                                "subject": "power module", "predicate": "requires",
+                                "value": "12", "unit": "V", "scope_key": "project:ADAS",
+                            },
+                        },
+                    ),
+                ],
+                query_fingerprint="query-cover-conflict",
+                applied_source_set_snapshot_id=order.source_set_snapshot_id,
+            )
+        return retrieve(requirement, attempt, query_override)
+
+    # Discover the conflict during finalization so all plan-node receipts are
+    # durable before the worker enters its human wait state.
+    service.harness_runtime.conflict_reviewer = None
+    first_artifact = service.run_internal_harness(
+        ctx, order.work_order_id, retrieve=conflicting_retrieve, writer=writer,
+    )
+    run = store.get_harness_run(first_artifact.run_id)
+    assert run is not None and run.status == "waiting_human"
+    before = store.list_node_execution_receipts(
+        run.harness_run_id, node_name="plan_node", status="committed",
+    )
+    assert {receipt.unit_id for receipt in before} == {
+        "preflight", "unit:task-cover", "unit:task-pins",
+        "aggregate", "pre-render-review", "render", "post-render-review", "release",
+    }
+    case = service.conflict_store.list_cases(
+        tenant_id="tenant-a", work_order_id=order.work_order_id,
+    )[0]
+    decision = ConflictDecision(
+        conflict_id=case.conflict_id,
+        action="choose_claim",
+        selected_claim_id=case.claims[0].claim_id,
+        requires_human=True,
+        blocking=False,
+    )
+    service.conflict_store.submit_decision(
+        case.conflict_id,
+        tenant_id="tenant-a",
+        actor_id="author",
+        expected_fingerprint=case.fingerprint,
+        expected_snapshot_hash=case.snapshot_hash,
+        expected_evidence_set_hash=case.evidence_set_hash,
+        expected_version=case.row_version,
+        decision=decision,
+        idempotency_key="resume-after-review",
+    )
+
+    # A fresh worker gets the normal conflict reviewer and resumes the same
+    # HarnessRun. The changed decision fingerprint invalidates cover and the
+    # dependent pins unit; no stale writer receipt can bypass that review.
+    service.harness_runtime.conflict_reviewer = service.prepare_conflict_writer_request
+    service.resume_internal_harness(
+        ctx, run.harness_run_id, retrieve=conflicting_retrieve, writer=writer,
+    )
+
+    assert writer_calls.count("field:cover") == 2
+    assert writer_calls.count("field:pins") == 2
+    after = store.list_node_execution_receipts(
+        run.harness_run_id, node_name="plan_node", status="committed",
+    )
+    assert len(after) > len(before)
+    assert len({receipt.input_fingerprint for receipt in after if receipt.unit_id == "unit:task-cover"}) == 2
+    assert len({receipt.input_fingerprint for receipt in after if receipt.unit_id == "unit:task-pins"}) == 2

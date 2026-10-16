@@ -683,13 +683,28 @@ class InternalDocumentHarnessRuntime:
             return output
         order = self.store.get_work_order(running.work_order_id)
         review_hash = self._plan_review_hashes(graph, order).get(node.node_id, "") if order else ""
+        input_fingerprint = self._plan_node_fingerprint(node, graph, review_hash)
         receipt = NodeExecutionReceipt(
             receipt_id=f"receipt-{uuid.uuid4().hex}",
             harness_run_id=running.harness_run_id,
             node_name="plan_node",
             unit_id=node.node_id,
-            input_fingerprint=self._plan_node_fingerprint(node, graph, review_hash),
-            action_key=node.action_key,
+            input_fingerprint=input_fingerprint,
+            # A plan node can execute again after a governed review decision
+            # changes its input fingerprint.  The raw plan action key is
+            # stable across that transition, so using it directly would
+            # collide with the run-level unique action-key index.  Derive the
+            # receipt key from the complete execution identity instead; the
+            # same input remains idempotent while a changed review version
+            # gets a new durable receipt.
+            action_key=receipt_action_key(
+                harness_run_id=running.harness_run_id,
+                node_name="plan_node",
+                unit_id=node.node_id,
+                attempt=attempt,
+                input_fingerprint=input_fingerprint,
+                action={"version": "plan-node-v1", "operation": node.action_key},
+            ),
             attempt=attempt,
             fencing_token=running.fencing_token,
         )
