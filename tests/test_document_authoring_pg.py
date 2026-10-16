@@ -88,6 +88,76 @@ class DocumentAuthoringPgParityTests(unittest.TestCase):
             artifact_root=os.path.join(self.tmp.name, "artifacts-pg")
         )
 
+    def test_conflict_decisions_round_trip_and_replay_on_both_backends(self):
+        from src.document_authoring.conflicts.detector import ConflictDetector
+        from src.document_authoring.conflicts.normalizer import normalize_claim
+        from src.document_authoring.conflicts.policy import ConflictPolicy
+        from src.document_authoring.conflicts.store import ConflictDecisionStore
+
+        for backend in (self._sqlite_store(), self._pg_store()):
+            with self.subTest(backend=backend._backend):
+                store = ConflictDecisionStore(backend_store=backend)
+                case = ConflictDetector().detect([
+                    normalize_claim(
+                        claim_id=f'claim-{value}', field_key='input_voltage', subject='power', predicate='requires',
+                        value=value, unit='V', source_kb_id=101,
+                        source_role='primary', evidence_id=f'evidence-{value}',
+                    ) for value in ('5', '12')
+                ])[0]
+                work_order_id = f'pg-conflict-{uuid.uuid4().hex}'
+                store.save_case(case, tenant_id='default', work_order_id=work_order_id)
+                request = dict(
+                    conflict_id=case.conflict_id, tenant_id='default', actor_id='alice',
+                    expected_fingerprint=case.fingerprint, expected_version=1,
+                    expected_snapshot_hash=case.snapshot_hash,
+                    expected_evidence_set_hash=case.evidence_set_hash,
+                    decision=ConflictPolicy().evaluate(case, purpose='compose').model_copy(
+                        update={'selected_claim_id': 'claim-5'},
+                    ), idempotency_key='pg-decision',
+                )
+                first = store.submit_decision(**request)
+                self.assertEqual(first, store.submit_decision(**request))
+                self.assertEqual(store.get_case(case.conflict_id).row_version, 2)
+                self.assertEqual(len(store.list_decisions(case.conflict_id, tenant_id='default')), 1)
+
+    def test_concurrent_conflict_decision_replays_share_one_result_on_both_backends(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        from src.document_authoring.conflicts.detector import ConflictDetector
+        from src.document_authoring.conflicts.normalizer import normalize_claim
+        from src.document_authoring.conflicts.policy import ConflictPolicy
+        from src.document_authoring.conflicts.store import ConflictDecisionStore
+
+        for backend in (self._sqlite_store(), self._pg_store()):
+            with self.subTest(backend=backend._backend):
+                store = ConflictDecisionStore(backend_store=backend)
+                case = ConflictDetector().detect([
+                    normalize_claim(
+                        claim_id=f'claim-{value}', field_key='input_voltage', subject='power', predicate='requires',
+                        value=value, unit='V', source_kb_id=101,
+                        source_role='primary', evidence_id=f'evidence-{value}',
+                    ) for value in ('5', '12')
+                ])[0]
+                store.save_case(case, tenant_id='default', work_order_id=f'pg-conflict-{uuid.uuid4().hex}')
+                barrier = Barrier(4)
+
+                def submit(_index):
+                    barrier.wait(timeout=10)
+                    return store.submit_decision(
+                        case.conflict_id, tenant_id='default', actor_id='alice',
+                        expected_fingerprint=case.fingerprint, expected_version=1,
+                        expected_snapshot_hash=case.snapshot_hash,
+                        expected_evidence_set_hash=case.evidence_set_hash,
+                        decision=ConflictPolicy().evaluate(case, purpose='compose').model_copy(
+                            update={'selected_claim_id': 'claim-5'},
+                        ), idempotency_key='pg-concurrent-decision',
+                    )
+
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    results = list(pool.map(submit, range(4)))
+                self.assertTrue(all(result == results[0] for result in results))
+                self.assertEqual(len(store.list_decisions(case.conflict_id, tenant_id='default')), 1)
+
     @staticmethod
     def _seed_template(store: DocumentAuthoringStore, suffix: str):
         store.save_renderer_policy(RendererPolicy(renderer_policy_id=f"renderer-{suffix}"))

@@ -1594,6 +1594,13 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
         if (error instanceof DOMException && error.name === 'AbortError') {
           finishTrace('error', '已停止生成');
+        } else if (error instanceof ApiError && error.status === 409 && error.body.includes('knowledge_scope_changed')) {
+          setInput((current) => current || query);
+          setDocumentContextState(null);
+          activeSessionRef.current = null;
+          setActiveSessionId(null);
+          setDocumentCards([]);
+          notify.error('来源范围已变化，草稿已保留；重新发送将新建会话，请重新选择附件与模板。');
         } else {
           finishTrace('error', error instanceof Error ? error.message : '发送失败');
           const failedSessionId = sessionId;

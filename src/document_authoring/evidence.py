@@ -19,7 +19,7 @@ from src.agents.schemas import Evidence
 from src.attachments.evidence import evidence_from_chunk
 from src.attachments.models import SOURCE_SCOPES, scope_allows_attachments
 from src.attachments.retrieval import AttachmentRetrievalService
-from src.pipelines.document_rag.schemas import RequestContext
+from src.pipelines.document_rag.schemas import DocumentRetrievalContract, RequestContext, ScopedRetrievalError
 from src.services.knowledge_scope_models import KnowledgeScopeSnapshot
 
 
@@ -126,6 +126,7 @@ class KnowledgeBaseEvidenceProvider:
         multi_kb_service: Any | None = None,
         knowledge_scope: KnowledgeScopeSnapshot | None = None,
         retrieval_budget: Any | None = None,
+        document_contracts: Mapping[int, DocumentRetrievalContract] | None = None,
     ):
         self.backend = backend
         self.top_k = max(1, int(top_k))
@@ -138,6 +139,7 @@ class KnowledgeBaseEvidenceProvider:
         self.multi_kb_service = multi_kb_service
         self.knowledge_scope = knowledge_scope
         self.retrieval_budget = retrieval_budget
+        self.document_contracts = document_contracts
 
     def retrieve(
         self,
@@ -179,7 +181,12 @@ class KnowledgeBaseEvidenceProvider:
                 retriever_kind="document",
                 per_source_top_k=self.top_k,
                 budget=self.retrieval_budget,
+                **({'document_contracts': self.document_contracts} if self.document_contracts is not None else {}),
             )
+            if self.document_contracts is not None:
+                failure = next((entry for entry in outcome.source_outcomes if entry.status not in {'success_with_hits', 'success_empty'}), None)
+                if failure is not None:
+                    raise ScopedRetrievalError(failure.status, failure.error_code)
             return [
                 _knowledge_base_evidence(
                     item,

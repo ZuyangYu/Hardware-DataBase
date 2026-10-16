@@ -3,6 +3,60 @@
 方案：`docs/superpowers/plans/2026-10-15-multi-knowledge-base-retrieval-authoring-human-review-plan-R3.md`。
 基础提交：`3c00bd97d9d6de9d8b470b271bd50d0bdccf7d45`。
 
+## 2026-10-16 会话接续
+
+从会话 `01a13e99-03ab-7493-9d19-0236aac3d3c6` 恢复到 `feature/multi-kb-retrieval-r3`，接续 `f2de38e` 之后未提交的冲突服务/API 和前端测试。本节更新后续进度，下方 T0–T5 记录保留为原阶段的验收结果。
+
+本轮工作：
+
+- [x] 审查并接续原有未提交改动，保持原 feature worktree。
+- [x] 共享 authoring SQLite/PostgreSQL 冲突存储、事项去重、版本锁、幂等正文检查与租户复查。
+- [x] PostgreSQL 在读取幂等记录前锁定事项行；四个并发重试返回同一决策，无重复写入。
+- [x] 设计候选进入 `approval_pending`；延期继续阻断；人工批准和自动发布都检查未决冲突。
+- [x] 事项列表/详情/决策和产物预览/下载重新核验冻结来源；声明不能覆盖服务器来源的 KB、角色、审批状态和证据身份。
+- [x] 冲突发现后 Harness 进入 `waiting_human` 并释放租约；该状态重试不消耗故障重试预算；有效决策可以幂等入队恢复原 HarnessRun。
+- [x] Worker 从持久快照恢复整个选库集合，按每库本地记录 ID 和版本戳构建 `frozen` 检索契约；常规和放宽查询共享调用预算。冻结检索失败不当成零命中。
+- [x] 来源复核使用实时授权，检查内容、源版本、修订、审批、索引代次和处理产物；证据按实际 KB/记录绑定，允许不同库内同名文件。
+- [x] 保留旧单库快照哈希读取兼容；保存完整多库选库快照，恢复时以当前执行者重新授权。
+- [x] 聊天状态卡接入来源冲突审阅：证据矩阵、候选/延期、处理后果、理由、历史、版本冲突和撤权清屏、网络失败使用原幂等键重试。
+- [x] `knowledge_scope_changed` 的 409 恢复输入草稿；再次发送创建新会话，清除旧模板和附件绑定。
+- [x] 新增经授权的产物审计 JSON 旁车下载，绑定产物哈希、来源快照、事项、决策、发布阻断项和执行审计 ID。
+- [x] 旧 SQLite 冲突表先补列/回填 JSON 中的快照哈希，再建去重索引；重复初始化不删除历史。新增双后端 `--check/--apply/--verify` 脚本，默认只读，旧重复事项要求先人工核对。
+- [x] 全量回归与最后补强的定向回归通过；本轮代码随本文提交。
+
+验证结果：
+
+- Python 全量：**3352 passed，200 skipped，60 warnings，52 subtests passed**，耗时 13 分 11 秒。未配置的外部服务套件保留跳过。
+- 最后补强的权限/冲突/冻结执行/迁移/旧发布门禁：**62 passed，2 subtests passed**，包含实际目标库写权限用例和新增迁移脚本用例。
+- 前端全量：**239 passed**；生产构建通过。
+- 浏览器：**5 passed**，使用 API fixtures，覆盖完整 ChatPage 的审阅、待审批、409、撤权及重试交互。
+- 真实临时 PostgreSQL：**31 passed，4 subtests passed**，覆盖 authoring、冲突并发重放和多库范围存储；迁移脚本真实 PG apply/verify/重复 apply 通过。
+- Ruff、`compileall`、`git diff --check` 通过。临时 PostgreSQL 容器已清理。
+
+复验入口：
+
+```bash
+uv run pytest -q
+uv run pytest -q tests/test_authoring_conflicts.py tests/test_multi_kb_frozen_execution.py tests/test_multi_kb_conflict_migration.py
+HDB_TEST_POSTGRES_DSN=<disposable-PG-DSN> uv run pytest -q tests/test_document_authoring_pg.py tests/test_multi_kb_store_contract.py
+uv run python scripts/production_hardening/migrate_multi_kb_conflict_review.py --db <authoring.db> --check
+uv run python scripts/production_hardening/migrate_multi_kb_conflict_review.py --backend postgres --dsn <authoring-DSN> --verify
+cd frontend
+npm test
+npm run build
+npm run test:e2e -- e2e/multi-kb-conflict-review.spec.ts
+```
+
+R3 尚未整体验收：
+
+1. 冲突检测目前消费显式结构化声明，没有面向真实文档的受控关键事实抽取器，不能把普通全文检索结果称为已完成的自动冲突发现。
+2. 尚需把生效决策完整接入章节生成输入和依赖失效/重算，验证取消、重启、迟到 Worker 与多章节恢复的完整端到端过程。
+3. 多库轮次禁用只支持锚点库的表格/电路等工具；严格多源结构化适配及其容量验收仍未完成。
+4. 来源引用点击定位、真实 RAGFlow 双/四库测试、人工标注相关性/冲突质量门槛、负载及关闭/回滚演练仍待完成。
+5. 审计附录以独立 JSON 旁车提供，尚未在 Office/PDF 文档内部追加审计章节；正式审批系统保持外部待审批边界。
+
+本轮没有执行生产数据库迁移、修改运行环境配置、启用功能开关或部署。临时 PG 仅用于隔离测试。
+
 ## 任务状态
 
 - [x] T0：共享检索池生命周期与旧单库兼容。

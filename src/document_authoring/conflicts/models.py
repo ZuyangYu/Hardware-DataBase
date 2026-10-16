@@ -41,19 +41,38 @@ class ConflictCase(BaseModel):
     scope_key: str = ""
     claims: tuple[NormalizedClaim, ...] = Field(min_length=2)
     severity: Literal["S0", "S1", "S2", "S3"] = "S2"
-    status: Literal["open", "resolved", "dismissed", "blocked"] = "open"
+    status: Literal[
+        "open", "resolved", "dismissed", "blocked", "deferred", "approval_pending",
+    ] = "open"
     snapshot_hash: str = ""
     evidence_set_hash: str = ""
     policy_version: str = "conflict-policy-v1"
+    conflict_kind: str = "technical_fact_conflict"
+    affected_unit_ids: tuple[str, ...] = ()
+    allowed_actions: tuple[str, ...] = ()
+    row_version: int = Field(default=1, ge=1)
 
 
 class ConflictDecision(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     conflict_id: str
-    action: Literal["retain_primary", "choose_claim", "report_difference", "integrity_block"]
+    action: Literal[
+        "retain_primary",
+        "choose_claim",
+        "report_difference",
+        "integrity_block",
+        "accept_authoritative_source",
+        "choose_design_candidate",
+        "keep_comparison",
+        "request_change_approval",
+        "defer",
+        "mark_not_applicable",
+    ]
     requires_human: bool
     blocking: bool
     selected_claim_id: str | None = None
     rationale: str = ""
     policy_version: str = "conflict-policy-v1"
+    expected_version: int | None = Field(default=None, ge=1)
+    proposed_value: Any | None = None

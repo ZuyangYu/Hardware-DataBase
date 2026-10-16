@@ -1031,6 +1031,13 @@ export async function downloadDocumentArtifact(
   );
 }
 
+export async function downloadDocumentArtifactAudit(card: DocumentCardData, artifact: DocumentCardArtifact): Promise<void> {
+  await apiDownload.blob(
+    `/api/v1/document-generation/artifacts/${encodeURIComponent(artifact.artifact_id)}/audit?kb=${encodeURIComponent(card.kb_name)}`,
+    `${artifact.artifact_id}-sources-and-decisions.json`,
+  );
+}
+
 /** The release service accepts only immutable review candidates, never drafts. */
 export function documentCardReviewCandidateArtifact(
   card: DocumentCardData,

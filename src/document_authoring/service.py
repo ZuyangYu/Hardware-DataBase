@@ -16,7 +16,7 @@ import uuid
 import zipfile
 from copy import copy
 from datetime import datetime, timezone
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from time import perf_counter
 from types import SimpleNamespace
 from typing import Any
@@ -47,6 +47,11 @@ from src.document_authoring.icd_scope_decision import (
     ICD_BLOCKING_SCOPE_EXCEPTION_KINDS,
     effective_frozen_pin_mappings,
 )
+from src.document_authoring.conflicts.store import ConflictDecisionStore
+from src.document_authoring.conflicts.detector import ConflictDetector
+from src.document_authoring.conflicts.models import ConflictDecision, NormalizedClaim
+from src.document_authoring.conflicts.normalizer import normalize_claim
+from src.document_authoring.conflicts.policy import ConflictPolicy
 from src.document_authoring.models import (
     AuthoringExecutionEvent,
     DeterministicRuleSpec,
@@ -309,6 +314,11 @@ class DocumentGenerationService:
     ):
         self.projects = project_service or ProjectService()
         self.store = store or DocumentAuthoringStore()
+        self.conflict_store = ConflictDecisionStore(
+            getattr(self.store, "db_path", None),
+            backend_store=self.store,
+        )
+        self.source_snapshot_validator: Callable[[RequestContext, Any, Any], None] | None = None
         self.planning = DocumentPlanningService(
             store=getattr(self.store, "planning", None),
         )
@@ -1800,18 +1810,27 @@ class DocumentGenerationService:
             if is_knowledge_base
             else ""
         )
-        frozen_kb_scope = (
-            dict(kb_scope_snapshot)
-            if kb_scope_snapshot
-            else {
+        if kb_scope_snapshot:
+            frozen_kb_scope = dict(kb_scope_snapshot)
+        elif is_knowledge_base:
+            frozen_kb_scope = {
                 "tenant_id": snapshot.tenant_id,
                 "knowledge_base_name": knowledge_base_name,
                 "resource_department_id": self._ctx_department_id(ctx),
                 "knowledge_base_id": self._ctx_kb_id(ctx),
             }
-            if is_knowledge_base
-            else {}
-        )
+            raw_scope = (getattr(ctx, "metadata", {}) or {}).get("knowledge_scope_snapshot")
+            if raw_scope is not None:
+                scope_payload = (
+                    raw_scope.model_dump(mode="json")
+                    if hasattr(raw_scope, "model_dump")
+                    else dict(raw_scope) if isinstance(raw_scope, Mapping) else {}
+                )
+                for key in ("purpose", "selection_hash", "sources", "snapshot_id"):
+                    if key in scope_payload:
+                        frozen_kb_scope[key] = scope_payload[key]
+        else:
+            frozen_kb_scope = {}
         if existing_task is not None:
             # Restart/regeneration lineages must reuse the exact task bound to
             # the parent work order; a fresh idempotency lookup could otherwise
@@ -2232,6 +2251,7 @@ class DocumentGenerationService:
         schema = self._schema(order.document_schema_id, order.document_schema_version)
         template = self._template(order.template_version_id)
         snapshot = self.resolve_source_snapshot(order)
+        self.validate_source_snapshot(ctx, order, snapshot)
         bindings = self.store.list_unit_bindings(order.template_schema_id, order.template_schema_version)
         by_unit = {binding.semantic_unit_id: binding for binding in bindings}
 
@@ -2334,6 +2354,313 @@ class DocumentGenerationService:
         if review is not None and review.source_snapshot_hash != self.resolve_source_snapshot(order).content_hash:
             raise ValueError("ICD scope review source snapshot differs from the work order")
         return review
+
+    def list_conflict_cases(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+    ) -> list[dict[str, Any]]:
+        """List unresolved cross-source conflicts for an authorized work order."""
+        order = self._order(ctx, work_order_id, "run_deterministic_work_order")
+        self.validate_live_source_snapshot(ctx, order)
+        if self.conflict_store is None:
+            return []
+        tenant_id = str(getattr(order, "tenant_id", None) or ctx.tenant_id or "default")
+        cases = self.conflict_store.list_cases(
+            tenant_id=tenant_id,
+            work_order_id=order.work_order_id,
+        )
+        return [case.model_dump(mode="json") for case in cases]
+
+    @staticmethod
+    def _explicit_claims_from_result(order: DocumentWorkOrder, result: Any) -> list[NormalizedClaim]:
+        """Read only server-produced structured claims from retrieved evidence.
+
+        Free-form evidence text is intentionally not parsed here. A retriever
+        or an approved claim extractor must attach ``normalized_claim`` (or a
+        list in ``normalized_claims``) with a real KB identity and evidence
+        provenance before a conflict can affect authoring state.
+        """
+        claims: list[NormalizedClaim] = []
+        for unit_id, outcome in (getattr(result, "outcomes", {}) or {}).items():
+            for evidence in getattr(outcome, "evidences", ()) or ():
+                metadata = dict(getattr(evidence, "metadata", {}) or {})
+                raw = metadata.get("normalized_claims")
+                if raw is None:
+                    raw = metadata.get("normalized_claim")
+                if raw is None:
+                    raw = metadata.get("claims")
+                if isinstance(raw, Mapping):
+                    raw_items = [raw]
+                elif isinstance(raw, NormalizedClaim):
+                    raw_items = [raw]
+                elif isinstance(raw, (list, tuple)):
+                    raw_items = list(raw)
+                else:
+                    continue
+                knowledge_source = metadata.get("knowledge_source")
+                if not isinstance(knowledge_source, Mapping):
+                    knowledge_source = {}
+                for index, item in enumerate(raw_items):
+                    if isinstance(item, Mapping) and 'normalized_value' in item:
+                        try:
+                            item = NormalizedClaim.model_validate(item)
+                        except ValueError:
+                            continue
+                    if isinstance(item, NormalizedClaim):
+                        trusted = {
+                            'source_kb_id': knowledge_source.get('kb_id') or metadata.get('kb_id') or item.source_kb_id,
+                            'source_role': knowledge_source.get('role') or metadata.get('source_role') or item.source_role,
+                            'approval_status': metadata.get('approval_status', item.approval_status),
+                            'source_content_hash': metadata.get('source_content_hash', item.source_content_hash),
+                            'source_version_id': metadata.get('source_version_id', item.source_version_id),
+                            'evidence_ids': (str(evidence.id),),
+                        }
+                        claims.append(NormalizedClaim.model_validate({**item.model_dump(), **trusted}))
+                        continue
+                    if not isinstance(item, Mapping):
+                        continue
+                    data = dict(item)
+                    claim_id = str(
+                        data.get("claim_id")
+                        or f"{getattr(evidence, 'id', '')}:{unit_id}:{index}"
+                    ).strip()
+                    source_kb_id = knowledge_source.get('kb_id') or metadata.get('kb_id') or data.get('source_kb_id') or getattr(order, 'knowledge_base_id', None)
+                    try:
+                        source_kb_id = int(source_kb_id)
+                    except (TypeError, ValueError):
+                        continue
+                    role = str(
+                        knowledge_source.get("role")
+                        or metadata.get("source_role")
+                        or data.get("source_role")
+                        or "reference"
+                    ).strip().casefold()
+                    if role not in {"primary", "peer", "reference", "standard"}:
+                        continue
+                    evidence_id = str(getattr(evidence, "id", "") or "").strip()
+                    try:
+                        claims.append(
+                            normalize_claim(
+                                claim_id=claim_id,
+                                field_key=str(data.get("field_key") or unit_id),
+                                subject=data.get("subject", ""),
+                                predicate=data.get("predicate", ""),
+                                value=data.get("value", data.get("display_value", "")),
+                                unit=str(data.get("unit") or ""),
+                                condition=data.get("condition", ""),
+                                scope_key=data.get("scope_key", ""),
+                                source_kb_id=source_kb_id,
+                                source_role=role,
+                                approval_status=metadata.get('approval_status', data.get('approval_status', '')),
+                                evidence_id=evidence_id,
+                                evidence_ids=(),
+                                source_content_hash=str(
+                                    metadata.get("source_content_hash", data.get('source_content_hash', ''))
+                                    or ""
+                                ),
+                                source_version_id=str(
+                                    metadata.get("source_version_id", data.get('source_version_id', ''))
+                                    or ""
+                                ),
+                                locator=dict(
+                                    data.get("locator")
+                                    or getattr(evidence, "locator", {})
+                                    or {}
+                                ),
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        continue
+        return claims
+
+    def _detect_and_persist_conflicts(
+        self,
+        order: DocumentWorkOrder,
+        snapshot: Any,
+        result: Any,
+    ) -> list[Any]:
+        """Persist structured conflicts and mark only their affected units.
+
+        This is called at the worker finalization boundary, after retrieval
+        scope validation and before a candidate can be released. Automatic
+        comparison/authoritative-source decisions are recorded as resolved
+        cases; unresolved cases remain open and force human review.
+        """
+        if self.conflict_store is None:
+            return []
+        claims = self._explicit_claims_from_result(order, result)
+        if len(claims) < 2:
+            return []
+        cases = ConflictDetector().detect(claims)
+        if not cases:
+            return []
+        purpose = str(
+            (getattr(order, "kb_scope_snapshot", {}) or {}).get("purpose") or "compose"
+        )
+        policy = ConflictPolicy()
+        persisted_cases: list[Any] = []
+        for detected in cases:
+            detected_ids = {claim.claim_id for claim in detected.claims}
+            detected_evidence_ids = {evidence_id for claim in detected.claims for evidence_id in claim.evidence_ids}
+            affected_ids: set[str] = set()
+            for unit_id, outcome in (getattr(result, "outcomes", {}) or {}).items():
+                for evidence in getattr(outcome, "evidences", ()) or ():
+                    if str(getattr(evidence, 'id', '')) in detected_evidence_ids:
+                        affected_ids.add(str(unit_id))
+                        continue
+                    metadata = dict(getattr(evidence, "metadata", {}) or {})
+                    raw = metadata.get("normalized_claims")
+                    if raw is None:
+                        raw = metadata.get("normalized_claim")
+                    if raw is None:
+                        raw = metadata.get("claims")
+                    raw_items = (
+                        [raw] if isinstance(raw, Mapping)
+                        else [raw] if isinstance(raw, NormalizedClaim)
+                        else list(raw) if isinstance(raw, (list, tuple)) else []
+                    )
+                    if any(
+                        (
+                            item.claim_id in detected_ids
+                            if isinstance(item, NormalizedClaim)
+                            else isinstance(item, Mapping)
+                            and str(item.get("claim_id") or "") in detected_ids
+                        )
+                        for item in raw_items
+                    ):
+                        affected_ids.add(str(unit_id))
+            affected = tuple(sorted(affected_ids))
+            decision = policy.evaluate(detected, purpose=purpose)
+            allowed_actions = (
+                ("retain_primary", "accept_authoritative_source", "choose_claim", "choose_design_candidate", "defer")
+                if decision.requires_human
+                else (decision.action,)
+            )
+            status = "open" if decision.requires_human else "resolved"
+            case = detected.model_copy(update={
+                "status": status,
+                "snapshot_hash": str(getattr(snapshot, "content_hash", "") or detected.snapshot_hash),
+                "affected_unit_ids": affected,
+                "allowed_actions": allowed_actions,
+            })
+            persisted = self.conflict_store.save_case(
+                case,
+                tenant_id=str(getattr(order, "tenant_id", None) or "default"),
+                work_order_id=order.work_order_id,
+            )
+            persisted_cases.append(persisted)
+            if persisted.status in {"open", "blocked", "deferred", "approval_pending"}:
+                for unit_id in affected:
+                    result.unit_statuses[unit_id] = "conflicting"
+                result.issues.append({
+                    "code": "authoring_conflict_requires_human",
+                    "conflict_id": persisted.conflict_id,
+                    "field_key": persisted.field_key,
+                    "affected_unit_ids": list(persisted.affected_unit_ids),
+                    "severity": persisted.severity,
+                })
+        return persisted_cases
+
+    def get_conflict_case(
+        self,
+        ctx: RequestContext,
+        conflict_id: str,
+        *,
+        expected_work_order_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return one conflict only after resolving its owning work order."""
+        if self.conflict_store is None:
+            return None
+        context = self.conflict_store.get_case_context(conflict_id)
+        if context is None:
+            return None
+        case, tenant_id, work_order_id = context
+        if str(ctx.tenant_id or "default") != tenant_id:
+            raise PermissionError("conflict_case_tenant_mismatch")
+        if expected_work_order_id is not None and str(expected_work_order_id) != work_order_id:
+            raise ValueError("conflict_case_work_order_mismatch")
+        order = self._order(ctx, work_order_id, "run_deterministic_work_order")
+        self.validate_live_source_snapshot(ctx, order)
+        payload = case.model_dump(mode="json")
+        payload["decisions"] = self.conflict_store.list_decisions(
+            conflict_id,
+            tenant_id=tenant_id,
+        )
+        return payload
+
+    def submit_conflict_decision(
+        self,
+        ctx: RequestContext,
+        conflict_id: str,
+        *,
+        expected_work_order_id: str | None = None,
+        expected_fingerprint: str,
+        expected_conflict_version: int = 1,
+        expected_snapshot_hash: str,
+        expected_evidence_set_hash: str,
+        decision: ConflictDecision,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Commit a user decision after work-order and source re-authorization."""
+        if self.conflict_store is None:
+            raise RuntimeError("conflict_store_not_configured")
+        context = self.conflict_store.get_case_context(conflict_id)
+        if context is None:
+            raise KeyError("conflict_case_not_found")
+        case, tenant_id, work_order_id = context
+        if str(ctx.tenant_id or "default") != tenant_id:
+            raise PermissionError("conflict_case_tenant_mismatch")
+        if expected_work_order_id is not None and str(expected_work_order_id) != work_order_id:
+            raise ValueError("conflict_case_work_order_mismatch")
+        order = self._order(ctx, work_order_id, "run_deterministic_work_order")
+        if getattr(order, 'scope_type', '') == 'knowledge_base' and not ctx.has_kb_permission(order.knowledge_base_name, 'write'):
+            raise PermissionError('target knowledge base write permission is required')
+        snapshot = self.resolve_source_snapshot(order)
+        self.validate_source_snapshot(ctx, order, snapshot)
+        if str(snapshot.content_hash or "") != str(expected_snapshot_hash or ""):
+            raise ValueError("source_snapshot_changed")
+        result = self.conflict_store.submit_decision(
+            conflict_id,
+            tenant_id=tenant_id,
+            actor_id=str(ctx.user_id),
+            expected_fingerprint=expected_fingerprint,
+            expected_version=expected_conflict_version,
+            expected_snapshot_hash=expected_snapshot_hash,
+            expected_evidence_set_hash=expected_evidence_set_hash,
+            decision=decision,
+            idempotency_key=idempotency_key,
+        )
+        # Keep the human decision in the same append-only execution audit as
+        # the Harness run. Only IDs, hashes, action and status cross this
+        # boundary; evidence text and prompts remain in governed stores.
+        runs = self.store.list_harness_runs(work_order_id)
+        if runs:
+            run = runs[-1]
+            self.store.append_execution_event(
+                AuthoringExecutionEvent(
+                    event_id=f"authoring-conflict-decision-{result['decision_id']}",
+                    event_type="conflict_decision",
+                    tenant_id=tenant_id,
+                    work_order_id=work_order_id,
+                    harness_run_id=run.harness_run_id,
+                    idempotency_key=f"conflict-decision:{result['decision_id']}",
+                    executor="authoring_graph",
+                    node_name="conflict_review",
+                    status="succeeded",
+                    sanitized_payload=safe_review_projection({
+                        "conflict_id": conflict_id,
+                        "decision_id": result["decision_id"],
+                        "action": decision.action,
+                        "decision_status": result.get("status"),
+                        "conflict_version": expected_conflict_version,
+                        "source_snapshot_hash": expected_snapshot_hash,
+                        "evidence_set_hash": expected_evidence_set_hash,
+                        "affected_unit_ids": list(case.affected_unit_ids),
+                    }),
+                )
+            )
+        return result
 
     def submit_icd_scope_resolution(
         self,
@@ -2460,6 +2787,7 @@ class DocumentGenerationService:
         reranker = self._reranker_for_policy(policy)
         fit_checker = self._fit_checker_for_policy(policy)
         snapshot = self.resolve_source_snapshot(order)
+        self.validate_source_snapshot(ctx, order, snapshot)
         if str(order.template_version_id).startswith("system-recipe:"):
             template, schema, _plan, _recipe = self._template_free_execution_inputs(order)
         else:
@@ -2532,6 +2860,7 @@ class DocumentGenerationService:
         if order.execution_mode not in {"internal_harness", "external_agent"} or not order.harness_policy_id:
             raise ValueError("work order is not configured for a Harness executor")
         snapshot = self.resolve_source_snapshot(order)
+        self.validate_source_snapshot(ctx, order, snapshot)
         scope_review = self.store.get_icd_scope_review(order.work_order_id)
         if scope_review is not None:
             if scope_review.source_snapshot_hash != snapshot.content_hash:
@@ -2541,7 +2870,7 @@ class DocumentGenerationService:
         policy = self.store.get_harness_policy(order.harness_policy_id, order.harness_policy_version)
         if policy is None or policy.status != "approved":
             raise ValueError("frozen HarnessPolicy is no longer approved")
-        if run.status in {"paused", "failed"}:
+        if run.status in {"paused", "failed", "waiting_human"}:
             run = self.store.queue_harness_retry(run.harness_run_id, policy.max_retries)
         if run.status != "retrying":
             raise ValueError(f"harness run cannot resume from status {run.status}")
@@ -2695,6 +3024,39 @@ class DocumentGenerationService:
             )
             raise
 
+    def _mark_harness_run_waiting_for_human(
+        self,
+        harness_run_id: str,
+    ):
+        """Persist the review wait discovered during finalization.
+
+        The Harness runtime computes its status before the authoring finalizer
+        performs conflict detection. A conflict therefore can be discovered
+        after the runtime has written ``completed``. Reopening that run here
+        keeps the durable resume path authoritative and releases any stale
+        worker lease.
+        """
+        run = self.store.get_harness_run(harness_run_id)
+        if run is None or run.status == "waiting_human":
+            return run
+        if run.status not in {"completed", "running"}:
+            return run
+        return self.store.replace_harness_run(run.model_copy(update={
+            "status": "waiting_human",
+            "current_node": "await_human",
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "release_status": "pending",
+        }))
+
+    @staticmethod
+    def _has_unresolved_conflict_cases(cases: Iterable[Any]) -> bool:
+        return any(
+            str(getattr(case, "status", ""))
+            in {"open", "blocked", "deferred", "approval_pending"}
+            for case in cases
+        )
+
     def _finalize_internal_harness_result(
         self,
         order: DocumentWorkOrder,
@@ -2706,6 +3068,10 @@ class DocumentGenerationService:
             return self._finalize_plan_internal_harness_result(
                 order, template, harness_run_id, result,
             )
+        snapshot = self.resolve_source_snapshot(order)
+        conflicts = self._detect_and_persist_conflicts(order, snapshot, result)
+        if self._has_unresolved_conflict_cases(conflicts):
+            self._mark_harness_run_waiting_for_human(harness_run_id)
         blocked_fields = self._block_generation_fields(order, result)
         bindings = self.store.list_unit_bindings(order.template_schema_id, order.template_schema_version)
         binding_by_unit = {binding.semantic_unit_id: binding for binding in bindings}
@@ -2808,6 +3174,10 @@ class DocumentGenerationService:
         coverage, unit review, deterministic aggregation, both review gates,
         and the existing allowlisted renderer in that order.
         """
+        snapshot = self.resolve_source_snapshot(order)
+        conflicts = self._detect_and_persist_conflicts(order, snapshot, result)
+        if self._has_unresolved_conflict_cases(conflicts):
+            self._mark_harness_run_waiting_for_human(harness_run_id)
         planning_store = getattr(self.planning, "store", None)
         if planning_store is None:
             raise ValueError("plan-backed finalization requires a planning store")
@@ -3396,6 +3766,11 @@ class DocumentGenerationService:
     ) -> DocumentArtifact:
         if not src.settings.DOCUMENT_AUTO_PUBLISH_VERIFIED:
             return candidate
+        conflict_store = getattr(self, 'conflict_store', None)
+        if conflict_store is not None and conflict_store.list_cases(
+            tenant_id=str(order.tenant_id or 'default'), work_order_id=order.work_order_id,
+        ):
+            return candidate
         if (
             report.status != "passed"
             or self._has_icd_blocking_issue(report.issues)
@@ -3747,6 +4122,13 @@ class DocumentGenerationService:
         if candidate.stage != "review_candidate":
             raise ValueError("only a review candidate may be approved")
         order = self._order(ctx, candidate.work_order_id, "approve_artifact")
+        conflict_store = getattr(self, 'conflict_store', None)
+        if conflict_store is not None and conflict_store.list_cases(
+            tenant_id=str(order.tenant_id or "default"),
+            work_order_id=order.work_order_id,
+        ):
+            raise ValueError("unresolved_conflicts_block_release")
+        self.validate_live_source_snapshot(ctx, order)
         report = self.store.get_validation_report(candidate.validation_report_id)
         if report is not None and self._has_icd_blocking_issue(report.issues):
             raise ValueError("candidate has an ICD blocking validation issue")
@@ -3858,11 +4240,46 @@ class DocumentGenerationService:
             "status": "failed" if report.status == "failed" else "requires_human",
         })
 
+    def document_artifact_audit(self, ctx: RequestContext, artifact_id: str) -> dict[str, Any]:
+        """Export the governed source/decision appendix beside immutable artifact bytes."""
+        artifact = self._artifact_for_context(ctx, artifact_id)
+        capability = 'download_approved_release' if artifact.stage == 'approved_release' else 'download_review_candidate'
+        order = self._order(ctx, artifact.work_order_id, capability)
+        self.validate_live_source_snapshot(ctx, order)
+        snapshot = self.resolve_source_snapshot(order)
+        tenant = str(order.tenant_id or 'default')
+        cases = self.conflict_store.list_cases(
+            tenant_id=tenant, work_order_id=order.work_order_id,
+            statuses=('open', 'resolved', 'dismissed', 'blocked', 'deferred', 'approval_pending'),
+        )
+        conflicts = [{**case.model_dump(mode='json'), 'decisions': self.conflict_store.list_decisions(
+            case.conflict_id, tenant_id=tenant,
+        )} for case in cases]
+        return {
+            'schema_version': 1,
+            'work_order_id': order.work_order_id,
+            'artifact_id': artifact.artifact_id,
+            'artifact_content_hash': artifact.content_hash,
+            'artifact_stage': artifact.stage,
+            'source_snapshot_id': snapshot.source_set_snapshot_id,
+            'source_snapshot_hash': snapshot.content_hash,
+            'purpose': (order.kb_scope_snapshot or {}).get('purpose', 'compose'),
+            'sources': snapshot.sources,
+            'source_names': snapshot.source_names,
+            'conflicts': conflicts,
+            'release_blocked': self._has_unresolved_conflict_cases(cases),
+            'execution_audit_refs': [
+                event.event_id for run in self.store.list_harness_runs(order.work_order_id)
+                for event in self.store.list_execution_events(run.harness_run_id)
+            ],
+        }
+
     def download_document_artifact(self, ctx: RequestContext, artifact_id: str) -> bytes:
         artifact = self._artifact_for_context(ctx, artifact_id)
         order = self._order_raw(artifact.work_order_id)
         capability = "download_approved_release" if artifact.stage == "approved_release" else "download_review_candidate"
         self.require_work_order_capability(ctx, order, capability)
+        self.validate_live_source_snapshot(ctx, order)
         content = self.store.read_artifact_content(artifact_id)
         artifact_format = getattr(artifact, "output_format", None) or order.target_format
         self._assert_artifact_content_clean(content, artifact_format)
@@ -3885,6 +4302,7 @@ class DocumentGenerationService:
         """
         source = self._artifact_for_context(ctx, artifact_id)
         order = self._order(ctx, source.work_order_id, "run_deterministic_work_order")
+        self.validate_live_source_snapshot(ctx, order)
         if order.scope_type == "knowledge_base" and (
             not order.knowledge_base_name
             or not ctx.has_kb_permission(order.knowledge_base_name, "write")
@@ -3997,6 +4415,7 @@ class DocumentGenerationService:
         order = self._order_raw(artifact.work_order_id)
         capability = "download_approved_release" if artifact.stage == "approved_release" else "download_review_candidate"
         self.require_work_order_capability(ctx, order, capability)
+        self.validate_live_source_snapshot(ctx, order)
         return preview_artifact(
             self.store.read_artifact_content(artifact_id),
             getattr(artifact, "output_format", None) or order.target_format,
@@ -4273,6 +4692,30 @@ class DocumentGenerationService:
                 raise PermissionError(
                     "knowledge base access is required for this work order"
                 )
+            frozen_sources = (getattr(order, "kb_scope_snapshot", {}) or {}).get("sources") or []
+            for source in frozen_sources:
+                if not isinstance(source, Mapping):
+                    continue
+                source_name = str(
+                    source.get("kb_name") or source.get("kb_name_snapshot") or ""
+                ).strip()
+                source_department = str(
+                    source.get("department_id") or owner_department or ""
+                ).strip()
+                if not source_name:
+                    continue
+                source_metadata = dict(getattr(ctx, "metadata", {}) or {})
+                if source_department:
+                    source_metadata["resource_department_id"] = source_department
+                    source_metadata["department_id"] = source_department
+                source_ctx = ctx
+                if source_metadata != getattr(ctx, "metadata", {}):
+                    source_ctx = copy(ctx)
+                    source_ctx.metadata = source_metadata
+                if not source_ctx.has_kb_permission(source_name, "read"):
+                    raise PermissionError(
+                        "knowledge base access is required for this work order"
+                    )
             return
         self.projects.access.require(ctx, order.project_id, capability)
 
@@ -4304,6 +4747,32 @@ class DocumentGenerationService:
             )
         return snapshot
 
+    def validate_source_snapshot(
+        self,
+        ctx: RequestContext,
+        order: DocumentWorkOrder,
+        snapshot: Any,
+    ) -> None:
+        """Run an application-owned live source/permission recheck.
+
+        The authoring store owns the immutable snapshot, while AppPipeline
+        owns the backend catalog and ACL context. This callback keeps those
+        responsibilities separate and makes the recheck mandatory at worker
+        and decision boundaries when the pipeline provides it.
+        """
+        validator = getattr(self, "source_snapshot_validator", None)
+        if callable(validator):
+            validator(ctx, order, snapshot)
+
+    def validate_live_source_snapshot(
+        self,
+        ctx: RequestContext,
+        order: DocumentWorkOrder,
+    ) -> None:
+        """Revalidate a source only when the application provides a live validator."""
+        if callable(getattr(self, "source_snapshot_validator", None)):
+            self.validate_source_snapshot(ctx, order, self.resolve_source_snapshot(order))
+
     @staticmethod
     def build_knowledge_base_retrieval_outcome(
         knowledge_base_name: str,
@@ -4313,6 +4782,7 @@ class DocumentGenerationService:
         requirement_id: str = "knowledge-base-retrieval",
         source_set_snapshot_id: str = "",
         attachment_ids: Sequence[str] = (),
+        frozen_sources: Sequence[Mapping[str, Any]] | None = None,
     ) -> RetrievalOutcome:
         """Bind KB and chat-attachment evidence to frozen source references."""
         frozen_source_names = list(dict.fromkeys(source_names))
@@ -4353,12 +4823,23 @@ class DocumentGenerationService:
                 str(metadata.get(key) or "").strip()
                 for key in ("knowledge_base_name", "kb_name")
             } - {""}
-            if any(name != knowledge_base_name for name in declared_kb_names):
+            actual_kb_name = knowledge_base_name
+            if frozen_sources is not None:
+                frozen = next((entry for entry in frozen_sources if (
+                    str(entry.get('kb_id')) == str(metadata.get('kb_id'))
+                    and str(entry.get('local_record_id')) == str(metadata.get('local_record_id'))
+                )), None)
+                if frozen is None or str(frozen.get('source_name')) != evidence.source_name:
+                    raise PermissionError('retrieval evidence is outside the frozen record set')
+                actual_kb_name = str(frozen.get('kb_name_snapshot') or frozen.get('kb_name') or '')
+                if metadata.get('source_content_hash') != frozen.get('source_content_hash'):
+                    raise ValueError('source_changed')
+            if any(name != actual_kb_name for name in declared_kb_names):
                 raise PermissionError("retrieval evidence knowledge base does not match selection")
             bound_evidence = copy(evidence)
             bound_evidence.metadata = {
                 **metadata,
-                "knowledge_base_name": knowledge_base_name,
+                "knowledge_base_name": actual_kb_name,
                 "source_type": "knowledge_base",
             }
             accepted.append(bound_evidence)
@@ -4424,6 +4905,12 @@ class DocumentGenerationService:
                 else "legacy_knowledge_base"
             ),
             sources=sources,
+            knowledge_scope_snapshot=(
+                dict(ctx.metadata.get('knowledge_scope_snapshot') or {})
+                if isinstance(ctx.metadata.get('knowledge_scope_snapshot'), Mapping)
+                else ctx.metadata['knowledge_scope_snapshot'].model_dump(mode='json')
+                if hasattr(ctx.metadata.get('knowledge_scope_snapshot'), 'model_dump') else {}
+            ),
         )
         return self.store.create_knowledge_base_source_snapshot(snapshot)
 

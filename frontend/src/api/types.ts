@@ -1491,6 +1491,37 @@ export type DocumentReview = {
   [k: string]: unknown;
 };
 
+export type DocumentConflict = {
+  conflict_id: string;
+  fingerprint?: string;
+  field_key?: string;
+  subject?: string;
+  predicate?: string;
+  claims?: Array<Record<string, unknown>>;
+  severity?: string;
+  status?: string;
+  snapshot_hash?: string;
+  evidence_set_hash?: string;
+  affected_unit_ids?: string[];
+  allowed_actions?: string[];
+  row_version?: number;
+  decisions?: Array<Record<string, unknown>>;
+  [k: string]: unknown;
+};
+
+export type DocumentConflictDecisionInput = {
+  expected_fingerprint: string;
+  source_snapshot_hash: string;
+  evidence_set_hash: string;
+  expected_conflict_version?: number;
+  action: string;
+  selected_claim_id?: string;
+  selected_alternative_ids?: string[];
+  reason?: string;
+  rationale?: string;
+  idempotency_key: string;
+};
+
 export type ArtifactRevision = {
   revision_id: string;
   task_id: string;

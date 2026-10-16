@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from src.document_authoring.chat_context import (
     DocumentAuthoringContext,
@@ -1368,6 +1368,44 @@ class DocumentReviewDecisionRequest(BaseModel):
     client_request_id: str = Field(min_length=1, max_length=128)
     status: str | None = Field(default=None, min_length=1, max_length=64)
     decision_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConflictDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    decision_schema_version: int = Field(default=1, ge=1, le=1)
+    expected_fingerprint: str = Field(min_length=1, max_length=128)
+    expected_snapshot_hash: str = Field(
+        min_length=1,
+        max_length=128,
+        validation_alias=AliasChoices("expected_snapshot_hash", "source_snapshot_hash"),
+    )
+    expected_evidence_set_hash: str = Field(
+        min_length=1,
+        max_length=128,
+        validation_alias=AliasChoices("expected_evidence_set_hash", "evidence_set_hash"),
+    )
+    expected_conflict_version: int = Field(default=1, ge=1)
+    action: Literal[
+        "retain_primary",
+        "choose_claim",
+        "report_difference",
+        "integrity_block",
+        "accept_authoritative_source",
+        "choose_design_candidate",
+        "keep_comparison",
+        "request_change_approval",
+        "defer",
+        "mark_not_applicable",
+    ]
+    selected_claim_id: str | None = Field(default=None, max_length=256)
+    rationale: str = Field(
+        default="",
+        max_length=4000,
+        validation_alias=AliasChoices("rationale", "reason"),
+    )
+    selected_alternative_ids: list[str] = Field(default_factory=list, max_length=16)
+    idempotency_key: str = Field(min_length=1, max_length=128)
 
 
 class CreateDocumentRevisionRequest(BaseModel):

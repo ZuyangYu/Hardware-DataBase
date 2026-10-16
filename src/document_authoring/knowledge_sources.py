@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from src.services.knowledge_scope_models import AuthorizedKnowledgeSource
+from src.pipelines.document_rag.schemas import DocumentRetrievalContract, DocumentSourceStamp
 
 
 def _value(document: Any, metadata: Mapping[str, Any], *names: str, default: Any = "") -> Any:
@@ -113,4 +114,34 @@ def build_frozen_source_entry(
     return entry
 
 
-__all__ = ["build_frozen_source_entry"]
+def frozen_document_contracts(sources: list[dict[str, Any]]) -> dict[int, DocumentRetrievalContract]:
+    """Bind each KB to its exact local records and immutable processing stamps."""
+    grouped: dict[int, dict[int, DocumentSourceStamp]] = {}
+    for source in sources:
+        try:
+            kb_id, record_id = int(source['kb_id']), int(source['local_record_id'])
+            if kb_id <= 0 or record_id <= 0 or not source.get('source_content_hash') or not source.get('remote_document_id'):
+                raise ValueError('source_unavailable')
+            stamp = DocumentSourceStamp(
+                kb_id=kb_id, local_record_id=record_id,
+                source_content_hash=str(source['source_content_hash']),
+                remote_document_id=str(source['remote_document_id']),
+                index_revision=int(source.get('index_revision') or 0),
+                source_version_id=str(source.get('source_version_id') or '') or None,
+                revision=str(source.get('revision') or '') or None,
+                processing_artifact_id=str(source.get('processing_artifact_id') or '') or None,
+                processor_version=str(source.get('processor_version') or '') or None,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError('source_unavailable') from exc
+        records = grouped.setdefault(kb_id, {})
+        if record_id in records and records[record_id] != stamp:
+            raise ValueError('source_changed')
+        records[record_id] = stamp
+    return {
+        kb_id: DocumentRetrievalContract(mode='frozen', allowed_record_ids=tuple(sorted(records)), expected_source_stamps=records)
+        for kb_id, records in grouped.items()
+    }
+
+
+__all__ = ["build_frozen_source_entry", "frozen_document_contracts"]
