@@ -177,6 +177,27 @@ def test_attempt_checkpoint_thread_preserves_live_attachment_acl(monkeypatch, tm
     assert "owned.md" in str(captured[0])
 
 
+def test_attachment_tool_service_detection_survives_cached_factory(monkeypatch):
+    """A test-time service factory must not poison later ACL service checks."""
+    from src.agents.tools import attachment_tools
+    from src.agents.tools.runtime import ToolRuntime
+    from src.attachments.service import AttachmentService
+    from src.attachments.store import AttachmentStore
+
+    service = AttachmentService(store=AttachmentStore())
+    monkeypatch.setattr(attachment_tools, "AttachmentService", lambda: object())
+    runtime = ToolRuntime(
+        kb_name="kb_hw",
+        ctx=None,
+        attachment_service=service,
+        attachment_session_id=42,
+        attachment_user_id=7,
+        source_scope="attachment_only",
+    )
+
+    assert attachment_tools._service(runtime) is service
+
+
 def test_graph_recursion_error_completes_with_actionable_notice(monkeypatch):
     """步数上限是执行预算，不是系统故障：轮次必须完成并给出可操作提示。"""
     from langgraph.errors import GraphRecursionError

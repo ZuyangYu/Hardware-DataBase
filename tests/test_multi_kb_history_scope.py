@@ -42,6 +42,22 @@ def test_incomplete_dependencies_conservatively_check_full_selection(api):
     assert "UNTRACKED_PRIVATE_RESULT" not in client.get(f"/api/v1/conversations/{session_id}/messages").text
 
 
+def test_revoked_inherited_dependency_hides_turn_even_when_direct_ids_omit_it(api):
+    client, auth, actor, owner, ids, conv, _ = api
+    session_id = create(client, ids).json()["id"]
+    url = f"/api/v1/conversations/{session_id}/turns"
+    parent = client.post(url, json={"query": "reference only"}).json()["turn"]
+    conv.complete_turn(actor.id, parent["id"], "REFERENCE_SECRET", {"source_dependencies": {
+        "version": 1, "kb_ids": [ids["B"]], "inherited_turn_ids": [], "complete": True,
+    }})
+    child = client.post(url, json={"query": "derived from reference"}).json()["turn"]
+    conv.complete_turn(actor.id, child["id"], "DERIVED_SECRET", {"source_dependencies": {
+        "version": 1, "kb_ids": [ids["A"]], "inherited_turn_ids": [parent["id"]], "complete": True,
+    }})
+    auth.set_knowledge_base_sharing("B", owner, False)
+    assert "DERIVED_SECRET" not in client.get(f"/api/v1/conversations/{session_id}/messages").text
+
+
 def test_sse_rejects_revoked_scope_before_replaying_events(api):
     client, auth, actor, owner, ids, conv, _ = api
     session_id = create(client, ids).json()["id"]

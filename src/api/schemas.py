@@ -1247,6 +1247,7 @@ class ConfirmTemplateRequest(BaseModel):
 
 
 class CreateWorkOrderRequest(BaseModel):
+    knowledge_scope: KnowledgeSelectionInput | None = None
     template_version_id: str
     document_schema_id: str
     document_schema_version: str
@@ -1264,6 +1265,7 @@ class ConvertDocumentArtifactRequest(BaseModel):
 
 
 class CreateGenerationSessionRequest(BaseModel):
+    knowledge_scope: KnowledgeSelectionInput | None = None
     template_version_id: str | None = Field(default=None, min_length=1)
     contract_version: Literal["legacy_brief_v1", "output_spec_v1"] = "legacy_brief_v1"
     purpose: str = ""

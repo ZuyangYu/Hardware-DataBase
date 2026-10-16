@@ -16,6 +16,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import src.settings
+from src.document_authoring.conflicts.governance import REVIEW_WORKER_CONTRACT, requires_review_contract
+
 
 SUBMISSION_STATUSES = frozenset({
     "pending", "running", "dispatched", "waiting_human", "retrying",
@@ -73,6 +76,7 @@ class DocumentPlanSubmission:
     created_at: str = field(default_factory=_iso)
     updated_at: str = field(default_factory=_iso)
     completed_at: str | None = None
+    required_worker_contract: str = ''
 
     @property
     def dead_letter(self) -> bool:
@@ -94,6 +98,7 @@ class DocumentPlanSubmission:
             "document_plan_hash": self.document_plan_hash,
             "source_snapshot_id": self.source_snapshot_id,
             "source_snapshot_hash": self.source_snapshot_hash,
+            **({'required_worker_contract': self.required_worker_contract} if self.required_worker_contract else {}),
         }
 
 
@@ -108,6 +113,8 @@ class DocumentPlanSubmissionStore:
             if parent:
                 os.makedirs(parent, exist_ok=True)
             self._init_db()
+        else:
+            self._init_postgres_worker_guard()
 
     def _connect(self) -> sqlite3.Connection:
         if getattr(self, "_backend", "sqlite") == "postgres":
@@ -181,11 +188,68 @@ class DocumentPlanSubmissionStore:
                 ("last_error", "TEXT NOT NULL DEFAULT ''"),
                 ("updated_at", "TEXT NOT NULL DEFAULT ''"),
                 ("completed_at", "TEXT"),
+                ('required_worker_contract', "TEXT NOT NULL DEFAULT ''"),
+                ('claimed_worker_contract', "TEXT NOT NULL DEFAULT ''"),
             ):
                 if column not in columns:
                     conn.execute(
                         f"ALTER TABLE document_plan_submissions ADD COLUMN {column} {ddl}"
                     )
+            self._backfill_worker_contracts(conn)
+            conn.execute("""CREATE TRIGGER IF NOT EXISTS document_submissions_worker_contract_guard
+                BEFORE UPDATE OF status, lease_token ON document_plan_submissions
+                WHEN NEW.required_worker_contract <> '' AND NEW.status = 'running'
+                  AND (OLD.status <> 'running' OR NEW.lease_token <> OLD.lease_token)
+                  AND NEW.claimed_worker_contract IS NOT
+                      (NEW.required_worker_contract || ':' || CAST(NEW.lease_token AS TEXT))
+                BEGIN SELECT RAISE(ABORT, 'unsupported_worker_contract'); END""")
+
+    def _init_postgres_worker_guard(self) -> None:
+        # Store-group provisioning derives table columns from SQLite, but
+        # triggers are backend-specific. Install the additive fence explicitly
+        # on both fresh and upgraded PostgreSQL schemas.
+        with closing(self._connect()) as conn:
+            conn.execute("ALTER TABLE document_plan_submissions ADD COLUMN IF NOT EXISTS required_worker_contract TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE document_plan_submissions ADD COLUMN IF NOT EXISTS claimed_worker_contract TEXT NOT NULL DEFAULT ''")
+            self._backfill_worker_contracts(conn)
+            conn.execute("""CREATE OR REPLACE FUNCTION document_submission_worker_contract_guard()
+                RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+                  IF NEW.required_worker_contract <> '' AND NEW.status = 'running'
+                     AND (OLD.status <> 'running' OR NEW.lease_token <> OLD.lease_token)
+                     AND NEW.claimed_worker_contract IS DISTINCT FROM
+                         (NEW.required_worker_contract || ':' || NEW.lease_token::text)
+                  THEN RAISE EXCEPTION 'unsupported_worker_contract' USING ERRCODE = '23514'; END IF;
+                  RETURN NEW;
+                END $$""")
+            conn.execute("""DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'document_submissions_worker_contract_guard'
+                    AND tgrelid = 'document_plan_submissions'::regclass) THEN
+                  CREATE TRIGGER document_submissions_worker_contract_guard
+                    BEFORE UPDATE OF status, lease_token ON document_plan_submissions
+                    FOR EACH ROW EXECUTE FUNCTION document_submission_worker_contract_guard();
+                END IF;
+                END $$""")
+
+    def _review_contract_from_snapshot(self, conn, source_snapshot_id: str, tenant_id: str) -> str:
+        exists = conn.execute("SELECT to_regclass('public.knowledge_base_source_snapshots') AS name").fetchone()['name'] if getattr(self, '_backend', 'sqlite') == 'postgres' else conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge_base_source_snapshots'",
+        ).fetchone()
+        if not exists:
+            return ''
+        row = conn.execute('SELECT payload_json FROM knowledge_base_source_snapshots WHERE source_set_snapshot_id = ? AND tenant_id = ?',
+                           (source_snapshot_id, tenant_id)).fetchone()
+        return REVIEW_WORKER_CONTRACT if row is not None and requires_review_contract(_load(row['payload_json'], {})) else ''
+
+    def _backfill_worker_contracts(self, conn) -> None:
+        rows = conn.execute("SELECT submission_id, source_snapshot_id, tenant_id FROM document_plan_submissions WHERE required_worker_contract = ''").fetchall()
+        for row in rows:
+            contract = self._review_contract_from_snapshot(conn, row['source_snapshot_id'], row['tenant_id'])
+            if contract:
+                conn.execute('UPDATE document_plan_submissions SET required_worker_contract = ? WHERE submission_id = ?', (contract, row['submission_id']))
+
+    @staticmethod
+    def _worker_contract_available(contract: str) -> bool:
+        return not contract or (contract == REVIEW_WORKER_CONTRACT and bool(getattr(src.settings, 'MULTI_KB_HUMAN_REVIEW_ENABLED', False)))
 
     @staticmethod
     def _validate_owner(tenant_id: str, user_id: str) -> tuple[str, str]:
@@ -264,6 +328,7 @@ class DocumentPlanSubmissionStore:
                     conn.execute("COMMIT")
                 return existing
             now = _now()
+            contract = submission.required_worker_contract or self._review_contract_from_snapshot(conn, submission.source_snapshot_id, tenant)
             values = (
                 submission.submission_id, tenant, user, submission.task_id,
                 submission.session_id, submission.knowledge_base_name,
@@ -278,6 +343,7 @@ class DocumentPlanSubmissionStore:
                 submission.work_order_id, submission.job_id, submission.last_error,
                 submission.created_at or _iso(now), submission.updated_at or _iso(now),
                 submission.completed_at,
+                contract,
             )
             conn.execute(
                 """INSERT INTO document_plan_submissions (
@@ -288,12 +354,13 @@ class DocumentPlanSubmissionStore:
                        client_request_id, status, attempt, max_attempts,
                        available_at, lease_owner, lease_token, lease_expires_at,
                        work_order_id, job_id, last_error, created_at, updated_at,
-                       completed_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       completed_at, required_worker_contract
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 values,
             )
             if close:
                 conn.execute("COMMIT")
+            submission.required_worker_contract = contract
             return submission
         except Exception:
             if close:
@@ -353,12 +420,13 @@ class DocumentPlanSubmissionStore:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 f"""SELECT * FROM document_plan_submissions
-                   WHERE (status IN ('pending', 'retrying')
+                   WHERE ((status IN ('pending', 'retrying')
                           AND {available_clause})
                       OR (status = 'running' AND lease_expires_at IS NOT NULL
-                          AND {lease_clause})
+                          AND {lease_clause}))
+                     AND (required_worker_contract = '' OR (required_worker_contract = ? AND ?))
                    ORDER BY created_at, submission_id LIMIT ?""",
-                (max(1, min(int(limit), 100)),),
+                (REVIEW_WORKER_CONTRACT, bool(getattr(src.settings, 'MULTI_KB_HUMAN_REVIEW_ENABLED', False)), max(1, min(int(limit), 100))),
             ).fetchall()
         return [_row_to_submission(row) for row in rows]
 
@@ -403,6 +471,9 @@ class DocumentPlanSubmissionStore:
                 }:
                     conn.execute("COMMIT")
                     return None
+                if not self._worker_contract_available(str(row['required_worker_contract'] or '')):
+                    conn.execute('COMMIT')
+                    return None
                 available = row["status"] in {"pending", "retrying"} and str(row["available_at"]) <= _iso(now)
                 expired = row["status"] == "running" and row["lease_expires_at"] and str(row["lease_expires_at"]) <= _iso(now)
                 if not (available or expired):
@@ -424,9 +495,10 @@ class DocumentPlanSubmissionStore:
                     """UPDATE document_plan_submissions
                        SET status = 'running', attempt = ?, lease_owner = ?,
                            lease_token = lease_token + 1, lease_expires_at = ?,
-                           updated_at = ?, last_error = ''
+                           updated_at = ?, last_error = '', claimed_worker_contract = ?
                        WHERE submission_id = ?""",
-                    (attempt, worker, _iso(expires), _iso(now), str(submission_id)),
+                    (attempt, worker, _iso(expires), _iso(now),
+                     f"{row['required_worker_contract']}:{int(row['lease_token']) + 1}" if row['required_worker_contract'] else '', str(submission_id)),
                 )
                 claimed = conn.execute(
                     "SELECT * FROM document_plan_submissions WHERE submission_id = ?",
@@ -621,6 +693,7 @@ def _row_to_submission(row: sqlite3.Row) -> DocumentPlanSubmission:
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
         completed_at=row["completed_at"],
+        required_worker_contract=str(row['required_worker_contract'] or '') if 'required_worker_contract' in row.keys() else '',
     )
 
 

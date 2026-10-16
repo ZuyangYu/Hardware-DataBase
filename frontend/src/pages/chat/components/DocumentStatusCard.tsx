@@ -17,6 +17,7 @@ import {
   documentCardTitle,
   downloadDocumentArtifact,
   downloadDocumentArtifactAudit,
+  downloadDocumentArtifactBundle,
   type DocumentCardData,
   type DocumentStatusTone,
 } from './documentCardModel';
@@ -309,12 +310,20 @@ export default function DocumentStatusCard({
               下载 {artifact.output_format ? `${artifactStageLabel(artifact.stage)}（${artifact.output_format.toUpperCase()}）` : artifactStageLabel(artifact.stage)}
             </button>
             {workOrderId && (
+              <>
               <button
                 type="button"
                 aria-label={`下载来源与决策记录（产物 ${artifact.artifact_id}）`}
                 className="rounded-md border border-[#e3e7f1] bg-white px-2 py-0.5 text-[11px] text-[#464c5e]"
                 onClick={() => void downloadDocumentArtifactAudit(card, artifact).catch((error) => notify.error(error instanceof Error ? error.message : '记录下载失败'))}
               >来源与决策记录</button>
+              <button
+                type="button"
+                aria-label={`下载含审计附录包（产物 ${artifact.artifact_id}）`}
+                className="rounded-md border border-[#e3e7f1] bg-white px-2 py-0.5 text-[11px] text-[#464c5e]"
+                onClick={() => void downloadDocumentArtifactBundle(card, artifact).catch((error) => notify.error(error instanceof Error ? error.message : '审计包下载失败'))}
+              >含审计附录包</button>
+              </>
             )}
             </span>
           ))}

@@ -162,6 +162,7 @@ class CircuitIndexService:
                     "uploaded_by": uploaded_by,
                     "original_name": original_name,
                     "file_path": file_path,
+                    "source_content_hash": content_hash or "",
                 },
             )
 
@@ -355,6 +356,7 @@ class CircuitIndexService:
         query: str,
         ctx: RequestContext | None,
         top_k: int = 5,
+        filters: dict | None = None,
     ) -> list[Evidence]:
         """Typed read-model entry; fail-closed on missing department context."""
         if operation not in TYPED_QUERY_OPERATIONS:
@@ -364,7 +366,7 @@ class CircuitIndexService:
                 "Typed circuit queries require department context and knowledge-base read permission."
             )
         with circuit_index_read_lock(self.store.root):
-            allowed_designs = self._allowed_designs_unlocked(kb_name, ctx, {})
+            allowed_designs = self._allowed_designs_unlocked(kb_name, ctx, dict(filters or {}))
             plan = analyze_question(query)
             top_k = max(1, int(top_k or 5))
             if operation == "structure_overview":

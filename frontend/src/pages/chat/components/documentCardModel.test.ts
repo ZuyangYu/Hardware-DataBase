@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { apiDownload } from '@/api/client';
 
 import {
   describeWorkOrderStatus,
@@ -6,6 +7,7 @@ import {
   clarificationAnswerValue,
   documentArtifactDownloadPath,
   documentArtifactFileName,
+  downloadDocumentArtifactBundle,
   documentCardFromChatTask,
   documentCardFromWorkOrderStatus,
   documentCardFromClarificationEvent,
@@ -42,6 +44,21 @@ const workOrderCard: DocumentCardData = {
 };
 
 describe('documentCardModel', () => {
+  it('downloads the governed bundle for the exact artifact and knowledge base', async () => {
+    const download = vi.spyOn(apiDownload, 'blob').mockResolvedValue(undefined);
+    try {
+      await downloadDocumentArtifactBundle(
+        { ...workOrderCard, kb_name: '电源 A' },
+        { artifact_id: 'artifact/b', stage: 'review_candidate', output_format: 'docx' },
+      );
+      expect(download).toHaveBeenCalledWith(
+        '/api/v1/document-generation/artifacts/artifact%2Fb/audit-bundle?kb=%E7%94%B5%E6%BA%90%20A',
+        'artifact-b-with-audit.zip',
+      );
+    } finally {
+      download.mockRestore();
+    }
+  });
   it('exposes a release request only for an unrequested review candidate', () => {
     const card: DocumentCardData = {
       kind: 'work_order_status',

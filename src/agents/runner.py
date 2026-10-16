@@ -2415,8 +2415,17 @@ class MultiSourceAgentRunner:
                 # authenticated worker always supplies the live resolver.
                 rt.multi_kb_retrieval = None
             else:
+                from src.services.structured_retrieval import build_structured_retrieval_adapters
+
                 rt.multi_kb_retrieval = MultiKnowledgeRetrievalService(
-                    knowledge_scope_resolver, self.rag_backend
+                    knowledge_scope_resolver, self.rag_backend,
+                    adapters=build_structured_retrieval_adapters(
+                        document_store=self.document_store,
+                        spreadsheet_service=self.spreadsheet_service,
+                        circuit_service=self.circuit_service,
+                        conversation_service=self.conversation_service,
+                        wiki_service=self.wiki_service,
+                    ),
                 )
             rt.retrieval_budget = RetrievalBudget(
                 max_calls=int(getattr(settings, "MULTI_KB_MAX_CALLS_PER_TURN", 24)),
@@ -2676,8 +2685,12 @@ class MultiSourceAgentRunner:
                         *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
                         make_conversation_search(rt, self.conversation_service),
                     ]
+                elif rt.multi_kb_retrieval is not None:
+                    from src.agents.tools.structured_scope_tools import make_scoped_structured_tools
+
+                    kb_tools.extend(make_scoped_structured_tools(rt, wiki_assist=wiki_assist))
                 tools.extend(kb_tools)
-                if wiki_assist:
+                if wiki_assist and rt.knowledge_scope is None:
                     tools.append(make_wiki_search(rt, self.wiki_service))
             if attachment_refs:
                 from src.agents.tools.attachment_tools import build_attachment_tools
@@ -2734,7 +2747,11 @@ class MultiSourceAgentRunner:
                         *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
                         make_conversation_search(rt, self.conversation_service),
                     ]
-                if wiki_assist:
+                elif rt.multi_kb_retrieval is not None:
+                    from src.agents.tools.structured_scope_tools import make_scoped_structured_tools
+
+                    tools.extend(make_scoped_structured_tools(rt, wiki_assist=wiki_assist))
+                if wiki_assist and rt.knowledge_scope is None:
                     tools.append(make_wiki_search(rt, self.wiki_service))
             if attachment_refs:
                 from src.agents.tools.attachment_tools import build_attachment_tools
@@ -3848,15 +3865,34 @@ class MultiSourceAgentRunner:
         verification: dict[str, Any],
     ) -> dict:
         failed = next((item for item in rt.diagnostics if item.get("status") not in {"ok"}), None)
+        scope_failed = next(
+            (
+                item for item in rt.multi_kb_source_outcomes
+                if item.get("status") not in {"success_with_hits", "success_empty"}
+            ),
+            None,
+        )
         answer_text = _current_run().answer
-        if failed is not None and rt.evidence:
+        if (failed is not None or scope_failed is not None) and rt.evidence:
             status, error_stage, error_message = (
                 "partial_failure",
                 "retrieval",
-                str(failed.get("error") or failed.get("status") or ""),
+                str(
+                    (failed or {}).get("error")
+                    or (failed or {}).get("status")
+                    or (scope_failed or {}).get("error_code")
+                    or (scope_failed or {}).get("status")
+                    or ""
+                ),
             )
-        elif failed is not None and not rt.evidence:
-            status, error_stage, error_message = "failed", "retrieval", str(failed.get("error") or "retrieval failed")
+        elif (failed is not None or scope_failed is not None) and not rt.evidence:
+            status, error_stage, error_message = "failed", "retrieval", str(
+                (failed or {}).get("error")
+                or (failed or {}).get("status")
+                or (scope_failed or {}).get("error_code")
+                or (scope_failed or {}).get("status")
+                or "retrieval failed"
+            )
         elif not rt.evidence:
             status, error_stage, error_message = "no_evidence", "retrieval", "no evidence"
         else:
@@ -3879,6 +3915,8 @@ class MultiSourceAgentRunner:
             "retrieval_ledger": list(rt.queries),
             "evidence_quality": _build_evidence_quality(rt.evidence),
             "verification": verification,
+            "multi_kb_source_outcomes": list(rt.multi_kb_source_outcomes),
+            "multi_kb_fusions": list(rt.multi_kb_fusions),
         }
         result.update(_scope_dependency_fields(rt.knowledge_scope))
         return result

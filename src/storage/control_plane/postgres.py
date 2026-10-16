@@ -1450,6 +1450,9 @@ class PostgresExecutionStore:
             settings, "MEMORY_EXTRACTION_ENABLED", True
         ):
             return
+        if str(session["knowledge_selection_hash"] or ""):
+            # P0-P2 multi-KB turns must not enter the project-memory namespace.
+            return
         department_id = session["department_id"]
         kb_id = session["kb_id"]
         if department_id in (None, "") or kb_id in (None, ""):

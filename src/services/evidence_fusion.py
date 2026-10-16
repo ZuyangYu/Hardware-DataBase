@@ -67,6 +67,8 @@ class EvidenceFusionResult:
     token_count: int
     candidate_refs: list[dict] = field(default_factory=list)
     discarded: dict[str, int] = field(default_factory=dict)
+    query_coverage: list[dict] = field(default_factory=list)
+    source_representatives: list[dict] = field(default_factory=list)
 
 
 def fuse_evidence(
@@ -89,7 +91,10 @@ def fuse_evidence(
     discarded = {"identity": 0, "quality": 0, "budget": 0}
     candidates = {}
     seen_ranks = set()
+    query_candidates = {}
     for outcome in outcomes:
+        query_key = (outcome.kb_id, outcome.query, outcome.retriever_kind)
+        query_candidates.setdefault(query_key, [])
         if outcome.status != "success_with_hits":
             continue
         for rank, item in enumerate(outcome.evidence, 1):
@@ -122,9 +127,35 @@ def fuse_evidence(
             seen_ranks.add(query_rank_key)
             candidates[key]["score"] += 1 / (60 + rank)
             candidates[key]["ranks"].append({"query": outcome.query, "rank": rank, "raw_score": item.score, "retriever_kind": outcome.retriever_kind})
+            query_candidates[query_key].append(key)
     ranked = sorted(candidates, key=lambda key: (-candidates[key]["score"], not candidates[key]["primary"], candidates[key]["kb_id"], key))
     source_ids = sorted({item["kb_id"] for item in candidates.values()}, key=lambda kb: (not any(c["kb_id"] == kb and c["primary"] for c in candidates.values()), kb))
     per_source = {kb: [key for key in ranked if candidates[key]["kb_id"] == kb] for kb in source_ids}
+    representatives = []
+    preferred = {kb: [] for kb in source_ids}
+    for kb in source_ids:
+        kinds = sorted({entry["retriever_kind"] for key in per_source[kb] for entry in candidates[key]["ranks"]})
+        for kind in kinds:
+            rows = [(key, entry) for key in per_source[kb] for entry in candidates[key]["ranks"]
+                    if entry["retriever_kind"] == kind]
+            best_rank = min(entry["rank"] for _, entry in rows)
+            top = [(key, entry) for key, entry in rows if entry["rank"] == best_rank]
+            # RAGFlow document scores have a known [0, 1] similarity scale.
+            # Compare only within this KB and retriever. Other scales retain
+            # rank fusion, including a malformed/unknown score in the group.
+            comparable = (kind == "document"
+                          and all(candidates[key]["item"].metadata["processor_kind"] == "ragflow"
+                                  and 0 <= entry["raw_score"] <= 1 for key, entry in rows))
+            if comparable:
+                key, entry = min(top, key=lambda row: (-row[1]["raw_score"], ranked.index(row[0])))
+            else:
+                key, entry = min(top, key=lambda row: ranked.index(row[0]))
+            preferred[kb].append(key)
+            representatives.append({"kb_id": kb, "retriever_kind": kind, "query": entry["query"],
+                                    "evidence_identity": key, "retriever_rank": entry["rank"],
+                                    "raw_score": entry["raw_score"],
+                                    "selection_method": "source_retriever_score" if comparable else "rank"})
+        preferred[kb] = [key for key in ranked if key in preferred[kb]]
     chosen = set()
     remaining = max(0, token_budget)
     limit = max(0, max_items)
@@ -132,13 +163,27 @@ def fuse_evidence(
         if len(chosen) >= limit:
             break
         others = source_ids[position + 1:]
-        reserve = sum(min(candidates[key]["cost"] for key in per_source[other]) for other in others)
-        feasible = [key for key in per_source[kb] if candidates[key]["cost"] <= remaining - reserve]
+        reserve = sum(min(candidates[key]["cost"] for key in preferred[other]) for other in others)
+        feasible = [key for key in preferred[kb] if candidates[key]["cost"] <= remaining - reserve]
+        if not feasible:
+            reserve = sum(min(candidates[key]["cost"] for key in per_source[other]) for other in others)
+            feasible = [key for key in preferred[kb] if candidates[key]["cost"] <= remaining - reserve]
+        if not feasible:
+            feasible = [key for key in per_source[kb] if candidates[key]["cost"] <= remaining - reserve]
         if not feasible:
             feasible = [key for key in per_source[kb] if candidates[key]["cost"] <= remaining]
         if feasible:
             chosen.add(feasible[0])
             remaining -= candidates[feasible[0]]["cost"]
+    # Preserve distinct query winners before repeated generic hits spend the
+    # spare budget. Output order remains RRF and never changes citations.
+    for keys in query_candidates.values():
+        if not keys or keys[0] in chosen or len(chosen) >= limit:
+            continue
+        key = keys[0]
+        if candidates[key]["cost"] <= remaining:
+            chosen.add(key)
+            remaining -= candidates[key]["cost"]
     for key in ranked:
         if key not in chosen and len(chosen) < limit and candidates[key]["cost"] <= remaining:
             chosen.add(key)
@@ -156,4 +201,15 @@ def fuse_evidence(
         coverage[candidate["kb_id"]] = True
     refs = [{"evidence_identity": key, **{field: candidates[key]["item"].metadata[field] for field in _IDENTITY_FIELDS}} for key in ranked]
     discarded["budget"] = len(candidates) - len(chosen)
-    return EvidenceFusionResult(admitted, coverage, bool(admitted) and all(coverage.values()), max(0, token_budget) - remaining, refs, discarded)
+    query_coverage = [{"kb_id": kb, "query": query, "retriever_kind": kind,
+                       "qualified_candidates": len(set(keys)),
+                       "retained_candidates": len(set(keys) & chosen),
+                       "covered": bool(set(keys) & chosen),
+                       "top_candidate_retained": bool(keys) and keys[0] in chosen,
+                       "budget_cropped": bool(keys) and keys[0] not in chosen}
+                      for (kb, query, kind), keys in query_candidates.items()]
+    for representative in representatives:
+        representative["retained"] = representative["evidence_identity"] in chosen
+    return EvidenceFusionResult(admitted, coverage, bool(admitted) and all(coverage.values()),
+                                max(0, token_budget) - remaining, refs, discarded,
+                                query_coverage, representatives)

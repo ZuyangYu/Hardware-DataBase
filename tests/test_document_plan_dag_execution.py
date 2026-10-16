@@ -165,6 +165,40 @@ def test_plan_executor_waits_for_dependencies_and_barriers() -> None:
     assert result.completed_nodes == graph.topological_order
 
 
+@pytest.mark.parametrize("status", ["conflicting", "blocked", "requires_human", "retrieval_failed", "insufficient_evidence"])
+def test_plan_executor_waits_for_human_without_executing_downstream(status):
+    graph = TaskGraphCompiler().compile(_plan_with_dependency())
+    calls = []
+
+    def unit(node, attempt):
+        calls.append(node.node_id)
+        return {"receipt_payload": {"status": status}}
+
+    result = PlanDAGExecutor(max_workers=2).run(graph, execute_unit=unit)
+    assert calls == ["unit:task-cover"]
+    assert result.statuses["unit:task-cover"] == "waiting_human"
+    assert result.statuses["unit:task-pins"] == "blocked_dependency"
+    assert "release" not in result.completed_nodes
+
+
+@pytest.mark.parametrize("status", ["conflicting", "blocked", "requires_human", "retrieval_failed", "insufficient_evidence"])
+def test_plan_executor_does_not_reuse_a_pending_receipt_or_its_downstream(status):
+    graph = TaskGraphCompiler().compile(_plan_with_dependency())
+    calls = []
+    committed = {node.node_id: {"kind": node.kind, "status": "ready_to_render"} for node in graph.nodes}
+    committed["unit:task-cover"]["status"] = status
+
+    def unit(node, attempt):
+        calls.append(node.node_id)
+        return {"receipt_payload": {"status": status}}
+
+    result = PlanDAGExecutor().run(graph, execute_unit=unit, committed_receipts=committed)
+    assert calls == ["unit:task-cover"]
+    assert result.statuses["unit:task-cover"] == "waiting_human"
+    assert result.statuses["unit:task-pins"] == "blocked_dependency"
+    assert "release" not in result.completed_nodes
+
+
 def test_plan_executor_fans_out_independent_units_with_bounded_workers() -> None:
     graph = TaskGraphCompiler().compile(_plan())
     started = Barrier(2)
@@ -237,8 +271,9 @@ def test_plan_executor_dispatches_structural_nodes_through_an_optional_callback(
 
 
 @pytest.mark.parametrize("prefixed_plan_units", [False, True])
+@pytest.mark.parametrize("pending_validation", [False, True])
 def test_runtime_executes_a_plan_route_without_constructing_the_legacy_graph(
-    tmp_path, monkeypatch, prefixed_plan_units
+    tmp_path, monkeypatch, prefixed_plan_units, pending_validation
 ) -> None:
     import src.document_authoring.harness.runtime as runtime_module
     import src.settings
@@ -254,7 +289,8 @@ def test_runtime_executes_a_plan_route_without_constructing_the_legacy_graph(
         source_names=["design.pdf"],
         created_by="user-a",
     )
-    plan_payload = _plan(status="accepted").model_dump(mode="json")
+    plan_payload = (_plan_with_dependency() if pending_validation else _plan()).model_dump(mode="json")
+    plan_payload["status"] = "accepted"
     if prefixed_plan_units:
         def prefixed(value: str) -> str:
             return value if value.startswith("field:") else f"field:{value}"
@@ -334,6 +370,13 @@ def test_runtime_executes_a_plan_route_without_constructing_the_legacy_graph(
     )
     store.planning.create_plan(plan, tenant_id="tenant-a", user_id="user-a")
     runtime = runtime_module.InternalDocumentHarnessRuntime(store=store)
+    if pending_validation:
+        validate = runtime.validator.validate_typed_field_draft
+
+        def requires_human(*args, **kwargs):
+            return validate(*args, **kwargs).model_copy(update={"validation_status": "requires_human"})
+
+        monkeypatch.setattr(runtime.validator, "validate_typed_field_draft", requires_human)
     run, manifest = runtime.create_run(
         order, policy, snapshot, template, schema, document_plan=plan,
     )
@@ -352,24 +395,25 @@ def test_runtime_executes_a_plan_route_without_constructing_the_legacy_graph(
     def retrieve(requirement, attempt, query_override=None):
         del attempt, query_override
         is_table = requirement.semantic_unit_id == "field:pins"
-        metadata = {
-            "knowledge_base_name": "ADAS",
-            "table_row": {
-                "row_key": "J1:1",
-                "cells": {"connector": "J1", "pin": "1", "signal": "CANH"},
-            },
-        } if is_table else {"knowledge_base_name": "ADAS"}
-        content = (
-            "connector=J1 pin=1 signal=CANH"
-            if is_table else "Cover title: ADAS ICD"
-        )
+        evidences = [EvidenceEnvelope(
+            id="ev-field:cover", content="Cover title: ADAS ICD",
+            source_name="design.pdf", metadata={"knowledge_base_name": "ADAS"},
+        )]
+        if is_table:
+            evidences = [EvidenceEnvelope(
+                id=f"ev-field:pins:{pin}", content=f"connector=J1 pin={pin} signal={signal}",
+                source_name="design.pdf", metadata={
+                    "knowledge_base_name": "ADAS",
+                    "table_row": {
+                        "row_key": f"J1:{pin}",
+                        "cells": {"connector": "J1", "pin": pin, "signal": signal},
+                    },
+                },
+            ) for pin, signal in [("1", "CANH"), ("2", "CANL")]]
         return __import__("src.agents.claim_evidence", fromlist=["RetrievalOutcome"]).RetrievalOutcome(
             requirement_id=requirement.requirement_id,
             status="success_with_hits",
-            evidences=[EvidenceEnvelope(
-                id=f"ev-{requirement.semantic_unit_id}", content=content,
-                source_name="design.pdf", metadata=metadata,
-            )],
+            evidences=evidences,
             query_fingerprint="query",
             applied_source_set_snapshot_id=snapshot.source_set_snapshot_id,
         )
@@ -383,7 +427,17 @@ def test_runtime_executes_a_plan_route_without_constructing_the_legacy_graph(
         retrieve=retrieve,
     )
 
+    if pending_validation:
+        assert [draft.unit_id for draft in result.drafts] == ["field:cover"]
+        assert result.unit_statuses["field:cover"] == "requires_human"
+        assert result.unit_statuses["field:pins"] == "blocked"
+        receipts = store.list_node_execution_receipts(run.harness_run_id, node_name="plan_node", status="committed")
+        assert [receipt.unit_id for receipt in receipts] == ["preflight"]
+        assert store.get_harness_run(run.harness_run_id).completed_units == 0
+        return
+
     assert len(result.drafts) == 2
+    assert all(draft.validation_status == "supported" for draft in result.drafts)
     assert {draft.unit_id for draft in result.drafts} == {"field:cover", "field:pins"}
     persisted_run = store.get_harness_run(run.harness_run_id)
     assert persisted_run is not None

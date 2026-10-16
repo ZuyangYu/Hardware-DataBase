@@ -205,6 +205,25 @@ def _toolset(tmp_path, *, permission: str = "write", context=None, event_sink=No
     )
 
 
+@pytest.mark.parametrize('via_template', [False, True])
+def test_chat_job_contract_survives_a_separate_authoring_database(tmp_path, monkeypatch, via_template):
+    import src.settings
+
+    toolset = _toolset(tmp_path)
+    toolset.pipeline.order = toolset.pipeline.order.model_copy(update={
+        'kb_scope_snapshot': {'sources': [{'kb_id': 101}, {'kb_id': 205}]},
+    })
+    toolset.pipeline.document_generation.store.get_work_order = lambda _work_order_id: toolset.pipeline.order
+    if via_template:
+        result = toolset.generate_document_from_template(purpose='参考模板生成 ICD 文档', output_format='xlsx')
+    else:
+        result = toolset.create_document_work_order(document_schema_id='schema-a', document_schema_version='1', generation_session_id='generation-session-a')
+    assert result.status == 'succeeded'
+    monkeypatch.setattr(src.settings, 'MULTI_KB_HUMAN_REVIEW_ENABLED', False, raising=False)
+    assert toolset.job_store.claim(result.job_id, 'old-worker') is None
+    assert toolset.job_store.get(result.job_id).attempt == 0
+
+
 def test_all_six_tools_are_typed_scoped_and_outer_serialized(tmp_path):
     toolset = _toolset(tmp_path)
 

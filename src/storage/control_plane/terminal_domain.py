@@ -58,6 +58,7 @@ def write_terminal_domains(
         and bool(getattr(config, "MEMORY_EXTRACTION_ENABLED", True))
         and turn.department_id not in (None, "")
         and turn.kb_id not in (None, "")
+        and not str(getattr(turn, "knowledge_selection_hash", "") or "")
     ):
         from src.memory.catalog import scope_fingerprint
 

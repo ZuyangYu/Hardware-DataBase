@@ -142,6 +142,7 @@ class GenerationSession(BaseModel):
     output_spec_id: str | None = None
     output_spec_version: int | None = Field(default=None, ge=1)
     output_spec_draft: dict[str, Any] | None = None
+    knowledge_scope_snapshot: dict[str, Any] = Field(default_factory=dict)
     document_plan_id: str | None = None
     document_plan_version: int | None = Field(default=None, ge=1)
     last_question_id: str | None = None
@@ -272,6 +273,7 @@ class GenerationSessionStore:
         output_spec_draft: dict[str, Any] | None = None,
         document_plan_id: str | None = None,
         document_plan_version: int | None = None,
+        knowledge_scope_snapshot: dict[str, Any] | None = None,
     ) -> GenerationSession:
         compatibility = _compatibility_service(self.db_path)
         if contract_version == "legacy_brief_v1" and compatibility.closure_enabled:
@@ -301,6 +303,7 @@ class GenerationSessionStore:
             output_spec_draft=output_spec_draft,
             document_plan_id=self._optional(document_plan_id),
             document_plan_version=document_plan_version,
+            knowledge_scope_snapshot=dict(knowledge_scope_snapshot or {}),
             created_at=now,
             updated_at=now,
         )

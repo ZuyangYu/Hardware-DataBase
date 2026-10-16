@@ -119,6 +119,28 @@ class DocGenArtifactApiTests(unittest.TestCase):
             r.headers.get("content-type", ""),
         )
 
+    def test_audit_bundle_download_uses_authorized_service_and_safe_filename(self):
+        self.stub.download_document_artifact_bundle = lambda ctx, artifact_id: b"ZIP-CONTENT"
+        token = self._token("user1")
+        response = self.client.get(
+            "/api/v1/document-generation/artifacts/art-1/audit-bundle?kb=shared",
+            headers=self._auth(token),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.content, b"ZIP-CONTENT")
+        self.assertIn("application/zip", response.headers["content-type"])
+        self.assertIn('document-art-1-with-audit.zip', response.headers['content-disposition'])
+
+        def revoked(*_args):
+            raise PermissionError("source_unavailable")
+
+        self.stub.download_document_artifact_bundle = revoked
+        denied = self.client.get(
+            "/api/v1/document-generation/artifacts/art-1/audit-bundle?kb=shared",
+            headers=self._auth(token),
+        )
+        self.assertEqual(denied.status_code, 403)
+
     def test_conversion_endpoint_queues_pdf_artifact_job(self):
         self.stub.submit_document_artifact_conversion = lambda ctx, artifact_id, *, target_format: SimpleNamespace(
             job_id="conversion-job-1",

@@ -11,6 +11,9 @@ from .models import NormalizedClaim
 
 
 _NUMERIC_RE = re.compile(r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([A-Za-zΩμµ%]+)?\s*$")
+_NUMBER = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+_RANGE_RE = re.compile(rf"^\s*({_NUMBER})\s*(?:~|～|–|—|至|to|-)\s*({_NUMBER})\s*([A-Za-zΩμµ%°]+)?\s*$", re.I)
+_LIMIT_RE = re.compile(rf"^\s*(<=|>=|<|>|≤|≥)\s*({_NUMBER})\s*([A-Za-zΩμµ%°]+)?\s*$")
 _UNIT_ALIASES = {
     "v": ("voltage", Decimal("1")),
     "mv": ("voltage", Decimal("0.001")),
@@ -27,6 +30,9 @@ _UNIT_ALIASES = {
     "ω": ("resistance", Decimal("1")),
     "kohm": ("resistance", Decimal("1000")),
     "%": ("ratio", Decimal("1")),
+    "°c": ("temperature", Decimal("1")),
+    "degc": ("temperature", Decimal("1")),
+    "deg": ("temperature", Decimal("1")),
 }
 
 
@@ -39,6 +45,23 @@ def _key(value: Any) -> str:
 
 
 def _numeric(value: Any, unit: str) -> tuple[str, str] | None:
+    text = _text(value)
+    ranged = _RANGE_RE.match(text)
+    limited = _LIMIT_RE.match(text)
+    if ranged or limited:
+        match = ranged or limited
+        alias = _UNIT_ALIASES.get(_text(match.group(3) or unit).casefold())
+        if alias is None:
+            return None
+        dimension, multiplier = alias
+        if ranged:
+            lower, upper = (Decimal(match.group(i)) * multiplier for i in (1, 2))
+            if lower > upper:
+                return None
+            return dimension, f"[{format(lower.normalize(), 'f')},{format(upper.normalize(), 'f')}]"
+        operator = match.group(1).replace("≤", "<=").replace("≥", ">=")
+        number = Decimal(match.group(2)) * multiplier
+        return dimension, operator + format(number.normalize(), "f")
     match = _NUMERIC_RE.match(_text(value))
     if not match:
         return None

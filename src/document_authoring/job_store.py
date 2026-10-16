@@ -18,6 +18,7 @@ from typing import Any
 
 import src.settings
 from src.result_exports.models import ResourceLock
+from src.document_authoring.conflicts.governance import REVIEW_WORKER_CONTRACT, requires_review_contract
 
 
 JOB_OPERATIONS = frozenset({"generate_work_order", "resume_work_order", "convert_artifact"})
@@ -69,6 +70,7 @@ class DocumentAuthoringJob:
     created_at: str = field(default_factory=_iso)
     updated_at: str = field(default_factory=_iso)
     completed_at: str | None = None
+    required_worker_contract: str = ''
 
     @property
     def dead_letter(self) -> bool:
@@ -161,10 +163,49 @@ class DocumentAuthoringJobStore:
                 conn.execute("ALTER TABLE document_authoring_jobs ADD COLUMN resource_lock_token INTEGER")
             if "task_id" not in columns:
                 conn.execute("ALTER TABLE document_authoring_jobs ADD COLUMN task_id TEXT")
+            if 'required_worker_contract' not in columns:
+                conn.execute("ALTER TABLE document_authoring_jobs ADD COLUMN required_worker_contract TEXT NOT NULL DEFAULT ''")
+            if 'claimed_worker_contract' not in columns:
+                conn.execute("ALTER TABLE document_authoring_jobs ADD COLUMN claimed_worker_contract TEXT NOT NULL DEFAULT ''")
+            for row in conn.execute("SELECT * FROM document_authoring_jobs WHERE required_worker_contract = ''").fetchall():
+                contract = self._review_contract_for_job(conn, _load(row['payload_json'], {}), row['work_order_id'], row['tenant_id'])
+                if contract:
+                    conn.execute('UPDATE document_authoring_jobs SET required_worker_contract = ? WHERE job_id = ?', (contract, row['job_id']))
+            # A field in payload alone would be ignored by older binaries. Bind
+            # each claim acknowledgment to its fencing token at the DB boundary.
+            # Retaining a previous acknowledgment cannot authorize takeover.
+            conn.execute("""CREATE TRIGGER IF NOT EXISTS document_jobs_worker_contract_guard
+                BEFORE UPDATE OF status, lease_token ON document_authoring_jobs
+                WHEN NEW.required_worker_contract <> '' AND NEW.status = 'running'
+                  AND (OLD.status <> 'running' OR NEW.lease_token <> OLD.lease_token)
+                  AND NEW.claimed_worker_contract IS NOT
+                      (NEW.required_worker_contract || ':' || CAST(NEW.lease_token AS TEXT))
+                BEGIN SELECT RAISE(ABORT, 'unsupported_worker_contract'); END""")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_document_authoring_jobs_task "
                 "ON document_authoring_jobs(tenant_id, task_id, created_at)"
             )
+
+    @staticmethod
+    def _review_contract_for_job(conn, payload: dict[str, Any], work_order_id: str | None, tenant_id: str) -> str:
+        declared = str(payload.get('required_worker_contract') or '').strip()
+        if declared:
+            return declared
+        if requires_review_contract(payload):
+            return REVIEW_WORKER_CONTRACT
+        if work_order_id and conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='document_work_orders'").fetchone():
+            row = conn.execute('SELECT payload_json FROM document_work_orders WHERE work_order_id = ? AND tenant_id = ?',
+                               (work_order_id, tenant_id)).fetchone()
+            if row is not None and requires_review_contract(_load(row['payload_json'], {})):
+                return REVIEW_WORKER_CONTRACT
+        return ''
+
+    @staticmethod
+    def _worker_contract_available(contract: str) -> bool:
+        return not contract or (
+            contract == REVIEW_WORKER_CONTRACT
+            and bool(getattr(src.settings, 'MULTI_KB_HUMAN_REVIEW_ENABLED', False))
+        )
 
     @staticmethod
     def _validate_operation(operation: str) -> str:
@@ -486,17 +527,18 @@ class DocumentAuthoringJobStore:
                     conn.execute("COMMIT")
                     return current
                 job_id = f"document-job-{uuid.uuid4().hex}"
+                contract = self._review_contract_for_job(conn, payload_value, work_order_id, tenant_id)
                 conn.execute(
                     """INSERT INTO document_authoring_jobs (
                            job_id, tenant_id, user_id, session_id, client_request_id,
                            operation, work_order_id, task_id, status, attempt, max_attempts,
-                           available_at, payload_json, created_at, updated_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)""",
+                           available_at, payload_json, created_at, updated_at, required_worker_contract
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?)""",
                     (
                         job_id, tenant_id, user_id, session_id, client_request_id,
                         operation, work_order_id, str(task_id).strip() if task_id else None,
                         max_attempts, _iso(available),
-                        _json(payload_value), _iso(now), _iso(now),
+                        _json(payload_value), _iso(now), _iso(now), contract,
                     ),
                 )
                 conn.execute(
@@ -626,11 +668,13 @@ class DocumentAuthoringJobStore:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """SELECT * FROM document_authoring_jobs
-                   WHERE (status = 'queued' AND datetime(available_at) <= datetime('now'))
+                   WHERE ((status = 'queued' AND datetime(available_at) <= datetime('now'))
                       OR (status = 'running' AND lease_expires_at IS NOT NULL
-                          AND datetime(lease_expires_at) <= datetime('now'))
+                          AND datetime(lease_expires_at) <= datetime('now')))
+                     AND (required_worker_contract = '' OR (required_worker_contract = ? AND ?))
                    ORDER BY created_at, job_id LIMIT ?""",
-                (max(1, min(int(limit), 100)),),
+                (REVIEW_WORKER_CONTRACT, bool(getattr(src.settings, 'MULTI_KB_HUMAN_REVIEW_ENABLED', False)),
+                 max(1, min(int(limit), 100))),
             ).fetchall()
         return [_row_to_job(row) for row in rows]
 
@@ -653,6 +697,9 @@ class DocumentAuthoringJobStore:
                 ).fetchone()
                 if row is None or row["status"] in {"succeeded", "failed", "cancelled", "dead_letter"}:
                     conn.execute("COMMIT")
+                    return None
+                if not self._worker_contract_available(str(row['required_worker_contract'] or '')):
+                    conn.execute('COMMIT')
                     return None
                 available = row["status"] == "queued" and str(row["available_at"]) <= _iso(now)
                 expired = (
@@ -716,9 +763,10 @@ class DocumentAuthoringJobStore:
                     """UPDATE document_authoring_jobs
                        SET status = 'running', attempt = ?, lease_owner = ?,
                            lease_token = lease_token + 1, lease_expires_at = ?,
-                           resource_lock_token = ?, updated_at = ?, last_error = ''
+                           resource_lock_token = ?, updated_at = ?, last_error = '', claimed_worker_contract = ?
                        WHERE job_id = ?""",
-                    (next_attempt, worker_id, _iso(expires), resource_lock_token, _iso(now), job_id),
+                    (next_attempt, worker_id, _iso(expires), resource_lock_token, _iso(now),
+                     f"{row['required_worker_contract']}:{int(row['lease_token']) + 1}" if row['required_worker_contract'] else '', job_id),
                 )
                 claimed = conn.execute(
                     "SELECT * FROM document_authoring_jobs WHERE job_id = ?", (job_id,)
@@ -1018,6 +1066,7 @@ def _row_to_job(row: sqlite3.Row) -> DocumentAuthoringJob:
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
         completed_at=row["completed_at"],
+        required_worker_contract=str(row['required_worker_contract'] or '') if 'required_worker_contract' in row.keys() else '',
     )
 
 

@@ -158,6 +158,14 @@ class DocumentAuthoringPgParityTests(unittest.TestCase):
                 self.assertTrue(all(result == results[0] for result in results))
                 self.assertEqual(len(store.list_decisions(case.conflict_id, tenant_id='default')), 1)
 
+    def test_submission_worker_contract_rejects_old_worker_on_both_backends(self):
+        from pytest import MonkeyPatch
+        from tests.test_review_submission_contract import check_submission_review_contract
+
+        for backend in (self._sqlite_store(), self._pg_store()):
+            with self.subTest(backend=backend._backend), MonkeyPatch.context() as patch:
+                check_submission_review_contract(backend, patch)
+
     @staticmethod
     def _seed_template(store: DocumentAuthoringStore, suffix: str):
         store.save_renderer_policy(RendererPolicy(renderer_policy_id=f"renderer-{suffix}"))

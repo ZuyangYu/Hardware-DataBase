@@ -149,6 +149,20 @@ class AdmittedEvidence(list):
     """
 
     budget_blocked: bool = False
+    # Multi-KB retrieval attaches source-level execution diagnostics and the
+    # fusion audit to the list returned by a single tool call.  Keeping these
+    # attributes on the list preserves the legacy ``(items, adds_nothing)``
+    # contract while preventing concurrent calls from mixing diagnostics.
+    source_statuses: list[dict[str, Any]] = []
+    fusion_summary: dict[str, Any] = {}
+
+
+class CitationAdmission(list):
+    """Citation numbers and the registry observed in the admission lock."""
+
+    def __init__(self, numbers=(), *, previously_registered=()):
+        super().__init__(numbers)
+        self.previously_registered = set(previously_registered)
 
 
 @dataclass
@@ -196,6 +210,8 @@ class ToolRuntime:
     memory_context: list[dict[str, Any]] = field(default_factory=list)
     memory_context_index: set[str] = field(default_factory=set)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    multi_kb_source_outcomes: list[dict[str, Any]] = field(default_factory=list)
+    multi_kb_fusions: list[dict[str, Any]] = field(default_factory=list)
     queries: list[dict[str, Any]] = field(default_factory=list)
     # External MCP plugins keep their own diagnostics and per-turn call budget:
     # external calls must not change retrieval rounds, the evidence set or the
@@ -258,7 +274,7 @@ class ToolRuntime:
                 for item in self.queries
             )
 
-    def add_evidence(self, items: list[Evidence], *, epoch: int | None = None) -> list[int | None]:
+    def add_evidence(self, items: list[Evidence], *, epoch: int | None = None) -> CitationAdmission:
         """Register evidence rows and return their 1-based citation numbers.
 
         ``None`` marks items rejected by the evidence budget: they were never
@@ -270,11 +286,11 @@ class ToolRuntime:
         registration is refused for calls that already ended or were revoked by
         cancellation, so a late result cannot mutate the evidence set.
         """
-        numbers: list[int | None] = []
         with self._lock:
+            numbers = CitationAdmission(previously_registered=self.evidence_index)
             if epoch is not None and int(epoch) not in self._active_call_epochs:
                 self._record_late_evidence_rejected()
-                return [None for _ in items]
+                return CitationAdmission([None for _ in items], previously_registered=self.evidence_index)
             fresh: list[int] = []
             for position, item in enumerate(items):
                 if item.id and item.id in self.evidence_index:
@@ -288,6 +304,13 @@ class ToolRuntime:
                 else len(fresh)
             )
             if self.knowledge_scope is not None:
+                import src.settings as settings
+
+                room = min(room, max(0, int(settings.MULTI_KB_EVIDENCE_MAX_ITEMS) - len(self.evidence)))
+
+                remaining_tokens = max(0, int(settings.MULTI_KB_CONTEXT_MAX_TOKENS)) - sum(
+                    _evidence_context_cost(item) for item in self.evidence
+                )
                 fresh.sort(key=lambda position: int(items[position].metadata.get("fusion_rank") or position + 1))
                 required = {source.kb_id for source in self.knowledge_scope.sources} if self.source_scope != "attachment_only" else set()
                 covered = {item.metadata.get("kb_id") for item in self.evidence}
@@ -299,8 +322,12 @@ class ToolRuntime:
                     missing_after = required - covered - {kb_id}
                     if room - len(kept) - 1 < len(missing_after):
                         continue
+                    cost = _evidence_context_cost(items[position])
+                    if cost > remaining_tokens:
+                        continue
                     kept.add(position)
                     covered.add(kb_id)
+                    remaining_tokens -= cost
             elif len(fresh) > room:
                 question_tokens = _evidence_tokens(self.question)
                 # 检索器相似度优先(RAGFlow score 为真实语义分), 词法分仅作次键;
@@ -395,6 +422,18 @@ class ToolRuntime:
                 }
             )
 
+    def record_multi_kb_result(
+        self,
+        source_statuses: list[dict[str, Any]],
+        fusion_summary: dict[str, Any] | None = None,
+    ) -> None:
+        """Keep bounded source/fusion diagnostics for the final audit summary."""
+
+        with self._lock:
+            self.multi_kb_source_outcomes.extend(dict(item) for item in source_statuses)
+            if fusion_summary:
+                self.multi_kb_fusions.append(dict(fusion_summary))
+
 
 def timed_tool_call(
     rt: ToolRuntime,
@@ -477,6 +516,8 @@ def timed_tool_call(
         )
         rt.end_tool_call(call_epoch)
         return AdmittedEvidence(), False
+    source_statuses = [dict(item) for item in getattr(items, "source_statuses", [])]
+    fusion_summary = dict(getattr(items, "fusion_summary", {}) or {})
     latency_ms = int((time.monotonic() - started) * 1000)
     try:
         from src.observability.metrics import record_agent_tool_call
@@ -488,11 +529,27 @@ def timed_tool_call(
     numbers = rt.add_evidence(items, epoch=call_epoch)
     rt.end_tool_call(call_epoch)
     admitted_items: AdmittedEvidence = AdmittedEvidence()
+    admitted_items.source_statuses = source_statuses
+    admitted_items.fusion_summary = fusion_summary
+    admitted_items.previous_evidence_ids = numbers.previously_registered
     for item, number in zip(items, numbers):
         if number is None:
             continue
         item.metadata = {**item.metadata, "citation_number": number}
         admitted_items.append(item)
+    if fusion_summary:
+        with rt._lock:
+            fusion_summary["runtime_admission"] = {
+                "admitted_items": len(admitted_items),
+                "budget_discarded": sum(number is None for number in numbers),
+                "coverage": {
+                    source.kb_id: any(item.metadata.get("kb_id") == source.kb_id for item in admitted_items)
+                    for source in rt.knowledge_scope.sources
+                },
+                "turn_context_used": sum(_evidence_context_cost(item) for item in rt.evidence),
+            }
+    if source_statuses:
+        rt.record_multi_kb_result(source_statuses, fusion_summary)
     # Distinguish "the source has nothing" from "the run already holds its
     # full evidence budget": only the latter is an execution limit, and the
     # model must be told so it can answer with the evidence it already has.
@@ -515,9 +572,10 @@ def timed_tool_call(
         },
     )
     adds_nothing = bool(admitted_items) and all(
-        item.id and item.id in pre_registered for item in admitted_items
+        item.id and item.id in (numbers.previously_registered if rt.knowledge_scope is not None else pre_registered)
+        for item in admitted_items
     )
-    return admitted_items, was_repeat and adds_nothing
+    return admitted_items, (was_repeat or rt.knowledge_scope is not None) and adds_nothing
 
 
 _LEADING_CITATION_RE = re.compile(r"(?m)^(\[\d+\])")
@@ -560,6 +618,12 @@ def evidence_budget_message(rt: ToolRuntime) -> str:
 
     budget = int(getattr(rt, "evidence_budget", 0) or 0)
     held = len(getattr(rt, "evidence", []) or [])
+    if rt.knowledge_scope is not None:
+        return (
+            f"本轮证据条数或上下文预算已不足（当前 {held} 条），"
+            "本次调用的新内容未纳入证据集；这不代表知识库中没有相关内容。"
+            "请基于已登记证据作答，并说明仍缺失的信息。"
+        )
     return (
         f"本轮可登记的证据已达上限（{budget} 条，当前 {held} 条），"
         "本次调用返回的新内容因超出预算未纳入证据集。"
@@ -579,6 +643,13 @@ def empty_result_message(
     return default
 
 
+def _evidence_context_cost(item: Evidence) -> int:
+    # Count the actual tool rendering as well as the fusion estimate.  The
+    # small margin covers citation-number growth after atomic admission.
+    rendered_cost = len(format_evidence_for_llm([item]).encode("utf-8")) + 16
+    return max(rendered_cost, int(item.metadata.get("context_token_estimate") or 0))
+
+
 def format_tool_result(rt: ToolRuntime, adds_nothing: bool, items: list[Evidence]) -> str:
     """Render a tool result for the model, collapsing no-op repeat calls.
 
@@ -594,19 +665,43 @@ def format_tool_result(rt: ToolRuntime, adds_nothing: bool, items: list[Evidence
     instead of the generic "no content" text, which the model would otherwise
     misread as a retrieval failure and retry.
     """
+    statuses = [
+        item for item in getattr(items, "source_statuses", [])
+        if item.get("status") not in {"success_with_hits", "success_empty"}
+    ]
+
+    def with_status_message(rendered: str) -> str:
+        if not statuses:
+            return rendered
+        rows = "\n".join(
+            f"- kb:{item.get('kb_id')} {item.get('status')}: "
+            f"{item.get('error_code') or item.get('status')}"
+            for item in statuses
+        )
+        return f"{rendered}\n\n来源检索未完成（部分结果不可用）：\n{rows}"
+
     if not items:
-        return empty_result_message(
+        return with_status_message(empty_result_message(
             rt,
             "（未找到相关内容）",
             budget_blocked=bool(getattr(items, "budget_blocked", False)),
-        )
+        ))
     if adds_nothing:
         with rt._lock:
             numbers = sorted({int(rt.evidence_index[item.id]) for item in items})
         cited = " ".join(f"[{number}]" for number in numbers)
         # 事实陈述，不带指令：是否继续引用 [n]、换关键词还是再次检索，
         # 由模型根据当前对话自行判断（策略在 SYSTEM_PROMPT，不在这里）。
-        return (
+        return with_status_message(
             f"本次调用返回的证据与历史消息中已注册的 {cited} 完全相同，无新增内容。"
         )
-    return format_evidence_for_llm(items)
+    if rt.knowledge_scope is not None:
+        previous_ids = getattr(items, "previous_evidence_ids", set())
+        previous = [item for item in items if item.id in previous_ids]
+        if previous:
+            fresh = [item for item in items if item.id not in previous_ids]
+            cited = " ".join(f"[{item.metadata['citation_number']}]" for item in previous)
+            return with_status_message(
+                f"{format_evidence_for_llm(fresh)}\n\n已注册证据 {cited} 的正文见此前检索结果。"
+            )
+    return with_status_message(format_evidence_for_llm(items))

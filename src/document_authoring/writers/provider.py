@@ -42,6 +42,9 @@ class WriterRequest(BaseModel):
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     allowed_derivations: list[dict[str, Any]] = Field(default_factory=list)
     missing_or_conflicts: list[dict[str, Any]] = Field(default_factory=list)
+    conflict_context: list[dict[str, Any]] = Field(default_factory=list)
+    decision_fingerprint: str = ""
+    dependency_review_fingerprint: str = ""
     prompt_version: str
 
     @model_validator(mode="after")

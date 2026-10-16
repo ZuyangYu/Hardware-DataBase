@@ -154,8 +154,16 @@ class ConflictDecisionStore:
                     (tenant, work_order, case.fingerprint, case.snapshot_hash),
                 ).fetchone()
                 if row is not None:
+                    existing = ConflictCase.model_validate(json.loads(row["payload_json"]))
+                    affected = tuple(sorted(set(existing.affected_unit_ids) | set(case.affected_unit_ids)))
+                    if affected != existing.affected_unit_ids:
+                        existing = existing.model_copy(update={"affected_unit_ids": affected})
+                        conn.execute(
+                            "UPDATE authoring_conflict_cases SET payload_json = ?, updated_at = ? WHERE conflict_id = ?",
+                            (self._json(existing.model_dump(mode="json")), now, existing.conflict_id),
+                        )
                     conn.execute("COMMIT")
-                    return ConflictCase.model_validate(json.loads(row["payload_json"]))
+                    return existing
                 conn.execute(
                     """INSERT INTO authoring_conflict_cases
                        (conflict_id, tenant_id, work_order_id, fingerprint,

@@ -118,3 +118,25 @@ def test_legacy_snapshot_hash_still_loads_without_multi_source_fields():
     payload = current.model_dump(mode='json', exclude={'content_hash', 'source_snapshot_kind', 'sources', 'knowledge_scope_snapshot'})
     payload['content_hash'] = content_hash(payload)
     assert KnowledgeBaseSourceSnapshot.model_validate(payload).content_hash == payload['content_hash']
+
+
+def test_harness_validation_accepts_actual_reference_kb_and_rejects_rogue_record(auth_scope, monkeypatch):
+    from src.agents.schemas import Evidence
+    from src.document_authoring.harness.graph import _validated_evidence
+    from src.document_authoring.service import DocumentGenerationService
+
+    _pipeline, _ctx, frozen = frozen_setup(auth_scope, monkeypatch)
+    source = frozen.sources[1]
+    raw = Evidence(id='ref', content='reference', source_name='same.pdf', content_kind='document_text', processor_kind='ragflow', metadata={
+        'kb_id': source['kb_id'], 'local_record_id': 9, 'kb_name': 'B',
+        'source_content_hash': source['source_content_hash'],
+    })
+    outcome = DocumentGenerationService.build_knowledge_base_retrieval_outcome(
+        'A', ['same.pdf'], [raw], frozen_sources=frozen.sources,
+        source_set_snapshot_id=frozen.source_set_snapshot_id,
+    )
+    order = SimpleNamespace(scope_type='knowledge_base', knowledge_base_name='A')
+    assert _validated_evidence(order, frozen, outcome)[0]['metadata']['knowledge_base_name'] == 'B'
+    outcome.evidences[0].metadata['local_record_id'] = 999
+    with pytest.raises(PermissionError):
+        _validated_evidence(order, frozen, outcome)

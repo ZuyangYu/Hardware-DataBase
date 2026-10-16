@@ -3,7 +3,10 @@
  * 保留:用户气泡(plain text)、助手气泡(MarkdownMessage)、流式无文本时流光占位、
  * 参考来源(证据)与记忆上下文面板。删掉:ExecutionRecord(trace)、ScheduledDraftCard、attachments、feedback。
  */
-import { memo, useState, type ReactNode } from 'react';
+import { memo, useEffect, useRef, useState, type ReactNode } from 'react';
+import { api } from '@/api/client';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { citationLocator, citationReadError, citationReadRequest, type CitationReadback } from '../citationModel';
 
 import type {
   EvidenceItem,
@@ -149,6 +152,32 @@ function DegradedBanner({ notes }: { notes: Array<{ stage: string; reason: strin
 /** 参考来源(证据)面板:贴在助手气泡底部,用 citations 样式。 */
 function EvidenceBlock({ evidence }: { evidence: EvidenceItem[] }) {
   const [open, setOpen] = useState(false);
+  const [sourceOpen, setSourceOpen] = useState(false);
+  const [reading, setReading] = useState(false);
+  const [source, setSource] = useState<CitationReadback | null>(null);
+  const [sourceError, setSourceError] = useState('');
+  const sourceRequest = useRef(0);
+  useEffect(() => () => { sourceRequest.current += 1; }, []);
+
+  async function readSource(item: EvidenceItem) {
+    const request = citationReadRequest(item);
+    if (!request) return;
+    const requestId = ++sourceRequest.current;
+    setSource(null);
+    setSourceError('');
+    setReading(true);
+    setSourceOpen(true);
+    try {
+      const result = await api.post<CitationReadback>('/api/v1/citations/resolve', request);
+      if (sourceRequest.current === requestId) setSource(result);
+    } catch (error) {
+      if (sourceRequest.current !== requestId) return;
+      setSource(null);
+      setSourceError(citationReadError(error));
+    } finally {
+      if (sourceRequest.current === requestId) setReading(false);
+    }
+  }
   if (evidence.length === 0) return null;
   return (
     <div className={CHAT_CITATIONS_CLASS}>
@@ -187,11 +216,29 @@ function EvidenceBlock({ evidence }: { evidence: EvidenceItem[] }) {
                   </div>
                 )}
                 {locator && <div className="mt-[5px] text-[11px] leading-[16px] text-[#9aa1b1]">{locator}</div>}
+                {citationReadRequest(item) && (
+                  <button type="button" onClick={() => void readSource(item)}
+                    className="mt-[6px] text-[12px] text-[#0b6cf5] hover:underline"
+                    aria-label={`查看原文 ${index + 1}：${fileName}`}>
+                    查看原文
+                  </button>
+                )}
               </div>
             );
           })}
         </div>
       )}
+      <Dialog open={sourceOpen} onOpenChange={(value) => {
+        setSourceOpen(value);
+        if (!value) { sourceRequest.current += 1; setSource(null); setReading(false); }
+      }}>
+        <DialogContent className="max-h-[80dvh] overflow-auto">
+          <DialogHeader><DialogTitle>{source ? `${source.kb_name} · ${source.source_name}` : '引用原文'}</DialogTitle></DialogHeader>
+          {reading && <p role="status">正在核验来源并读取原文…</p>}
+          {sourceError && <p role="alert">{sourceError}</p>}
+          {source && <div className="whitespace-pre-wrap break-words text-[13px] leading-[21px]">{source.content}</div>}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -351,22 +398,6 @@ function citationPreview(item: EvidenceItem): string {
     typeof metadata.text_preview === 'string' ? metadata.text_preview : '',
   ];
   return candidates.find((value) => typeof value === 'string' && value.trim())?.trim() ?? '';
-}
-
-function citationLocator(item: EvidenceItem): string {
-  const locator = item.locator ?? {};
-  const sheet = String(locator.sheet_name ?? '');
-  const cell = String(locator.cell_ref ?? '');
-  const row = locator.row_index;
-  if (sheet && cell) return `定位：${sheet} · ${cell}`;
-  if (sheet && row !== undefined && row !== null) return `定位：${sheet} · 第 ${Number(row) + 1} 行`;
-  const page = locator.page ?? item.metadata?.page ?? item.metadata?.page_number;
-  if (page !== undefined && page !== null && String(page)) return `定位：第 ${page} 页`;
-  const chunk = locator.chunk_id ?? item.chunk_id;
-  if (chunk) return `定位：片段 ${chunk}`;
-  const design = locator.design_id ?? item.metadata?.design_id;
-  if (design) return `定位：设计 ${design}`;
-  return '';
 }
 
 function StreamingText({ content }: { content: string }) {

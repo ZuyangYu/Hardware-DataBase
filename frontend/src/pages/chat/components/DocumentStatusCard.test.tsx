@@ -321,6 +321,7 @@ describe('DocumentStatusCard', () => {
     expect(markup).toContain('aria-label="下载 final（工单 wo-123）"');
     expect(markup).toContain('下载来源与决策记录（产物 a-1）');
     expect(markup).toContain('下载来源与决策记录（产物 a-2）');
+    expect(markup).toContain('下载含审计附录包（产物 a-1）');
 
     const noArtifacts = renderToStaticMarkup(
       <DocumentStatusCard card={workOrderCard} onRefreshStatus={() => undefined} />,

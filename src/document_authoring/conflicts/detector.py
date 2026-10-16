@@ -35,11 +35,14 @@ class ConflictDetector:
             groups[key].append(claim)
         cases: list[ConflictCase] = []
         for key, grouped in groups.items():
+            grouped = list({claim.claim_id: claim for claim in grouped}.values())
             values = {claim.normalized_unit + ":" + claim.normalized_value for claim in grouped}
             if len(values) <= 1:
                 continue
-            claim_ids = sorted(claim.claim_id for claim in grouped)
-            fingerprint = _hash({"key": key, "claims": claim_ids, "values": sorted(values)})
+            fingerprint = _hash({"key": key, "claims": sorted(
+                (claim.claim_id, claim.normalized_unit, claim.normalized_value, claim.source_content_hash)
+                for claim in grouped
+            )})
             evidence_hash = _hash(sorted({e for claim in grouped for e in claim.evidence_ids}))
             cases.append(
                 ConflictCase(

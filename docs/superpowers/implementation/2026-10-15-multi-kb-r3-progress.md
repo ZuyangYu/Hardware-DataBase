@@ -57,6 +57,17 @@ R3 尚未整体验收：
 
 本轮没有执行生产数据库迁移、修改运行环境配置、启用功能开关或部署。临时 PG 仅用于隔离测试。
 
+## 2026-10-16 后续修复
+
+- [x] 历史权限复核递归展开 `source_dependencies.inherited_turn_ids`；API 在读取、SSE、取消和重启入口加载父 turn，缺失或不完整依赖 fail closed，撤权继承来源后不再泄露派生正文。
+- [x] 多知识库 turn 在 SQLite/PG 的完成与编辑路径跳过 `project_reflection` 长期记忆 outbox；单库自动提取行为保持不变。
+- [x] 证据去重和字段预算按知识库/本地记录保留独立出处；相同正文跨库不会覆盖来源，字段上限先保证每个已命中 KB 的代表席位。
+- [x] 生成产物审计 lineage 兼容旧测试替身/旧 artifact 行，仍对真实父产物递归执行来源授权和版本复核。
+
+本轮新增/修复回归：多库、冲突、冻结、结构化、引用、文档生成相关 **465 passed，20 skipped，2 subtests passed**；Ruff 与 `git diff --check` 通过。此前隔离真实 RAGFlow 试跑的 7/7 固定锚点、四库融合及撤权边界结果见 [`2026-10-16-multi-kb-r3-live-acceptance.md`](./2026-10-16-multi-kb-r3-live-acceptance.md)。
+
+R3 仍未宣称完成独立人工相关性/冲突标注、长稳负载、正式审批系统接入、真实迁移回滚演练和 Office/PDF 内嵌审计章节；这些仍是 T5/T10/T11 的发布前证据。
+
 ## 任务状态
 
 - [x] T0：共享检索池生命周期与旧单库兼容。

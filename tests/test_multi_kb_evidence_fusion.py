@@ -153,3 +153,60 @@ def test_runtime_reserves_a_slot_for_other_selected_source_and_keeps_citation_nu
     rt.finalize_evidence()
     assert [item.id for item in rt.evidence] == ids
     assert rt.evidence_index["205:1"] == 4
+
+
+def test_four_source_query_representatives_survive_repeated_generic_rrf_hits():
+    """Minimized from live EPS/ADAS/control retrieval; no source passages copied."""
+    from src.services.evidence_fusion import fuse_evidence
+
+    eps60 = evidence(101, chunk="supply60", content="KL30 18-32V", score=.86, role="peer")
+    generic60 = evidence(101, chunk="predriver60", content="L9908 current monitor", score=.42, role="peer")
+    eps62 = evidence(205, chunk="supply62", content="battery 9-36V", score=.74, role="peer")
+    generic62 = evidence(205, chunk="predriver62", content="L9908 SPI", score=.45, role="peer")
+    adas = evidence(306, chunk="pmic", content="LP87702 VCC1V8 VCC1V1", score=.89, role="peer")
+    control = evidence(407, chunk="control", content="KL30 20-30V (test candidate)", score=.65, role="peer")
+    outcomes = [
+        outcome(101, [eps60, generic60], query="KL30 operating voltage"),
+        outcome(101, [replace(generic60, score=.4)], query="battery operating voltage"),
+        outcome(101, [replace(generic60, score=.3)], query="LP87702 output"),
+        outcome(205, [generic62], query="KL30 operating voltage"),
+        outcome(205, [eps62, generic62], query="battery operating voltage"),
+        outcome(205, [replace(generic62, score=.3)], query="LP87702 output"),
+        outcome(306, [adas], query="LP87702 output"),
+        outcome(407, [control], query="KL30 operating voltage"),
+    ]
+    result = fuse_evidence(outcomes, purpose="compare", max_items=4, token_budget=40, token_counter=lambda _: 10)
+    assert {item.content for item in result.evidence} == {eps60.content, eps62.content, adas.content, control.content}
+    assert result.complete
+    assert result.token_count == 40
+    assert [item.metadata["fusion_rank"] for item in result.evidence] == [1, 2, 3, 4]
+    retained = {(item["kb_id"], item["query"]): item["top_candidate_retained"] for item in result.query_coverage}
+    assert retained[(101, "KL30 operating voltage")] is True
+    assert retained[(205, "battery operating voltage")] is True
+    assert retained[(101, "LP87702 output")] is False
+
+
+def test_unknown_score_scale_falls_back_to_rank_without_displacing_repeated_hit():
+    from src.services.evidence_fusion import fuse_evidence
+
+    stable = evidence(chunk="stable", content="repeated relevant result", score=.8)
+    unknown = evidence(chunk="unknown", content="unknown score scale", score=1000)
+    result = fuse_evidence([outcome(101, [stable], query="first"), outcome(101, [stable], query="second"),
+                            outcome(101, [unknown], query="third")],
+                           purpose="answer", max_items=1, token_budget=10, token_counter=lambda _: 10)
+    assert result.evidence[0].content == stable.content
+    assert result.source_representatives[0]["selection_method"] == "rank"
+
+
+def test_query_coverage_reports_budget_crop_without_inventing_a_retained_hit():
+    from src.services.evidence_fusion import fuse_evidence
+
+    first = evidence(chunk="first", score=.9)
+    second = evidence(chunk="second", score=.8)
+    result = fuse_evidence([outcome(101, [first], query="first"), outcome(101, [second], query="second")],
+                           purpose="answer", max_items=1, token_budget=10, token_counter=lambda _: 10)
+    rows = {item["query"]: item for item in result.query_coverage}
+    assert rows["first"]["covered"] is True
+    assert rows["second"]["covered"] is False
+    assert rows["second"]["budget_cropped"] is True
+    assert result.discarded["budget"] == 1

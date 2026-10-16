@@ -114,6 +114,7 @@ def _authorized_circuit_query(
             query=query,
             ctx=ctx,
             top_k=top_k,
+            **({"filters": filters} if filters else {}),
         )
     return circuit_service.query(
         kb_name=kb_name,

@@ -10,6 +10,64 @@ from src.pipelines.document_rag.base import RAGBackend
 from src.pipelines.document_store import PipelineDocumentStore
 
 
+class ScopedEvidenceBatch(list):
+    """Evidence rows carrying source-level status and fusion audit metadata."""
+
+    source_statuses: list[dict[str, Any]] = []
+    fusion_summary: dict[str, Any] = {}
+
+
+def _scope_statuses(outcome) -> list[dict[str, Any]]:
+    return [
+        {
+            "kb_id": int(getattr(item, "kb_id", 0) or 0),
+            "query": str(getattr(item, "query", "") or ""),
+            "retriever_kind": str(getattr(item, "retriever_kind", "") or ""),
+            "status": str(getattr(item, "status", "retrieval_failed") or "retrieval_failed"),
+            "error_code": str(getattr(item, "error_code", "") or "") or None,
+            "diagnostics": dict(getattr(item, "diagnostics", {}) or {}),
+        }
+        for item in (getattr(outcome, "source_outcomes", None) or [])
+    ]
+
+
+def _fuse_scoped_outcome(outcome, *, purpose: str, max_items: int):
+    """Fuse production outcomes while keeping compatibility with old test doubles."""
+
+    source_outcomes = getattr(outcome, "source_outcomes", None)
+    if not source_outcomes:
+        return list(getattr(outcome, "evidence", []) or []), {}
+    import src.settings as settings
+    from src.services.evidence_fusion import fuse_evidence
+
+    fused = fuse_evidence(
+        outcome,
+        purpose=purpose,
+        max_items=max(1, min(int(max_items), int(settings.MULTI_KB_EVIDENCE_MAX_ITEMS))),
+        token_budget=max(0, int(settings.MULTI_KB_CONTEXT_MAX_TOKENS)),
+    )
+    return list(fused.evidence), {
+        "selection_hash": str(getattr(outcome, "selection_hash", "") or ""),
+        "coverage": dict(fused.coverage),
+        "complete": bool(fused.complete),
+        "token_count": int(fused.token_count),
+        "candidate_refs": list(fused.candidate_refs),
+        "discarded": dict(fused.discarded),
+        "query_coverage": list(fused.query_coverage),
+        "source_representatives": list(fused.source_representatives),
+    }
+
+
+def _scoped_batch(outcome, *, purpose: str, max_items: int) -> ScopedEvidenceBatch:
+    raw_items, fusion_summary = _fuse_scoped_outcome(
+        outcome, purpose=purpose, max_items=max_items
+    )
+    result = ScopedEvidenceBatch(_convert_scoped_evidence(item) for item in raw_items)
+    result.source_statuses = _scope_statuses(outcome)
+    result.fusion_summary = fusion_summary
+    return result
+
+
 def _backend_filters(
     kb_name: str,
     ctx,
@@ -86,7 +144,11 @@ def make_document_search(rt, rag_backend: RAGBackend, document_store: PipelineDo
                 per_source_top_k=max(1, min(int(top_k), 20)),
                 budget=budget,
             )
-            return [_convert_scoped_evidence(item) for item in outcome.evidence]
+            return _scoped_batch(
+                outcome,
+                purpose=str(getattr(rt.knowledge_scope, "purpose", "answer")),
+                max_items=max(1, min(int(top_k), 20)),
+            )
         backend_filters = _backend_filters(rt.kb_name, rt.ctx, None, document_store)
         retrieve_kwargs: dict[str, Any] = {"top_k": top_k, "ctx": rt.ctx, "filters": backend_filters}
         raw = rag_backend.retrieve(rt.kb_name, query, **retrieve_kwargs)
@@ -196,7 +258,11 @@ def make_document_search_batch(
                 )
                 for value in normalized:
                     rt.log_query("document_search", value)
-                return [_convert_scoped_evidence(item) for item in outcome.evidence]
+                return _scoped_batch(
+                    outcome,
+                    purpose=str(getattr(rt.knowledge_scope, "purpose", "answer")),
+                    max_items=max(1, min(safe_top_k, 20)),
+                )
 
             items, adds_nothing = timed_tool_call(
                 rt, "document_search_batch", " | ".join(normalized), None, run_multi

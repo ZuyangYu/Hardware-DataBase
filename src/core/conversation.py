@@ -934,6 +934,9 @@ class ConversationService:
             src.settings, "MEMORY_EXTRACTION_ENABLED", True
         ):
             return
+        if str(session["knowledge_selection_hash"] or ""):
+            # P0-P2 multi-KB turns must not enter the project-memory namespace.
+            return
         department_id = session["department_id"]
         kb_id = session["kb_id"]
         if department_id in (None, "") or kb_id in (None, ""):
@@ -2605,6 +2608,7 @@ class ConversationService:
                     and session_auto_memory == 1
                     and row["department_id"] not in (None, "")
                     and row["kb_id"] not in (None, "")
+                    and not str(row["knowledge_selection_hash"] or "")
                 ):
                     from src.memory.catalog import scope_fingerprint
                     from src.memory.jobs import enqueue_project_reflection_in_connection

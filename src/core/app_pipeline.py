@@ -34,6 +34,7 @@ from src.document_authoring.evidence import (
     KnowledgeBaseEvidenceProvider,
 )
 from src.document_authoring.knowledge_sources import build_frozen_source_entry
+from src.document_authoring.conflicts.governance import requires_review_contract, REVIEW_WORKER_CONTRACT
 from src.document_authoring.job_store import DocumentAuthoringJobStore
 from src.document_authoring.circuit_capabilities import enrich_circuit_capabilities
 from src.document_authoring.icd_scope_decision import (
@@ -1325,6 +1326,9 @@ class AppPipeline:
         contract_version: str = "legacy_brief_v1",
         output_spec: dict[str, Any] | None = None,
     ):
+        raw_scope = ctx.metadata.get("knowledge_scope_snapshot")
+        if raw_scope:
+            self.document_generation.require_human_review_available({"kb_scope_snapshot": raw_scope})
         compatibility = getattr(self.document_generation, "compatibility", None)
         if compatibility is not None and auto_confirm_recommended:
             compatibility.record_auto_confirmation_attempt(
@@ -1404,6 +1408,7 @@ class AppPipeline:
             brief=brief,
             conversation_id=ctx.metadata.get("conversation_id"),
             initiating_turn_id=ctx.metadata.get("initiating_turn_id"),
+            knowledge_scope_snapshot=ctx.metadata.get("knowledge_scope_snapshot"),
         )
         sessions = self.document_generation.store.generation_sessions
         task = self.document_generation.ensure_document_task(
@@ -1493,11 +1498,13 @@ class AppPipeline:
         scope = draft.get("source_scope") or {}
         if scope.get("attachments") or scope.get("projects") or scope.get("structured_inputs"):
             raise ValueError("当前初步资料预览尚不支持附件、项目或结构化输入范围；不会擅自替换为知识库检索")
-        if set(scope.get("knowledge_bases") or []) - {knowledge_base_name}:
+        selected_names = {source.get("kb_name") for source in (ctx.metadata.get("knowledge_scope_snapshot") or {}).get("sources", [])} or {knowledge_base_name}
+        if set(scope.get("knowledge_bases") or []) - selected_names:
             raise ValueError("当前初步资料预览不能跨知识库检索，不会擅自改变来源范围")
         snapshot, _ = self._planning_source_snapshot(ctx, knowledge_base_name=knowledge_base_name)
         source_names = list(snapshot.source_names)
-        provider = KnowledgeBaseEvidenceProvider(self.backend, top_k=5, source_names=source_names)
+        provider_kwargs = self._frozen_kb_provider_kwargs(ctx, knowledge_base_name, snapshot)
+        provider = KnowledgeBaseEvidenceProvider(self.backend, top_k=5, source_names=source_names, **provider_kwargs)
         outline = draft.get("outline") or []
         query = " ".join([
             str(draft.get("purpose") or ""),
@@ -1530,6 +1537,10 @@ class AppPipeline:
             seen.add(key)
             excerpts.append({
                 "evidence_id": item.id, "source_name": item.source_name,
+                "kb_id": item.metadata.get("kb_id"),
+                "knowledge_base_name": item.metadata.get("knowledge_base_name"),
+                "local_record_id": item.metadata.get("local_record_id"),
+                "locator": dict(item.locator),
                 "excerpt": item.content[:800],
             })
             if len(excerpts) == 5:
@@ -1731,6 +1742,7 @@ class AppPipeline:
             output_spec_draft=draft,
             conversation_id=ctx.metadata.get("conversation_id"),
             initiating_turn_id=ctx.metadata.get("initiating_turn_id"),
+            knowledge_scope_snapshot=ctx.metadata.get("knowledge_scope_snapshot"),
         )
         task = self.document_generation.ensure_document_task(
             ctx,
@@ -1786,6 +1798,16 @@ class AppPipeline:
         requested_kb = ctx.metadata.get("document_template_kb_name")
         if requested_kb is not None and session.knowledge_base_name != requested_kb:
             raise PermissionError("generation session belongs to another knowledge base")
+        stored_scope = getattr(session, "knowledge_scope_snapshot", {})
+        if stored_scope:
+            scope = KnowledgeScopeSnapshot.model_validate(stored_scope)
+            resolver = KnowledgeScopeResolver(AuthService())
+            actor_id = self._resolve_actor_user_id(ctx, resolver.auth)
+            resolver.revalidate(actor_id, scope)
+            requested = ctx.metadata.get("knowledge_scope_snapshot")
+            if requested and requested.get("selection_hash") != scope.selection_hash:
+                raise ValueError("knowledge_scope_changed")
+            ctx.metadata["knowledge_scope_snapshot"] = scope.model_dump(mode="json")
         return session
 
     def _inherited_output_spec_scope(
@@ -2181,10 +2203,17 @@ class AppPipeline:
             raise ValueError("output spec draft is missing")
         intake = getattr(self, "output_spec_intake", None) or OutputSpecIntakeService()
         spec = intake.to_output_spec(draft).model_copy(update={"status": "proposed"})
-        snapshot, source_summary = self._planning_source_snapshot(
-            ctx,
-            knowledge_base_name=session.knowledge_base_name,
-        )
+        preview_id = (draft.get("content_preview") or {}).get("source_snapshot_id")
+        preview_snapshot = self.document_generation.store.get_knowledge_base_source_snapshot(preview_id) if preview_id else None
+        if preview_snapshot is not None and getattr(preview_snapshot, "source_snapshot_kind", "") == "multi_knowledge_v1":
+            self._validate_authoring_source_snapshot(ctx, None, preview_snapshot)
+            snapshot = preview_snapshot
+            source_summary = {"snapshot_content_hash": snapshot.content_hash, "snapshot_hash": snapshot.content_hash,
+                              "snapshot_bound": True, "source_count": len(snapshot.sources),
+                              "knowledge_base_count": len((snapshot.knowledge_scope_snapshot or {}).get("sources", [])),
+                              "attachment_count": 0}
+        else:
+            snapshot, source_summary = self._planning_source_snapshot(ctx, knowledge_base_name=session.knowledge_base_name)
         template = None
         analysis = None
         bindings: list[Any] = []
@@ -3763,6 +3792,7 @@ class AppPipeline:
                 payload={
                     "work_order_id": work_order_id,
                     "knowledge_base_name": order.knowledge_base_name,
+                    **({"required_worker_contract": REVIEW_WORKER_CONTRACT} if requires_review_contract(order) else {}),
                 },
             )
             mark_task_queued = getattr(self.document_generation, "mark_document_task_queued", None)
@@ -3822,6 +3852,7 @@ class AppPipeline:
                 "knowledge_base_name": order.knowledge_base_name,
                 "source_artifact_id": artifact.artifact_id,
                 "target_format": normalized_target,
+                **({"required_worker_contract": REVIEW_WORKER_CONTRACT} if requires_review_contract(order) else {}),
             },
         )
         return job
@@ -3953,6 +3984,7 @@ class AppPipeline:
                 "work_order_id": order.work_order_id,
                 "knowledge_base_name": order.knowledge_base_name,
                 "harness_run_id": str(harness_run_id),
+                **({"required_worker_contract": REVIEW_WORKER_CONTRACT} if requires_review_contract(order) else {}),
             },
         )
         mark_task_queued = getattr(self.document_generation, "mark_document_task_queued", None)
@@ -3988,6 +4020,17 @@ class AppPipeline:
         return self.document_generation.auto_generate_document(
             ctx, retrieve_factory=retrieve_factory, **kwargs,
         )
+
+    def _frozen_kb_provider_kwargs(self, ctx: RequestContext, kb_name: str, snapshot: Any) -> dict[str, Any]:
+        if getattr(snapshot, "source_snapshot_kind", "") != "multi_knowledge_v1":
+            return {}
+        from src.document_authoring.knowledge_sources import frozen_document_contracts
+        from src.services.multi_kb_retrieval import MultiKnowledgeRetrievalService, RetrievalBudget
+        self._validate_authoring_source_snapshot(ctx, None, snapshot)
+        resolver, scope = self._resolve_frozen_authoring_scope(ctx, kb_name, snapshot)
+        return {"knowledge_scope": scope, "multi_kb_service": MultiKnowledgeRetrievalService(resolver, self.backend),
+                "retrieval_budget": RetrievalBudget(max_calls=24, timeout_seconds=30, should_cancel=ctx.metadata.get("document_job_cancelled")),
+                "document_contracts": frozen_document_contracts(snapshot.sources)}
 
     def _knowledge_base_retriever(
         self,
@@ -6436,6 +6479,9 @@ class AppPipeline:
 
     def document_artifact_audit(self, ctx: RequestContext, artifact_id: str) -> dict[str, Any]:
         return self.document_generation.document_artifact_audit(ctx, artifact_id)
+
+    def download_document_artifact_bundle(self, ctx: RequestContext, artifact_id: str) -> bytes:
+        return self.document_generation.download_document_artifact_bundle(ctx, artifact_id)
 
     def preview_document_artifact(self, ctx: RequestContext, artifact_id: str) -> dict[str, Any]:
         return self.document_generation.preview_document_artifact(ctx, artifact_id)

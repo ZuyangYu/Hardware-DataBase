@@ -256,8 +256,11 @@ class ExternalConversationQueryEngine:
         return {"rebuilt": rebuilt, "failed": failed}
 
     # ---- queries ---------------------------------------------------------
-    def search_by_scope(self, department_id: str | int | None, kb_name: str, query: str, top_k: int = 5) -> list[dict]:
+    def search_by_scope(self, department_id: str | int | None, kb_name: str, query: str, top_k: int = 5,
+                        *, conversation_ids: tuple[str, ...] | None = None) -> list[dict]:
         dept = _require_department_id(department_id, "searching")
+        if conversation_ids == ():
+            return []
         try:
             db_path = self.db_path(dept, kb_name, create=False)
         except ValueError:
@@ -270,15 +273,21 @@ class ExternalConversationQueryEngine:
         where, where_params = _like_clauses(["m.content", "c.title", "c.source_file"], tokens)
         order_sql, order_params = _token_match_order(["m.content", "c.title"], tokens)
         limit = min(200, max(40, max(1, int(top_k)) * 8))
-        params = [dept, *where_params, *order_params, limit]
+        selection_clause = ""
+        selection_params = []
+        if conversation_ids is not None:
+            selection_clause = f" AND c.conversation_id IN ({','.join('?' for _ in conversation_ids)})"
+            selection_params = list(conversation_ids)
+        params = [dept, *where_params, *selection_params, *order_params, limit]
         sql = f"""
             SELECT m.id AS message_id, m.conversation_id, m.role, m.turn_index,
                    m.content, m.ts, m.start_offset,
-                   c.title, c.source_file, c.origin, c.source_group
+                   c.title, c.source_file, c.origin, c.source_group,
+                   c.content_hash AS source_content_hash
             FROM messages m
             JOIN conversations c ON c.conversation_id = m.conversation_id
                  AND c.department_id = ?
-            WHERE {where}
+            WHERE {where}{selection_clause}
             ORDER BY {order_sql} DESC, {_ROLE_WEIGHT_SQL} DESC, m.id ASC
             LIMIT ?
         """
@@ -312,7 +321,7 @@ class ExternalConversationQueryEngine:
             return []
         sql = """
             SELECT conversation_id, title, source_file, origin, source_group,
-                   turn_count, block_count, status, created_at,
+                   turn_count, block_count, status, created_at, content_hash,
                    summary, key_points_json, summary_generated_at
             FROM conversations WHERE department_id = ? ORDER BY created_at DESC, conversation_id ASC
         """

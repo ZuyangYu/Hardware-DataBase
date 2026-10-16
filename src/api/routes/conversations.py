@@ -28,6 +28,15 @@ def _conv_service() -> ConversationService:
     return ConversationService()
 
 
+def _can_read_turn(auth, user, turn, conv: ConversationService) -> bool:
+    return can_read_turn(
+        auth,
+        user,
+        turn,
+        dependency_loader=lambda inherited_id: conv.get_turn(user.id, str(inherited_id)),
+    )
+
+
 def _session_view(s, *, user=None, auth=None, scope=None) -> SessionView:
     restricted = False
     if scope is None and getattr(s, "knowledge_selection", None) and user is not None:
@@ -293,7 +302,7 @@ def list_messages(
     for m in messages:
         if m.turn_id:
             owning_turn = conv.get_turn(user.id, str(m.turn_id))
-            if owning_turn is not None and not can_read_turn(auth, user, owning_turn):
+            if owning_turn is not None and not _can_read_turn(auth, user, owning_turn, conv):
                 views.append(MessageView(id=m.id, session_id=m.session_id, turn_id=m.turn_id,
                     role=m.role, content="来源权限已变化", footer="", created_at=m.created_at,
                     redacted=True, source_access_restricted=True))

@@ -26,7 +26,8 @@ class ConflictPolicy:
             if claim.source_role == "primary"
             and claim.approval_status in {"approved", "effective", "released"}
         ]
-        if len(approved_primary) == 1:
+        approved_values = {(c.normalized_unit, c.normalized_value) for c in approved_primary}
+        if len(approved_values) == 1:
             return ConflictDecision(
                 conflict_id=case.conflict_id,
                 action="retain_primary",

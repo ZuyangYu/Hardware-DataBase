@@ -39,7 +39,7 @@ class ConflictCase(BaseModel):
     predicate: str = ""
     condition: str = ""
     scope_key: str = ""
-    claims: tuple[NormalizedClaim, ...] = Field(min_length=2)
+    claims: tuple[NormalizedClaim, ...] = Field(min_length=1)
     severity: Literal["S0", "S1", "S2", "S3"] = "S2"
     status: Literal[
         "open", "resolved", "dismissed", "blocked", "deferred", "approval_pending",

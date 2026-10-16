@@ -31,6 +31,7 @@ from src.core.conversation import (
     ConversationService,
     StaleTurnOwner,
 )
+from src.core.intent import classify_intent
 from src.document_authoring.chat_context import (
     DocumentAuthoringContext,
     DocumentContext,
@@ -54,7 +55,15 @@ from src.api.schemas import (
     TurnStartResponse,
     TurnView,
 )
-from src.core.intent import classify_intent
+
+
+def _can_read_turn(auth, user, turn, conv: ConversationService) -> bool:
+    return can_read_turn(
+        auth,
+        user,
+        turn,
+        dependency_loader=lambda inherited_id: conv.get_turn(user.id, str(inherited_id)),
+    )
 
 router = APIRouter(tags=["query"])
 _TURN_CANCEL_SIGNALS: dict[str, threading.Event] = {}
@@ -1320,7 +1329,7 @@ def start_turn(
     turn = conv.get_turn(user.id, turn_id)
     if turn is None:
         raise HTTPException(status_code=404, detail="turn not found")
-    if not can_read_turn(auth, user, turn):
+    if not _can_read_turn(auth, user, turn, conv):
         raise HTTPException(status_code=403, detail="knowledge_scope_denied")
     ctx = build_context_for_user(user, turn.kb_name, auth=auth)
     reject_system_admin_kb_access(ctx)
@@ -1353,7 +1362,7 @@ def get_turn(
     turn = conv.get_turn(user.id, turn_id)
     if turn is None:
         raise HTTPException(status_code=404, detail="turn not found")
-    if not can_read_turn(auth, user, turn):
+    if not _can_read_turn(auth, user, turn, conv):
         return _restricted_turn_view(turn)
     return _turn_view(turn)
 
@@ -1381,7 +1390,7 @@ def list_active_turns(
     else:
         turns = conv.list_active_turns(user.id, session_id)
     return [
-        _turn_view(turn) if can_read_turn(auth, user, turn) else _restricted_turn_view(turn)
+        _turn_view(turn) if _can_read_turn(auth, user, turn, conv) else _restricted_turn_view(turn)
         for turn in turns
     ]
 
@@ -1406,7 +1415,7 @@ def cancel_turn(
     local_signal = _existing_turn_cancel_signal(turn_id)
     if local_signal is not None:
         local_signal.set()
-    return _turn_view(turn) if can_read_turn(auth, user, turn) else _restricted_turn_view(turn)
+    return _turn_view(turn) if _can_read_turn(auth, user, turn, conv) else _restricted_turn_view(turn)
 
 
 @router.get("/turns/{turn_id}/events")
@@ -1421,7 +1430,7 @@ async def stream_turn_events(
     turn = conv.get_turn(user.id, turn_id)
     if turn is None:
         raise HTTPException(status_code=404, detail="turn not found")
-    if not can_read_turn(auth, user, turn):
+    if not _can_read_turn(auth, user, turn, conv):
         raise HTTPException(status_code=403, detail="knowledge_scope_denied")
     try:
         last_seq = max(after, int(request.headers.get("Last-Event-ID") or 0))
@@ -1437,7 +1446,7 @@ async def stream_turn_events(
 
         def _readable() -> bool:
             current = conv.get_turn(user.id, turn_id)
-            return current is not None and can_read_turn(auth, user, current)
+            return current is not None and _can_read_turn(auth, user, current, conv)
 
         def _restricted_event():
             return _sse(

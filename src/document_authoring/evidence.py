@@ -187,12 +187,28 @@ class KnowledgeBaseEvidenceProvider:
                 failure = next((entry for entry in outcome.source_outcomes if entry.status not in {'success_with_hits', 'success_empty'}), None)
                 if failure is not None:
                     raise ScopedRetrievalError(failure.status, failure.error_code)
+            raw_evidence = list(outcome.evidence)
+            if getattr(outcome, "source_outcomes", None):
+                import src.settings as settings
+                from src.services.evidence_fusion import fuse_evidence
+
+                raw_evidence = list(
+                    fuse_evidence(
+                        outcome,
+                        purpose=str(getattr(self.knowledge_scope, "purpose", "compose")),
+                        max_items=max(
+                            1,
+                            min(self.top_k, int(settings.MULTI_KB_EVIDENCE_MAX_ITEMS)),
+                        ),
+                        token_budget=max(0, int(settings.MULTI_KB_CONTEXT_MAX_TOKENS)),
+                    ).evidence
+                )
             return [
                 _knowledge_base_evidence(
                     item,
                     kb_name=str((item.metadata or {}).get("knowledge_source", {}).get("kb_name") or kb_name),
                 )
-                for item in outcome.evidence
+                for item in raw_evidence
             ]
         # ``None`` means the standalone adapter has no source restriction;
         # an explicit empty sequence is a frozen empty source set and must

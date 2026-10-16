@@ -51,6 +51,24 @@ from src.document_authoring.template_analysis import TemplateMappingCorrection
 router = APIRouter(tags=["document-generation"])
 
 
+def _apply_generation_scope(ctx, user, auth, selection):
+    if selection is None:
+        return ctx
+    if not src.settings.MULTI_KB_CHAT_ENABLED or not src.settings.MULTI_KB_HUMAN_REVIEW_ENABLED:
+        raise HTTPException(status_code=409, detail="multi_kb_authoring_feature_unavailable")
+    from src.services.knowledge_scope import KnowledgeScopeResolver
+    try:
+        scope = KnowledgeScopeResolver(auth, tenant_key=ctx.tenant_id or "default").resolve(
+            user, ctx.metadata["document_template_kb_name"], selection,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="knowledge_scope_denied") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    ctx.metadata["knowledge_scope_snapshot"] = scope.model_dump(mode="json")
+    return ctx
+
+
 def _read_upload_limited(file: UploadFile, limit: int) -> bytes:
     """Read a parser-bound upload in chunks and reject oversized bodies early."""
     if limit <= 0:
@@ -420,7 +438,7 @@ def create_generation_session(
     pipeline: AppPipeline = Depends(get_pipeline),
     auth: AuthService = Depends(get_auth_service),
 ):
-    ctx = _write_ctx(user, auth, kb)
+    ctx = _apply_generation_scope(_write_ctx(user, auth, kb), user, auth, payload.knowledge_scope)
     try:
         return pipeline.create_document_generation_session(
             ctx,
@@ -606,7 +624,7 @@ def create_work_order(
     pipeline: AppPipeline = Depends(get_pipeline),
     auth: AuthService = Depends(get_auth_service),
 ):
-    ctx = _write_ctx(user, auth, kb)
+    ctx = _apply_generation_scope(_write_ctx(user, auth, kb), user, auth, payload.knowledge_scope)
     try:
         kwargs = {
             "template_version_id": payload.template_version_id,
@@ -1752,6 +1770,31 @@ def artifact_audit(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get('/document-generation/artifacts/{artifact_id}/audit-bundle')
+def artifact_audit_bundle(
+    artifact_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        content = pipeline.download_document_artifact_bundle(ctx, artifact_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    safe_artifact_id = re.sub(r'[^A-Za-z0-9._-]+', '-', artifact_id).strip('.-') or 'artifact'
+    return Response(
+        content=content,
+        media_type='application/zip',
+        headers={'Content-Disposition': f'attachment; filename="document-{safe_artifact_id}-with-audit.zip"'},
+    )
 
 
 @router.get("/document-generation/artifacts/{artifact_id}/download")

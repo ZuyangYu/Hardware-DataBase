@@ -209,7 +209,17 @@ def _service(rt: ToolRuntime) -> AttachmentService:
     configured = getattr(rt, "attachment_service", None)
     if configured is None:
         return AttachmentService()
-    if isinstance(configured, AttachmentService):
+    # ``AttachmentService`` is imported for the normal runtime path, but test
+    # and embedding callers may temporarily replace the module attribute with
+    # a factory.  A cached factory is not a valid second argument to
+    # ``isinstance``; prefer the small service protocol and only use the type
+    # check when the imported value is actually a class.
+    if (
+        hasattr(configured, "get_attachment")
+        and hasattr(configured, "build_refs")
+    ):
+        return configured
+    if isinstance(AttachmentService, type) and isinstance(configured, AttachmentService):
         return configured
     # Keep compatibility with callers that injected the raw store before the
     # per-call ACL boundary was introduced.
