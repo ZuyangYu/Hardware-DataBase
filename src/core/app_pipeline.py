@@ -6553,5 +6553,8 @@ class AppPipeline:
     def download_document_artifact_bundle(self, ctx: RequestContext, artifact_id: str) -> bytes:
         return self.document_generation.download_document_artifact_bundle(ctx, artifact_id)
 
+    def download_document_artifact_with_audit(self, ctx: RequestContext, artifact_id: str) -> bytes:
+        return self.document_generation.download_document_artifact_with_audit(ctx, artifact_id)
+
     def preview_document_artifact(self, ctx: RequestContext, artifact_id: str) -> dict[str, Any]:
         return self.document_generation.preview_document_artifact(ctx, artifact_id)

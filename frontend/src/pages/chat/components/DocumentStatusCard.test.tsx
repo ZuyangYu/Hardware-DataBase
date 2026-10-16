@@ -322,6 +322,7 @@ describe('DocumentStatusCard', () => {
     expect(markup).toContain('下载来源与决策记录（产物 a-1）');
     expect(markup).toContain('下载来源与决策记录（产物 a-2）');
     expect(markup).toContain('下载含审计附录包（产物 a-1）');
+    expect(markup).toContain('下载含内嵌审计章节（产物 a-1）');
 
     const noArtifacts = renderToStaticMarkup(
       <DocumentStatusCard card={workOrderCard} onRefreshStatus={() => undefined} />,

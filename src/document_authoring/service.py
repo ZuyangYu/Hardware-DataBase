@@ -53,7 +53,11 @@ from src.document_authoring.conflicts.models import ConflictDecision, Normalized
 from src.document_authoring.conflicts.normalizer import normalize_claim
 from src.document_authoring.conflicts.policy import ConflictPolicy
 from src.document_authoring.conflicts.governance import requires_review_contract
-from src.document_authoring.audit_bundle import audit_json, build_audit_bundle
+from src.document_authoring.audit_bundle import (
+    audit_json,
+    build_audit_bundle,
+    build_embedded_audit_artifact,
+)
 from src.document_authoring.models import (
     AuthoringExecutionEvent,
     DeterministicRuleSpec,
@@ -4468,6 +4472,23 @@ class DocumentGenerationService:
         if audit_json(self.document_artifact_audit(ctx, artifact_id)) != audit_json(audit):
             raise ValueError('artifact_audit_changed')
         return bundle
+
+    def download_document_artifact_with_audit(self, ctx: RequestContext, artifact_id: str) -> bytes:
+        """Download a copy of the artifact with the audit chapter embedded in it.
+
+        The persisted artifact and its approval hash remain unchanged.  Source
+        permissions, conflict decisions and the source snapshot are checked
+        both before and after the representation is rendered.
+        """
+        audit = self.document_artifact_audit(ctx, artifact_id)
+        content = self.download_document_artifact(ctx, artifact_id)
+        artifact = self._artifact_for_context(ctx, artifact_id)
+        order = self._order_raw(artifact.work_order_id)
+        output_format = getattr(artifact, 'output_format', None) or order.target_format
+        embedded = build_embedded_audit_artifact(content, output_format, audit)
+        if audit_json(self.document_artifact_audit(ctx, artifact_id)) != audit_json(audit):
+            raise ValueError('artifact_audit_changed')
+        return embedded
 
     def download_document_artifact(self, ctx: RequestContext, artifact_id: str) -> bytes:
         artifact = self._artifact_for_context(ctx, artifact_id)

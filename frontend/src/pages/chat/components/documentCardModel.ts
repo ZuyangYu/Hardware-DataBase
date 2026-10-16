@@ -1046,6 +1046,15 @@ export async function downloadDocumentArtifactBundle(card: DocumentCardData, art
   );
 }
 
+export async function downloadDocumentArtifactWithAudit(card: DocumentCardData, artifact: DocumentCardArtifact): Promise<void> {
+  const safeArtifactId = artifact.artifact_id.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[.-]+|[.-]+$/g, '') || 'artifact';
+  const targetFormat = artifact.output_format || card.targetFormat || 'bin';
+  await apiDownload.blob(
+    `/api/v1/document-generation/artifacts/${encodeURIComponent(artifact.artifact_id)}/audit-document?kb=${encodeURIComponent(card.kb_name)}`,
+    `${safeArtifactId}-with-audit.${targetFormat}`,
+  );
+}
+
 /** The release service accepts only immutable review candidates, never drafts. */
 export function documentCardReviewCandidateArtifact(
   card: DocumentCardData,

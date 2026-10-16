@@ -118,6 +118,17 @@ def test_controlled_bundle_binds_unmodified_office_bytes_frozen_sources_and_pend
             assert 'ev-target' in text and 'ev-reference' in text
 
 
+def test_embedded_audit_document_keeps_original_artifact_immutable(tmp_path):
+    service, ctx, original, case = _bundle_fixture(tmp_path)
+    embedded = service.download_document_artifact_with_audit(ctx, 'artifact-1')
+
+    assert service.store.read_artifact_content('artifact-1') == original
+    text = '\n'.join(paragraph.text for paragraph in Document(io.BytesIO(embedded)).paragraphs)
+    assert 'Approved target requirement remains 5 V.' in text
+    assert '来源与决策审计附录' in text
+    assert case.conflict_id in text
+
+
 def test_bundle_rechecks_permissions_after_render_and_rejects_changed_bytes(tmp_path):
     service, ctx, _original, _case = _bundle_fixture(tmp_path)
     checks = []
@@ -170,7 +181,12 @@ def test_reviewing_an_approved_reference_still_requires_target_specification_cha
     assert audit['pending_approvals'][0]['approval_reason'] == 'critical_specification_approval_required'
 
 
-@pytest.mark.parametrize('operation', ['document_artifact_audit', 'download_document_artifact', 'preview_document_artifact'])
+@pytest.mark.parametrize('operation', [
+    'document_artifact_audit',
+    'download_document_artifact',
+    'download_document_artifact_with_audit',
+    'preview_document_artifact',
+])
 def test_derived_artifact_reads_recheck_inherited_source_permissions(tmp_path, operation):
     service, ctx, _original, _case = _bundle_fixture(tmp_path)
     artifact = service._artifact_for_context(ctx, 'artifact-1')

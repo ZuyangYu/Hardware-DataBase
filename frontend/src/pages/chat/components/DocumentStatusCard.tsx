@@ -18,6 +18,7 @@ import {
   downloadDocumentArtifact,
   downloadDocumentArtifactAudit,
   downloadDocumentArtifactBundle,
+  downloadDocumentArtifactWithAudit,
   type DocumentCardData,
   type DocumentStatusTone,
 } from './documentCardModel';
@@ -323,6 +324,12 @@ export default function DocumentStatusCard({
                 className="rounded-md border border-[#e3e7f1] bg-white px-2 py-0.5 text-[11px] text-[#464c5e]"
                 onClick={() => void downloadDocumentArtifactBundle(card, artifact).catch((error) => notify.error(error instanceof Error ? error.message : '审计包下载失败'))}
               >含审计附录包</button>
+              <button
+                type="button"
+                aria-label={`下载含内嵌审计章节（产物 ${artifact.artifact_id}）`}
+                className="rounded-md border border-[#e3e7f1] bg-white px-2 py-0.5 text-[11px] text-[#464c5e]"
+                onClick={() => void downloadDocumentArtifactWithAudit(card, artifact).catch((error) => notify.error(error instanceof Error ? error.message : '内嵌审计文档下载失败'))}
+              >含内嵌审计章节</button>
               </>
             )}
             </span>

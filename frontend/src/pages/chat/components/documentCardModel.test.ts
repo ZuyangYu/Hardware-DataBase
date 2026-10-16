@@ -8,6 +8,7 @@ import {
   documentArtifactDownloadPath,
   documentArtifactFileName,
   downloadDocumentArtifactBundle,
+  downloadDocumentArtifactWithAudit,
   documentCardFromChatTask,
   documentCardFromWorkOrderStatus,
   documentCardFromClarificationEvent,
@@ -44,6 +45,22 @@ const workOrderCard: DocumentCardData = {
 };
 
 describe('documentCardModel', () => {
+  it('downloads the artifact with its audit chapter embedded', async () => {
+    const download = vi.spyOn(apiDownload, 'blob').mockResolvedValue(undefined);
+    try {
+      await downloadDocumentArtifactWithAudit(
+        { ...workOrderCard, kb_name: '电源 A' },
+        { artifact_id: 'artifact/b', stage: 'review_candidate', output_format: 'docx' },
+      );
+      expect(download).toHaveBeenCalledWith(
+        '/api/v1/document-generation/artifacts/artifact%2Fb/audit-document?kb=%E7%94%B5%E6%BA%90%20A',
+        'artifact-b-with-audit.docx',
+      );
+    } finally {
+      download.mockRestore();
+    }
+  });
+
   it('downloads the governed bundle for the exact artifact and knowledge base', async () => {
     const download = vi.spyOn(apiDownload, 'blob').mockResolvedValue(undefined);
     try {

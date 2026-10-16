@@ -1797,6 +1797,46 @@ def artifact_audit_bundle(
     )
 
 
+@router.get('/document-generation/artifacts/{artifact_id}/audit-document')
+def artifact_audit_document(
+    artifact_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        content = pipeline.download_document_artifact_with_audit(ctx, artifact_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    target_format = "bin"
+    document_generation = getattr(pipeline, "document_generation", None)
+    store = getattr(document_generation, "store", None)
+    get_artifact = getattr(store, "get_artifact", None)
+    get_work_order = getattr(store, "get_work_order", None)
+    if callable(get_artifact):
+        artifact = get_artifact(artifact_id)
+        if artifact is not None and callable(get_work_order):
+            order = get_work_order(getattr(artifact, "work_order_id", ""))
+            target_format = str(
+                getattr(artifact, "output_format", None)
+                or getattr(order, "target_format", "")
+                or "bin"
+            ).strip().lower()
+    target_format = re.sub(r"[^a-z0-9]+", "", target_format) or "bin"
+    safe_artifact_id = re.sub(r'[^A-Za-z0-9._-]+', '-', artifact_id).strip('.-') or 'artifact'
+    return Response(
+        content=content,
+        media_type=_DOCUMENT_DOWNLOAD_MEDIA_TYPES.get(target_format, "application/octet-stream"),
+        headers={"Content-Disposition": f'attachment; filename="document-{safe_artifact_id}-with-audit.{target_format}"'},
+    )
+
+
 @router.get("/document-generation/artifacts/{artifact_id}/download")
 def artifact_download(
     artifact_id: str,
