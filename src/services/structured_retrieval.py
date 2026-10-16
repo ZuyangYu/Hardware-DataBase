@@ -44,16 +44,30 @@ class RecordScopedAdapter:
             raise PermissionError("read permission required")
         if scope.kb_id is None or contract.mode not in {"chat", "frozen"}:
             raise ScopedRetrievalError("source_unavailable", "source_identity_missing")
+        if contract.processor_kind not in (None, self.processor_kind):
+            raise ScopedRetrievalError("source_unavailable", "processor_kind_mismatch")
         allowed = contract.allowed_record_ids
         if contract.mode == "frozen" and (not allowed or set(contract.expected_source_stamps) != set(allowed)):
             raise ScopedRetrievalError("source_unavailable", "incomplete_frozen_source_set")
+        all_records = {
+            record.id: record for record in self.document_store.list_documents(kb_name, scope.department_id)
+            if allowed is None or record.id in allowed
+        }
+        if allowed is not None and set(all_records) != set(allowed):
+            raise ScopedRetrievalError("source_unavailable", "source_record_missing")
         records = {
             record.id: record for record in self.document_store.list_documents(kb_name, scope.department_id)
             if record.processor_kind == self.processor_kind
             and normalize_parse_status(record.status, record.processor_kind) == TASK_STATUS_COMPLETED
             and (allowed is None or record.id in allowed)
         }
-        if allowed is not None and set(records) != set(allowed):
+        selected_processor_ids = {
+            record_id for record_id, record in all_records.items()
+            if record.processor_kind == self.processor_kind
+        }
+        if allowed is not None and not contract.processor_kind and set(records) != set(allowed):
+            raise ScopedRetrievalError("source_unavailable", "source_record_missing")
+        if contract.processor_kind and selected_processor_ids - set(records):
             raise ScopedRetrievalError("source_unavailable", "source_record_missing")
         for record_id, record in records.items():
             if record.kb_id not in (0, None, scope.kb_id):

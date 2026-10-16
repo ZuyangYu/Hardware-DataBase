@@ -4063,6 +4063,7 @@ class AppPipeline:
         ]
         attachment_ids = list(dict.fromkeys(item for item in attachment_ids if item))
         frozen_snapshot = None
+        structured_retrieval_services: dict[str, tuple[Any, dict[int, Any]]] = {}
         get_snapshot = getattr(getattr(self.document_generation, 'store', None), 'get_knowledge_base_source_snapshot', None)
         if source_set_snapshot_id and callable(get_snapshot):
             candidate = get_snapshot(source_set_snapshot_id)
@@ -4086,6 +4087,41 @@ class AppPipeline:
                     should_cancel=ctx.metadata.get('document_job_cancelled')),
                 'document_contracts': frozen_document_contracts(frozen_snapshot.sources),
             }
+            # A frozen multi-KB authoring scope can contain text, spreadsheet,
+            # circuit and conversation records in the same KB. Build strict
+            # structured adapters once and bind each retriever kind to the
+            # complete source set; the processor discriminator lets an
+            # adapter ignore other record kinds without widening its filter.
+            structured_store = getattr(self.backend, "store", None)
+            if callable(getattr(structured_store, "list_documents", None)):
+                from src.services.structured_retrieval import build_structured_retrieval_adapters
+
+                adapters = build_structured_retrieval_adapters(
+                    document_store=structured_store,
+                    spreadsheet_service=getattr(self, "spreadsheet_service", None),
+                    circuit_service=getattr(self, "circuit_service", None),
+                    conversation_service=getattr(self.backend, "conversation_indexes", None),
+                )
+                processor_by_retriever = {
+                    "spreadsheet_semantic": "spreadsheet_table",
+                    "spreadsheet_cell": "spreadsheet_table",
+                    "circuit": "circuit_design",
+                    "circuit_structure_overview": "circuit_design",
+                    "circuit_module_list": "circuit_design",
+                    "circuit_resolve_identity": "circuit_design",
+                    "circuit_resolved_connections": "circuit_design",
+                    "conversation": "external_conversation",
+                }
+                for retriever_kind, processor_kind in processor_by_retriever.items():
+                    if retriever_kind not in adapters:
+                        continue
+                    structured_retrieval_services[retriever_kind] = (
+                        MultiKnowledgeRetrievalService(resolver, self.backend, adapters=adapters),
+                        frozen_document_contracts(
+                            frozen_snapshot.sources,
+                            processor_kind=processor_kind,
+                        ),
+                    )
         multi_kb_authoring = (getattr(ctx, "metadata", {}) or {}).get(
             "knowledge_scope_snapshot"
         ) is not None
@@ -4219,6 +4255,40 @@ class AppPipeline:
                 )
                 return [*circuit_evidences, *frozen_pin_evidence]
             specialized["relationship_lookup"] = _relationship_retriever
+
+        if multi_kb_authoring and structured_retrieval_services:
+            capability_retrievers = {
+                "tabular_lookup": "spreadsheet_semantic",
+                "entity_lookup": "circuit",
+                "relationship_lookup": "circuit_resolved_connections",
+                "conversation_lookup": "conversation",
+            }
+
+            def _multi_kb_structured_retriever(
+                query: str,
+                requirement: Any,
+                *,
+                retriever_kind: str,
+            ) -> list[Any]:
+                service_and_contracts = structured_retrieval_services.get(retriever_kind)
+                if service_and_contracts is None:
+                    return []
+                service, contracts = service_and_contracts
+                outcome = service.search(
+                    snapshot=scope,
+                    queries=[query],
+                    retriever_kind=retriever_kind,
+                    per_source_top_k=src.settings.FINAL_TOP_K,
+                    budget=provider_kwargs["retrieval_budget"],
+                    document_contracts=contracts,
+                )
+                return list(outcome.evidence)
+
+            for capability, retriever_kind in capability_retrievers.items():
+                if retriever_kind in structured_retrieval_services:
+                    specialized[capability] = lambda query, requirement, kind=retriever_kind: (
+                        _multi_kb_structured_retriever(query, requirement, retriever_kind=kind)
+                    )
 
         # The registry generalises the Stage 0 tabular_lookup dispatch: the
         # default (RAGFlow) retriever is always invoked, specialised retrievers

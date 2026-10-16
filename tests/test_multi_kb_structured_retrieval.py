@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from hashlib import sha256
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,9 +12,11 @@ from src.agents.tools import retrieval_executor as pools
 from src.external_conversations.models import ConversationTurn, ExternalConversation
 from src.external_conversations.query_engine import ExternalConversationQueryEngine
 from src.pipelines.document_rag.schemas import DocumentRetrievalContract, DocumentSourceStamp
+from src.pipelines.document_rag.schemas import Evidence, ScopedDocumentRetrievalOutcome, RequestContext
 from src.pipelines.document_store import PipelineDocumentStore
 from src.pipelines.spreadsheet.table_store import TableIndexStore
 from src.services.spreadsheet_index_service import SpreadsheetIndexService
+from src.services.knowledge_scope_models import AuthorizedKnowledgeSource
 from tests import test_knowledge_scope as scope_fixtures
 
 auth_scope = scope_fixtures.auth_scope
@@ -85,6 +88,70 @@ def test_same_filename_and_component_in_two_kbs_keep_actual_record_provenance(in
     assert fused.discarded["identity"] == 0
 
 
+def test_structured_multi_kb_fanout_supports_four_sources_with_one_budgeted_call_each(monkeypatch):
+    from src.services.multi_kb_retrieval import MultiKnowledgeRetrievalService, RetrievalBudget
+
+    sources = tuple(
+        AuthorizedKnowledgeSource(
+            kb_id=100 + index, kb_name=f"KB{index}", department_id="7", role="reference",
+        )
+        for index in range(1, 5)
+    )
+    snapshot = SimpleNamespace(
+        actor_user_id=9, tenant_key="default", selection_hash="a" * 64,
+        sources=sources,
+    )
+
+    class Resolver:
+        def revalidate(self, actor_user_id, selected):
+            assert actor_user_id == selected.actor_user_id == 9
+            return sources
+
+        def context_for_source(self, actor_user_id, source):
+            return RequestContext(
+                user_id=str(actor_user_id), tenant_id="default",
+                kb_permissions={f"7:{source.kb_name}": "read"},
+                metadata={"kb_id": source.kb_id, "department_id": source.department_id},
+            )
+
+    calls: list[int] = []
+
+    class Adapter:
+        def retrieve_with_scope(self, kb_name, query, *, ctx, contract, top_k, **kwargs):
+            del query, contract, top_k, kwargs
+            kb_id = int(ctx.metadata["kb_id"])
+            calls.append(kb_id)
+            item = Evidence(
+                id=f"structured:{kb_id}", content=f"{kb_name}: U1",
+                source_name=f"{kb_name}.xlsx", metadata={
+                    "kb_id": kb_id, "local_record_id": kb_id,
+                    "source_content_hash": f"{kb_id:064x}",
+                    "remote_document_id": f"doc-{kb_id}",
+                    "index_revision": 1,
+                    "chunk_or_structured_locator": {"record_id": kb_id, "sheet_name": "Power", "row_index": 2},
+                },
+            )
+            return ScopedDocumentRetrievalOutcome("success_with_hits", [item])
+
+    from src.agents.tools import retrieval_executor as pools
+    monkeypatch.setattr(settings, "MULTI_KB_CHAT_ENABLED", True)
+    monkeypatch.setattr(settings, "RETRIEVAL_PER_REQUEST_FANOUT", 4, raising=False)
+    pools.reset_retrieval_executor(deadline_seconds=1)
+    pools.initialize_retrieval_executor()
+    try:
+        outcome = MultiKnowledgeRetrievalService(
+            Resolver(), object(), adapters={"spreadsheet_semantic": Adapter()},
+        ).search(
+            snapshot=snapshot, queries=["U1"], retriever_kind="spreadsheet_semantic",
+            per_source_top_k=1, budget=RetrievalBudget(max_calls=4, timeout_seconds=3),
+        )
+    finally:
+        pools.reset_retrieval_executor(deadline_seconds=1)
+    assert calls == [101, 102, 103, 104]
+    assert [item.kb_id for item in outcome.source_outcomes] == calls
+    assert {item.metadata["kb_id"] for item in outcome.evidence} == set(calls)
+
+
 def test_frozen_spreadsheet_filters_before_ranking_and_never_reads_other_record(indexes):
     from src.services.structured_retrieval import build_structured_retrieval_adapters
 
@@ -98,6 +165,50 @@ def test_frozen_spreadsheet_filters_before_ranking_and_never_reads_other_record(
     assert "5V" in outcome.evidence[0].content
     assert "99V" not in outcome.evidence[0].content
     assert outcome.evidence[0].metadata["source_content_hash"] == allowed.content_hash
+
+
+def test_frozen_spreadsheet_ignores_other_processor_records_in_same_kb(indexes):
+    from src.services.structured_retrieval import build_structured_retrieval_adapters
+
+    resolver, snapshot, documents, spreadsheets, add = indexes
+    table_record = add("A", "5V")
+    documents.upsert_document(
+        kb_name="A", document_name="spec.pdf", original_file_name="spec.pdf",
+        dataset_kind="design", dataset_id="local", document_id="spec",
+        source_group="design", department_id=table_record.department_id,
+        uploaded_by="reader", kb_id=table_record.kb_id, status="indexed",
+        content_kind="document_text", processor_kind="ragflow",
+        content_hash="text-hash",
+    )
+    text_record = next(
+        record for record in documents.list_documents("A", table_record.department_id)
+        if record.document_name == "spec.pdf"
+    )
+    contract = DocumentRetrievalContract(
+        mode="frozen",
+        allowed_record_ids=(table_record.id, text_record.id),
+        expected_source_stamps={
+            table_record.id: DocumentSourceStamp(
+                table_record.kb_id, table_record.id, table_record.content_hash,
+                table_record.document_id, 0,
+            ),
+            text_record.id: DocumentSourceStamp(
+                text_record.kb_id, text_record.id, text_record.content_hash,
+                text_record.document_id, 0,
+            ),
+        },
+        processor_kind="spreadsheet_table",
+    )
+    adapter = build_structured_retrieval_adapters(
+        document_store=documents, spreadsheet_service=spreadsheets,
+    )["spreadsheet_semantic"]
+    outcome = adapter.retrieve_with_scope(
+        "A", "U1", ctx=resolver.context_for_source(snapshot.actor_user_id, snapshot.sources[0]),
+        contract=contract, top_k=1,
+    )
+    assert outcome.status == "success_with_hits"
+    assert len(outcome.evidence) == 1
+    assert outcome.evidence[0].metadata["local_record_id"] == table_record.id
 
 
 def test_changed_frozen_record_fails_before_any_index_read(indexes):

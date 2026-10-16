@@ -101,6 +101,10 @@ class DocumentRetrievalContract:
     mode: Literal["chat", "frozen"] = "chat"
     allowed_record_ids: tuple[int, ...] | None = None
     expected_source_stamps: dict[int, DocumentSourceStamp] = field(default_factory=dict)
+    # A frozen authoring scope may contain several processor kinds in one KB.
+    # Structured adapters use this optional discriminator to validate only the
+    # records they can read while retaining the complete source identity set.
+    processor_kind: str | None = None
 
 
 @dataclass

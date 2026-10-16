@@ -114,7 +114,11 @@ def build_frozen_source_entry(
     return entry
 
 
-def frozen_document_contracts(sources: list[dict[str, Any]]) -> dict[int, DocumentRetrievalContract]:
+def frozen_document_contracts(
+    sources: list[dict[str, Any]],
+    *,
+    processor_kind: str | None = None,
+) -> dict[int, DocumentRetrievalContract]:
     """Bind each KB to its exact local records and immutable processing stamps."""
     grouped: dict[int, dict[int, DocumentSourceStamp]] = {}
     for source in sources:
@@ -139,7 +143,12 @@ def frozen_document_contracts(sources: list[dict[str, Any]]) -> dict[int, Docume
             raise ValueError('source_changed')
         records[record_id] = stamp
     return {
-        kb_id: DocumentRetrievalContract(mode='frozen', allowed_record_ids=tuple(sorted(records)), expected_source_stamps=records)
+        kb_id: DocumentRetrievalContract(
+            mode='frozen',
+            allowed_record_ids=tuple(sorted(records)),
+            expected_source_stamps=records,
+            processor_kind=processor_kind,
+        )
         for kb_id, records in grouped.items()
     }
 
