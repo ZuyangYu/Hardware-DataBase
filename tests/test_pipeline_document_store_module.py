@@ -44,6 +44,22 @@ class PipelineDocumentStoreModuleTests(unittest.TestCase):
                 conn.close()
             self.assertIn("kb_id", columns)
 
+    def test_pipeline_store_backend_override_honors_store_named_key(self):
+        """PIPELINE_DOCUMENT_STORE_BACKEND 是公开配置键，不能被静默忽略。"""
+        import src.settings as app_settings
+        from src.storage import domain_pg
+
+        for name, value in (
+            ("PIPELINE_DOCUMENT_STORE_BACKEND", app_settings.PIPELINE_DOCUMENT_STORE_BACKEND),
+            ("PIPELINE_DOCUMENT_DATABASE_URL", app_settings.PIPELINE_DOCUMENT_DATABASE_URL),
+        ):
+            self.addCleanup(setattr, app_settings, name, value)
+        app_settings.PIPELINE_DOCUMENT_STORE_BACKEND = "postgres"
+        app_settings.PIPELINE_DOCUMENT_DATABASE_URL = "postgresql://u@h/db"
+        backend, dsn = domain_pg.resolve_domain_backend("PIPELINE_DOCUMENT")
+        self.assertEqual(backend, "postgres")
+        self.assertEqual(dsn, "postgresql://u@h/db")
+
     def test_get_dataset_returns_the_persisted_id_and_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = PipelineDocumentStore(db_path=os.path.join(tmp, "pipeline_documents.db"))
