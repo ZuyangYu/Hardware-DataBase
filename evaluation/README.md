@@ -23,6 +23,17 @@
 uv run hardware-database-eval validate --dataset evaluation/datasets/hardware_qa_v1.jsonl
 ```
 
+## 多知识库冲突固定回归
+
+`datasets/multi_kb_conflicts_v1.jsonl` 包含 22 个合成工程案例，覆盖单位/条件/对象/版本区分、主库事实保护、缺依据、四库归组和注入文本。标签尚待独立人工复核；该数据集不用于宣称真实检索相关性或最终发布验收。
+
+```bash
+uv run python scripts/production_hardening/multi_kb_conflict_eval.py \
+  --output storage/evaluations/multi-kb-r3-conflicts/report.json
+```
+
+执行器使用原始声明文本和临时 SQLite 调用真实冲突/写作准备服务，输出逐例来源、状态、输入和失败原因。返回码 0/2 分别表示本地通过/失败；增加 `--require-human-review` 时，未复核标签返回 3。复现两个自动裁决模式及人工复核流程见 `docs/superpowers/implementation/multi-kb-conflict-acceptance.md`。
+
 ## Streamlit 运行控制
 
 系统管理员可在“RAGAS 评估”页面查看运行阶段、当前样本、完成/总数、成功/失败数和已耗时间。“暂停”和“取消”都是协作式操作：它们会等待正在执行的模型请求结束，并在下一个安全检查点生效。“取消”不会删除已保存的 `snapshot.jsonl`；选择“继续”后，系统会使用原始数据集和筛选条件恢复运行，并跳过已成功的样本。
