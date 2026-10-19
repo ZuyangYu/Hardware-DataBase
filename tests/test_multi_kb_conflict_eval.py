@@ -20,6 +20,10 @@ def case_fixture():
             {"id": "a", "kb_id": 1, "content": "输入电压5V。", "approval_status": "approved"},
             {"id": "b", "kb_id": 1, "content": "输入电压12V。", "approval_status": "approved"},
         ],
+        "expected_claims": [
+            {"evidence_id": "a", "field_key": "operating_voltage", "normalized_value": "5", "normalized_unit": "voltage"},
+            {"evidence_id": "b", "field_key": "operating_voltage", "normalized_value": "12", "normalized_unit": "voltage"},
+        ],
         "expected": {
             "claim_count": 2, "retained_evidence_ids": ["a", "b"],
             "groups": [{
@@ -29,6 +33,13 @@ def case_fixture():
             }],
         },
     }
+
+
+def observation_fixture():
+    return {**copy.deepcopy(case_fixture()["expected"]), "provenance_valid": True, "claims": [
+        {"evidence_ids": ["a"], "field_key": "operating_voltage", "normalized_value": "5", "normalized_unit": "voltage"},
+        {"evidence_ids": ["b"], "field_key": "operating_voltage", "normalized_value": "12", "normalized_unit": "voltage"},
+    ]}
 
 
 def test_raw_conflicting_text_reaches_persisted_review_and_writer_block(monkeypatch):
@@ -45,16 +56,32 @@ def test_raw_conflicting_text_reaches_persisted_review_and_writer_block(monkeypa
 
 
 def test_gate_rejects_a_missed_critical_conflict_even_when_extraction_count_matches():
-    observed = {"claim_count": 2, "retained_evidence_ids": ["a", "b"],
-                "groups": [], "provenance_valid": True}
+    observed = {**observation_fixture(), "groups": []}
     failures = evaluation.score_case(case_fixture(), observed, auto_resolve=False)
 
     assert any("groups" in failure for failure in failures)
 
 
+@pytest.mark.parametrize("mutation", [{"normalized_value": "50"}, {"normalized_unit": "current"}])
+def test_gate_rejects_wrong_normalized_value_with_unchanged_group_and_provenance(monkeypatch, mutation):
+    from src.document_authoring.conflicts.extractor import GroundedClaimExtractor
+
+    original = GroundedClaimExtractor.extract
+
+    def incorrectly_scaled(self, evidence):
+        return [claim.model_copy(update=mutation) if claim.normalized_value == "5" else claim
+                for claim in original(self, evidence)]
+
+    monkeypatch.setattr(GroundedClaimExtractor, "extract", incorrectly_scaled)
+    report = evaluation.evaluate([case_fixture()])
+
+    assert report["verdict"] == "fail"
+    assert any("normalized_claims" in failure for failure in report["cases"][0]["failures"])
+
+
 @pytest.mark.parametrize("mutation", ["foreign_evidence", "lost_provenance", "silent_no_extraction"])
 def test_gate_detects_wrong_source_identity_or_silent_extraction_failure(mutation):
-    observed = {**copy.deepcopy(case_fixture()["expected"]), "provenance_valid": True}
+    observed = observation_fixture()
     if mutation == "foreign_evidence":
         observed["groups"][0]["evidence_ids"] = ["a", "foreign"]
     elif mutation == "lost_provenance":
@@ -92,6 +119,10 @@ def test_critical_miss_count_includes_each_missed_field(monkeypatch):
     case["evidence"][0]["content"] += "静态电流小于200uA。"
     case["evidence"][1]["content"] += "静态电流小于300uA。"
     case["expected"]["claim_count"] = 4
+    case["expected_claims"].extend([
+        {"evidence_id": "a", "field_key": "quiescent_current", "normalized_value": "<0.0002", "normalized_unit": "current"},
+        {"evidence_id": "b", "field_key": "quiescent_current", "normalized_value": "<0.0003", "normalized_unit": "current"},
+    ])
     case["expected"]["groups"].append({**case["expected"]["groups"][0], "field_key": "quiescent_current"})
     monkeypatch.setattr(ConflictDetector, "detect", lambda _self, _claims: [])
 
@@ -121,13 +152,18 @@ def test_empty_or_duplicate_dataset_is_rejected(tmp_path, records):
         evaluation.load_cases(path)
 
 
-@pytest.mark.parametrize("mutation", ["unknown_source", "missing_expectation", "unattributed_review"])
+@pytest.mark.parametrize("mutation", ["unknown_source", "missing_expectation", "unattributed_review",
+                                      "missing_claim_label", "unknown_claim_evidence"])
 def test_invalid_label_or_source_binding_is_rejected(tmp_path, mutation):
     case = case_fixture()
     if mutation == "unknown_source":
         case["evidence"][0]["kb_id"] = 99
     elif mutation == "missing_expectation":
         del case["expected"]["groups"]
+    elif mutation == "missing_claim_label":
+        case["expected_claims"].pop()
+    elif mutation == "unknown_claim_evidence":
+        case["expected_claims"][0]["evidence_id"] = "unknown"
     else:
         case["review"] = {"status": "approved", "reviewer": ""}
     path = tmp_path / "cases.jsonl"

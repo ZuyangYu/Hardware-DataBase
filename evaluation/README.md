@@ -25,7 +25,7 @@ uv run hardware-database-eval validate --dataset evaluation/datasets/hardware_qa
 
 ## 多知识库冲突固定回归
 
-`datasets/multi_kb_conflicts_v1.jsonl` 包含 22 个合成工程案例，覆盖单位/条件/对象/版本区分、主库事实保护、缺依据、四库归组和注入文本。标签尚待独立人工复核；该数据集不用于宣称真实检索相关性或最终发布验收。
+`datasets/multi_kb_conflicts_v1.jsonl` 包含 22 个合成工程案例、45 条预期声明的归一化值/量纲标签，覆盖单位/条件/对象/版本区分、主库事实保护、缺依据、四库归组和注入文本。标签尚待独立人工复核；该数据集不用于宣称真实检索相关性或最终发布验收。
 
 ```bash
 uv run python scripts/production_hardening/multi_kb_conflict_eval.py \

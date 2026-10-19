@@ -70,6 +70,13 @@ class Expected(FixtureModel):
     groups: list[ExpectedGroup]
 
 
+class ExpectedClaim(FixtureModel):
+    evidence_id: str = Field(min_length=1)
+    field_key: str = Field(min_length=1)
+    normalized_value: str = Field(min_length=1)
+    normalized_unit: str = Field(min_length=1)
+
+
 class Review(FixtureModel):
     status: Literal["pending", "approved"]
     reviewer: str | None
@@ -90,6 +97,7 @@ class Case(FixtureModel):
     unit_label: str = Field(min_length=1)
     sources: list[Source] = Field(min_length=1, max_length=4)
     evidence: list[Evidence] = Field(min_length=1)
+    expected_claims: list[ExpectedClaim]
     expected: Expected
     expected_auto_resolve: Expected | None = None
 
@@ -101,6 +109,8 @@ class Case(FixtureModel):
             raise ValueError("source and evidence identities must be unique within a case")
         if any(item.kb_id not in source_ids for item in self.evidence):
             raise ValueError("evidence references an unselected source")
+        if any(claim.evidence_id not in evidence_ids for claim in self.expected_claims):
+            raise ValueError("claim labels reference unknown evidence")
         roles = [source.role for source in self.sources]
         if self.purpose == "compose" and (roles.count("primary") != 1 or "peer" in roles):
             raise ValueError("compose requires one primary and reference/standard sources")
@@ -109,6 +119,8 @@ class Case(FixtureModel):
         for expected in (self.expected, self.expected_auto_resolve):
             if expected is None:
                 continue
+            if expected.claim_count != len(self.expected_claims):
+                raise ValueError("claim_count must match the independently labeled claims")
             labels = [expected.retained_evidence_ids]
             for group in expected.groups:
                 labels.extend([group.evidence_ids, group.selected_evidence_ids])
@@ -161,6 +173,13 @@ def score_case(case: dict, observed: dict, *, auto_resolve: bool) -> list[str]:
     failures = []
     if observed["claim_count"] != expected["claim_count"]:
         failures.append(f"claim_count: expected {expected['claim_count']}, got {observed['claim_count']}")
+    actual_claims = [{"evidence_id": claim["evidence_ids"][0] if len(claim["evidence_ids"]) == 1 else None,
+                      **{key: claim[key] for key in ("field_key", "normalized_value", "normalized_unit")}}
+                     for claim in observed["claims"]]
+    if sorted(json.dumps(claim, sort_keys=True) for claim in actual_claims) != sorted(
+        json.dumps(claim, sort_keys=True) for claim in case["expected_claims"]
+    ):
+        failures.append("normalized_claims differ in evidence identity, field, value or canonical unit")
     if not observed["provenance_valid"]:
         failures.append("provenance: source identity, version, hash or exact quote span missing/changed")
     if sorted(observed["retained_evidence_ids"]) != sorted(expected["retained_evidence_ids"]):
@@ -249,12 +268,13 @@ def evaluate(cases: list[dict], *, require_human_review: bool = False) -> dict:
                 observed = None
                 failures = [f"execution_error: {type(exc).__name__}: {exc}"]
             results.append({"id": case["id"], "category": case["category"], "expected": expected,
+                            "expected_normalized_claims": case["expected_claims"],
                             "observed": observed, "failures": failures, "passed": not failures})
     pending = [case["id"] for case in cases if case["review"]["status"] != "approved"]
     passed = all(result["passed"] for result in results)
     verdict = "fail" if not passed else "insufficient_evaluation" if require_human_review and pending else "pass"
     return {
-        "schema_version": 1, "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "schema_version": 2, "recorded_at": datetime.now(timezone.utc).isoformat(),
         "evaluation_kind": "offline_conflict_regression", "model_used_for_scoring": False,
         "case_set_sha256": _digest(cases), "extractor_version": GroundedClaimExtractor.version,
         "policy_version": ConflictPolicy().version,
