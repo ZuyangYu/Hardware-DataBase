@@ -4,6 +4,7 @@ import io
 import zipfile
 
 import pytest
+from docx import Document
 
 from src.document_authoring.template_analyzers import analyze_template
 
@@ -350,3 +351,48 @@ def test_docx_analysis_exposes_paragraph_and_table_cells_but_protects_external_r
     )
     assert all(unit.writable is False for unit in analysis.units if unit.blocked_reason == "external_relationship")
     assert analysis.status == "requires_human"
+
+
+def test_docx_analysis_exposes_text_and_split_run_placeholders_for_real_template_mapping():
+    document = Document()
+    document.add_heading("输入电压", level=1)
+    paragraph = document.add_paragraph()
+    paragraph.add_run("{{operating_")
+    paragraph.add_run("voltage}}")
+    table = document.add_table(rows=1, cols=2)
+    table.cell(0, 0).text = "静态电流"
+    table.cell(0, 1).text = "{{quiescent_current}}"
+    content = io.BytesIO()
+    document.save(content)
+
+    analysis = analyze_template(content.getvalue(), "docx")
+    units = {unit.unit_id: unit for unit in analysis.units}
+
+    assert analysis.status == "ready_for_confirmation"
+    assert units["paragraph:0"].value_preview == "输入电压"
+    assert units["paragraph:0"].structural_role_hint == "section_header"
+    assert units["paragraph:1"].value_preview == "{{operating_voltage}}"
+    assert units["paragraph:1"].value_kind == "text"
+    assert units["paragraph:1"].structural_role_hint == "placeholder"
+    assert units["paragraph:1"].candidate_for_auto_fill is True
+    assert units["table:0:0:0"].value_preview == "静态电流"
+    assert units["table:0:0:1"].value_preview == "{{quiescent_current}}"
+    assert units["table:0:0:1"].structural_role_hint == "placeholder"
+    assert units["table:0:0:1"].candidate_for_auto_fill is True
+
+
+def test_docx_text_preview_is_bounded_but_value_hash_covers_the_complete_text():
+    def analyze_text(text):
+        document = Document()
+        document.add_paragraph(text)
+        content = io.BytesIO()
+        document.save(content)
+        return analyze_template(content.getvalue(), "docx").units[0]
+
+    first = analyze_text("A" * 300 + "-first")
+    second = analyze_text("A" * 300 + "-second")
+
+    assert first.value_preview == "A" * 256
+    assert second.value_preview == first.value_preview
+    assert first.value_hash and second.value_hash
+    assert first.value_hash != second.value_hash

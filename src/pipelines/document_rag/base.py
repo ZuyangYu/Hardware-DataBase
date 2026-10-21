@@ -52,7 +52,8 @@ class RAGBackend(ABC):
     def list_documents(self, kb_name: str, ctx: RequestContext | None = None) -> list[DocumentInfo]:
         """List documents in a knowledge base."""
 
-    def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None) -> ParseResult | None:
+    def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None,
+                         *, deadline: float | None = None, should_cancel=None) -> ParseResult | None:
         """Return parsed chunks for a document when the backend can expose them."""
         return None
 

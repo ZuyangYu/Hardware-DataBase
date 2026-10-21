@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.document_authoring.conflicts.detector import ConflictDetector
+from src.document_authoring.conflicts.extractor import GroundedClaimExtractor
 from src.document_authoring.conflicts.normalizer import normalize_claim
 from src.document_authoring.conflicts.policy import ConflictPolicy
 from src.document_authoring.conflicts.store import ConflictDecisionStore
@@ -44,6 +45,24 @@ def test_equivalent_units_do_not_create_a_conflict():
     ]
 
     assert ConflictDetector().detect(claims) == []
+
+
+def test_claim_extractor_normalizes_stringified_source_kb_identity():
+    from src.agents.schemas import Evidence
+
+    evidence = Evidence(
+        id="evidence-1", content="输入电压5V。", source_name="target.docx",
+        content_kind="document_text", processor_kind="ragflow",
+        metadata={
+            "knowledge_source": {"kb_id": "101", "role": "primary"},
+            "source_content_hash": "a" * 64, "source_version_id": "v1",
+        },
+    )
+
+    claims = GroundedClaimExtractor().extract([evidence])
+
+    assert len(claims) == 1
+    assert claims[0].source_kb_id == 101
 
 
 def test_different_project_scope_is_not_a_cross_source_conflict():

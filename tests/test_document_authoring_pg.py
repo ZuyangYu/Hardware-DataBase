@@ -17,6 +17,7 @@ import os
 import tempfile
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
@@ -217,6 +218,95 @@ class DocumentAuthoringPgParityTests(unittest.TestCase):
             sqlite_store.read_template_content(f"tv-{sqlite_suffix}"),
             pg_store.read_template_content(f"tv-{pg_suffix}"),
         )
+
+    def test_authoring_history_uses_durable_creation_order_on_both_backends(self):
+        """Restore order survives out-of-order import and has a stable ID tie break."""
+        from src.document_authoring.models import (
+            DocumentArtifact, DocumentHumanEvent, HarnessRun, NodeExecutionReceipt,
+        )
+        from tests.test_knowledge_base_document_work_orders import make_work_order
+
+        for store in (self._sqlite_store(), self._pg_store()):
+            suffix = uuid.uuid4().hex
+            template = self._seed_template(store, suffix)
+            oldest = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            orders = {}
+            # Newer rows arrive before an older imported row; b/c share a time.
+            for key, offset in (("c", 1), ("a", 0), ("b", 1)):
+                order = make_work_order(
+                    work_order_id=f"{suffix}-{key}", tenant_id=suffix,
+                    project_id=suffix, template_version_id=template.template_version_id,
+                    created_at=oldest + timedelta(days=offset),
+                )
+                orders[key] = store.create_work_order(order)
+                store.create_work_order(type(order).model_validate({
+                    **order.model_dump(),
+                    "work_order_id": f"{suffix}-kb-{key}", "scope_type": "knowledge_base",
+                    "project_id": None, "baseline_id": None, "knowledge_base_name": suffix,
+                    "baseline_content_hash": "", "input_fingerprint": "",
+                }))
+            run = store.create_harness_run(HarnessRun(
+                harness_run_id=f"run-{suffix}", work_order_id=orders["a"].work_order_id,
+                run_manifest_id="manifest", status="queued",
+            ))
+            run = store.claim_harness_run(run.harness_run_id, "worker", 300)
+            for key, offset in (("c", 1), ("a", 0), ("b", 1)):
+                created_at = oldest + timedelta(days=offset)
+                receipt = store.begin_node_execution_owned(NodeExecutionReceipt(
+                    receipt_id=f"{suffix}-receipt-{key}", harness_run_id=run.harness_run_id,
+                    node_name="plan_node", unit_id=key, input_fingerprint=key,
+                    fencing_token=run.fencing_token, created_at=created_at,
+                ), "worker", run.fencing_token)
+                store.commit_node_execution_owned(
+                    receipt.receipt_id, run.harness_run_id, "worker", run.fencing_token,
+                    {"unit_id": key},
+                )
+                artifact = store.save_artifact(DocumentArtifact(
+                    artifact_id=f"{suffix}-artifact-{key}", work_order_id=orders["a"].work_order_id,
+                    run_id=run.harness_run_id, stage="review_candidate",
+                    content_hash=hashlib.sha256(key.encode()).hexdigest(),
+                    validation_report_id="report", integrity_manifest_id="integrity",
+                    created_at=created_at,
+                ), key.encode(), "docx")
+                store.save_human_event(DocumentHumanEvent(
+                    event_id=f"{suffix}-event-{key}", work_order_id=orders["a"].work_order_id,
+                    run_id=run.harness_run_id, artifact_id=f"{suffix}-artifact-c",
+                    unit_id=key, event_type="feedback", subject_artifact_content_hash=artifact.content_hash,
+                    actor_id="alice", actor_role="reviewer", created_at=created_at,
+                ))
+            queries = (
+                ("project", lambda: [row.work_order_id for row in store.list_work_orders(suffix, suffix)],
+                 [orders[key].work_order_id for key in ("c", "b", "a")]),
+                ("knowledge_base", lambda: [row.work_order_id for row in store.list_work_orders_for_knowledge_base(suffix, suffix)],
+                 [f"{suffix}-kb-{key}" for key in ("c", "b", "a")]),
+                ("receipts", lambda: [row.receipt_id for row in store.list_node_execution_receipts(run.harness_run_id)],
+                 [f"{suffix}-receipt-{key}" for key in ("a", "b", "c")]),
+                ("artifacts", lambda: [row.artifact_id for row in store.list_artifacts(orders["a"].work_order_id)],
+                 [f"{suffix}-artifact-{key}" for key in ("a", "b", "c")]),
+                ("human_events", lambda: [row.event_id for row in store.list_human_events(f"{suffix}-artifact-c")],
+                 [f"{suffix}-event-{key}" for key in ("a", "b", "c")]),
+            )
+            for name, query, expected in queries:
+                with self.subTest(backend=store._backend, history=name):
+                    self.assertEqual(query(), expected)
+
+    def test_work_order_version_lock_rejects_stale_updates_on_both_backends(self):
+        from tests.test_knowledge_base_document_work_orders import make_work_order
+
+        for store in (self._sqlite_store(), self._pg_store()):
+            with self.subTest(backend=store._backend):
+                suffix = uuid.uuid4().hex
+                template = self._seed_template(store, suffix)
+                original = store.create_work_order(make_work_order(
+                    work_order_id=suffix, template_version_id=template.template_version_id,
+                ))
+                revised = original.model_copy(update={"status": "retrieving", "lock_version": 1})
+                self.assertEqual(store.replace_work_order(revised), revised)
+                with self.assertRaisesRegex(RuntimeError, "changed concurrently"):
+                    store.replace_work_order(original.model_copy(update={"status": "failed", "lock_version": 1}))
+                persisted = store.get_work_order(suffix)
+                self.assertEqual(persisted.status, "retrieving")
+                self.assertEqual(persisted.lock_version, 1)
 
     def test_all_group_stores_run_on_postgres(self) -> None:
         store = self._pg_store()

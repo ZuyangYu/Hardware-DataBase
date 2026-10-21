@@ -102,6 +102,9 @@ class KnowledgeSourceRetrievalOutcome:
     evidence: list[Evidence] = data_field(default_factory=list)
     error_code: str | None = None
     diagnostics: dict = data_field(default_factory=dict)
+    work_id: str = ""
+    target_ids: tuple[str, ...] = ()
+    query_id: str = ""
 
 
 @dataclass

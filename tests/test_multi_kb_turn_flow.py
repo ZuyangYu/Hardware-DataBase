@@ -56,6 +56,23 @@ def test_create_session_and_turn_return_server_scope_and_persist_it(api):
     assert turn["knowledge_scope"]["selection_hash"] == stored.knowledge_selection_hash
 
 
+def test_pending_authorized_turn_can_start_before_model_summary_exists(api):
+    client, _, _, _, ids, _, _ = api
+    # Exercise the production queue-only start route, without the API-test runner.
+    client.app.dependency_overrides.pop(get_pipeline)
+    session_id = create(client, ids).json()["id"]
+    turn = client.post(
+        f"/api/v1/conversations/{session_id}/turns", json={"query": "compare voltages"},
+    ).json()["turn"]
+
+    response = client.post(f"/api/v1/turns/{turn['id']}/start")
+
+    assert response.status_code == 202, response.text
+    visible = client.get(f"/api/v1/turns/{turn['id']}").json()
+    assert visible["source_access_restricted"] is False
+    assert visible["knowledge_scope"]["selection_hash"] == turn["knowledge_selection_hash"]
+
+
 def test_disabled_feature_does_not_silently_create_single_kb_session(api, monkeypatch):
     client, _, _, _, ids, _, _ = api
     monkeypatch.setattr(settings, "MULTI_KB_CHAT_ENABLED", False)

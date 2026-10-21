@@ -58,6 +58,53 @@ def test_source_snapshot_can_persist_multi_source_roles_and_versions():
     assert len(result.content_hash) == 64
 
 
+def test_pipeline_work_order_creation_passes_frozen_multi_source_snapshot():
+    scope = snapshot(1)
+    frozen = KnowledgeBaseSourceSnapshot.create(
+        tenant_id="default",
+        knowledge_base_name="KB101",
+        source_names=["primary.pdf", "reference.pdf"],
+        created_by="alice",
+        source_snapshot_kind="multi_knowledge_v1",
+        sources=[
+            {"kb_id": 101, "kb_name_snapshot": "KB101", "department_id": "7", "role": "primary", "source_name": "primary.pdf", "local_record_id": 1},
+            {"kb_id": 205, "kb_name_snapshot": "KB205", "department_id": "7", "role": "reference", "source_name": "reference.pdf", "local_record_id": 2},
+        ],
+        knowledge_scope_snapshot=scope.model_dump(mode="json"),
+    )
+    pipeline = object.__new__(AppPipeline)
+    pipeline.document_generation = Mock()
+    pipeline.document_generation.create_knowledge_base_work_order.return_value = SimpleNamespace(
+        work_order_id="wo-multi",
+    )
+    pipeline.list_file_infos = Mock(return_value=[SimpleNamespace(name="anchor-only.pdf")])
+    pipeline._planning_source_snapshot = Mock(return_value=(frozen, {"snapshot_bound": True}))
+    ctx = RequestContext(
+        user_id="alice",
+        tenant_id="default",
+        metadata={"department_id": "7", "knowledge_scope_snapshot": scope.model_dump(mode="json")},
+        kb_permissions={"7:KB101": "read"},
+    )
+
+    order = pipeline.create_knowledge_base_document_work_order(
+        ctx,
+        knowledge_base_name="KB101",
+        template_version_id="template-1",
+        document_schema_id="schema-1",
+        document_schema_version="1",
+    )
+
+    assert order.work_order_id == "wo-multi"
+    pipeline._planning_source_snapshot.assert_called_once_with(
+        ctx,
+        knowledge_base_name="KB101",
+        persist=False,
+    )
+    kwargs = pipeline.document_generation.create_knowledge_base_work_order.call_args.kwargs
+    assert kwargs["source_names"] == ["primary.pdf", "reference.pdf"]
+    assert kwargs["source_snapshot"] is frozen
+
+
 def test_authoring_dedup_and_field_cap_keep_independent_source_occurrences():
     from src.document_authoring.retriever_registry import dedup_by_content
     from src.document_authoring.harness.graph import _select_field_evidence

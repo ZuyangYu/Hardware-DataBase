@@ -24,17 +24,18 @@ def validate_citation_processing_identity(record, expected: Mapping) -> None:
         raise ScopedRetrievalError("source_changed")
 
 
-def read_citation_content(pipeline, record, ctx, locator: dict, *, expected_evidence_text_hash: str | None = None) -> str | None:
-    content = _read_citation_content(pipeline, record, ctx, locator)
+def read_citation_content(pipeline, record, ctx, locator: dict, *, expected_evidence_text_hash: str | None = None,
+                          deadline: float | None = None) -> str | None:
+    content = _read_citation_content(pipeline, record, ctx, locator, deadline=deadline)
     if content is not None and expected_evidence_text_hash is not None:
         if sha256(content.encode("utf-8")).hexdigest() != expected_evidence_text_hash:
             raise ScopedRetrievalError("source_changed")
     return content
 
 
-def _read_citation_content(pipeline, record, ctx, locator: dict) -> str | None:
+def _read_citation_content(pipeline, record, ctx, locator: dict, *, deadline: float | None = None) -> str | None:
     if record.processor_kind == "ragflow":
-        result = pipeline.get_parse_result(record.kb_name, f"ragflow:{record.id}", ctx=ctx)
+        result = pipeline.get_parse_result(record.kb_name, f"ragflow:{record.id}", ctx=ctx, deadline=deadline)
         chunk_id = str(locator.get("chunk_id") or "")
         if result is None or not chunk_id:
             return None

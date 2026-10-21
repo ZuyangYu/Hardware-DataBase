@@ -5,6 +5,7 @@
  */
 import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
+import { Popover } from 'radix-ui';
 
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
@@ -12,6 +13,7 @@ import { cn } from '@/lib/utils';
 import { formatDateTime } from '@/lib/enterprise-ui';
 import type { KbView, KnowledgePurpose, MemoryConsentView, SessionMemorySummary } from '@/api/types';
 import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
   Dialog,
   DialogContent,
@@ -119,6 +121,9 @@ export default function ChatHeader({
   const [revoking, setRevoking] = useState(false);
   const extracted = memorySummary?.extracted_memories ?? 0;
   const activeCount = sessionConsents?.filter((consent) => consent.status === 'active').length ?? 0;
+  const selectableKbs = availableKbs.filter((kb) => kb.permission && kb.kb_id != null);
+  const selectedKbs = selectableKbs.filter((kb) => selectedKnowledgeBaseIds.includes(Number(kb.kb_id)));
+  const remainingKbs = selectableKbs.filter((kb) => !selectedKnowledgeBaseIds.includes(Number(kb.kb_id)));
   // 展示按授权时间倒序,最新在前
   const sortedConsents = [...(sessionConsents ?? [])].sort((a, b) =>
     a.granted_at < b.granted_at ? 1 : -1,
@@ -147,64 +152,82 @@ export default function ChatHeader({
   }
 
   return (
-    <div className={CHAT_HEADER_CLASS}>
+    <div className={cn(CHAT_HEADER_CLASS, 'h-auto min-h-[56px] flex-wrap py-[8px]')}>
       <div className={CHAT_HEADER_TITLE_STACK_CLASS}>
         <span className={CHAT_HEADER_TITLE_NAME_CLASS}>{title || '新对话'}</span>
         <span className={CHAT_HEADER_TITLE_META_CLASS}>{kbName}</span>
       </div>
-      <div className="flex items-center gap-[8px]">
-        {onKnowledgeScopeChange && availableKbs.filter((kb) => kb.permission && kb.kb_id != null).length > 1 && (
-          <details className="relative">
-            <summary className="cursor-pointer list-none rounded-[8px] px-[8px] py-[4px] text-[11px] text-[#68728a] hover:bg-[#f6f7fa]">
-              多库范围
-            </summary>
-            <div className="absolute right-0 top-[30px] z-30 w-[250px] rounded-[10px] border border-[#e5e8f0] bg-white p-[10px] shadow-lg">
-              <label className="mb-[8px] flex items-center justify-between gap-[8px] text-[11px] text-[#464c5e]">
-                用途
-                <select
-                  aria-label="知识库用途"
-                  value={knowledgePurpose}
-                  disabled={knowledgeScopeDisabled}
-                  onChange={(event) => onKnowledgeScopeChange(
-                    event.target.value as KnowledgePurpose,
-                    selectedKnowledgeBaseIds,
-                  )}
-                  className="rounded border border-[#e5e8f0] px-[5px] py-[3px] text-[11px]"
+      <div className="flex max-w-full flex-wrap items-center gap-[8px] [&>*]:shrink-0">
+        {onKnowledgeScopeChange && selectableKbs.length > 1 && selectableKbs.some((kb) => kb.name === kbName) && (
+          <Popover.Root>
+            <Popover.Trigger asChild>
+              <button type="button" className="shrink-0 whitespace-nowrap rounded-[8px] px-[8px] py-[4px] text-[11px] text-[#68728a] hover:bg-[#f6f7fa]">
+                多库范围 · {selectedKbs.length}
+              </button>
+            </Popover.Trigger>
+            <Popover.Portal>
+              <Popover.Content aria-label="知识库范围" align="end" sideOffset={6} collisionPadding={12} className="z-50 w-[320px] max-w-[calc(100vw-24px)] rounded-[10px] border border-[#e5e8f0] bg-white p-[10px] shadow-lg">
+                <label className="mb-[8px] flex items-center justify-between gap-[8px] text-[11px] text-[#464c5e]">
+                  用途
+                  <select
+                    aria-label="知识库用途"
+                    value={knowledgePurpose}
+                    disabled={knowledgeScopeDisabled}
+                    onChange={(event) => onKnowledgeScopeChange(
+                      event.target.value as KnowledgePurpose,
+                      selectedKnowledgeBaseIds,
+                    )}
+                    className="rounded border border-[#e5e8f0] px-[5px] py-[3px] text-[11px]"
+                  >
+                    <option value="answer">问答</option>
+                    <option value="compare">对比</option>
+                    <option value="compose">编写文档</option>
+                  </select>
+                </label>
+                <ul aria-label="已选知识库" className="mb-[8px] max-h-[200px] space-y-[4px] overflow-y-auto">
+                  {selectedKbs.map((kb) => {
+                    const id = Number(kb.kb_id);
+                    const anchor = kb.name === kbName;
+                    return (
+                      <li key={id} className="flex items-center gap-[7px] rounded-[6px] bg-[#f6f7fa] px-[7px] py-[5px] text-[11px] text-[#464c5e]">
+                        <span className="min-w-0 flex-1 truncate" title={kb.name}>{kb.name}</span>
+                        {anchor ? <span className="shrink-0 text-[10px] text-[#8a92a5]">主库</span> : (
+                          <button
+                            type="button"
+                            aria-label={`移除知识库 ${kb.name}`}
+                            disabled={knowledgeScopeDisabled}
+                            onClick={() => onKnowledgeScopeChange(knowledgePurpose, selectedKnowledgeBaseIds.filter((value) => value !== id))}
+                            className="shrink-0 rounded px-[4px] text-[#68728a] hover:bg-[#e5e8f0] disabled:opacity-45"
+                          >
+                            移除
+                          </button>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+                <Select
+                  value=""
+                  disabled={knowledgeScopeDisabled || remainingKbs.length === 0}
+                  onValueChange={(value) => onKnowledgeScopeChange(knowledgePurpose, [...selectedKnowledgeBaseIds, Number(value)])}
                 >
-                  <option value="answer">问答</option>
-                  <option value="compare">对比</option>
-                  <option value="compose">编写文档</option>
-                </select>
-              </label>
-              <div className="space-y-[4px]">
-                {availableKbs.filter((kb) => kb.permission && kb.kb_id != null).map((kb) => {
-                  const id = Number(kb.kb_id);
-                  const checked = selectedKnowledgeBaseIds.includes(id);
-                  const anchor = kb.name === kbName;
-                  return (
-                    <label key={id} className="flex items-center gap-[7px] text-[11px] text-[#464c5e]">
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        disabled={knowledgeScopeDisabled || anchor}
-                        onChange={(event) => {
-                          const next = event.target.checked
-                            ? [...selectedKnowledgeBaseIds, id]
-                            : selectedKnowledgeBaseIds.filter((value) => value !== id);
-                          onKnowledgeScopeChange(knowledgePurpose, next);
-                        }}
-                      />
-                      <span className="truncate">{kb.name}</span>
-                      {anchor && <span className="ml-auto text-[10px] text-[#8a92a5]">主库</span>}
-                    </label>
-                  );
-                })}
-              </div>
-              <p className="mt-[8px] text-[10px] leading-4 text-[#8a92a5]">
-                选库集合会绑定到新会话；范围变化时请新建会话。
-              </p>
-            </div>
-          </details>
+                  <SelectTrigger aria-label="添加知识库" className="w-full text-[11px]">
+                    <SelectValue placeholder={remainingKbs.length ? '选择一个知识库添加' : '已添加所有可用知识库'} />
+                  </SelectTrigger>
+                  <SelectContent position="popper" align="start" className="max-w-[calc(100vw-24px)]">
+                    {remainingKbs.map((kb) => (
+                      <SelectItem key={kb.kb_id} value={String(kb.kb_id)}>
+                        <span className="block max-w-[280px] truncate" title={kb.name}>{kb.name}</span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="mt-[8px] text-[10px] leading-4 text-[#8a92a5]">
+                  仅选主库即可单库检索；逐个添加其他知识库进行联合检索。范围变化后新建会话。
+                </p>
+              </Popover.Content>
+            </Popover.Portal>
+          </Popover.Root>
         )}
         {kbName && onWikiAssistChange && (
           <label

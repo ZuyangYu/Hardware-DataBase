@@ -135,6 +135,32 @@ class RetrievalSummaryTests(unittest.TestCase):
         self.assertEqual(summary["status"], "success")
         self.assertEqual(summary["retrieval_rounds"], 1)
 
+    def test_summary_and_footer_expose_target_coverage_and_source_failures(self):
+        from types import SimpleNamespace
+
+        rt = ToolRuntime(kb_name="k", ctx=None)
+        rt.record_diagnostic(_diag("document_search", hit_count=1))
+        rt.add_evidence(_ev([1]))
+        rt.turn_evidence_plan = SimpleNamespace(coverage_snapshot=lambda: {
+            "coverage_mode": "source_query", "required": 2,
+            "states": {"pending": 0, "candidate": 0, "admitted": 1, "missing": 1, "blocked": 0},
+            "complete": False, "targeted_kb_ids": [5], "not_targeted_kb_ids": [],
+            "requirements": [
+                {"target_id": "t1", "query_id": "q1", "state": "admitted", "reason": ""},
+                {"target_id": "t2", "query_id": "q2", "state": "missing", "reason": "no_qualified_evidence"},
+            ],
+        })
+        rt.multi_kb_source_outcomes = [
+            {"kb_id": 6, "status": "timeout", "error_code": "timeout"},
+        ]
+        summary = self._runner()._build_retrieval_summary(rt, [], self._verification())
+        self.assertEqual(summary["turn_evidence_coverage"]["states"]["admitted"], 1)
+        self.assertEqual(summary["missing"][0]["target_id"], "t2")
+        footer = self._runner()._format_footer(rt, self._verification(), [])
+        self.assertIn("目标证据覆盖", footer)
+        self.assertIn("未完成来源", footer)
+        self.assertIn("kb:6 timeout", footer)
+
 
 if __name__ == "__main__":
     unittest.main()

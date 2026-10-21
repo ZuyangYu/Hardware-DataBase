@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import httpx
 
@@ -476,6 +476,7 @@ class RAGFlowClient:
         self.api_key = api_key if api_key is not None else src.settings.RAGFLOW_API_KEY
         self.timeout = timeout if timeout is not None else src.settings.RAGFLOW_TIMEOUT_SECONDS
         self._async_client_factory = async_client_factory or httpx.AsyncClient
+        self.request_count = 0
         if not self.api_key:
             raise ValueError("RAGFLOW_API_KEY is not configured.")
         # RAGFlowBackend reuses one client for the process. Keep the sync
@@ -491,6 +492,7 @@ class RAGFlowClient:
         return f"{self.base_url}{path}"
 
     def request(self, method: str, path: str, **kwargs) -> dict:
+        self.request_count += 1
         response = self._sync_client.request(
             method,
             self._url(path),
@@ -517,6 +519,7 @@ class RAGFlowClient:
         """Run one RAGFlow request and cancel its client task on demand."""
         try:
             async with self._async_client_factory(timeout=self.timeout) as client:
+                self.request_count += 1
                 request_task = asyncio.create_task(
                     client.request(
                         method,
@@ -695,10 +698,94 @@ class RAGFlowClient:
         documents = data.get("data", {}).get("docs", data.get("data", []))
         return documents if isinstance(documents, list) else []
 
-    def list_chunks(self, dataset_id: str, document_id: str) -> list[dict]:
-        data = self.request("GET", f"/api/v1/datasets/{dataset_id}/documents/{document_id}/chunks")
-        chunks = data.get("data", {}).get("chunks", data.get("data", []))
-        return chunks if isinstance(chunks, list) else []
+    def list_chunks(
+        self,
+        dataset_id: str,
+        document_id: str,
+        *,
+        page_size: int | None = None,
+        max_pages: int | None = None,
+        max_bytes: int | None = None,
+        deadline: float | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[dict]:
+        """Read every chunk page instead of silently returning the first page.
+
+        RAGFlow defaults to 30 chunks per page. Citation readback must either
+        see the complete listing or fail explicitly: a truncated list would be
+        indistinguishable from a missing locator. Protections are cumulative
+        over the whole read, not reset per page.
+        """
+        size = int(page_size if page_size is not None else src.settings.RAGFLOW_CHUNK_LIST_PAGE_SIZE)
+        page_limit = int(max_pages if max_pages is not None else src.settings.RAGFLOW_CHUNK_LIST_MAX_PAGES)
+        byte_limit = int(max_bytes if max_bytes is not None else src.settings.RAGFLOW_CHUNK_LIST_MAX_BYTES)
+        if size <= 0 or page_limit <= 0 or byte_limit <= 0:
+            raise ValueError("chunk listing limits must be positive")
+
+        results: list[dict] = []
+        seen_ids: set[str] = set()
+        serialized_bytes = 0
+        page = 1
+        while True:
+            if should_cancel is not None and should_cancel():
+                raise ScopedRetrievalError("cancelled")
+            request_timeout: float | None = None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ScopedRetrievalError("timeout", "citation_readback_timeout")
+                request_timeout = min(float(self.timeout), remaining)
+            if page > page_limit:
+                raise ScopedRetrievalError("source_unavailable", "citation_readback_incomplete")
+
+            kwargs: dict[str, Any] = {"params": {"page": page, "page_size": size}}
+            if request_timeout is not None:
+                kwargs["timeout"] = request_timeout
+            data = self.request(
+                "GET",
+                f"/api/v1/datasets/{dataset_id}/documents/{document_id}/chunks",
+                **kwargs,
+            )
+            payload = data.get("data")
+            if isinstance(payload, dict):
+                batch = payload.get("chunks", [])
+                total = payload.get("total", data.get("total"))
+            else:
+                batch = payload if isinstance(payload, list) else []
+                total = data.get("total")
+            if not isinstance(batch, list):
+                raise ScopedRetrievalError("source_unavailable", "citation_readback_incomplete")
+            if not batch:
+                break
+
+            serialized_bytes += len(json.dumps(batch, ensure_ascii=False).encode("utf-8"))
+            if serialized_bytes > byte_limit:
+                raise ScopedRetrievalError("source_unavailable", "citation_readback_incomplete")
+
+            new_items = 0
+            for chunk in batch:
+                chunk_id = str(chunk.get("id") or chunk.get("chunk_id") or "")
+                if chunk_id and chunk_id in seen_ids:
+                    continue
+                if chunk_id:
+                    seen_ids.add(chunk_id)
+                results.append(chunk)
+                new_items += 1
+            if not new_items:
+                raise ScopedRetrievalError("source_unavailable", "citation_readback_incomplete")
+
+            try:
+                total_count = int(total) if total is not None else None
+            except (TypeError, ValueError):
+                total_count = None
+            if total_count is not None and len(results) >= total_count:
+                break
+            if total_count is None and len(batch) < size:
+                break
+            if total_count is None and page >= page_limit:
+                raise ScopedRetrievalError("source_unavailable", "citation_readback_incomplete")
+            page += 1
+        return results
 
     def retrieve(
         self,
@@ -1253,6 +1340,7 @@ class RAGFlowBackend(RAGBackend):
         should_cancel: Callable[[], bool] | None = None,
         before_request: Callable[[], None] | None = None,
         remaining_seconds: Callable[[], float] | None = None,
+        locators_by_record: Mapping[int, tuple] | None = None,
     ) -> ScopedDocumentRetrievalOutcome:
         diagnostics = {"remote_scope_fallback": False, "discarded_chunks": 0}
         try:
@@ -1266,10 +1354,15 @@ class RAGFlowBackend(RAGBackend):
                 scoped_filters["allowed_record_ids"] = list(contract.allowed_record_ids)
             if contract.mode == "frozen":
                 scoped_filters["balanced_route"] = True
+            client = self._client()
+            http_before = int(getattr(client, "request_count", 0) or 0)
             evidence = self._retrieve(kb_name, query, top_k=top_k, ctx=ctx, filters=scoped_filters,
                                       should_cancel=should_cancel, _contract=contract,
                                       _before_request=before_request, _remaining_seconds=remaining_seconds,
                                       _diagnostics=diagnostics)
+            diagnostics["remote_http_calls"] = max(
+                0, int(getattr(client, "request_count", 0) or 0) - http_before,
+            )
             self._validate_retrieval_contract(kb_name, ctx, contract)
             if should_cancel is not None and should_cancel():
                 raise ScopedRetrievalError("cancelled")
@@ -2174,19 +2267,30 @@ class RAGFlowBackend(RAGBackend):
             )
         return documents
 
-    def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None) -> ParseResult | None:
+    def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None,
+                         *, deadline: float | None = None,
+                         should_cancel: Callable[[], bool] | None = None) -> ParseResult | None:
         self._check_kb_access(kb_name, ctx, "read")
         record = self._get_record_for_document_id(kb_name, document_id, ctx=ctx)
         if not record:
             return None
         _check_record_department(record, ctx)
         if record.processor_kind != PROCESSOR_KIND_RAGFLOW:
-            return None
+            raise ScopedRetrievalError("filter_unsupported", "citation_processor_unsupported")
         try:
-            raw_chunks = self._client().list_chunks(record.dataset_id, record.document_id)
+            raw_chunks = self._client().list_chunks(
+                record.dataset_id, record.document_id,
+                deadline=deadline, should_cancel=should_cancel,
+            )
+        except ScopedRetrievalError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise ScopedRetrievalError("timeout", "citation_readback_timeout") from exc
+        except (httpx.HTTPError, RAGFlowAPIError) as exc:
+            raise ScopedRetrievalError("source_unavailable", "citation_source_unavailable") from exc
         except Exception as exc:
             log(f"RAGFlow chunk fetch failed for {document_id}: {exc}")
-            return None
+            raise ScopedRetrievalError("source_unavailable", "citation_source_unavailable") from exc
 
         chunks = []
         for index, chunk in enumerate(raw_chunks):

@@ -1064,8 +1064,11 @@ class AppPipeline:
             )
             raise
 
-    def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None):
-        return self.documents.get_parse_result(kb_name, document_id, ctx=ctx)
+    def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None,
+                         *, deadline: float | None = None, should_cancel=None):
+        return self.documents.get_parse_result(
+            kb_name, document_id, ctx=ctx, deadline=deadline, should_cancel=should_cancel,
+        )
 
     # Project/document-authoring domain entry points.  REST, UI and future MCP
     # adapters must use these service methods instead of reaching into SQLite,
@@ -1980,6 +1983,7 @@ class AppPipeline:
         ctx: RequestContext,
         *,
         knowledge_base_name: str,
+        persist: bool = True,
     ) -> tuple[Any, dict[str, Any]]:
         """Freeze currently readable source identities for a proposal."""
 
@@ -2035,6 +2039,7 @@ class AppPipeline:
             source_names,
             source_snapshot_kind="multi_knowledge_v1" if multi_scope is not None else "legacy_knowledge_base",
             sources=frozen_sources,
+            persist=persist,
         )
         source_hash = content_hash({
             # KnowledgeBaseSourceSnapshot includes created_at and therefore
@@ -2925,7 +2930,18 @@ class AppPipeline:
             is_general_chat=False,
         )
         source_names = []
-        if effective_scope != "attachment_only":
+        source_snapshot = None
+        if (
+            effective_scope != "attachment_only"
+            and (ctx.metadata.get("knowledge_scope_snapshot") or None) is not None
+        ):
+            source_snapshot, _ = self._planning_source_snapshot(
+                ctx,
+                knowledge_base_name=knowledge_base_name,
+                persist=False,
+            )
+            source_names = list(source_snapshot.source_names)
+        elif effective_scope != "attachment_only":
             for document in self.list_file_infos(knowledge_base_name, ctx):
                 name = (
                     document.get("name", "")
@@ -2941,6 +2957,8 @@ class AppPipeline:
                 "upload and parse a source before generating a document"
             )
         kwargs.pop("source_names", None)
+        if source_snapshot is not None:
+            kwargs["source_snapshot"] = source_snapshot
         return self.document_generation.create_knowledge_base_work_order(
             ctx,
             knowledge_base_name=knowledge_base_name,
@@ -3975,7 +3993,10 @@ class AppPipeline:
         job = job_store.create_job(
             tenant_id=ctx.tenant_id or "default",
             user_id=ctx.user_id,
-            session_id=ctx.session_id or f"document-generation:{order.work_order_id}",
+            # HTTP contexts receive a fresh session id for each request.  A
+            # resume request is bound to the frozen work order instead, so a
+            # replayed conflict decision cannot enqueue a second resume job.
+            session_id=f"document-generation:{order.work_order_id}",
             client_request_id=str(client_request_id),
             operation="resume_work_order",
             work_order_id=order.work_order_id,

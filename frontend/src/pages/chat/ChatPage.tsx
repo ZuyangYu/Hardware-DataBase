@@ -251,9 +251,16 @@ export default function ChatPage({
     () => visibleKbs.find((item) => item.name === mountedKbName)?.kb_id ?? null,
     [visibleKbs, mountedKbName],
   );
+  const previousAnchorKnowledgeBaseId = useRef<number | null>(null);
   useEffect(() => {
+    const anchorChanged = previousAnchorKnowledgeBaseId.current !== anchorKnowledgeBaseId;
+    previousAnchorKnowledgeBaseId.current = anchorKnowledgeBaseId;
     if (anchorKnowledgeBaseId == null) {
       setSelectedKnowledgeBaseIds([]);
+      return;
+    }
+    if (anchorChanged) {
+      setSelectedKnowledgeBaseIds([anchorKnowledgeBaseId]);
       return;
     }
     setSelectedKnowledgeBaseIds((previous) => {

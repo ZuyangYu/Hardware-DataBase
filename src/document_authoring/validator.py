@@ -35,7 +35,7 @@ class DocumentValidator:
         for violation in integrity_manifest.get("cell_policy_violations", []):
             issues.append({"kind": "renderer_integrity", "message": violation})
         issues.extend(additional_issues or [])
-        status = "failed" if any(issue["kind"] == "renderer_integrity" for issue in issues) else (
+        status = "failed" if any(issue.get("kind") == "renderer_integrity" for issue in issues) else (
             "requires_human" if issues else "passed"
         )
         return ValidationReport(
@@ -292,6 +292,14 @@ class DocumentValidator:
         conflicts = []
         for key, by_value in values.items():
             if len(by_value) <= 1:
+                continue
+            # This check is for disagreements *between* semantic units.  A
+            # single unit may intentionally preserve several source claims
+            # (for example, a reviewed draft that shows the selected value
+            # alongside its discarded alternatives); those claims are
+            # governed by the conflict review context rather than being a
+            # cross-unit consistency failure.
+            if len({unit_id for unit_ids in by_value.values() for unit_id in unit_ids}) <= 1:
                 continue
             distinct_values = list(by_value)
             if all(

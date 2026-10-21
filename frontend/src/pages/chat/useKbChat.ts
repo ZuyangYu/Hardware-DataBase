@@ -611,7 +611,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
               .join('|');
             return expected === actual;
           })
-          : rows;
+          : rows.filter((session) => !session.knowledge_scope && !session.knowledge_selection_hash);
         loadedSessionKey.current = selectedSessionKey;
         // A session created while this fetch was in flight is not in ``rows``.
         // Keep the new conversation in the list (and selected) instead of

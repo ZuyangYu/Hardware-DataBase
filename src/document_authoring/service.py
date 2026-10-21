@@ -1501,6 +1501,7 @@ class DocumentGenerationService:
         *,
         knowledge_base_name: str,
         source_names: list[str],
+        source_snapshot: KnowledgeBaseSourceSnapshot | None = None,
         template_version_id: str,
         document_schema_id: str,
         document_schema_version: str,
@@ -1550,9 +1551,16 @@ class DocumentGenerationService:
             harness_policy_id,
             execution_mode,
         )
-        snapshot = self._create_knowledge_base_source_snapshot(
-            ctx, knowledge_base_name, source_names
-        )
+        if source_snapshot is None:
+            snapshot = self._create_knowledge_base_source_snapshot(
+                ctx, knowledge_base_name, source_names
+            )
+        else:
+            if str(source_snapshot.tenant_id) != str(ctx.tenant_id or "default"):
+                raise ValueError("source snapshot tenant does not match request context")
+            if str(source_snapshot.knowledge_base_name) != str(knowledge_base_name):
+                raise ValueError("source snapshot knowledge base does not match request")
+            snapshot = self.store.create_knowledge_base_source_snapshot(source_snapshot)
         try:
             return self._create_frozen_work_order(
                 ctx,
@@ -5141,6 +5149,7 @@ class DocumentGenerationService:
         *,
         source_snapshot_kind: str = "legacy_knowledge_base",
         sources: list[dict[str, Any]] | None = None,
+        persist: bool = True,
     ) -> KnowledgeBaseSourceSnapshot:
         snapshot = KnowledgeBaseSourceSnapshot.create(
             tenant_id=ctx.tenant_id or "default",
@@ -5160,7 +5169,7 @@ class DocumentGenerationService:
                 if hasattr(ctx.metadata.get('knowledge_scope_snapshot'), 'model_dump') else {}
             ),
         )
-        return self.store.create_knowledge_base_source_snapshot(snapshot)
+        return self.store.create_knowledge_base_source_snapshot(snapshot) if persist else snapshot
 
     def _order_raw(self, work_order_id: str) -> DocumentWorkOrder:
         order = self.store.get_work_order(work_order_id)

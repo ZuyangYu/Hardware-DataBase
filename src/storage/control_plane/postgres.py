@@ -384,6 +384,7 @@ class PostgresExecutionStore:
                 raise PermissionError("chat session does not belong to current user")
             from src.services.knowledge_scope_persistence import (
                 turn_scope_payload, request_fingerprint, require_replay_fingerprint, require_scope_binding,
+                initial_scope_summary,
             )
 
             scope = turn_scope_payload(knowledge_scope, user_id=user_id, anchor_kb_id=session_row["kb_id"], stored_hash=session_row["knowledge_selection_hash"])
@@ -435,10 +436,11 @@ class PostgresExecutionStore:
                     department_id, kb_id, query, query_mode, status, client_request_id,
                     turn_sequence, trace_context_json, document_context_json,
                     export_plan_json, source_scope, required_attachment_ids, wiki_assist,
-                    created_at, knowledge_scope_json, knowledge_selection_hash, knowledge_request_fingerprint
+                    created_at, knowledge_scope_json, knowledge_selection_hash, knowledge_request_fingerprint,
+                    summary_json
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, clock_timestamp(), %s, %s, %s
+                    %s, %s, clock_timestamp(), %s, %s, %s, %s
                 ) RETURNING *
                 """,
                 (
@@ -463,6 +465,7 @@ class PostgresExecutionStore:
                     Jsonb(scope),
                     scope.get("selection_hash", ""),
                     fingerprint,
+                    Jsonb(initial_scope_summary(scope)),
                 ),
             ).fetchone()
             for ordinal, ref in enumerate(attachment_refs):

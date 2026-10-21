@@ -11,6 +11,8 @@ boundary rather than presentation alone.
 """
 from __future__ import annotations
 
+import os
+
 from fastapi import APIRouter, Depends, HTTPException
 
 import src.settings as settings
@@ -76,6 +78,13 @@ def _current_config() -> dict[str, object]:
     """Snapshot of the effective user-facing settings."""
     snapshot: dict[str, object] = {}
     for key in _config_surface_keys():
+        # These two keys deliberately distinguish "blank = inherit legacy
+        # value" from an explicitly configured integer. Returning the derived
+        # effective value would make a UI save silently turn inheritance into
+        # a hard-coded number.
+        if key in {"MULTI_KB_FUSION_MAX_BYTES", "MULTI_KB_TURN_EVIDENCE_MAX_BYTES"} and not os.getenv(key, "").strip():
+            snapshot[key] = ""
+            continue
         # Read the live attribute rather than os.getenv so we reflect
         # runtime state after apply_settings + reload_settings.
         value = getattr(settings, key, settings.DEFAULT_VALUES.get(key, ""))

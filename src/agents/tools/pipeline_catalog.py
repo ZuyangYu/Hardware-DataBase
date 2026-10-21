@@ -161,7 +161,7 @@ def make_catalog_tool(rt, *, document_store: PipelineDocumentStore, spreadsheet_
                     processor_kind="pipeline_catalog",
                     score=1.0,
                     locator={},
-                    metadata={"tool": "list_kb_sources"},
+                    metadata={"tool": "list_kb_sources", "evidence_role": "navigation"},
                 )
             ]
 

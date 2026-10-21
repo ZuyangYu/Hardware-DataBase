@@ -5,9 +5,12 @@ live in kbs.py / upload.py alongside their KB parents.
 """
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
+import src.settings
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import AuthService, AuthUser
 
@@ -19,6 +22,22 @@ from src.services.citation_readback import read_citation_content, validate_citat
 from src.services.knowledge_scope_models import AuthorizedKnowledgeSource
 
 router = APIRouter(tags=["files"])
+
+
+def _citation_http_error(exc: ScopedRetrievalError) -> HTTPException:
+    """Map typed readback failures without disguising them as missing text."""
+    if exc.status == "access_denied":
+        return HTTPException(status_code=403, detail="citation_access_denied")
+    if exc.status == "source_changed":
+        return HTTPException(status_code=409, detail="citation_source_changed")
+    if exc.status == "filter_unsupported":
+        code = exc.error_code if exc.error_code.startswith("citation_") else f"citation_{exc.error_code}"
+        return HTTPException(status_code=422, detail=code)
+    if exc.status == "timeout":
+        return HTTPException(status_code=504, detail="citation_readback_timeout")
+    if exc.status == "source_unavailable" and exc.error_code == "citation_readback_incomplete":
+        return HTTPException(status_code=502, detail="citation_readback_incomplete")
+    return HTTPException(status_code=503, detail="citation_source_unavailable")
 
 
 class CitationReadRequest(BaseModel):
@@ -57,7 +76,14 @@ def resolve_citation(
         reject_system_admin_kb_access(ctx)
         if not ctx.has_kb_permission(identity.kb_name, "read"):
             raise HTTPException(status_code=403, detail="citation_access_denied")
-        record = pipeline.document_store.get_document_by_id_scoped(body.local_record_id, identity.department_id)
+        # AppPipeline owns the backend document store; keep the old direct
+        # attribute as a compatibility fallback for lightweight integrations.
+        document_store = getattr(pipeline, "document_store", None)
+        if document_store is None:
+            document_store = getattr(getattr(pipeline, "backend", None), "store", None)
+        if document_store is None:
+            raise HTTPException(status_code=503, detail="citation_store_unavailable")
+        record = document_store.get_document_by_id_scoped(body.local_record_id, identity.department_id)
         if record is None or record.kb_name != identity.kb_name or record.kb_id not in (0, None, identity.kb_id):
             raise HTTPException(status_code=404, detail="citation_source_not_found")
         if not record.content_hash or record.content_hash != body.source_content_hash:
@@ -69,12 +95,13 @@ def resolve_citation(
         return ctx, record
 
     ctx, record = authorize_and_read()
+    deadline = time.monotonic() + max(1, int(src.settings.RAGFLOW_TIMEOUT_SECONDS))
     try:
         content = read_citation_content(pipeline, record, ctx, body.locator,
-                                        expected_evidence_text_hash=body.evidence_text_hash)
+                                        expected_evidence_text_hash=body.evidence_text_hash,
+                                        deadline=deadline)
     except ScopedRetrievalError as exc:
-        raise HTTPException(status_code=409 if exc.status == "source_changed" else 422 if exc.status == "filter_unsupported" else 404,
-                            detail=f"citation_{exc.status}") from exc
+        raise _citation_http_error(exc) from exc
     authorize_and_read()
     if content is None:
         raise HTTPException(status_code=404, detail="citation_locator_not_found")
@@ -98,7 +125,12 @@ def get_file_chunks(
     reject_system_admin_kb_access(ctx)
     if not ctx.has_kb_permission(kb_name, "read"):
         raise HTTPException(status_code=403, detail="read permission required")
-    result = pipeline.get_parse_result(kb_name, file_id, ctx=ctx)
+    result = None
+    deadline = time.monotonic() + max(1, int(src.settings.RAGFLOW_TIMEOUT_SECONDS))
+    try:
+        result = pipeline.get_parse_result(kb_name, file_id, ctx=ctx, deadline=deadline)
+    except ScopedRetrievalError as exc:
+        raise _citation_http_error(exc) from exc
     if result is None:
         raise HTTPException(status_code=404, detail="parse result not found")
     return ParseResultView(

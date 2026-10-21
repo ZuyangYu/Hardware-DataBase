@@ -71,6 +71,92 @@ class EvidenceFusionResult:
     source_representatives: list[dict] = field(default_factory=list)
 
 
+@dataclass
+class RankedCandidate:
+    identity: str
+    item: object
+    score: float
+    cost: int
+    kb_id: int
+    primary: bool
+    ranks: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class ScopedCandidateBatch:
+    candidates: list[RankedCandidate]
+    discarded: dict[str, int] = field(default_factory=dict)
+    query_candidates: dict[tuple, list[str]] = field(default_factory=dict)
+
+
+def rank_evidence_candidates(
+    outcomes, *, purpose: str, min_score: float | None = None,
+    token_counter: Callable[[str], int] | None = None,
+) -> ScopedCandidateBatch:
+    """Identity/quality-validate and rank every qualified candidate.
+
+    This entry deliberately stops before per-call item/byte admission. The
+    runtime owns that final, reversible decision; a ranking helper must not
+    silently delete a target candidate.
+    """
+    if hasattr(outcomes, "source_outcomes"):
+        outcomes = outcomes.source_outcomes
+    if purpose not in {"answer", "compare", "compose"}:
+        raise ValueError("invalid_knowledge_purpose")
+    threshold = settings.RAGFLOW_SIMILARITY_THRESHOLD if min_score is None else min_score
+    count = token_counter or (lambda text: len(text.encode("utf-8")))
+    discarded = {"identity": 0, "quality": 0, "budget": 0}
+    candidates: dict[str, dict] = {}
+    seen_ranks = set()
+    query_candidates: dict[tuple, list[str]] = {}
+    for outcome in outcomes:
+        query_key = (outcome.kb_id, outcome.query, outcome.retriever_kind)
+        query_candidates.setdefault(query_key, [])
+        if outcome.status != "success_with_hits":
+            continue
+        for rank, item in enumerate(outcome.evidence, 1):
+            metadata = dict(item.metadata or {})
+            try:
+                key = evidence_identity(metadata)
+                source = metadata.get("knowledge_source") or {}
+                if (metadata["evidence_text_hash"] != evidence_text_hash(item.content)
+                        or metadata["kb_id"] != outcome.kb_id or source.get("kb_id") != outcome.kb_id
+                        or str(source.get("department_id")) != str(metadata["department_id"])):
+                    raise EvidenceIdentityIncomplete()
+            except EvidenceIdentityIncomplete:
+                discarded["identity"] += 1
+                continue
+            if not math.isfinite(item.score) or item.score < threshold:
+                discarded["quality"] += 1
+                continue
+            if key not in candidates:
+                render_payload = json.dumps({
+                    "source": source_label(item.source_name, metadata),
+                    "locator": metadata["chunk_or_structured_locator"],
+                    "content": item.content[:1200],
+                }, ensure_ascii=False, sort_keys=True)
+                cost = max(1, int(count(render_payload if token_counter else render_payload + " " * 128)))
+                candidates[key] = {"item": replace(item, id=key, metadata=metadata), "score": 0.0, "cost": cost,
+                                   "kb_id": outcome.kb_id, "primary": source.get("role") == "primary", "ranks": []}
+            query_rank_key = (outcome.kb_id, outcome.query, outcome.retriever_kind, key)
+            if query_rank_key in seen_ranks:
+                continue
+            seen_ranks.add(query_rank_key)
+            candidates[key]["score"] += 1 / (60 + rank)
+            candidates[key]["ranks"].append({"query": outcome.query, "rank": rank, "raw_score": item.score,
+                                             "retriever_kind": outcome.retriever_kind})
+            query_candidates[query_key].append(key)
+    ranked = sorted(candidates, key=lambda key: (-candidates[key]["score"], not candidates[key]["primary"],
+                                                 candidates[key]["kb_id"], key))
+    return ScopedCandidateBatch(
+        candidates=[RankedCandidate(identity=key, item=candidates[key]["item"], score=candidates[key]["score"],
+                                    cost=candidates[key]["cost"], kb_id=candidates[key]["kb_id"],
+                                    primary=candidates[key]["primary"], ranks=list(candidates[key]["ranks"]))
+                    for key in ranked],
+        discarded=discarded, query_candidates=query_candidates,
+    )
+
+
 def fuse_evidence(
     outcomes, *, purpose: str, max_items: int, token_budget: int,
     token_counter: Callable[[str], int] | None = None, min_score: float | None = None,

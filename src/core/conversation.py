@@ -1135,6 +1135,7 @@ class ConversationService:
                     raise PermissionError("chat session does not belong to current user")
                 from src.services.knowledge_scope_persistence import (
                     turn_scope_payload, request_fingerprint, require_replay_fingerprint, require_scope_binding,
+                    initial_scope_summary,
                 )
 
                 scope = turn_scope_payload(knowledge_scope, user_id=user_id, anchor_kb_id=session_row["kb_id"], stored_hash=session_row["knowledge_selection_hash"])
@@ -1208,8 +1209,9 @@ class ConversationService:
                         department_id, kb_id, status, client_request_id, turn_sequence,
                         trace_context_json, created_at,
                         document_context_json, export_plan_json, source_scope, required_attachment_ids,
-                        wiki_assist, knowledge_scope_json, knowledge_selection_hash, knowledge_request_fingerprint
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        wiki_assist, knowledge_scope_json, knowledge_selection_hash, knowledge_request_fingerprint,
+                        summary_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         turn_id,
@@ -1234,6 +1236,7 @@ class ConversationService:
                         json.dumps(scope, ensure_ascii=False),
                         scope.get("selection_hash", ""),
                         fingerprint,
+                        json.dumps(initial_scope_summary(scope), ensure_ascii=False),
                     ),
                 )
                 if attachment_refs:
@@ -2946,6 +2949,18 @@ def row_to_message(row) -> ChatMessage:
                 if not isinstance(item, dict):
                     continue
                 locator = item.get("locator")
+                metadata = item.get("metadata")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                # Refresh must retain the governed readback contract, while
+                # unrelated retrieval diagnostics stay out of history previews.
+                citation_metadata = {
+                    key: metadata[key] for key in (
+                        "kb_id", "kb_name", "local_record_id", "knowledge_source",
+                        "source_content_hash", "source_version_id", "revision", "approval_status",
+                        "index_revision", "processing_artifact_id", "processor_version", "evidence_text_hash",
+                    ) if key in metadata
+                }
+                citation_metadata["citation_number"] = metadata.get("citation_number")
                 citations.append(
                     {
                         "id": item.get("id"),
@@ -2954,13 +2969,7 @@ def row_to_message(row) -> ChatMessage:
                         "locator": locator if isinstance(locator, dict) else {},
                         # 内容只保留预览长度，payload 保持轻量。
                         "content": str(item.get("content") or "")[:240],
-                        "metadata": {
-                            "citation_number": (item.get("metadata") or {}).get(
-                                "citation_number"
-                            )
-                            if isinstance(item.get("metadata"), dict)
-                            else None,
-                        },
+                        "metadata": citation_metadata,
                     }
                 )
     try:

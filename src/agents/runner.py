@@ -1431,6 +1431,40 @@ class MultiSourceAgentRunner:
         except (TypeError, ValueError):
             return None
 
+    def _field_plan_for_targets(self, query: str, targets: Sequence) -> Any | None:
+        if not bool(getattr(settings, "MULTI_KB_EXPLICIT_FIELDS_ENABLED", False)):
+            return None
+        try:
+            from src.services.field_requirements import FieldCoveragePlan, extract_requirements
+
+            requirements = extract_requirements(query, targets)
+            return FieldCoveragePlan(requirements) if requirements else None
+        except Exception:
+            return None
+
+    def _history_target_hint(
+        self, *, action_scope: Any, user_id: int | None, session_id: int | None,
+    ) -> list[dict]:
+        """Read the nearest completed turn's server target summary."""
+        if user_id is None or session_id is None:
+            return []
+        current_turn_id = ""
+        if isinstance(action_scope, dict):
+            current_turn_id = str(action_scope.get("turn_id") or "")
+        try:
+            from src.core.conversation import ConversationService
+            from src.services.retrieval_targets import history_target_hint
+
+            for turn in ConversationService().list_recent_turns(int(user_id), int(session_id), limit=5):
+                if turn.id == current_turn_id or turn.status != "completed":
+                    continue
+                hint = history_target_hint(turn.summary)
+                if hint:
+                    return hint
+        except Exception:
+            return []
+        return []
+
     def _get_model(self):
         # create_chat_model is lru_cached; the lock avoids duplicate builds on
         # first concurrent requests after startup.
@@ -2408,8 +2442,37 @@ class MultiSourceAgentRunner:
 
             attachment_edit_enabled=allow_document_write,
             knowledge_scope=knowledge_scope,
+            document_store=self.document_store,
         )
         if knowledge_scope is not None:
+            from src.services.retrieval_targets import compile_work_items, looks_like_follow_up, resolve_turn_targets
+
+            history_hint = None
+            if looks_like_follow_up(query):
+                history_hint = self._history_target_hint(
+                    action_scope=action_scope, user_id=numeric_user_id,
+                    session_id=conversation_session_id,
+                )
+            rt.turn_retrieval_targets = resolve_turn_targets(
+                query,
+                sources=knowledge_scope.sources,
+                document_store=self.document_store,
+                turn_id=str(thread_id or ""),
+                scope_fingerprint=knowledge_scope.selection_hash,
+                history_hint=history_hint,
+            )
+            if rt.turn_retrieval_targets.resolution == "resolved":
+                rt.turn_work_items = compile_work_items(rt.turn_retrieval_targets.targets)
+                from src.services.turn_evidence_plan import TurnEvidencePlan
+
+                rt.turn_evidence_plan = TurnEvidencePlan.from_targets(
+                    rt.turn_retrieval_targets.targets,
+                    turn_id=str(thread_id or ""),
+                    selected_kb_ids=[source.kb_id for source in knowledge_scope.sources],
+                )
+                rt.field_evidence_plan = self._field_plan_for_targets(
+                    query, rt.turn_retrieval_targets.targets,
+                )
             if knowledge_scope_resolver is None:
                 # Direct callers may inject a service in tests, but the
                 # authenticated worker always supplies the live resolver.
@@ -2434,6 +2497,42 @@ class MultiSourceAgentRunner:
                 ),
                 should_cancel=should_cancel,
             )
+        elif rt.kb_name and ctx is not None:
+            # Single-KB compatibility uses the same target shape without
+            # fabricating a multi-KB knowledge scope or selection hash.
+            from types import SimpleNamespace
+
+            from src.services.retrieval_targets import compile_work_items, looks_like_follow_up, resolve_turn_targets
+            from src.services.turn_evidence_plan import TurnEvidencePlan
+
+            metadata = dict(getattr(ctx, "metadata", {}) or {})
+            kb_id = metadata.get("kb_id")
+            if kb_id:
+                source = SimpleNamespace(
+                    kb_id=int(kb_id), kb_name=rt.kb_name,
+                    department_id=str(metadata.get("resource_department_id") or metadata.get("department_id") or ""),
+                    role="primary",
+                )
+                history_hint = None
+                if looks_like_follow_up(query):
+                    history_hint = self._history_target_hint(
+                        action_scope=action_scope, user_id=numeric_user_id,
+                        session_id=conversation_session_id,
+                    )
+                rt.turn_retrieval_targets = resolve_turn_targets(
+                    query, sources=[source], document_store=self.document_store,
+                    turn_id=str(thread_id or ""), scope_fingerprint=f"kb:{kb_id}",
+                    history_hint=history_hint,
+                )
+                if rt.turn_retrieval_targets.resolution == "resolved":
+                    rt.turn_work_items = compile_work_items(rt.turn_retrieval_targets.targets)
+                    rt.turn_evidence_plan = TurnEvidencePlan.from_targets(
+                        rt.turn_retrieval_targets.targets, turn_id=str(thread_id or ""),
+                        selected_kb_ids=[int(kb_id)],
+                    )
+                    rt.field_evidence_plan = self._field_plan_for_targets(
+                        query, rt.turn_retrieval_targets.targets,
+                    )
         if attachment_refs:
             from src.attachments.service import AttachmentService
 
@@ -2688,7 +2787,8 @@ class MultiSourceAgentRunner:
                 elif rt.multi_kb_retrieval is not None:
                     from src.agents.tools.structured_scope_tools import make_scoped_structured_tools
 
-                    kb_tools.extend(make_scoped_structured_tools(rt, wiki_assist=wiki_assist))
+                    scoped_tools = make_scoped_structured_tools(rt, wiki_assist=wiki_assist)
+                    kb_tools.extend(tool for tool in scoped_tools if getattr(tool, "multi_kb_exposed", True))
                 tools.extend(kb_tools)
                 if wiki_assist and rt.knowledge_scope is None:
                     tools.append(make_wiki_search(rt, self.wiki_service))
@@ -2711,6 +2811,7 @@ class MultiSourceAgentRunner:
                 f"{base_prompt.format_map(_PromptDict(kb_name=scope_kb, workflow=workflow))}\n\n"
                 "本轮按受控动作计划执行：只能调用当前可见的业务工具；"
                 "附件、知识库和文档产物均须通过这些工具访问，绝不可访问任意文件系统。"
+                "当工具结果明确提示“本轮所有目标/查询义务均已取得已编号证据”时，必须立即停止检索并基于现有证据作答。"
             )
             memory_context = "" if rt.knowledge_scope is not None else self._prefetch_memory_context(
                 query=query,
@@ -2750,7 +2851,8 @@ class MultiSourceAgentRunner:
                 elif rt.multi_kb_retrieval is not None:
                     from src.agents.tools.structured_scope_tools import make_scoped_structured_tools
 
-                    tools.extend(make_scoped_structured_tools(rt, wiki_assist=wiki_assist))
+                    scoped_tools = make_scoped_structured_tools(rt, wiki_assist=wiki_assist)
+                    tools.extend(tool for tool in scoped_tools if getattr(tool, "multi_kb_exposed", True))
                 if wiki_assist and rt.knowledge_scope is None:
                     tools.append(make_wiki_search(rt, self.wiki_service))
             if attachment_refs:
@@ -3791,6 +3893,24 @@ class MultiSourceAgentRunner:
         answer_text = _current_run().answer
         verification = _build_citation_verification(answer_text, rt.evidence)
         record.retrieval_summary = self._build_retrieval_summary(rt, timeline, verification)
+        if getattr(rt, "turn_retrieval_targets", None) is not None:
+            record.retrieval_summary["retrieval_targets"] = {
+                "resolution": rt.turn_retrieval_targets.resolution,
+                "target_fingerprint": rt.turn_retrieval_targets.target_fingerprint,
+                "targeted_kb_ids": list(rt.turn_retrieval_targets.targeted_kb_ids),
+                "targets": [
+                    {
+                        "target_id": target.target_id, "kb_id": target.kb_id,
+                        "record_id": target.record_id, "document_name": target.document_name,
+                        "processor_kind": target.processor_kind, "query_id": target.query_id,
+                        "locators": [locator.__dict__ for locator in target.locators],
+                    }
+                    for target in rt.turn_retrieval_targets.targets
+                ],
+            }
+        if getattr(rt, "turn_evidence_plan", None) is not None:
+            record.retrieval_summary["turn_evidence_coverage"] = rt.turn_evidence_plan.coverage_snapshot()
+        record.retrieval_summary["invocations"] = list(rt.invocations)
         record.retrieval_summary["intent_plan"] = intent_plan.to_dict()
         record.retrieval_summary["conversation_plan"] = conversation_plan.to_dict()
         record.retrieval_summary.update(_conversation_action_audit_fields(
@@ -3919,6 +4039,17 @@ class MultiSourceAgentRunner:
             "multi_kb_fusions": list(rt.multi_kb_fusions),
         }
         result.update(_scope_dependency_fields(rt.knowledge_scope))
+        plan = getattr(rt, "turn_evidence_plan", None)
+        if plan is not None:
+            snapshot = plan.coverage_snapshot()
+            result["missing"] = [
+                item for item in snapshot.get("requirements", [])
+                if item.get("state") in {"missing", "blocked", "pending", "candidate"}
+            ]
+            result["turn_evidence_coverage"] = snapshot
+        field_plan = getattr(rt, "field_evidence_plan", None)
+        if field_plan is not None:
+            result["field_evidence_coverage"] = field_plan.coverage_snapshot()
         return result
 
     def _format_footer(
@@ -3955,6 +4086,51 @@ class MultiSourceAgentRunner:
                 )
         else:
             sections.append("- 无")
+        failed_sources = [
+            item for item in rt.multi_kb_source_outcomes
+            if item.get("status") not in {"success_with_hits", "success_empty"}
+        ]
+        if failed_sources:
+            sections.append("\n**未完成来源**")
+            for item in failed_sources[-8:]:
+                sections.append(
+                    f"- kb:{item.get('kb_id')} {item.get('status')} "
+                    f"{item.get('error_code') or item.get('status')}"
+                )
+        plan = getattr(rt, "turn_evidence_plan", None)
+        if plan is not None:
+            coverage = plan.coverage_snapshot()
+            sections.append("\n**目标证据覆盖**")
+            sections.append(
+                f"- 已准入 {coverage['states'].get('admitted', 0)} / 必需 {coverage['required']}；"
+                f"候选 {coverage['states'].get('candidate', 0)}，缺失 {coverage['states'].get('missing', 0)}，"
+                f"受限 {coverage['states'].get('blocked', 0)}"
+            )
+            incomplete = [
+                item for item in coverage.get("requirements", [])
+                if item.get("state") not in {"admitted"}
+            ]
+            for item in incomplete[:8]:
+                sections.append(
+                    f"- 目标 {item.get('target_id')} / 查询 {item.get('query_id')}："
+                    f"{item.get('state')} {item.get('reason') or ''}".rstrip()
+                )
+        field_plan = getattr(rt, "field_evidence_plan", None)
+        if field_plan is not None:
+            field_coverage = field_plan.coverage_snapshot()
+            sections.append("\n**字段级验证**")
+            sections.append(
+                f"- 支持 {field_coverage['states'].get('supported', 0)} / 必需 {field_coverage['required']}；"
+                f"矛盾 {field_coverage['states'].get('contradicted', 0)}，"
+                f"未验证 {field_coverage['states'].get('unknown', 0)}"
+            )
+            for item in field_coverage.get("requirements", []):
+                if item.get("status") == "supported":
+                    continue
+                sections.append(
+                    f"- {item.get('field_type')} / 目标 {item.get('target_id')}："
+                    f"{item.get('status')} {item.get('reason') or ''}".rstrip()
+                )
         sections.append("\n**Grounding**")
         sections.append(
             "- 语义支持=未评估 · 证据引用覆盖率={cov:.0%} · 无效引用={invalid} · 校验方式=仅核对 [n] 编号（未做逐句归因或冲突校验）".format(

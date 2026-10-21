@@ -210,3 +210,14 @@ def test_query_coverage_reports_budget_crop_without_inventing_a_retained_hit():
     assert rows["second"]["covered"] is False
     assert rows["second"]["budget_cropped"] is True
     assert result.discarded["budget"] == 1
+
+
+def test_rank_evidence_candidates_stops_before_budget_cropping():
+    from src.services.evidence_fusion import rank_evidence_candidates
+
+    items = [evidence(chunk=f"chunk-{index}", content=f"evidence {index}", score=0.9 - index * 0.01)
+             for index in range(12)]
+    ranked = rank_evidence_candidates([outcome(101, items)], purpose="answer", token_counter=lambda _: 10)
+    assert len(ranked.candidates) == 12
+    assert ranked.discarded["budget"] == 0
+    assert ranked.candidates[0].ranks[0]["rank"] == 1

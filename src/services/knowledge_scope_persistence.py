@@ -15,6 +15,23 @@ class IdempotencyConflict(ValueError):
         super().__init__("idempotency_conflict")
 
 
+def initial_scope_summary(scope: dict[str, Any]) -> dict[str, Any]:
+    """Authorize queued/streaming turns before the model produces its summary.
+
+    Source selection is pinned for the entire session, including its history.
+    Completed turns still use the execution summary and fail closed if that
+    summary omits complete dependencies.
+    """
+    if not scope:
+        return {}
+    return {"source_dependencies": {
+        "version": 1,
+        "kb_ids": sorted({source["kb_id"] for source in scope["sources"]}),
+        "inherited_turn_ids": [],
+        "complete": True,
+    }}
+
+
 def selection_for_session(selection, *, user_id: int, anchor_kb_id: int | None, tenant_key: str = "default") -> tuple[dict, str]:
     if selection is None:
         return {}, ""

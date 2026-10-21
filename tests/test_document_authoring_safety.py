@@ -263,3 +263,38 @@ def test_cross_unit_consistency_ignores_complementary_assertions_sharing_an_anch
     ]
 
     assert DocumentValidator.validate_cross_unit_consistency(drafts) == []
+
+
+def test_cross_unit_consistency_ignores_conflicting_assertions_within_one_semantic_unit():
+    """A unit may expose multiple claims without creating a cross-unit conflict.
+
+    Cross-unit consistency is meant to compare the same consistency key across
+    distinct semantic units.  Multiple assertions attached to one draft are
+    still inside one unit and need review at the unit level instead of being
+    reported as a cross-unit conflict.
+    """
+    drafts = [
+        DocumentUnitDraft(
+            unit_id="field:power-rail",
+            run_id="run-1",
+            generated_by="managed_writer",
+            assertions=[
+                DraftAssertion(
+                    assertion_id="a1",
+                    claim_id="power-rail",
+                    consistency_key="power-rail:voltage",
+                    text="The rail is 3.3 V.",
+                    value="3.3 V",
+                ),
+                DraftAssertion(
+                    assertion_id="a2",
+                    claim_id="power-rail",
+                    consistency_key="power-rail:voltage",
+                    text="The rail is 5 V.",
+                    value="5 V",
+                ),
+            ],
+        ),
+    ]
+
+    assert DocumentValidator.validate_cross_unit_consistency(drafts) == []

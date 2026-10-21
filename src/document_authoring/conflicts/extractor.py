@@ -47,7 +47,19 @@ class GroundedClaimExtractor:
             metadata = dict(_get(evidence, "metadata", {}) or {})
             source = metadata.get("knowledge_source") or {}
             identity = str(_get(evidence, "id", "") or "")
-            kb_id = source.get("kb_id") or metadata.get("kb_id")
+            raw_kb_id = source.get("kb_id") or metadata.get("kb_id")
+            # Evidence metadata crosses JSON/API boundaries where integer
+            # identities are commonly serialized as strings.  Normalize that
+            # representation at the extractor boundary while rejecting
+            # ambiguous values such as booleans or decimal strings.
+            if isinstance(raw_kb_id, bool):
+                kb_id = None
+            elif isinstance(raw_kb_id, int):
+                kb_id = raw_kb_id
+            elif isinstance(raw_kb_id, str) and re.fullmatch(r"[1-9]\d*", raw_kb_id.strip()):
+                kb_id = int(raw_kb_id.strip())
+            else:
+                kb_id = None
             role = source.get("role") or metadata.get("source_role")
             if not identity or not isinstance(kb_id, int) or kb_id <= 0 or role not in {"primary", "peer", "reference", "standard"}:
                 continue

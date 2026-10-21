@@ -1198,7 +1198,9 @@ class DocumentAuthoringStore:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """SELECT payload_json FROM document_work_orders
-                   WHERE tenant_id = ? AND scope_key = ? ORDER BY rowid DESC""",
+                   WHERE tenant_id = ? AND scope_key = ?
+                   ORDER BY COALESCE(json_extract(payload_json, '$.created_at'), '') DESC,
+                            work_order_id DESC""",
                 (tenant_id, f"project:{project_id}"),
             ).fetchall()
         return [DocumentWorkOrder.model_validate(_payload(row)) for row in rows]
@@ -1211,7 +1213,9 @@ class DocumentAuthoringStore:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """SELECT payload_json FROM document_work_orders
-                   WHERE tenant_id = ? AND scope_key = ? ORDER BY rowid DESC""",
+                   WHERE tenant_id = ? AND scope_key = ?
+                   ORDER BY COALESCE(json_extract(payload_json, '$.created_at'), '') DESC,
+                            work_order_id DESC""",
                 (tenant_id, f"knowledge_base:{knowledge_base_name}"),
             ).fetchall()
         return [DocumentWorkOrder.model_validate(_payload(row)) for row in rows]
@@ -1222,7 +1226,8 @@ class DocumentAuthoringStore:
             try:
                 updated = conn.execute(
                     """UPDATE document_work_orders SET status = ?, payload_json = ?
-                       WHERE work_order_id = ? AND json_extract(payload_json, '$.lock_version') = ?""",
+                       WHERE work_order_id = ?
+                         AND CAST(json_extract(payload_json, '$.lock_version') AS BIGINT) = ?""",
                     (order.status, _json(order), order.work_order_id, order.lock_version - 1),
                 ).rowcount
                 if updated == 1:
@@ -1894,7 +1899,7 @@ class DocumentAuthoringStore:
         if status is not None:
             query += " AND status = ?"
             params.append(status)
-        query += " ORDER BY rowid, receipt_id"
+        query += " ORDER BY COALESCE(json_extract(payload_json, '$.created_at'), ''), receipt_id"
         with closing(self._connect()) as conn:
             rows = conn.execute(query, params).fetchall()
         return [NodeExecutionReceipt.model_validate(_payload(row)) for row in rows]
@@ -2104,7 +2109,8 @@ class DocumentAuthoringStore:
     def list_artifacts(self, work_order_id: str) -> list[DocumentArtifact]:
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT payload_json FROM document_artifacts WHERE work_order_id = ? ORDER BY rowid", (work_order_id,)
+                """SELECT payload_json FROM document_artifacts WHERE work_order_id = ?
+                   ORDER BY created_at, artifact_id""", (work_order_id,)
             ).fetchall()
         return [DocumentArtifact.model_validate(_payload(row)) for row in rows]
 
@@ -2547,7 +2553,8 @@ class DocumentAuthoringStore:
     def list_human_events(self, artifact_id: str) -> list[DocumentHumanEvent]:
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT payload_json FROM document_human_events WHERE artifact_id = ? ORDER BY rowid", (artifact_id,)
+                """SELECT payload_json FROM document_human_events WHERE artifact_id = ?
+                   ORDER BY COALESCE(json_extract(payload_json, '$.created_at'), ''), event_id""", (artifact_id,)
             ).fetchall()
         return [DocumentHumanEvent.model_validate(_payload(row)) for row in rows]
 

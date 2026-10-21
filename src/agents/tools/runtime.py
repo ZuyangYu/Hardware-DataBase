@@ -166,6 +166,15 @@ class CitationAdmission(list):
 
 
 @dataclass
+class AdmissionResult:
+    evidence: list[Evidence] = field(default_factory=list)
+    numbers: list[int | None] = field(default_factory=list)
+    target_coverage: dict[str, Any] = field(default_factory=dict)
+    rejected: dict[str, int] = field(default_factory=dict)
+    source_statuses: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class ToolRuntime:
     kb_name: str
     ctx: RequestContext | None
@@ -173,7 +182,14 @@ class ToolRuntime:
     # opaque to ordinary retrieval tools; only the explicitly gated document
     # tool factory consumes it.
     document_context: Any | None = None
+    document_store: Any | None = None
     knowledge_scope: KnowledgeScopeSnapshot | None = None
+    # Server-resolved explicit file/sheet/pin targets for this turn. Tools
+    # share this object; model-supplied IDs never replace it.
+    turn_retrieval_targets: Any | None = None
+    turn_work_items: tuple[Any, ...] = ()
+    turn_evidence_plan: Any | None = None
+    field_evidence_plan: Any | None = None
     # Multi-KB retrieval is injected by the authenticated execution boundary.
     # Keeping both objects request-scoped prevents a tool from widening a
     # persisted scope or creating an independent budget for each source.
@@ -210,6 +226,11 @@ class ToolRuntime:
     memory_context: list[dict[str, Any]] = field(default_factory=list)
     memory_context_index: set[str] = field(default_factory=set)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    invocations: list[dict[str, Any]] = field(default_factory=list)
+    candidate_pool: dict[str, Evidence] = field(default_factory=dict)
+    _candidate_pool_order: list[str] = field(default_factory=list)
+    last_rejection_reasons: dict[str, int] = field(default_factory=dict)
+    _invocation_seq: int = 0
     multi_kb_source_outcomes: list[dict[str, Any]] = field(default_factory=list)
     multi_kb_fusions: list[dict[str, Any]] = field(default_factory=list)
     queries: list[dict[str, Any]] = field(default_factory=list)
@@ -239,6 +260,8 @@ class ToolRuntime:
         """Revoke every outstanding call epoch (cancellation/run teardown)."""
         with self._lock:
             self._active_call_epochs.clear()
+            self.candidate_pool.clear()
+            self._candidate_pool_order.clear()
 
     def check_cancel(self) -> None:
         if self.should_cancel is not None and self.should_cancel():
@@ -274,6 +297,79 @@ class ToolRuntime:
                 for item in self.queries
             )
 
+    def _remember_candidate_locked(self, item: Evidence) -> None:
+        key = str(item.id or f"{item.source_name}:{len(self.candidate_pool)}")
+        if key not in self.candidate_pool:
+            self._candidate_pool_order.append(key)
+        self.candidate_pool[key] = item
+        import src.settings as settings
+
+        limit = max(1, int(getattr(settings, "MULTI_KB_MAX_SOURCES", 4))
+                    * int(getattr(settings, "MULTI_KB_PER_SOURCE_CANDIDATES",
+                                getattr(settings, "MULTI_KB_PER_SOURCE_TOP_K", 8))))
+        while len(self.candidate_pool) > limit and self._candidate_pool_order:
+            oldest = self._candidate_pool_order.pop(0)
+            self.candidate_pool.pop(oldest, None)
+        byte_budget = 2 * int(getattr(settings, "MULTI_KB_TURN_EVIDENCE_MAX_BYTES",
+                                       getattr(settings, "MULTI_KB_CONTEXT_MAX_TOKENS", 8000)))
+        while self._candidate_pool_order:
+            total = sum(_evidence_context_cost(item) for item in self.candidate_pool.values())
+            if total <= byte_budget:
+                break
+            oldest = self._candidate_pool_order.pop(0)
+            self.candidate_pool.pop(oldest, None)
+
+    def promote_pooled_candidates(self) -> list[Evidence]:
+        """Admit previously bounded candidates once room becomes available."""
+        plan = getattr(self, "turn_evidence_plan", None)
+        if plan is None or not self.candidate_pool:
+            return []
+        import src.settings as settings
+
+        promoted: list[Evidence] = []
+        with self._lock:
+            room = max(0, int(self.evidence_budget) - len(self.evidence)) if self.evidence_budget > 0 else 10**9
+            room = min(room, max(0, int(getattr(settings, "MULTI_KB_EVIDENCE_MAX_ITEMS", 24)) - len(self.evidence)))
+            byte_limit = int(getattr(settings, "MULTI_KB_TURN_EVIDENCE_MAX_BYTES",
+                                     getattr(settings, "MULTI_KB_CONTEXT_MAX_TOKENS", 8000)))
+            remaining_bytes = max(0, byte_limit - sum(_evidence_context_cost(item) for item in self.evidence))
+            ordered = sorted(
+                self.candidate_pool.values(),
+                key=lambda item: (
+                    0 if plan.evaluate(item) else 1,
+                    -float(getattr(item, "score", 0.0) or 0.0),
+                    str(item.id or ""),
+                ),
+            )
+            for item in ordered:
+                if len(promoted) >= room:
+                    break
+                matched = plan.evaluate(item)
+                if not matched or not item.id or item.id in self.evidence_index:
+                    continue
+                cost = _evidence_context_cost(item)
+                if cost > remaining_bytes:
+                    continue
+                item.metadata = {**item.metadata, "citation_number": len(self.evidence) + 1}
+                self.evidence.append(item)
+                self.evidence_index[item.id] = len(self.evidence)
+                plan.mark_admitted(matched, item.id)
+                self._apply_field_verification(item)
+                promoted.append(item)
+                remaining_bytes -= cost
+                self.candidate_pool.pop(item.id, None)
+                if item.id in self._candidate_pool_order:
+                    self._candidate_pool_order.remove(item.id)
+        return promoted
+
+    def _apply_field_verification(self, item: Evidence) -> None:
+        plan = getattr(self, "field_evidence_plan", None)
+        if plan is not None:
+            try:
+                plan.apply(plan.evaluate(item))
+            except Exception:
+                pass
+
     def add_evidence(self, items: list[Evidence], *, epoch: int | None = None) -> CitationAdmission:
         """Register evidence rows and return their 1-based citation numbers.
 
@@ -295,39 +391,114 @@ class ToolRuntime:
             for position, item in enumerate(items):
                 if item.id and item.id in self.evidence_index:
                     numbers.append(self.evidence_index[item.id])
+                    plan = getattr(self, "turn_evidence_plan", None)
+                    if plan is not None:
+                        plan.mark_admitted(plan.evaluate(item), item.id)
+                    self._apply_field_verification(item)
                     continue
                 fresh.append(position)
                 numbers.append(None)
-            room = (
+            self.last_rejection_reasons = {"call_quota": 0, "item_limit": 0, "byte_limit": 0, "token_limit": 0}
+            budget_room = (
                 max(0, self.evidence_budget - len(self.evidence))
                 if self.evidence_budget > 0
                 else len(fresh)
             )
+            room = budget_room
             if self.knowledge_scope is not None:
                 import src.settings as settings
 
-                room = min(room, max(0, int(settings.MULTI_KB_EVIDENCE_MAX_ITEMS) - len(self.evidence)))
+                item_room = max(0, int(settings.MULTI_KB_EVIDENCE_MAX_ITEMS) - len(self.evidence))
+                room = min(room, item_room)
 
                 remaining_tokens = max(0, int(settings.MULTI_KB_CONTEXT_MAX_TOKENS)) - sum(
                     _evidence_context_cost(item) for item in self.evidence
                 )
-                fresh.sort(key=lambda position: int(items[position].metadata.get("fusion_rank") or position + 1))
+                remaining_bytes = max(0, int(getattr(
+                    settings, "MULTI_KB_TURN_EVIDENCE_MAX_BYTES", settings.MULTI_KB_CONTEXT_MAX_TOKENS,
+                ))) - sum(_evidence_context_cost(item) for item in self.evidence)
+                plan = getattr(self, "turn_evidence_plan", None)
+
+                def admission_priority(position: int) -> tuple:
+                    item = items[position]
+                    fusion_rank = int(item.metadata.get("fusion_rank") or position + 1)
+                    if plan is None:
+                        return (1, fusion_rank)
+                    matched = plan.evaluate(item)
+                    pending = any(plan.states[requirement_id].state == "pending" for requirement_id in matched)
+                    return (0 if pending else 1, fusion_rank)
+
+                fresh.sort(key=admission_priority)
                 required = {source.kb_id for source in self.knowledge_scope.sources} if self.source_scope != "attachment_only" else set()
+                if plan is not None and plan.targeted_kb_ids:
+                    required = set(plan.targeted_kb_ids)
                 covered = {item.metadata.get("kb_id") for item in self.evidence}
                 kept = set()
-                for position in fresh:
-                    if len(kept) >= room:
-                        break
-                    kb_id = items[position].metadata.get("kb_id")
-                    missing_after = required - covered - {kb_id}
-                    if room - len(kept) - 1 < len(missing_after):
-                        continue
-                    cost = _evidence_context_cost(items[position])
-                    if cost > remaining_tokens:
-                        continue
-                    kept.add(position)
-                    covered.add(kb_id)
-                    remaining_tokens -= cost
+                if plan is not None:
+                    # Target/query obligations get first claim on the turn
+                    # budget. Background chunks wait until every obligation is
+                    # admitted, so a fast generic batch cannot crowd them out.
+                    outstanding = {
+                        requirement_id for requirement_id, state in plan.states.items()
+                        if state.state in {"pending", "candidate"}
+                    }
+                    covered_by_fresh = set()
+                    for position in fresh:
+                        covered_by_fresh.update(plan.evaluate(items[position]))
+                    reserve_ids = outstanding - covered_by_fresh
+                    reserve_cost = 0
+                    if reserve_ids:
+                        cheapest = min(_evidence_context_cost(items[position]) for position in fresh) if fresh else 1200
+                        reserve_cost = len(reserve_ids) * cheapest
+                    per_requirement: dict[str, int] = {}
+                    for position in fresh:
+                        matched = plan.evaluate(items[position])
+                        if len(kept) >= room:
+                            self.last_rejection_reasons["call_quota" if room == budget_room else "item_limit"] += 1
+                            if matched:
+                                self._remember_candidate_locked(items[position])
+                            continue
+                        if not matched:
+                            continue
+                        usable = [requirement_id for requirement_id in matched
+                                  if per_requirement.get(requirement_id, 0) < 2]
+                        if not usable:
+                            continue
+                        cost = _evidence_context_cost(items[position])
+                        if cost > remaining_tokens:
+                            self.last_rejection_reasons["token_limit"] += 1
+                            self._remember_candidate_locked(items[position])
+                            continue
+                        if cost + reserve_cost > remaining_bytes:
+                            self.last_rejection_reasons["byte_limit"] += 1
+                            self._remember_candidate_locked(items[position])
+                            continue
+                        kept.add(position)
+                        for requirement_id in usable:
+                            per_requirement[requirement_id] = per_requirement.get(requirement_id, 0) + 1
+                        remaining_tokens -= cost
+                        remaining_bytes -= cost
+                else:
+                    for position in fresh:
+                        if len(kept) >= room:
+                            self.last_rejection_reasons["call_quota" if room == budget_room else "item_limit"] += 1
+                            break
+                        kb_id = items[position].metadata.get("kb_id")
+                        missing_after = required - covered - {kb_id}
+                        if room - len(kept) - 1 < len(missing_after):
+                            self.last_rejection_reasons["item_limit"] += 1
+                            continue
+                        cost = _evidence_context_cost(items[position])
+                        if cost > remaining_tokens:
+                            self.last_rejection_reasons["token_limit"] += 1
+                            continue
+                        if cost > remaining_bytes:
+                            self.last_rejection_reasons["byte_limit"] += 1
+                            continue
+                        kept.add(position)
+                        covered.add(kb_id)
+                        remaining_tokens -= cost
+                        remaining_bytes -= cost
             elif len(fresh) > room:
                 question_tokens = _evidence_tokens(self.question)
                 # 检索器相似度优先(RAGFlow score 为真实语义分), 词法分仅作次键;
@@ -344,12 +515,22 @@ class ToolRuntime:
                 kept = set(fresh)
             for position in fresh:
                 if position not in kept:
+                    plan = getattr(self, "turn_evidence_plan", None)
+                    if plan is not None:
+                        matched = plan.evaluate(items[position])
+                        if matched:
+                            self._remember_candidate_locked(items[position])
+                        plan.mark_candidate(matched, items[position].id or "")
                     continue
                 item = items[position]
                 key = item.id or f"{item.source_name}:{len(self.evidence)}"
                 self.evidence.append(item)
                 self.evidence_index[key] = len(self.evidence)
                 numbers[position] = len(self.evidence)
+                plan = getattr(self, "turn_evidence_plan", None)
+                if plan is not None:
+                    plan.mark_admitted(plan.evaluate(item), key)
+                self._apply_field_verification(item)
         return numbers
 
     @staticmethod
@@ -363,6 +544,26 @@ class ToolRuntime:
             )
         except Exception:
             pass
+
+    def admit_candidate_batch(self, batch, *, epoch: int | None = None,
+                              source_statuses: list[dict[str, Any]] | None = None) -> AdmissionResult:
+        """Admit a ranked candidate batch through the one runtime lock."""
+        items = list(batch)
+        numbers = self.add_evidence(items, epoch=epoch)
+        admitted = []
+        for item, number in zip(items, numbers):
+            if number is None:
+                continue
+            item.metadata = {**item.metadata, "citation_number": number}
+            admitted.append(item)
+        plan = getattr(self, "turn_evidence_plan", None)
+        return AdmissionResult(
+            evidence=admitted, numbers=list(numbers),
+            target_coverage=plan.coverage_snapshot() if plan is not None else {},
+            rejected={"budget_discarded": sum(number is None for number in numbers),
+                      **dict(getattr(self, "last_rejection_reasons", {}) or {})},
+            source_statuses=list(source_statuses or getattr(batch, "source_statuses", []) or []),
+        )
 
     def finalize_evidence(self) -> None:
         """按问题相关性重排证据堆;citation_number 在 metadata 里,编号不变。"""
@@ -409,6 +610,15 @@ class ToolRuntime:
         with self._lock:
             self.mcp_diagnostics.append(dict(diagnostic))
 
+    def next_invocation_id(self) -> str:
+        with self._lock:
+            self._invocation_seq += 1
+            return f"inv-{self._invocation_seq}"
+
+    def record_invocation(self, diagnostic: dict[str, Any]) -> None:
+        with self._lock:
+            self.invocations.append(dict(diagnostic))
+
     def record_diagnostic(self, diag: ToolDiagnostics) -> None:
         with self._lock:
             self.diagnostics.append(
@@ -435,6 +645,12 @@ class ToolRuntime:
                 self.multi_kb_fusions.append(dict(fusion_summary))
 
 
+def _query_fingerprint(tool_name: str, query: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(f"{tool_name}\0{query}".encode("utf-8")).hexdigest()[:16]
+
+
 def timed_tool_call(
     rt: ToolRuntime,
     tool_name: str,
@@ -456,17 +672,55 @@ def timed_tool_call(
     all of them.
     """
     rt.check_cancel()
+    invocation_id = rt.next_invocation_id()
     was_repeat = rt.has_query(tool_name, query)
     with rt._lock:
         pre_registered = set(rt.evidence_index)
     rt.emit("tool_started", {"tool_name": tool_name, "query": query})
     started = time.monotonic()
     call_epoch = rt.begin_tool_call()
+    phase_timings: dict[str, int] = {}
+    source_statuses: list[dict[str, Any]] = []
+    try:
+        rt.promote_pooled_candidates()
+    except Exception:
+        pass
+
+    def invocation_diagnostic(status: str, *, admitted: int = 0, error: str = "") -> dict[str, Any]:
+        budget = getattr(rt, "retrieval_budget", None)
+        remaining_callable = getattr(budget, "remaining_seconds", None)
+        calls_used = getattr(budget, "calls_used", 0)
+        diagnostics = [dict(item.get("diagnostics") or {}) for item in source_statuses]
+        return {
+            "invocation_id": invocation_id,
+            "tool_name": tool_name,
+            "query_fingerprint": _query_fingerprint(tool_name, query),
+            "filters": dict(filters or {}),
+            "status": status,
+            "error": error[:300],
+            "admitted_items": admitted,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "phase_timings": dict(phase_timings),
+            "source_operations": {
+                "source_calls": len(source_statuses),
+                "candidate_queries": sum(int(item.get("candidate_queries") or 0) for item in diagnostics),
+                "validation_queries": sum(int(item.get("validation_queries") or 0) for item in diagnostics),
+                "records": sum(int(item.get("records") or 0) for item in diagnostics),
+                "remote_http_calls": sum(int(item.get("remote_http_calls") or 0) for item in diagnostics),
+            },
+            "budget_calls_used": int(calls_used or 0) if not callable(calls_used) else int(calls_used()),
+            "budget_remaining_seconds": (round(float(remaining_callable()), 3)
+                                         if callable(remaining_callable) else None),
+        }
     try:
         from src.core.concurrency import governor_acquire
 
+        governor_started = time.monotonic()
         with governor_acquire("tool", interactive=True):
+            phase_timings["queue_wait_ms"] = int((time.monotonic() - governor_started) * 1000)
+            execution_started = time.monotonic()
             items = fn()
+            phase_timings["tool_execution_ms"] = int((time.monotonic() - execution_started) * 1000)
         # Late results from a cancelled run must never be registered as
         # evidence (P0-007); re-check cancellation after the call returns.
         rt.check_cancel()
@@ -515,6 +769,7 @@ def timed_tool_call(
             },
         )
         rt.end_tool_call(call_epoch)
+        rt.record_invocation(invocation_diagnostic("failed", error=str(exc)))
         return AdmittedEvidence(), False
     source_statuses = [dict(item) for item in getattr(items, "source_statuses", [])]
     fusion_summary = dict(getattr(items, "fusion_summary", {}) or {})
@@ -526,28 +781,46 @@ def timed_tool_call(
     except Exception:
         pass
     rt.log_query(tool_name, query)
-    numbers = rt.add_evidence(items, epoch=call_epoch)
+    navigation_only = bool(items) and all(
+        str((item.metadata or {}).get("evidence_role") or "") == "navigation" for item in items
+    )
+    if navigation_only:
+        for item in items:
+            item.metadata = {**item.metadata, "citation_number": 0}
+        numbers = CitationAdmission([None for _ in items], previously_registered=rt.evidence_index)
+        admitted_items = AdmittedEvidence(items)
+    else:
+        numbers = rt.add_evidence(items, epoch=call_epoch)
+        admitted_items = AdmittedEvidence()
     rt.end_tool_call(call_epoch)
-    admitted_items: AdmittedEvidence = AdmittedEvidence()
     admitted_items.source_statuses = source_statuses
     admitted_items.fusion_summary = fusion_summary
     admitted_items.previous_evidence_ids = numbers.previously_registered
-    for item, number in zip(items, numbers):
-        if number is None:
-            continue
-        item.metadata = {**item.metadata, "citation_number": number}
-        admitted_items.append(item)
+    if not navigation_only:
+        for item, number in zip(items, numbers):
+            if number is None:
+                continue
+            item.metadata = {**item.metadata, "citation_number": number}
+            admitted_items.append(item)
+    rt.record_invocation(invocation_diagnostic(
+        "ok", admitted=0 if navigation_only else len(admitted_items),
+        error="budget_discarded" if items and not admitted_items else "",
+    ))
     if fusion_summary:
         with rt._lock:
             fusion_summary["runtime_admission"] = {
                 "admitted_items": len(admitted_items),
                 "budget_discarded": sum(number is None for number in numbers),
+                "rejection_reasons": dict(getattr(rt, "last_rejection_reasons", {}) or {}),
                 "coverage": {
                     source.kb_id: any(item.metadata.get("kb_id") == source.kb_id for item in admitted_items)
                     for source in rt.knowledge_scope.sources
                 },
                 "turn_context_used": sum(_evidence_context_cost(item) for item in rt.evidence),
             }
+            plan = getattr(rt, "turn_evidence_plan", None)
+            if plan is not None:
+                fusion_summary["runtime_admission"]["target_coverage"] = plan.coverage_snapshot()
     if source_statuses:
         rt.record_multi_kb_result(source_statuses, fusion_summary)
     # Distinguish "the source has nothing" from "the run already holds its
@@ -650,7 +923,14 @@ def _evidence_context_cost(item: Evidence) -> int:
     return max(rendered_cost, int(item.metadata.get("context_token_estimate") or 0))
 
 
-def format_tool_result(rt: ToolRuntime, adds_nothing: bool, items: list[Evidence]) -> str:
+def format_navigation_for_llm(items: list[Evidence]) -> str:
+    return "\n\n".join(
+        f'<kb_navigation source="{item.source_name}">\n{str(item.content or "")[:MAX_EVIDENCE_CONTENT_CHARS]}\n</kb_navigation>'
+        for item in items
+    )
+
+
+def _format_tool_result_inner(rt: ToolRuntime, adds_nothing: bool, items: list[Evidence]) -> str:
     """Render a tool result for the model, collapsing no-op repeat calls.
 
     A repeated (tool, query) that returned only already-registered evidence
@@ -686,6 +966,8 @@ def format_tool_result(rt: ToolRuntime, adds_nothing: bool, items: list[Evidence
             "（未找到相关内容）",
             budget_blocked=bool(getattr(items, "budget_blocked", False)),
         ))
+    if all(str((item.metadata or {}).get("evidence_role") or "") == "navigation" for item in items):
+        return with_status_message(format_navigation_for_llm(items))
     if adds_nothing:
         with rt._lock:
             numbers = sorted({int(rt.evidence_index[item.id]) for item in items})
@@ -705,3 +987,19 @@ def format_tool_result(rt: ToolRuntime, adds_nothing: bool, items: list[Evidence
                 f"{format_evidence_for_llm(fresh)}\n\n已注册证据 {cited} 的正文见此前检索结果。"
             )
     return with_status_message(format_evidence_for_llm(items))
+
+
+def format_tool_result(rt: ToolRuntime, adds_nothing: bool, items: list[Evidence]) -> str:
+    rendered = _format_tool_result_inner(rt, adds_nothing, items)
+    plan = getattr(rt, "turn_evidence_plan", None)
+    if plan is not None:
+        try:
+            coverage = plan.coverage_snapshot()
+        except Exception:
+            coverage = {}
+        if coverage.get("complete"):
+            rendered += (
+                "\n\n（本轮所有目标/查询义务均已取得已编号证据；"
+                "请停止继续检索，直接基于现有证据作答。）"
+            )
+    return rendered

@@ -111,5 +111,8 @@ class DocumentManager:
     def clear_finished_parse_tasks(self, kb_name: str | None = None, ctx: RequestContext | None = None):
         self.processing_backend.clear_finished_parse_tasks(kb_name, ctx=ctx)
 
-    def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None):
-        return self.processing_backend.get_parse_result(kb_name, document_id, ctx=ctx)
+    def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None,
+                         *, deadline: float | None = None, should_cancel=None):
+        return self.processing_backend.get_parse_result(
+            kb_name, document_id, ctx=ctx, deadline=deadline, should_cancel=should_cancel,
+        )

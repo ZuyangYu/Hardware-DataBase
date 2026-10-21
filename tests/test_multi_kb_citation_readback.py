@@ -31,8 +31,9 @@ def citations(tmp_path, auth_scope):
 
     class Pipeline:
         document_store = documents
+        backend = SimpleNamespace(store=documents)
 
-        def get_parse_result(self, kb_name, document_id, ctx=None):
+        def get_parse_result(self, kb_name, document_id, ctx=None, *, deadline=None):
             assert document_id == f"ragflow:{records[kb_name].id}"
             assert ctx.metadata["kb_id"] == ids[kb_name]
             return SimpleNamespace(chunks=[
@@ -63,6 +64,17 @@ def test_same_file_and_chunk_names_read_actual_selected_kb(citations):
     assert result.json()["content"] == "B selected chunk"
     assert result.json()["kb_id"] == records["B"].kb_id
     assert result.json()["local_record_id"] == records["B"].id
+
+
+def test_citation_readback_uses_backend_store_when_pipeline_has_no_legacy_store_attribute(citations):
+    client, _, records = citations
+    pipeline = client.app.dependency_overrides[get_pipeline]
+    delattr(pipeline, "document_store")
+
+    result = client.post("/api/v1/citations/resolve", json=payload(records["B"]))
+
+    assert result.status_code == 200, result.text
+    assert result.json()["content"] == "B selected chunk"
 
 
 def test_citation_record_cannot_be_substituted_from_another_selected_kb(citations):
@@ -179,3 +191,74 @@ def test_spreadsheet_readback_uses_exact_sheet_row_and_rejects_other_record(inde
     assert content == "Component: U1; Voltage: 5V"
     assert read_citation_content(pipeline, record, ctx, {"sheet_name": "other", "row_index": 2}) is None
     assert read_citation_content(pipeline, record, ctx, {"sheet_name": "Power", "row_index": 3}) is None
+
+
+@pytest.mark.parametrize("status, error_code, http_status, detail", [
+    ("access_denied", None, 403, "citation_access_denied"),
+    ("source_changed", None, 409, "citation_source_changed"),
+    ("filter_unsupported", "citation_processor_unsupported", 422, "citation_processor_unsupported"),
+    ("timeout", "citation_readback_timeout", 504, "citation_readback_timeout"),
+    ("source_unavailable", "citation_readback_incomplete", 502, "citation_readback_incomplete"),
+    ("source_unavailable", "citation_source_unavailable", 503, "citation_source_unavailable"),
+    ("cancelled", "cancelled", 503, "citation_source_unavailable"),
+])
+def test_citation_read_failures_map_to_explicit_http_contract(citations, monkeypatch, status, error_code, http_status, detail):
+    from src.pipelines.document_rag.schemas import ScopedRetrievalError
+
+    client, _, records = citations
+    pipeline = client.app.dependency_overrides[get_pipeline]
+
+    def fail(*_args, **_kwargs):
+        raise ScopedRetrievalError(status, error_code)
+
+    monkeypatch.setattr(pipeline, "get_parse_result", fail)
+    result = client.post("/api/v1/citations/resolve", json=payload(records["B"]))
+    assert result.status_code == http_status, result.text
+    assert result.json()["detail"] == detail
+    assert "selected chunk" not in result.text
+
+
+def test_preview_read_failures_are_not_reported_as_missing_chunks(citations, monkeypatch):
+    from src.pipelines.document_rag.schemas import ScopedRetrievalError
+
+    client, _, records = citations
+    pipeline = client.app.dependency_overrides[get_pipeline]
+    record = records["A"]
+
+    def fail(*_args, **_kwargs):
+        raise ScopedRetrievalError("source_unavailable", "citation_readback_incomplete")
+
+    monkeypatch.setattr(pipeline, "get_parse_result", fail)
+    monkeypatch.setattr("src.api.routes.files.build_context_for_user", lambda *_a, **_k: _preview_ctx(record))
+    result = client.get(f"/api/v1/kbs/A/files/ragflow:{record.id}/chunks")
+    assert result.status_code == 502
+    assert result.json()["detail"] == "citation_readback_incomplete"
+
+
+def test_preview_unsupported_processor_is_not_reported_as_missing(citations, monkeypatch):
+    from src.pipelines.document_rag.schemas import ScopedRetrievalError
+
+    client, _, records = citations
+    pipeline = client.app.dependency_overrides[get_pipeline]
+    record = records["A"]
+
+    def fail(*_args, **_kwargs):
+        raise ScopedRetrievalError("filter_unsupported", "citation_processor_unsupported")
+
+    monkeypatch.setattr(pipeline, "get_parse_result", fail)
+    monkeypatch.setattr("src.api.routes.files.build_context_for_user", lambda *_a, **_k: _preview_ctx(record))
+    result = client.get(f"/api/v1/kbs/A/files/ragflow:{record.id}/chunks")
+    assert result.status_code == 422
+    assert result.json()["detail"] == "citation_processor_unsupported"
+
+
+def _preview_ctx(record):
+    from src.pipelines.document_rag.schemas import RequestContext
+
+    department_id = str(record.department_id)
+    return RequestContext(
+        user_id="reader", roles=[], allowed_kbs=["A"],
+        kb_permissions={f"{department_id}:A": "admin"},
+        metadata={"resource_department_id": department_id, "department_id": department_id,
+                  "kb_id": record.kb_id},
+    )

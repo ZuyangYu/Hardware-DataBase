@@ -51,6 +51,11 @@ def store(request, tmp_path):
     try:
         with psycopg.connect(make_conninfo(**{**params, "dbname": name}), autocommit=True) as conn:
             apply_schema(conn, include_indexes=True)
+            from src.quality.store import initialize_schema
+            from src.storage.control_plane.sql_adapter import PgSqlAdapterConnection
+            from psycopg.rows import dict_row
+            conn.row_factory = dict_row
+            initialize_schema(PgSqlAdapterConnection(conn))
         service = PostgresConversationService(make_conninfo(**{**params, "dbname": name}))
         try:
             yield service, 1
@@ -74,6 +79,9 @@ def test_scope_roundtrip_survives_list_claim_and_new_service(store):
     turn = service.create_turn(user, session.id, "compare supplies", knowledge_scope=scope)
     assert turn.knowledge_scope == scope.model_dump(mode="json")
     assert turn.knowledge_selection_hash == scope.selection_hash
+    assert turn.summary["source_dependencies"] == {
+        "version": 1, "kb_ids": [101, 205], "inherited_turn_ids": [], "complete": True,
+    }
     assert len(turn.knowledge_request_fingerprint) == 64
     assert service.list_sessions(user)[0].knowledge_selection_hash == scope.selection_hash
     claimed = service.claim_turn(user, turn.id, "worker-new")
@@ -101,6 +109,32 @@ def test_legacy_defaults_and_replay_remain_compatible(store):
     assert session.knowledge_selection is None
     assert turn.knowledge_scope is None
     assert turn.knowledge_selection_hash == turn.knowledge_request_fingerprint == ""
+
+
+def test_history_citations_preserve_source_readback_identity(store):
+    service, user = store
+    scope = snapshot(user)
+    session = create(service, user, scope)
+    turn = service.create_turn(user, session.id, "voltage", knowledge_scope=scope)
+    metadata = {
+        "citation_number": 1, "kb_id": 205, "kb_name": "KB205", "local_record_id": 7,
+        "source_content_hash": "a" * 64, "source_version_id": "version-2",
+        "revision": "B", "approval_status": "pending", "index_revision": 3,
+        "processing_artifact_id": "", "processor_version": "", "evidence_text_hash": "b" * 64,
+        "knowledge_source": {"kb_id": 205, "kb_name": "KB205", "role": "reference"},
+    }
+    summary = {**turn.summary, "evidence": [{
+        "id": "document:205:claim", "source_name": "spec.pdf", "content_kind": "document_text",
+        "content": "raw evidence " * 100, "locator": {"chunk_id": "chunk-2"},
+        "metadata": {**metadata, "internal_diagnostics": "not part of citation readback"},
+    }]}
+    service.complete_turn(user, turn.id, "The candidate is 12 V [1].", summary)
+
+    message = next(row for row in service.list_messages(user, session.id) if row.id == turn.assistant_message_id)
+
+    assert message.citations[0]["metadata"] == metadata
+    assert message.citations[0]["locator"] == {"chunk_id": "chunk-2"}
+    assert len(message.citations[0]["content"]) == 240
 
 
 def test_new_protocol_replay_ignores_snapshot_nonce_and_authorization_time(store):

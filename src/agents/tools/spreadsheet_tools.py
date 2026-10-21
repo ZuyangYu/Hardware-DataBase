@@ -51,6 +51,74 @@ _CJK_NOISY_NGRAMS = frozenset({"电电", "围使", "存容", "源网", "络名"}
 _BOILERPLATE_MARKERS = ("填写说明", "template instructions", "封面", "cover", "模板变更历史")
 
 
+def _find_pin_column(connection, record_id: int, sheet_name: str, pin_field: str) -> str | None:
+    """Resolve the pin-number column from the sheet's own header row."""
+    import json
+
+    wanted = {str(pin_field or "").strip().casefold(), "管脚号", "pin number", "pin no.", "pin", "引脚号"}
+    wanted.discard("")
+    try:
+        rows = connection.execute(
+            "SELECT values_json FROM table_semantic_rows WHERE record_id = ? AND sheet_name = ? ORDER BY row_index",
+            (record_id, sheet_name),
+        ).fetchall()
+    except Exception:
+        return None
+    for row in rows:
+        try:
+            values = json.loads(row["values_json"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        for key, value in (values or {}).items():
+            if str(value).strip().casefold() in wanted:
+                return str(key)
+    return None
+
+
+def _row_matches_pin(row, pin_value: str, pin_field: str = "", pin_key: str | None = None) -> bool:
+    import json
+    import re
+
+    try:
+        values = json.loads(row["values_json"] or "{}")
+    except (TypeError, ValueError):
+        values = {}
+    if pin_key and pin_key in values:
+        return str(values[pin_key]).strip() == str(pin_value).strip()
+    field = pin_field.casefold()
+    key_found = False
+    for key, value in (values or {}).items():
+        key_text = str(key).casefold()
+        key_matches = bool(field and field in key_text) or "pin number" in key_text or key_text in {"pin", "pin no.", "管脚号", "引脚号"}
+        if not key_matches:
+            continue
+        key_found = True
+        if str(value).strip() == str(pin_value).strip():
+            return True
+    if key_found:
+        return False
+    text = f"{row['semantic_text'] or ''}\n{row['raw_text'] or ''}"
+    patterns = (
+        rf"(?:第\s*{re.escape(str(pin_value))}\s*脚|管脚(?:号)?\s*[:：]?\s*{re.escape(str(pin_value))}(?!\d)|"
+        rf"pin\s*(?:number|no\.?)?\s*[:：#]?\s*{re.escape(str(pin_value))}(?!\d))"
+    )
+    return bool(re.search(patterns, text, re.IGNORECASE))
+
+
+def _query_relevance_score(text: str, tokens: list[str], confidence: float = 0.0) -> float:
+    """Bounded query-match score; parser confidence only breaks ties.
+
+    The adapters sort candidates by ``Evidence.score``; assigning the parser's
+    confidence there made an unrelated high-confidence row outrank a row that
+    actually matched the question. Keep the two signals separate.
+    """
+    matched = {token for token in tokens if token in str(text or "").casefold()}
+    if not matched:
+        return float(confidence or 0.0) / 1_000_000
+    return len(matched) + sum(len(token) for token in matched) / 1000.0 + float(confidence or 0.0) / 1_000_000
+
+
+
 def _knowledge_base_scope(
     service: SpreadsheetIndexService,
     kb_name: str,
@@ -165,7 +233,64 @@ def _like_clauses(columns: list[str], tokens: list[str]) -> tuple[str, list[str]
     return "(" + " OR ".join(clauses) + ")", params
 
 
-def _semantic_rows(rt, service: SpreadsheetIndexService, query: str, top_k: int) -> list[Evidence]:
+def _authoritative_metadata(rt, document_store, row, locator: dict, content: str, base: dict) -> dict:
+    """Bind a legacy spreadsheet row to its authoritative document record."""
+    metadata = dict(base)
+    record = None
+    if document_store is not None:
+        ctx_metadata = getattr(rt.ctx, "metadata", {}) or {}
+        department_id = str(ctx_metadata.get("resource_department_id") or ctx_metadata.get("department_id") or "")
+        try:
+            record = document_store.get_document_by_id_scoped(int(row["record_id"]), department_id)
+        except Exception:
+            record = None
+    if record is None:
+        return metadata
+    if record.kb_name != rt.kb_name or record.processor_kind != "spreadsheet_table":
+        return metadata
+    index_hash = row["index_content_hash"] if "index_content_hash" in row.keys() else ""
+    if index_hash and index_hash != record.content_hash:
+        return metadata
+    from hashlib import sha256
+
+    metadata.update({
+        "tenant_key": str(getattr(rt.ctx, "tenant_id", None) or "default"),
+        "kb_id": record.kb_id if record.kb_id not in (0, None) else int(row["index_kb_id"] or 0),
+        "kb_name": record.kb_name,
+        "department_id": str(record.department_id),
+        "local_record_id": int(record.id),
+        "source_content_hash": str(record.content_hash or ""),
+        "remote_document_id": str(record.document_id or ""),
+        "source_version_id": record.source_version_id,
+        "revision": record.revision,
+        "approval_status": record.approval_status,
+        "project_id": record.project_id,
+        "processor_kind": "spreadsheet_table",
+        "chunk_or_structured_locator": dict(locator),
+        "locator": dict(locator),
+        "index_revision": int(getattr(record, "index_revision", 0) or 0),
+        "processing_artifact_id": str(getattr(record, "processing_artifact_id", "") or ""),
+        "processor_version": str(getattr(record, "processor_version", "") or ""),
+        "evidence_text_hash": sha256(content.encode("utf-8")).hexdigest(),
+    })
+    try:
+        from src.services.evidence_fusion import evidence_identity
+
+        metadata["authoritative_evidence_identity"] = evidence_identity(metadata)
+    except Exception:
+        pass
+    return metadata
+
+
+def _target_record_ids(rt, target: str | None = None) -> list[int]:
+    targets = getattr(getattr(rt, "turn_retrieval_targets", None), "targets", ()) or ()
+    if target is not None:
+        targets = tuple(item for item in targets if item.target_id == target)
+    return sorted({int(item.record_id) for item in targets})
+
+
+def _semantic_rows(rt, service: SpreadsheetIndexService, query: str, top_k: int,
+                   target: str | None = None) -> list[Evidence]:
     scope = _knowledge_base_scope(
         service, rt.kb_name, rt.ctx, "search spreadsheet semantic rows in"
     )
@@ -174,9 +299,14 @@ def _semantic_rows(rt, service: SpreadsheetIndexService, query: str, top_k: int)
         return []
     tokens = _tokens(query)
     where, params = _like_clauses(["r.semantic_text", "r.raw_text"], tokens)
+    target_ids = _target_record_ids(rt, target)
+    if target_ids:
+        where = f"({where}) AND r.record_id IN ({','.join('?' for _ in target_ids)})"
+        params.extend(target_ids)
     params.append(max(1, int(top_k)))
     sql = f"""
-        SELECT r.*, d.document_name, d.source_group
+        SELECT r.*, d.document_name, d.source_group,
+               d.content_hash AS index_content_hash, d.kb_id AS index_kb_id
         FROM table_semantic_rows r
         JOIN table_documents d ON d.record_id = r.record_id
         WHERE {where}
@@ -194,38 +324,49 @@ def _semantic_rows(rt, service: SpreadsheetIndexService, query: str, top_k: int)
         except sqlite3.Error:
             return []
     evidences = []
-    for row in rows:
+    for rank, row in enumerate(rows, 1):
         values = json.loads(row["values_json"] or "{}")
         raw_values = json.loads(row["raw_values_json"] or "{}")
+        content = row["semantic_text"] or row["raw_text"]
+        locator = {
+            "record_id": row["record_id"],
+            "sheet_name": row["sheet_name"],
+            "row_index": row["row_index"],
+            "header_row_index": row["header_row_index"],
+            "cell_ref": row.get("cell_ref") if "cell_ref" in row.keys() else None,
+        }
+        metadata = _authoritative_metadata(rt, getattr(rt, "document_store", None), row, locator, content, {
+            "tool": "spreadsheet_row_search",
+            "query": query,
+            "raw_text": row["raw_text"],
+            "values": values,
+            "raw_values": raw_values,
+            "confidence": row["confidence"],
+            "parser_confidence": float(row["confidence_score"] or 0.0),
+            "retriever_rank": rank,
+            "source_group": row["source_group"],
+        })
+        if getattr(rt, "document_store", None) is not None and "local_record_id" not in metadata:
+            continue
+        relevance = _query_relevance_score(content, tokens, float(row["confidence_score"] or 0.0))
+        metadata["query_relevance"] = relevance
         evidences.append(
             Evidence(
                 id=f"xlsx:{row['record_id']}:{row['sheet_name']}:{row['row_index']}:semantic",
-                content=row["semantic_text"] or row["raw_text"],
+                content=content,
                 source_name=row["document_name"],
                 content_kind="spreadsheet_table",
                 processor_kind="spreadsheet_table",
-                score=float(row["confidence_score"] or 0.0),
-                locator={
-                    "record_id": row["record_id"],
-                    "sheet_name": row["sheet_name"],
-                    "row_index": row["row_index"],
-                    "header_row_index": row["header_row_index"],
-                },
-                metadata={
-                    "tool": "spreadsheet_row_search",
-                    "query": query,
-                    "raw_text": row["raw_text"],
-                    "values": values,
-                    "raw_values": raw_values,
-                    "confidence": row["confidence"],
-                    "source_group": row["source_group"],
-                },
+                score=relevance,
+                locator=locator,
+                metadata=metadata,
             )
         )
     return evidences
 
 
-def _cell_rows(rt, service: SpreadsheetIndexService, query: str, top_k: int) -> list[Evidence]:
+def _cell_rows(rt, service: SpreadsheetIndexService, query: str, top_k: int,
+               target: str | None = None) -> list[Evidence]:
     scope = _knowledge_base_scope(
         service, rt.kb_name, rt.ctx, "search spreadsheet cells in"
     )
@@ -234,9 +375,14 @@ def _cell_rows(rt, service: SpreadsheetIndexService, query: str, top_k: int) -> 
         return []
     tokens = _tokens(query)
     where, params = _like_clauses(["c.value", "c.raw_value", "c.header"], tokens)
+    target_ids = _target_record_ids(rt, target)
+    if target_ids:
+        where = f"({where}) AND c.record_id IN ({','.join('?' for _ in target_ids)})"
+        params.extend(target_ids)
     params.append(max(1, int(top_k)))
     sql = f"""
-        SELECT c.*, d.document_name, d.source_group
+        SELECT c.*, d.document_name, d.source_group,
+               d.content_hash AS index_content_hash, d.kb_id AS index_kb_id
         FROM table_cells c
         JOIN table_documents d ON d.record_id = c.record_id
         WHERE {where}
@@ -253,38 +399,49 @@ def _cell_rows(rt, service: SpreadsheetIndexService, query: str, top_k: int) -> 
             rows = conn.execute(sql, params).fetchall()
         except sqlite3.Error:
             return []
-    return [
-        Evidence(
-            id=f"xlsx:{row['record_id']}:{row['sheet_name']}:{row['cell_ref']}:cell",
-            content=f"{row['header'] or 'Cell'}: {row['value']}",
-            source_name=row["document_name"],
-            content_kind="spreadsheet_table",
-            processor_kind="spreadsheet_table",
-            score=1.0,
-            locator={
-                "record_id": row["record_id"],
-                "sheet_name": row["sheet_name"],
-                "row_index": row["row_index"],
-                "col_index": row["col_index"],
-                "cell_ref": row["cell_ref"],
-            },
-            metadata={
-                "tool": "spreadsheet_cell_lookup",
-                "query": query,
-                "header": row["header"],
-                "raw_value": row["raw_value"],
-                "number_format": row["number_format"],
-                "source_group": row["source_group"],
-            },
+    evidences = []
+    for rank, row in enumerate(rows, 1):
+        content = f"{row['header'] or 'Cell'}: {row['value']}"
+        locator = {
+            "record_id": row["record_id"],
+            "sheet_name": row["sheet_name"],
+            "row_index": row["row_index"],
+            "col_index": row["col_index"],
+            "cell_ref": row["cell_ref"],
+        }
+        metadata = _authoritative_metadata(rt, getattr(rt, "document_store", None), row, locator, content, {
+            "tool": "spreadsheet_cell_lookup",
+            "query": query,
+            "header": row["header"],
+            "raw_value": row["raw_value"],
+            "number_format": row["number_format"],
+            "retriever_rank": rank,
+            "source_group": row["source_group"],
+        })
+        if getattr(rt, "document_store", None) is not None and "local_record_id" not in metadata:
+            continue
+        relevance = _query_relevance_score(
+            f"{row['header'] or ''}\n{row['value'] or ''}\n{row['raw_value'] or ''}", tokens,
         )
-        for row in rows
-    ]
+        metadata["query_relevance"] = relevance
+        evidences.append(
+            Evidence(
+                id=f"xlsx:{row['record_id']}:{row['sheet_name']}:{row['cell_ref']}:cell",
+                content=content,
+                source_name=row["document_name"],
+                content_kind="spreadsheet_table",
+                processor_kind="spreadsheet_table",
+                score=relevance,
+                locator=locator,
+                metadata=metadata,
+            )
+        )
+    return evidences
 
 
 def make_spreadsheet_tools(rt, spreadsheet_service: SpreadsheetIndexService):
     """Return the two spreadsheet tool closures bound to this run."""
-
-    def spreadsheet_row_search(query: str, top_k: int = rt.top_k) -> str:
+    def spreadsheet_row_search(query: str, top_k: int = rt.top_k, target: str | None = None) -> str:
         """按语义检索 Excel 表格行, 只适合取"具体某行/某个值"这类单点信息。
         注意: 统计数量、求和、最值、均值、按条件筛选多行、数值比较等问题用本工具会漏行漏列,
         必须改用 spreadsheet_schema_lookup + spreadsheet_sql_query 一次完成。"""
@@ -295,11 +452,11 @@ def make_spreadsheet_tools(rt, spreadsheet_service: SpreadsheetIndexService):
             "spreadsheet_row_search",
             query,
             None,
-            lambda: _semantic_rows(rt, spreadsheet_service, query, max(1, min(int(top_k), 20))),
+            lambda: _semantic_rows(rt, spreadsheet_service, query, max(1, min(int(top_k), 20)), target),
         )
         return format_tool_result(rt, adds_nothing, items)
 
-    def spreadsheet_cell_lookup(query: str, top_k: int = rt.top_k) -> str:
+    def spreadsheet_cell_lookup(query: str, top_k: int = rt.top_k, target: str | None = None) -> str:
         """按精确值检索单元格（表头/原始值匹配），适合查找具体参数值、型号、数量等。"""
         from src.agents.tools.runtime import format_tool_result, timed_tool_call
 
@@ -308,7 +465,7 @@ def make_spreadsheet_tools(rt, spreadsheet_service: SpreadsheetIndexService):
             "spreadsheet_cell_lookup",
             query,
             None,
-            lambda: _cell_rows(rt, spreadsheet_service, query, max(1, min(int(top_k), 20))),
+            lambda: _cell_rows(rt, spreadsheet_service, query, max(1, min(int(top_k), 20)), target),
         )
         return format_tool_result(rt, adds_nothing, items)
 
@@ -407,28 +564,50 @@ class SpreadsheetSemanticTool:
         if not os.path.exists(db_path):
             return []
         record_id = int((filters or {}).get("record_id") or 0)
+        sheet_name = str((filters or {}).get("sheet_name") or "").strip()
+        row_index = (filters or {}).get("row_index")
+        pin_value = str((filters or {}).get("pin_value") or "").strip()
+        pin_field = str((filters or {}).get("pin_field") or "").strip()
         tokens = _tokens(query)
         columns = ["r.semantic_text", "r.raw_text"]
         where, where_params = _like_clauses(columns, tokens)
         relevance_order, order_params = _token_match_order(columns, tokens)
+        # A resolved locator is the query constraint; do not additionally
+        # require the free-text question tokens to appear in the target row.
+        if pin_value or (isinstance(row_index, int) and not isinstance(row_index, bool) and sheet_name):
+            where, where_params = "1=1", []
         # SQLite binds placeholders in SQL-text order: WHERE, record filter,
-        # then ORDER BY relevance. Keep the parameter list in that order.
+        # locator filters, then ORDER BY relevance.
         params = [*where_params]
         requested_top_k = max(1, int(top_k))
         record_clause = " AND r.record_id = ?" if record_id else ""
         if record_id:
             params.append(record_id)
+        locator_clauses = ""
+        if sheet_name:
+            locator_clauses += " AND r.sheet_name = ?"
+            params.append(sheet_name)
+        if isinstance(row_index, int) and not isinstance(row_index, bool):
+            locator_clauses += " AND r.row_index = ?"
+            params.append(row_index)
+        if pin_value:
+            # Pin matching depends on the header/value mapping. Narrow by the
+            # sheet first and resolve the exact column in Python instead of a
+            # noisy LIKE '%2%' over every numeric value.
+            pass
         params.extend(order_params)
         params.append(_candidate_limit(requested_top_k))
         sql = f"""
             SELECT r.*, d.document_name, d.source_group
             FROM table_semantic_rows r
             JOIN table_documents d ON d.record_id = r.record_id
-            WHERE {where}{record_clause}
+            WHERE {where}{record_clause}{locator_clauses}
             ORDER BY {relevance_order} DESC, r.confidence_score DESC, r.id ASC
             LIMIT ?
         """
-        return self._query_rows(db_path, sql, params, query, tokens, requested_top_k)
+        return self._query_rows(db_path, sql, params, query, tokens, requested_top_k,
+                                pin_value=pin_value, pin_field=pin_field, sheet_name=sheet_name,
+                                record_id=record_id)
 
     def _query_rows(
         self,
@@ -438,6 +617,11 @@ class SpreadsheetSemanticTool:
         query: str,
         tokens: list[str],
         top_k: int,
+        *,
+        pin_value: str = "",
+        pin_field: str = "",
+        sheet_name: str = "",
+        record_id: int = 0,
     ) -> list[Evidence]:
         try:
             conn = sqlite3.connect(db_path, timeout=30)
@@ -449,15 +633,30 @@ class SpreadsheetSemanticTool:
                 rows = conn.execute(sql, params).fetchall()
             except sqlite3.Error:
                 return []
+            pin_key = None
+            if pin_value and sheet_name and record_id:
+                pin_key = _find_pin_column(conn, record_id, sheet_name, pin_field)
+        if pin_value:
+            rows = [row for row in rows if _row_matches_pin(row, pin_value, pin_field, pin_key)]
+        locator_match = bool(pin_value or (sheet_name and isinstance(row_index, int)))
         rows = _rank_rows(
             rows,
             tokens,
             lambda row: f"{row['semantic_text'] or ''}\n{row['raw_text'] or ''}",
         )
+        return self._build_evidence(rows, query, tokens, top_k, locator_match=locator_match)
+
+    def _build_evidence(self, rows, query: str, tokens: list[str], top_k: int,
+                        *, locator_match: bool = False) -> list[Evidence]:
         evidences = []
-        for row in rows:
+        for rank, row in enumerate(rows, 1):
             values = json.loads(row["values_json"] or "{}")
             raw_values = json.loads(row["raw_values_json"] or "{}")
+            parser_confidence = float(row["confidence_score"] or 0.0)
+            relevance = _query_relevance_score(
+                f"{row['semantic_text'] or ''}\n{row['raw_text'] or ''}", tokens, parser_confidence,
+            )
+            score = 1.0 + relevance if locator_match else relevance
             evidences.append(
                 Evidence(
                     id=f"xlsx:{row['record_id']}:{row['sheet_name']}:{row['row_index']}:semantic",
@@ -465,7 +664,7 @@ class SpreadsheetSemanticTool:
                     source_name=row["document_name"],
                     content_kind="spreadsheet_table",
                     processor_kind="spreadsheet_table",
-                    score=float(row["confidence_score"] or 0.0),
+                    score=score,
                     locator={
                         "record_id": row["record_id"],
                         "sheet_name": row["sheet_name"],
@@ -479,11 +678,96 @@ class SpreadsheetSemanticTool:
                         "values": values,
                         "raw_values": raw_values,
                         "confidence": row["confidence"],
+                        "parser_confidence": parser_confidence,
+                        "query_relevance": relevance,
+                        "locator_match": locator_match,
+                        "retriever_rank": rank,
                         "source_group": row["source_group"],
                     },
                 )
             )
         return evidences[:top_k]
+
+    def run_batch(
+        self, query: str, kb_name: str, ctx, record_ids: list[int],
+        locators_by_record: dict[int, tuple], top_k: int = 5,
+    ) -> list[Evidence]:
+        """One parameterized candidate query for every allowed record."""
+        ids = sorted({int(record_id) for record_id in record_ids if int(record_id) > 0})
+        if not ids:
+            return []
+        scope = _knowledge_base_scope(self.spreadsheet_service, kb_name, ctx,
+                                      "search spreadsheet semantic rows in")
+        db_path = scope.db_path
+        if not os.path.exists(db_path):
+            return []
+        tokens = _tokens(query)
+        columns = ["r.semantic_text", "r.raw_text"]
+        where, where_params = _like_clauses(columns, tokens)
+        relevance_order, order_params = _token_match_order(columns, tokens)
+        locators = [locator for record_id in ids for locator in (locators_by_record.get(record_id) or ())]
+        if any(getattr(locator, "pin_value", None) for locator in locators):
+            where, where_params = "1=1", []
+        params = [*where_params]
+        branches = []
+        for record_id in ids:
+            record_locators = tuple(locators_by_record.get(record_id) or ())
+            if not record_locators:
+                branches.append("r.record_id = ?")
+                params.append(record_id)
+                continue
+            for locator in record_locators:
+                branch = ["r.record_id = ?"]
+                branch_params = [record_id]
+                if getattr(locator, "sheet_name", None):
+                    branch.append("r.sheet_name = ?")
+                    branch_params.append(locator.sheet_name)
+                if isinstance(getattr(locator, "row_index", None), int):
+                    branch.append("r.row_index = ?")
+                    branch_params.append(locator.row_index)
+                if getattr(locator, "pin_value", None):
+                    branch.append("(LOWER(r.semantic_text) LIKE ? OR LOWER(r.raw_text) LIKE ? OR LOWER(r.values_json) LIKE ?)")
+                    pattern = f"%{locator.pin_value}%"
+                    branch_params.extend([pattern, pattern, pattern])
+                branches.append("(" + " AND ".join(branch) + ")")
+                params.extend(branch_params)
+        params.extend(order_params)
+        params.append(_candidate_limit(top_k))
+        sql = f"""
+            SELECT r.*, d.document_name, d.source_group
+            FROM table_semantic_rows r
+            JOIN table_documents d ON d.record_id = r.record_id
+            WHERE {where} AND ({" OR ".join(branches)})
+            ORDER BY {relevance_order} DESC, r.confidence_score DESC, r.id ASC
+            LIMIT ?
+        """
+        try:
+            with closing(sqlite3.connect(db_path, timeout=30)) as connection:
+                connection.row_factory = sqlite3.Row
+                rows = connection.execute(sql, params).fetchall()
+                pin_keys = {}
+                for record_id in ids:
+                    for locator in (locators_by_record.get(record_id) or ()):
+                        if getattr(locator, "pin_value", None) and getattr(locator, "sheet_name", None):
+                            pin_keys[(int(record_id), str(locator.sheet_name))] = _find_pin_column(
+                                connection, int(record_id), str(locator.sheet_name),
+                                str(getattr(locator, "pin_field", "") or ""),
+                            )
+        except sqlite3.Error:
+            return []
+        pin_by_record: dict[int, set[str]] = {}
+        for record_id in ids:
+            for locator in (locators_by_record.get(record_id) or ()):
+                if getattr(locator, "pin_value", None):
+                    pin_by_record.setdefault(int(record_id), set()).add(str(locator.pin_value))
+        if pin_by_record:
+            rows = [row for row in rows if any(
+                _row_matches_pin(row, value, "", pin_keys.get((int(row["record_id"]), str(row["sheet_name"]))))
+                for value in pin_by_record.get(int(row["record_id"]), set())
+            )]
+        rows = _rank_rows(rows, tokens, lambda row: f"{row['semantic_text'] or ''}\n{row['raw_text'] or ''}")
+        return self._build_evidence(rows, query, tokens, top_k, locator_match=bool(pin_by_record))
+
 
 
 class SpreadsheetCellTool:
@@ -511,22 +795,43 @@ class SpreadsheetCellTool:
         if not os.path.exists(db_path):
             return []
         record_id = int((filters or {}).get("record_id") or 0)
+        sheet_name = str((filters or {}).get("sheet_name") or "").strip()
+        row_index = (filters or {}).get("row_index")
+        cell_ref = str((filters or {}).get("cell_ref") or "").strip().upper()
+        pin_value = str((filters or {}).get("pin_value") or "").strip()
+        pin_field = str((filters or {}).get("pin_field") or "").strip()
         tokens = _tokens(query)
         columns = ["c.value", "c.raw_value", "c.header"]
         where, where_params = _like_clauses(columns, tokens)
         relevance_order, order_params = _token_match_order(columns, tokens)
+        if pin_value or cell_ref or (isinstance(row_index, int) and not isinstance(row_index, bool) and sheet_name):
+            where, where_params = "1=1", []
         params = [*where_params]
         requested_top_k = max(1, int(top_k))
         record_clause = " AND c.record_id = ?" if record_id else ""
         if record_id:
             params.append(record_id)
+        locator_clauses = ""
+        if sheet_name:
+            locator_clauses += " AND c.sheet_name = ?"
+            params.append(sheet_name)
+        if isinstance(row_index, int) and not isinstance(row_index, bool):
+            locator_clauses += " AND c.row_index = ?"
+            params.append(row_index)
+        if cell_ref:
+            locator_clauses += " AND UPPER(c.cell_ref) = ?"
+            params.append(cell_ref)
+        if pin_value:
+            header_pattern = f"%{pin_field.casefold()}%" if pin_field else "%pin%"
+            locator_clauses += " AND (LOWER(c.header) LIKE ? OR LOWER(c.header) LIKE '%脚%') AND c.raw_value = ?"
+            params.extend([header_pattern, pin_value])
         params.extend(order_params)
         params.append(_candidate_limit(requested_top_k))
         sql = f"""
             SELECT c.*, d.document_name, d.source_group
             FROM table_cells c
             JOIN table_documents d ON d.record_id = c.record_id
-            WHERE {where}{record_clause}
+            WHERE {where}{record_clause}{locator_clauses}
             ORDER BY {relevance_order} DESC, c.id ASC
             LIMIT ?
         """
@@ -545,32 +850,112 @@ class SpreadsheetCellTool:
             tokens,
             lambda row: f"{row['header'] or ''}\n{row['value'] or ''}\n{row['raw_value'] or ''}",
         )
-        return [
-            Evidence(
-                id=f"xlsx:{row['record_id']}:{row['sheet_name']}:{row['cell_ref']}:cell",
-                content=f"{row['header'] or 'Cell'}: {row['value']}",
-                source_name=row["document_name"],
-                content_kind="spreadsheet_table",
-                processor_kind="spreadsheet_table",
-                score=1.0,
-                locator={
-                    "record_id": row["record_id"],
-                    "sheet_name": row["sheet_name"],
-                    "row_index": row["row_index"],
-                    "col_index": row["col_index"],
-                    "cell_ref": row["cell_ref"],
-                },
-                metadata={
-                    "tool": self.name,
-                    "query": query,
-                    "header": row["header"],
-                    "raw_value": row["raw_value"],
-                    "number_format": row["number_format"],
-                    "source_group": row["source_group"],
-                },
+        return self._build_evidence(rows, query, tokens, requested_top_k,
+                                    locator_match=bool(pin_value or cell_ref or isinstance(row_index, int)))
+
+    def _build_evidence(self, rows, query: str, tokens: list[str], top_k: int,
+                        *, locator_match: bool = False) -> list[Evidence]:
+        evidences = []
+        for rank, row in enumerate(rows, 1):
+            parser_confidence = float(row["confidence_score"] or 0.0) if "confidence_score" in row.keys() else 0.0
+            relevance = _query_relevance_score(
+                f"{row['header'] or ''}\n{row['value'] or ''}\n{row['raw_value'] or ''}", tokens, parser_confidence,
             )
-            for row in rows[:requested_top_k]
-        ]
+            evidences.append(
+                Evidence(
+                    id=f"xlsx:{row['record_id']}:{row['sheet_name']}:{row['cell_ref']}:cell",
+                    content=f"{row['header'] or 'Cell'}: {row['value']}",
+                    source_name=row["document_name"],
+                    content_kind="spreadsheet_table",
+                    processor_kind="spreadsheet_table",
+                    score=1.0 + relevance if locator_match else relevance,
+                    locator={
+                        "record_id": row["record_id"],
+                        "sheet_name": row["sheet_name"],
+                        "row_index": row["row_index"],
+                        "col_index": row["col_index"],
+                        "cell_ref": row["cell_ref"],
+                    },
+                    metadata={
+                        "tool": self.name,
+                        "query": query,
+                        "header": row["header"],
+                        "raw_value": row["raw_value"],
+                        "number_format": row["number_format"],
+                        "parser_confidence": parser_confidence,
+                        "query_relevance": relevance,
+                        "retriever_rank": rank,
+                        "source_group": row["source_group"],
+                    },
+                )
+            )
+        return evidences[:top_k]
+
+    def run_batch(
+        self, query: str, kb_name: str, ctx, record_ids: list[int],
+        locators_by_record: dict[int, tuple], top_k: int = 5,
+    ) -> list[Evidence]:
+        """One parameterized cell query for every allowed record."""
+        ids = sorted({int(record_id) for record_id in record_ids if int(record_id) > 0})
+        if not ids:
+            return []
+        scope = _knowledge_base_scope(self.spreadsheet_service, kb_name, ctx,
+                                      "search spreadsheet cells in")
+        db_path = scope.db_path
+        if not os.path.exists(db_path):
+            return []
+        tokens = _tokens(query)
+        columns = ["c.value", "c.raw_value", "c.header"]
+        where, where_params = _like_clauses(columns, tokens)
+        relevance_order, order_params = _token_match_order(columns, tokens)
+        locators = [locator for record_id in ids for locator in (locators_by_record.get(record_id) or ())]
+        if any(getattr(locator, "pin_value", None) or getattr(locator, "cell_ref", None) for locator in locators):
+            where, where_params = "1=1", []
+        params = [*where_params]
+        branches = []
+        for record_id in ids:
+            record_locators = tuple(locators_by_record.get(record_id) or ())
+            if not record_locators:
+                branches.append("c.record_id = ?")
+                params.append(record_id)
+                continue
+            for locator in record_locators:
+                branch = ["c.record_id = ?"]
+                branch_params = [record_id]
+                if getattr(locator, "sheet_name", None):
+                    branch.append("c.sheet_name = ?")
+                    branch_params.append(locator.sheet_name)
+                if isinstance(getattr(locator, "row_index", None), int):
+                    branch.append("c.row_index = ?")
+                    branch_params.append(locator.row_index)
+                if getattr(locator, "cell_ref", None):
+                    branch.append("UPPER(c.cell_ref) = ?")
+                    branch_params.append(locator.cell_ref.upper())
+                if getattr(locator, "pin_value", None):
+                    header_pattern = f"%{(getattr(locator, 'pin_field', '') or 'pin').casefold()}%"
+                    branch.append("(LOWER(c.header) LIKE ? OR LOWER(c.header) LIKE '%脚%') AND c.raw_value = ?")
+                    branch_params.extend([header_pattern, locator.pin_value])
+                branches.append("(" + " AND ".join(branch) + ")")
+                params.extend(branch_params)
+        params.extend(order_params)
+        params.append(_candidate_limit(top_k))
+        sql = f"""
+            SELECT c.*, d.document_name, d.source_group
+            FROM table_cells c
+            JOIN table_documents d ON d.record_id = c.record_id
+            WHERE {where} AND ({" OR ".join(branches)})
+            ORDER BY {relevance_order} DESC, c.id ASC
+            LIMIT ?
+        """
+        try:
+            with closing(sqlite3.connect(db_path, timeout=30)) as connection:
+                connection.row_factory = sqlite3.Row
+                rows = connection.execute(sql, params).fetchall()
+        except sqlite3.Error:
+            return []
+        rows = _rank_rows(rows, tokens, lambda row: f"{row['header'] or ''}\n{row['value'] or ''}\n{row['raw_value'] or ''}")
+        return self._build_evidence(rows, query, tokens, top_k)
+
 
 
 # ---- SQL 只读查询工具(物化表 + sqlglot 校验, TableRAG 式混合检索的 SQL 路) ----
@@ -791,7 +1176,8 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
                         processor_kind="spreadsheet_table",
                         score=1.0,
                         locator={"part": f"{chunk_index}/{len(chunks)}"},
-                        metadata={"tool": "spreadsheet_schema_lookup", "query": query},
+                        metadata={"tool": "spreadsheet_schema_lookup", "query": query,
+                                  "evidence_role": "navigation"},
                     )
                 )
             return evidences
