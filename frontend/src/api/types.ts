@@ -992,6 +992,9 @@ export interface EvaluationKnowledgeBase {
   department_name: string | null;
   physical_exists: boolean;
   registered: boolean;
+  owner_user_id: number | null;
+  owner_username: string | null;
+  evaluation_blocked_reason: string;
 }
 
 export interface EvaluationRunListItem {

@@ -19,6 +19,8 @@ from src.agents.tools.runtime import ToolRuntime
 from src.attachments.models import AttachmentNotFound
 from src.attachments.service import AttachmentService
 from src.attachments.store import AttachmentStore
+from src.core.app_logs import AppLogService
+from src.core.auth import ROLE_SYSTEM_ADMIN, AuthUser
 
 
 def _service(tmp_path, monkeypatch):
@@ -229,6 +231,23 @@ def test_release_tool_resolves_candidate_and_emits_card(tmp_path, monkeypatch):
     cards = [event for event in events if event["type"] == "document_card"]
     assert cards and cards[0]["payload"]["card"]["release_state"] == "pending"
 
+    admin = AuthUser(
+        id=99,
+        username="root",
+        role=ROLE_SYSTEM_ADMIN,
+        is_active=True,
+        department_id=None,
+    )
+    rows = AppLogService(str(tmp_path / "auth.db")).list_audit_events(
+        admin, action="attachment.release_request"
+    )
+    assert len(rows) == 1
+    assert rows[0].target_id == revision.revision_id
+    assert '"source": "chat_tool"' in rows[0].metadata_json
+    # The numeric identity is preserved even when no auth row exists in this
+    # isolated fixture database.
+    assert '"actor_user_id": 11' in rows[0].metadata_json
+
 
 def test_attachment_list_surfaces_candidate_release_state(tmp_path, monkeypatch):
     from src.agents.tools.attachment_tools import make_attachment_list
@@ -336,32 +355,73 @@ def test_release_routes_request_review_and_permission(tmp_path, monkeypatch):
     service, _store = _service(tmp_path, monkeypatch)
     revision = _candidate(service)
     real_reviewer_ctx = attachment_routes._reviewer_ctx
+    review_session = SimpleNamespace(kb_name="ADAS")
     monkeypatch.setattr(attachment_routes, "_require_enabled", lambda: None)
-    monkeypatch.setattr(attachment_routes, "_require_session", lambda *_args: None)
+    monkeypatch.setattr(
+        attachment_routes, "_require_session", lambda *_args: review_session
+    )
     monkeypatch.setattr(attachment_routes, "_attachment_service", lambda: service)
 
+    owner = AuthUser(id=11, username="owner", role="employee", is_active=True, department_id=1)
+    reviewer = AuthUser(
+        id=42, username="reviewer", role="employee", is_active=True, department_id=1
+    )
     requested = attachment_routes.request_attachment_release(
         session_id=7,
         revision_id=revision.revision_id,
         payload=attachment_routes.AttachmentReleaseRequestIn(comment="走审核"),
-        user=SimpleNamespace(id=11),
+        user=owner,
         auth=None,
     )
     assert requested["release_state"] == "pending"
     assert "替换为" in requested["change_summary"]
 
-    monkeypatch.setattr(attachment_routes, "_reviewer_ctx", lambda *_args: None)
+    monkeypatch.setattr(
+        attachment_routes, "_reviewer_ctx", lambda *_args: review_session
+    )
     reviewed = attachment_routes.review_attachment_release(
         session_id=7,
         revision_id=revision.revision_id,
         payload=attachment_routes.AttachmentReleaseReviewIn(
             decision="approve", comment="ok"
         ),
-        user=SimpleNamespace(id=42),
+        user=reviewer,
         auth=None,
     )
     assert reviewed["release_state"] == "approved"
     assert reviewed["released_attachment_id"]
+
+    admin = AuthUser(
+        id=99,
+        username="root",
+        role=ROLE_SYSTEM_ADMIN,
+        is_active=True,
+        department_id=None,
+    )
+    logs = AppLogService(str(tmp_path / "auth.db"))
+    release_requests = logs.list_audit_events(admin, action="attachment.release_request")
+    release_reviews = logs.list_audit_events(admin, action="attachment.release_review")
+    request_started = logs.list_audit_events(
+        admin, action="attachment.release_request.requested"
+    )
+    review_started = logs.list_audit_events(
+        admin, action="attachment.release_review.requested"
+    )
+    assert len(release_requests) == 1
+    assert len(request_started) == 1
+    assert release_requests[0].actor_username == "owner"
+    assert release_requests[0].target_id == revision.revision_id
+    assert release_requests[0].kb_name == "ADAS"
+    assert len(release_reviews) == 1
+    assert len(review_started) == 1
+    assert release_reviews[0].actor_username == "reviewer"
+    assert release_reviews[0].metadata_json.count('"decision": "approve"') == 1
+    request_meta = json.loads(release_requests[0].metadata_json)
+    request_started_meta = json.loads(request_started[0].metadata_json)
+    review_meta = json.loads(release_reviews[0].metadata_json)
+    review_started_meta = json.loads(review_started[0].metadata_json)
+    assert request_meta["attempt_id"] == request_started_meta["attempt_id"]
+    assert review_meta["attempt_id"] == review_started_meta["attempt_id"]
 
     # A reviewer without KB write permission is rejected before the service.
     session = SimpleNamespace(kb_name="ADAS")

@@ -394,8 +394,13 @@ class DocumentPlanSubmissionStore:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                from src.document_authoring import pg_support
+
                 row = conn.execute(
-                    "SELECT * FROM document_plan_submissions WHERE submission_id = ?",
+                    pg_support.for_update(
+                        self,
+                        "SELECT * FROM document_plan_submissions WHERE submission_id = ?",
+                    ),
                     (str(submission_id),),
                 ).fetchone()
                 if row is None or row["status"] in {

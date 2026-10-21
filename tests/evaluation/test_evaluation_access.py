@@ -11,12 +11,13 @@ from src.evaluation.access import (
 from src.evaluation.schemas import EvaluationSample
 
 
-def _kb(kb_id: int, name: str, department_id: int) -> KnowledgeBaseSummary:
+def _kb(kb_id: int, name: str, department_id: int, owner_user_id: int | None = None) -> KnowledgeBaseSummary:
     return KnowledgeBaseSummary(
         name=name,
         kb_id=kb_id,
         department_id=department_id,
         department_name=f"部门-{department_id}",
+        owner_user_id=owner_user_id,
         registered=True,
         physical_exists=False,
     )
@@ -55,6 +56,40 @@ def test_resolve_knowledge_base_uses_id_and_real_department_and_rejects_name_mis
 def test_name_only_resolution_rejects_cross_department_duplicates():
     with pytest.raises(ValueError, match="kb_id"):
         resolve_knowledge_base([_kb(1, "ADAS", 47), _kb(2, "ADAS", 100)], kb_name="ADAS")
+
+
+def test_resolve_knowledge_base_carries_registered_data_owner():
+    binding = resolve_knowledge_base(
+        [_kb(1, "ADAS", 47, owner_user_id=42)],
+        kb_id=1,
+        kb_name="ADAS",
+    )
+
+    assert binding.owner_user_id == 42
+
+    without_owner = resolve_knowledge_base([_kb(1, "ADAS", 47)], kb_id=1)
+    assert without_owner.owner_user_id is None
+
+
+def test_evaluation_retrieval_runs_under_the_kb_owner_identity():
+    """检索身份是 KB 负责人：sysadmin 排评测，但读内容的是 owner 的授权。"""
+    with_owner = normalize_sample_for_binding(
+        _sample("allowed"), _binding_with_owner()
+    )
+    with_owner_context = build_evaluation_context(with_owner)
+    assert with_owner_context.user_id == "42"
+    assert with_owner_context.has_kb_permission("ADAS", "read")
+
+    without_owner = normalize_sample_for_binding(_sample("allowed"), _binding(1, "ADAS", 47))
+    assert build_evaluation_context(without_owner).user_id == "evaluation"
+
+
+def _binding_with_owner():
+    return resolve_knowledge_base(
+        [_kb(1, "ADAS", 47, owner_user_id=42)],
+        kb_id=1,
+        kb_name="ADAS",
+    )
 
 
 def test_select_evaluation_samples_filters_by_kb_before_optional_filters():

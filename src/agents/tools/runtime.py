@@ -145,9 +145,16 @@ class AdmittedEvidence(list):
     keep unpacking ``(items, adds_nothing)``.  Carrying the budget flag on the
     result itself (instead of on the shared runtime) keeps concurrent parallel
     tool calls from attributing another call's budget rejection to themselves.
+
+    ``failure`` carries a tool/backend failure (timeout, unavailable service,
+    permission error).  It must reach the model as a distinct outcome: a
+    failed retrieval is **not** evidence that the knowledge base has no such
+    material, and the model must not answer with a confident negative.
     """
 
     budget_blocked: bool = False
+    failure: str = ""
+    tool_name: str = ""
 
 
 @dataclass
@@ -445,7 +452,10 @@ def timed_tool_call(
             },
         )
         rt.end_tool_call(call_epoch)
-        return AdmittedEvidence(), False
+        failed = AdmittedEvidence()
+        failed.failure = friendly_error_message(exc)
+        failed.tool_name = tool_name
+        return failed, False
     latency_ms = int((time.monotonic() - started) * 1000)
     try:
         from src.observability.metrics import record_agent_tool_call
@@ -535,11 +545,39 @@ def evidence_budget_message(rt: ToolRuntime) -> str:
     )
 
 
+def tool_failure_message(items: list[Evidence]) -> str:
+    """Render a tool/backend failure for the model.
+
+    The distinction matters: "the source returned nothing" is a fact about the
+    knowledge base, while "the tool failed" is a fact about this execution.
+    Conflating them makes the model answer "没有找到" with full confidence when
+    the backend was simply down.
+    """
+    failure = str(getattr(items, "failure", "") or "").strip()
+    if not failure:
+        return ""
+    tool_name = str(getattr(items, "tool_name", "") or "工具").strip()
+    return (
+        f"（本次调用 {tool_name} 失败：{failure}。"
+        "这是工具或后端故障，不代表知识库/附件中没有相关内容。"
+        "请不要据此断言“没有找到”；如需该信息，可重试，"
+        "或如实告知用户本次检索未完成。）"
+    )
+
+
 def empty_result_message(
-    rt: ToolRuntime, default: str, *, budget_blocked: bool = False
+    rt: ToolRuntime,
+    default: str,
+    *,
+    budget_blocked: bool = False,
+    items: list[Evidence] | None = None,
 ) -> str:
     """Return the accurate reason for an empty tool result."""
 
+    if items is not None:
+        failure_message = tool_failure_message(items)
+        if failure_message:
+            return failure_message
     if budget_blocked:
         return evidence_budget_message(rt)
     return default
@@ -565,6 +603,7 @@ def format_tool_result(rt: ToolRuntime, adds_nothing: bool, items: list[Evidence
             rt,
             "（未找到相关内容）",
             budget_blocked=bool(getattr(items, "budget_blocked", False)),
+            items=items,
         )
     if adds_nothing:
         with rt._lock:

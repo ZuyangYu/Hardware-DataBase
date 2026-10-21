@@ -72,6 +72,7 @@ from src.agents.tools.runtime import (
 )
 from src.agents.tools.spreadsheet_tools import make_spreadsheet_sql_tools, make_spreadsheet_tools
 from src.agents.tools.wiki_tools import make_wiki_search
+from src.attachments.audit import begin_attachment_audit, finish_attachment_audit
 from src.circuit.index_service import CircuitIndexService
 from src.core.cancellation import QueryCancelled
 from src.core.conversation import GENERAL_CHAT_KB_NAME
@@ -274,6 +275,14 @@ def _direct_attachment_proposal_answer(
         return None
 
     if cancel_requested:
+        attempt = begin_attachment_audit(
+            action="attachment.proposal_reject",
+            target_type="attachment_edit_proposal",
+            target_id=proposal.proposal_id,
+            actor_user_id=user_id,
+            kb_name=str(getattr(rt, "kb_name", "") or ""),
+            metadata={"session_id": session_id, "source": "chat"},
+        )
         try:
             service.reject_attachment_proposal(
                 proposal_id=proposal.proposal_id,
@@ -282,7 +291,18 @@ def _direct_attachment_proposal_answer(
                 note="用户在对话中取消",
             )
         except Exception as exc:  # noqa: BLE001
+            finish_attachment_audit(
+                attempt,
+                success=False,
+                error_message=str(exc),
+                metadata={"session_id": session_id, "source": "chat"},
+            )
             return f"取消章节修改提案失败：{str(exc)[:200]}"
+        finish_attachment_audit(
+            attempt,
+            success=True,
+            metadata={"session_id": session_id, "source": "chat"},
+        )
         emit_event({
             "type": "stage",
             "payload": {
@@ -294,6 +314,14 @@ def _direct_attachment_proposal_answer(
         })
         return "已取消该附件章节修改提案，未生成候选，原附件保持不变。"
 
+    attempt = begin_attachment_audit(
+        action="attachment.proposal_confirm",
+        target_type="attachment_edit_proposal",
+        target_id=proposal.proposal_id,
+        actor_user_id=user_id,
+        kb_name=str(getattr(rt, "kb_name", "") or ""),
+        metadata={"session_id": session_id, "source": "chat"},
+    )
     try:
         revision = service.confirm_attachment_proposal(
             proposal_id=proposal.proposal_id,
@@ -301,11 +329,32 @@ def _direct_attachment_proposal_answer(
             user_id=user_id,
         )
     except Exception as exc:  # noqa: BLE001
+        finish_attachment_audit(
+            attempt,
+            success=False,
+            error_message=str(exc),
+            metadata={"session_id": session_id, "source": "chat"},
+        )
         return f"确认章节修改提案失败：{str(exc)[:200]}"
 
     from src.attachments.service import revision_change_summary
 
     change_summary = revision_change_summary(revision)
+    finish_attachment_audit(
+        attempt,
+        success=True,
+        target_type="attachment_revision",
+        target_id=revision.revision_id,
+        metadata={
+            "session_id": session_id,
+            "proposal_id": proposal.proposal_id,
+            "parent_attachment_id": revision.parent_attachment_id,
+            "child_attachment_id": revision.child_attachment_id,
+            "operation": revision.operation,
+            "change_summary": change_summary,
+            "source": "chat",
+        },
+    )
     download_url = (
         f"/api/v1/conversations/{session_id}/attachments/"
         f"{revision.child_attachment_id}/download"
@@ -431,6 +480,35 @@ class _RunRecord:
 _RUN_RECORD: contextvars.ContextVar[_RunRecord | None] = contextvars.ContextVar(
     "agent_run_record", default=None
 )
+
+
+@dataclass
+class _TurnPlan:
+    """Everything a streaming turn needs before the first token is emitted.
+
+    ``_prepare_turn`` builds this.  The split follows the natural yield
+    boundary: the first ``yield`` used to sit ~1300 lines into ``_stream_impl``,
+    so preparation is synchronous and the streaming section stays focused on
+    event ordering, cancellation and citations.
+    """
+
+    record: _RunRecord
+    emit_event: Callable[[dict], None]
+    rt: Any
+    tools: list[Any]
+    document_tools: list[Any]
+    system_prompt: str
+    intent_plan: Any
+    conversation_plan: Any
+    is_general: bool
+    document_flow_routed: bool
+    legacy_direct_shortcuts: bool
+    action_plan: Any
+    action_plan_issues: list[Any]
+    action_plan_mode: str
+    action_execution: Any
+    direct_control_answer: str | None
+    direct_answer_grounding: str
 
 
 @dataclass
@@ -2124,7 +2202,7 @@ class MultiSourceAgentRunner:
                     retrieval_rounds=int(summary.get("retrieval_rounds") or 0),
                 )
 
-    def _stream_impl(
+    def _prepare_turn(
         self,
         *,
         query: str,
@@ -2144,16 +2222,13 @@ class MultiSourceAgentRunner:
         attachment_user_id: int | None = None,
         conversation_session_id: int | None = None,
         action_scope: Any | None = None,
-    ) -> Generator[str, None, None]:
-        """Run the deep agent and stream answer deltas live.
+    ) -> "_TurnPlan":
+        """Build the synchronous part of a turn before streaming starts.
 
-        Text of the in-flight model message is yielded immediately as
-        provisional answer; a message that turns out to carry tool calls is
-        reclassified as interim narration and announced via ``event_callback``
-        as a ``narration`` event so consumers can retract the already-streamed
-        text (see ``strip_narration_segments``). Other side-channel events
-        (stage / tool_started / tool_result / degraded) are forwarded as
-        ``{"type": ..., "payload": {...}}`` dicts via ``event_callback``.
+        Routing, tool assembly, prompt construction, document-context
+        recovery and memory prefetch all happen here.  None of it yields,
+        so it is testable without a generator and the streaming section in
+        ``_stream_impl`` only has to reason about event ordering.
         """
         record = _RunRecord()
         _RUN_RECORD.set(record)
@@ -3400,6 +3475,94 @@ class MultiSourceAgentRunner:
         if direct_control_answer is None and action_plan_feedback is not None:
             direct_control_answer = action_plan_feedback
             direct_answer_grounding = "conversation_action_plan"
+
+        return _TurnPlan(
+            record=record,
+            emit_event=emit_event,
+            rt=rt,
+            tools=tools,
+            document_tools=document_tools,
+            system_prompt=system_prompt,
+            intent_plan=intent_plan,
+            conversation_plan=conversation_plan,
+            is_general=is_general,
+            document_flow_routed=document_flow_routed,
+            legacy_direct_shortcuts=legacy_direct_shortcuts,
+            action_plan=action_plan,
+            action_plan_issues=action_plan_issues,
+            action_plan_mode=action_plan_mode,
+            action_execution=action_execution,
+            direct_control_answer=direct_control_answer,
+            direct_answer_grounding=direct_answer_grounding,
+        )
+
+    def _stream_impl(
+        self,
+        *,
+        query: str,
+        kb_name: str,
+        history: list[tuple[str, str]],
+        ctx: RequestContext | None = None,
+        thread_id: str = "",
+        event_callback: Callable[[dict], None] | None = None,
+        query_mode: str = "deep",
+        should_cancel: Callable[[], bool] | None = None,
+        persist_thread: bool = False,
+        wiki_assist: bool = False,
+        document_context: Any | None = None,
+        document_flow: bool | None = None,
+        attachments: list[Any] | None = None,
+        source_scope: str = "auto",
+        attachment_user_id: int | None = None,
+        conversation_session_id: int | None = None,
+        action_scope: Any | None = None,
+    ) -> Generator[str, None, None]:
+        """Run the deep agent and stream answer deltas live.
+
+        Text of the in-flight model message is yielded immediately as
+        provisional answer; a message that turns out to carry tool calls is
+        reclassified as interim narration and announced via ``event_callback``
+        as a ``narration`` event so consumers can retract the already-streamed
+        text (see ``strip_narration_segments``). Other side-channel events
+        (stage / tool_started / tool_result / degraded) are forwarded as
+        ``{"type": ..., "payload": {...}}`` dicts via ``event_callback``.
+        """
+        plan = self._prepare_turn(
+            query=query,
+            kb_name=kb_name,
+            history=history,
+            ctx=ctx,
+            thread_id=thread_id,
+            event_callback=event_callback,
+            query_mode=query_mode,
+            should_cancel=should_cancel,
+            persist_thread=persist_thread,
+            wiki_assist=wiki_assist,
+            document_context=document_context,
+            document_flow=document_flow,
+            attachments=attachments,
+            source_scope=source_scope,
+            attachment_user_id=attachment_user_id,
+            conversation_session_id=conversation_session_id,
+            action_scope=action_scope,
+        )
+        record = plan.record
+        emit_event = plan.emit_event
+        rt = plan.rt
+        tools = plan.tools
+        document_tools = plan.document_tools
+        system_prompt = plan.system_prompt
+        intent_plan = plan.intent_plan
+        conversation_plan = plan.conversation_plan
+        is_general = plan.is_general
+        document_flow_routed = plan.document_flow_routed
+        legacy_direct_shortcuts = plan.legacy_direct_shortcuts
+        action_plan = plan.action_plan
+        action_plan_issues = plan.action_plan_issues
+        action_plan_mode = plan.action_plan_mode
+        action_execution = plan.action_execution
+        direct_control_answer = plan.direct_control_answer
+        direct_answer_grounding = plan.direct_answer_grounding
 
         if direct_control_answer is not None:
             record.answer = direct_control_answer

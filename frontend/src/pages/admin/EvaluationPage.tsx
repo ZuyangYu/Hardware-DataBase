@@ -134,9 +134,11 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
       .then((rows) => {
         if (cancelled) return;
         setKnowledgeBases(rows);
-        setSelectedKbId((current) => (
-          current != null && rows.some((item) => item.kb_id === current) ? current : rows[0]?.kb_id ?? null
-        ));
+        setSelectedKbId((current) => {
+          if (current != null && rows.some((item) => item.kb_id === current)) return current;
+          const preferred = rows.find((item) => !item.evaluation_blocked_reason) ?? rows[0];
+          return preferred?.kb_id ?? null;
+        });
       })
       .catch((error) => {
         if (!cancelled) notify.error(error instanceof Error ? error.message : '加载评估知识库失败');
@@ -681,11 +683,17 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
                       {knowledgeBases.map((item) => (
                         <SelectItem key={item.kb_id} value={String(item.kb_id)}>
                           {item.kb_name} · {item.department_name || `部门 ${item.department_id ?? '-'}`}（ID {item.kb_id}）
+                          {item.evaluation_blocked_reason ? ' · 评测不可用' : ''}
                         </SelectItem>
                       ))}
                     </SelectContent>
                   </Select>
                 )}
+                {selectedKnowledgeBase?.evaluation_blocked_reason ? (
+                  <p className="mt-[6px] text-[11px] whitespace-pre-wrap text-[#a10b0b]">
+                    {selectedKnowledgeBase.evaluation_blocked_reason}
+                  </p>
+                ) : null}
               </Field>
               <Field label="评估数据集">
                 {!datasetsLoaded ? (

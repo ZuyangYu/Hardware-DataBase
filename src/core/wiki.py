@@ -276,6 +276,12 @@ class WikiService:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    def _for_update(self, sql: str) -> str:
+        """PG 行锁；SQLite 由 ``BEGIN IMMEDIATE`` 写锁兜底（见 domain_pg）。"""
+        from src.storage import domain_pg
+
+        return domain_pg.for_update(self, sql)
+
     def _init_db(self) -> None:
         with closing(self._connect()) as conn:
             conn.executescript(
@@ -751,7 +757,9 @@ class WikiService:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM wiki_pages WHERE kb_id = ? AND department_id = ? AND slug = ?",
+                    self._for_update(
+                        "SELECT * FROM wiki_pages WHERE kb_id = ? AND department_id = ? AND slug = ?"
+                    ),
                     (kb_id, department_id, slug),
                 ).fetchone()
                 if row is None:
@@ -800,7 +808,9 @@ class WikiService:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM wiki_pages WHERE kb_id = ? AND department_id = ? AND slug = ?",
+                    self._for_update(
+                        "SELECT * FROM wiki_pages WHERE kb_id = ? AND department_id = ? AND slug = ?"
+                    ),
                     (kb_id, department_id, slug),
                 ).fetchone()
                 if row is None:
@@ -827,7 +837,9 @@ class WikiService:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM wiki_pages WHERE kb_id = ? AND department_id = ? AND slug = ?",
+                    self._for_update(
+                        "SELECT * FROM wiki_pages WHERE kb_id = ? AND department_id = ? AND slug = ?"
+                    ),
                     (kb_id, department_id, slug),
                 ).fetchone()
                 if row is None:
@@ -1335,10 +1347,16 @@ class WikiService:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 src = conn.execute(
-                    "SELECT * FROM wiki_pages WHERE kb_id = ? AND slug = ?", (kb_id, source_slug)
+                    self._for_update(
+                        "SELECT * FROM wiki_pages WHERE kb_id = ? AND slug = ?"
+                    ),
+                    (kb_id, source_slug),
                 ).fetchone()
                 tgt = conn.execute(
-                    "SELECT * FROM wiki_pages WHERE kb_id = ? AND slug = ?", (kb_id, target_slug)
+                    self._for_update(
+                        "SELECT * FROM wiki_pages WHERE kb_id = ? AND slug = ?"
+                    ),
+                    (kb_id, target_slug),
                 ).fetchone()
                 if src is None or tgt is None:
                     raise ValueError("page not found")
@@ -1648,7 +1666,10 @@ class WikiService:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM wiki_pages WHERE kb_id = ? AND slug = ?", (kb_id, slug)
+                    self._for_update(
+                        "SELECT * FROM wiki_pages WHERE kb_id = ? AND slug = ?"
+                    ),
+                    (kb_id, slug),
                 ).fetchone()
                 if row is None:
                     conn.execute(
@@ -1724,7 +1745,10 @@ class WikiService:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM wiki_pages WHERE kb_id = ? AND slug = ?", (kb_id, slug)
+                    self._for_update(
+                        "SELECT * FROM wiki_pages WHERE kb_id = ? AND slug = ?"
+                    ),
+                    (kb_id, slug),
                 ).fetchone()
                 if row is None:
                     conn.execute(

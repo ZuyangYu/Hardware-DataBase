@@ -330,8 +330,14 @@ class AppLogService:
     ) -> int:
         with closing(self._connect()) as conn:
             # The audit hash chain is read-then-insert; serialize the append so
-            # concurrent API/worker writers cannot fork the chain.
+            # concurrent API/worker writers cannot fork the chain.  A row lock
+            # is not enough: the table may be empty, so use a transaction-scoped
+            # advisory lock on PostgreSQL (no-op on SQLite, where BEGIN
+            # IMMEDIATE already takes the write lock).
             conn.execute("BEGIN IMMEDIATE")
+            from src.storage import domain_pg
+
+            domain_pg.advisory_xact_lock(conn, "audit_events:integrity_chain")
             created_at = utc_now()
             actor_department_id = actor.department_id if actor else department_id
             metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
@@ -534,6 +540,7 @@ class AppLogService:
 
     def list_audit_actions(self, viewer: AuthUser, limit: int = 200) -> list[str]:
         where, params = scoped_where(viewer)
+        _exclude_requested_rows(where, params)
         params.append(max(1, min(limit, 1000)))
         sql = f"""
             SELECT DISTINCT action
@@ -651,17 +658,29 @@ class AppLogService:
         success: bool | None = None,
         keyword: str | None = None,
     ) -> dict[str, int]:
-        """当前筛选下按 success 分组：{"success": n, "failed": n}。"""
+        """当前筛选下分组：completed success/failed 与 write-ahead requested。
+
+        ``requested`` 是写前意图，不能算成成功或失败；总数 = 三者之和。
+        """
         where, params = _audit_where(viewer, action, kb_name, success, keyword)
-        sql = f"SELECT success, COUNT(*) AS cnt FROM audit_events WHERE {' AND '.join(where)} GROUP BY success"
+        requested_where = [*where, "action LIKE ?"]
+        requested_params = [*params, _REQUESTED_ACTION_LIKE]
+        done_where = [*where, "action NOT LIKE ?"]
+        done_params = [*params, _REQUESTED_ACTION_LIKE]
+        sql = f"SELECT success, COUNT(*) AS cnt FROM audit_events WHERE {' AND '.join(done_where)} GROUP BY success"
         with closing(self._connect()) as conn:
-            rows = conn.execute(sql, params).fetchall()
-        result = {"success": 0, "failed": 0}
+            rows = conn.execute(sql, done_params).fetchall()
+            requested_row = conn.execute(
+                f"SELECT COUNT(*) AS cnt FROM audit_events WHERE {' AND '.join(requested_where)}",
+                requested_params,
+            ).fetchone()
+        result = {"success": 0, "failed": 0, "requested": 0}
         for row in rows:
             if int(row["success"]) == 1:
                 result["success"] = int(row["cnt"])
             else:
                 result["failed"] += int(row["cnt"])
+        result["requested"] = int(requested_row["cnt"]) if requested_row else 0
         return result
 
     def audit_action_breakdown(
@@ -674,6 +693,7 @@ class AppLogService:
     ) -> list[tuple[str, int]]:
         """当前筛选下按 action 分组计数（不含 action 过滤本身），按 count 降序。员工只看本部门。"""
         where, params = _audit_where(viewer, None, kb_name, success, keyword)
+        _exclude_requested_rows(where, params)
         params.append(max(1, min(limit, 200)))
         sql = (
             f"SELECT action, COUNT(*) AS cnt FROM audit_events "
@@ -690,6 +710,7 @@ class AppLogService:
         算好再作为参数传入：SQLite 的 datetime('now', ...) 在 PostgreSQL 上不存在。
         """
         where, params = scoped_where(viewer)
+        _exclude_requested_rows(where, params)
         cutoff = (datetime.fromisoformat(utc_now()) - timedelta(days=days)).isoformat()
         params.append(cutoff)
         sql = (
@@ -788,6 +809,21 @@ def can_view_row(viewer: AuthUser, user_id: int | None, department_id: int | Non
     if viewer.role == ROLE_EMPLOYEE:
         return department_id == viewer.department_id
     return user_id == viewer.id
+
+
+_REQUESTED_ACTION_LIKE = "%.requested"
+
+
+def _exclude_requested_rows(where: list[str], params: list[Any]) -> None:
+    """Keep write-ahead intent rows out of completion counts/action lists.
+
+    They stay visible in the event table (so a crashed operation is not
+    invisible), but must not inflate success/failure totals or the filter
+    dropdown with a duplicate action for every mutation.
+    """
+
+    where.append("action NOT LIKE ?")
+    params.append(_REQUESTED_ACTION_LIKE)
 
 
 def _audit_where(

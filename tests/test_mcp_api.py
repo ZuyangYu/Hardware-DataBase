@@ -225,6 +225,7 @@ class McpPluginsApiTests(unittest.TestCase):
             "plugins.mcp.user_unsubscribe",
         ):
             self.assertIn(expected, actions)
+            self.assertIn(f"{expected}.requested", actions)
 
     def test_connection_change_auto_disables_and_voids_the_test(self):
         with McpStubServer() as stub:
@@ -367,6 +368,7 @@ class McpPluginsApiTests(unittest.TestCase):
             "plugins.mcp.delete",
         ):
             self.assertIn(expected, actions)
+            self.assertIn(f"{expected}.requested", actions)
 
     def test_registration_allowed_while_switch_off_but_enable_is_blocked(self):
         """The admin UI states registration stays available with MCP_ENABLED=false."""

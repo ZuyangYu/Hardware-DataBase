@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import threading
 import unittest
 import uuid
 
@@ -23,6 +24,9 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 import src.settings as app_settings
 from src.document_authoring.models import (
+    AuthoringExecutionEvent,
+    DocumentWorkOrder,
+    HarnessRun,
     RendererPolicy,
     TemplateSecurityReport,
     TemplateVersion,
@@ -172,6 +176,150 @@ class DocumentAuthoringPgParityTests(unittest.TestCase):
         self.assertEqual(
             sqlite_store.generation_sessions.get_session(sqlite_session.session_id).user_id,
             pg_store.generation_sessions.get_session(pg_session.session_id).user_id,
+        )
+
+    # -- concurrency contract (PG only: SQLite serialises via BEGIN IMMEDIATE) --
+
+    def _seed_work_order_and_run(
+        self, store: DocumentAuthoringStore, suffix: str
+    ) -> HarnessRun:
+        order = store.create_work_order(
+            DocumentWorkOrder(
+                work_order_id=f"wo-{suffix}",
+                tenant_id="tenant-a",
+                project_id="project-a",
+                baseline_id="baseline-a",
+                baseline_content_hash="baseline-hash",
+                source_set_snapshot_id="snapshot-a",
+                template_version_id="template-a",
+                document_schema_id="schema-a",
+                document_schema_version="1",
+                template_schema_id="template-schema-a",
+                template_schema_version="1",
+                retrieval_policy_version="1",
+                renderer_policy_version="1",
+                target_format="xlsx",
+                execution_mode="internal_harness",
+                harness_policy_id="harness-policy",
+                harness_policy_version="1",
+                created_by="alice",
+            )
+        )
+        return store.create_harness_run(
+            HarnessRun(
+                harness_run_id=f"run-{suffix}",
+                work_order_id=order.work_order_id,
+                run_manifest_id=f"manifest-{suffix}",
+                status="queued",
+                max_retries=1,
+            )
+        )
+
+    def test_concurrent_claim_grants_a_single_fencing_token(self) -> None:
+        """Two workers claiming the same run must not both receive a lease.
+
+        Regression: ``BEGIN IMMEDIATE`` is rewritten to plain ``BEGIN`` on
+        PostgreSQL, so without an explicit ``FOR UPDATE`` both workers read
+        ``fencing_token=N`` and write ``N+1`` -- a split-brain lease.
+        """
+        store = self._pg_store()
+        run = self._seed_work_order_and_run(store, f"claim-{uuid.uuid4().hex[:6]}")
+        barrier = threading.Barrier(2)
+        results: list[tuple[str, object]] = []
+        lock = threading.Lock()
+
+        def worker(name: str) -> None:
+            barrier.wait(timeout=10)
+            try:
+                claimed = store.claim_harness_run(
+                    run.harness_run_id, name, lease_seconds=60
+                )
+                outcome: tuple[str, object, str] = ("ok", claimed.fencing_token, name)
+            except Exception as exc:  # noqa: BLE001 - asserted below
+                outcome = ("error", f"{type(exc).__name__}: {exc}", name)
+            with lock:
+                results.append(outcome)
+
+        threads = [
+            threading.Thread(target=worker, args=(f"worker-{index}",))
+            for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        winners = [outcome for outcome in results if outcome[0] == "ok"]
+        self.assertEqual(
+            len(winners),
+            1,
+            f"exactly one worker must win the claim, got {results}",
+        )
+        self.assertEqual(winners[0][1], 1)
+        stored = store.get_harness_run(run.harness_run_id)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.status, "running")
+        self.assertEqual(stored.fencing_token, 1)
+        self.assertEqual(stored.lease_owner, winners[0][2])
+
+    def test_stale_owner_write_is_rejected_after_reclaim(self) -> None:
+        """Fencing must reject the deposed worker's write, not interleave it."""
+        store = self._pg_store()
+        run = self._seed_work_order_and_run(store, f"fence-{uuid.uuid4().hex[:6]}")
+        first = store.claim_harness_run(run.harness_run_id, "worker-old", lease_seconds=60)
+        paused = store.request_harness_run_state(run.harness_run_id, "paused")
+        self.assertEqual(paused.fencing_token, first.fencing_token + 1)
+        store.queue_harness_retry(run.harness_run_id, max_retries=1)
+        reclaimed = store.claim_harness_run(run.harness_run_id, "worker-new", lease_seconds=60)
+        self.assertGreater(reclaimed.fencing_token, first.fencing_token)
+
+        with self.assertRaises(Exception):
+            store.update_harness_run_owned(
+                run.harness_run_id,
+                "worker-old",
+                first.fencing_token,
+                current_node="stale-write",
+            )
+
+    def test_concurrent_event_append_allocates_unique_sequences(self) -> None:
+        """Sequence allocation is read-modify-write and needs the run row lock."""
+        store = self._pg_store()
+        run = self._seed_work_order_and_run(store, f"seq-{uuid.uuid4().hex[:6]}")
+        barrier = threading.Barrier(2)
+        sequences: list[int] = []
+        lock = threading.Lock()
+
+        def append(index: int) -> None:
+            event = AuthoringExecutionEvent(
+                event_id=f"evt-{uuid.uuid4().hex}",
+                event_type="tool_called",
+                tenant_id="tenant-a",
+                work_order_id=run.work_order_id,
+                harness_run_id=run.harness_run_id,
+                idempotency_key=f"key-{uuid.uuid4().hex}",
+                executor="agent_field_harness",
+                tool_name="retrieve_evidence",
+                field_id="field-0",
+                sanitized_payload={"evidence_ids": ["ev-1"], "issue_codes": []},
+            )
+            barrier.wait(timeout=10)
+            stored = store.append_execution_event(event)
+            with lock:
+                sequences.append(stored.sequence)
+
+        threads = [
+            threading.Thread(target=append, args=(index,)) for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertEqual(len(sequences), 2, sequences)
+        self.assertEqual(
+            sorted(sequences),
+            [1, 2],
+            f"concurrent appends must not share a sequence: {sequences}",
         )
 
 

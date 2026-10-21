@@ -155,6 +155,12 @@ class DocumentReviewStore:
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
+    def _for_update(self, sql: str) -> str:
+        """PG 行锁；SQLite 由 ``BEGIN IMMEDIATE`` 写锁兜底（见 pg_support）。"""
+        from src.document_authoring import pg_support
+
+        return pg_support.for_update(self, sql)
+
     def _init_db(self) -> None:
         with closing(self._connect()) as connection:
             connection.executescript(
@@ -400,7 +406,9 @@ class DocumentReviewStore:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
-                    "SELECT * FROM document_reviews WHERE review_id = ?",
+                    self._for_update(
+                        "SELECT * FROM document_reviews WHERE review_id = ?"
+                    ),
                     (review_id,),
                 ).fetchone()
                 review = self._review_from_row(row)

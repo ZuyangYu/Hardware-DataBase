@@ -185,6 +185,100 @@ def test_get_run_reads_incremental_diagnostics_while_scoring(tmp_path, monkeypat
     assert payload["sample_results_error"] == ""
 
 
+def test_get_run_redacts_kb_content_but_keeps_counts_and_metrics(tmp_path, monkeypatch):
+    """system_admin must not read KB content through evaluation diagnostics."""
+    state = EvaluationRunState.new_online(
+        run_id="run-1",
+        dataset_path="dataset.jsonl",
+        snapshot_path="",
+        total_samples=1,
+    ).model_copy(update={"status": "completed"})
+    run_dir = tmp_path / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "summary.json").write_text(
+        json.dumps({"run_id": "run-1", "sample_count": 1}), encoding="utf-8"
+    )
+    (run_dir / "results.jsonl").write_text(
+        json.dumps(
+            {
+                "sample_id": "case-1",
+                "question": "Q",
+                "reference_answer": "R",
+                "response": "KB 正文派生的回答",
+                "scored_response": "KB 正文派生的回答",
+                "retrieved_contexts": ["机密正文 A", "机密正文 B"],
+                "metrics": [
+                    {
+                        "sample_id": "case-1",
+                        "metric_name": "faithfulness",
+                        "score": 0.8,
+                        "reason": "引用了机密正文 A",
+                        "details": {"quoted": "机密正文 A"},
+                    }
+                ],
+                "metadata": {
+                    "ragas_scoring": {"scored_contexts": ["机密正文 A"]},
+                    "retrieval_summary": {
+                        "status": "success",
+                        "final_top_k": 2,
+                        "evidence": [{"content": "机密正文 A"}],
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    class Controller:
+        def load_for_display(self, run_id):
+            return state
+
+    monkeypatch.setattr(evaluation, "_check_output_root", lambda _value: str(tmp_path))
+    monkeypatch.setattr(evaluation, "_controller", lambda _output_root: Controller())
+    payload = evaluation.get_run("run-1", output_root=str(tmp_path))
+    sample = payload["sample_results"][0]
+
+    dumped = json.dumps(payload, ensure_ascii=False)
+    assert "机密正文" not in dumped
+    assert sample["response"] == ""
+    assert sample["scored_response"] == ""
+    assert sample["retrieved_contexts"] == []
+    assert sample["metadata"]["retrieved_context_count"] == 2
+    assert sample["metadata"]["content_redacted"] is True
+    assert sample["metrics"][0]["score"] == 0.8
+    assert sample["metrics"][0]["reason"] == ""
+    assert sample["metrics"][0]["details"] == {}
+    assert sample["metadata"]["ragas_scoring"]["scored_context_count"] == 1
+    assert sample["metadata"]["retrieval_summary"]["final_top_k"] == 2
+    assert "evidence" not in sample["metadata"]["retrieval_summary"]
+
+
+def test_preflight_rejects_kb_without_active_data_owner(tmp_path, monkeypatch):
+    """开评读取必须归属到 KB 负责人；无负责人的库不能评测。"""
+    dataset = tmp_path / "dataset.jsonl"
+    dataset.write_text(_sample().model_dump_json() + "\n", encoding="utf-8")
+    monkeypatch.setattr(evaluation, "_check_output_root", lambda _value: str(tmp_path / "runs"))
+    monkeypatch.setattr(evaluation, "_check_dataset_path", lambda _value, _root: str(dataset))
+
+    response = evaluation.preflight_run(
+        CreateEvaluationRunRequest(
+            dataset_path=str(dataset),
+            kb_id=7,
+            kb_name="shared",
+        ),
+        output_root="storage/evaluations",
+        _actor=_evaluation_admin(),
+        auth=_EvaluationAuth(
+            [KnowledgeBaseSummary(name="shared", kb_id=7, department_id=47, registered=True)]
+        ),
+        pipeline=_EvaluationPipeline(),
+    )
+
+    assert response.can_create is False
+    assert any("数据负责人" in message for message in response.errors)
+
+
 def test_delete_run_removes_failed_run_artifacts(tmp_path, monkeypatch):
     run_dir = tmp_path / "run-1"
     run_dir.mkdir()
@@ -236,11 +330,21 @@ class _EvaluationPipeline:
 
 
 class _EvaluationAuth:
-    def __init__(self, summaries):
+    def __init__(self, summaries, owner: AuthUser | None = None):
         self.summaries = summaries
+        self.owner = owner or AuthUser(
+            id=42,
+            username="kb-owner",
+            role="employee",
+            is_active=True,
+            department_id=47,
+        )
 
     def list_knowledge_base_summaries(self, existing):
         return list(self.summaries)
+
+    def get_user_by_id(self, user_id):
+        return self.owner if int(user_id) == self.owner.id else None
 
 
 def test_list_evaluation_knowledge_bases_exposes_registered_stable_id_rows():
@@ -254,6 +358,16 @@ def test_list_evaluation_knowledge_bases_exposes_registered_stable_id_rows():
                     kb_id=7,
                     department_id=47,
                     department_name="硬件部",
+                    owner_user_id=42,
+                    owner_username="kb-owner",
+                    registered=True,
+                    physical_exists=True,
+                ),
+                KnowledgeBaseSummary(
+                    name="legacy",
+                    kb_id=8,
+                    department_id=47,
+                    department_name="硬件部",
                     registered=True,
                     physical_exists=True,
                 ),
@@ -262,9 +376,14 @@ def test_list_evaluation_knowledge_bases_exposes_registered_stable_id_rows():
         ),
     )
 
-    assert [row.kb_id for row in rows] == [7]
+    assert [row.kb_id for row in rows] == [7, 8]
     assert rows[0].kb_name == "shared"
     assert rows[0].department_name == "硬件部"
+    assert rows[0].owner_user_id == 42
+    assert rows[0].owner_username == "kb-owner"
+    assert rows[0].evaluation_blocked_reason == ""
+    assert rows[1].owner_user_id is None
+    assert "未登记数据负责人" in rows[1].evaluation_blocked_reason
 
 
 def test_preflight_reports_selected_kb_counts_and_normalizes_dataset_scope(tmp_path, monkeypatch):
@@ -282,7 +401,7 @@ def test_preflight_reports_selected_kb_counts_and_normalizes_dataset_scope(tmp_p
         output_root="storage/evaluations",
         _actor=_evaluation_admin(),
         auth=_EvaluationAuth(
-            [KnowledgeBaseSummary(name="shared", kb_id=7, department_id=47, registered=True)]
+            [KnowledgeBaseSummary(name="shared", kb_id=7, department_id=47, owner_user_id=42, registered=True)]
         ),
         pipeline=_EvaluationPipeline(),
     )
@@ -330,7 +449,7 @@ def test_create_run_uses_selected_kb_and_run_local_normalized_samples(tmp_path, 
         output_root="storage/evaluations",
         _actor=_evaluation_admin(),
         auth=_EvaluationAuth(
-            [KnowledgeBaseSummary(name="shared", kb_id=7, department_id=47, registered=True)]
+            [KnowledgeBaseSummary(name="shared", kb_id=7, department_id=47, owner_user_id=42, registered=True)]
         ),
         pipeline=_EvaluationPipeline(),
     )
@@ -356,7 +475,7 @@ def test_create_run_rejects_kb_id_and_name_mismatch(tmp_path, monkeypatch):
             output_root="storage/evaluations",
             _actor=_evaluation_admin(),
             auth=_EvaluationAuth(
-                [KnowledgeBaseSummary(name="shared", kb_id=7, department_id=47, registered=True)]
+                [KnowledgeBaseSummary(name="shared", kb_id=7, department_id=47, owner_user_id=42, registered=True)]
             ),
             pipeline=_EvaluationPipeline(),
         )
@@ -403,7 +522,7 @@ def test_start_run_rejects_modified_run_local_execution_dataset(tmp_path, monkey
             output_root="storage/evaluations",
             _actor=_evaluation_admin(),
             auth=_EvaluationAuth(
-                [KnowledgeBaseSummary(name="shared", kb_id=7, department_id=47, registered=True)]
+                [KnowledgeBaseSummary(name="shared", kb_id=7, department_id=47, owner_user_id=42, registered=True)]
             ),
             pipeline=_EvaluationPipeline(),
         )
@@ -455,7 +574,7 @@ def test_start_run_revalidates_filtered_cohort_using_saved_filters(tmp_path, mon
         output_root="storage/evaluations",
         _actor=_evaluation_admin(),
         auth=_EvaluationAuth(
-            [KnowledgeBaseSummary(name="shared", kb_id=7, department_id=47, registered=True)]
+            [KnowledgeBaseSummary(name="shared", kb_id=7, department_id=47, owner_user_id=42, registered=True)]
         ),
         pipeline=_EvaluationPipeline(),
     )
