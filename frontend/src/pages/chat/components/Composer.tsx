@@ -168,14 +168,14 @@ export default function Composer({
               disabled={disabled}
             >
               <SelectTrigger
-                aria-label="挂载知识库"
-                title={kbName ? `当前挂载：${kbName}` : '未挂载知识库'}
+                aria-label="选择主知识库"
+                title={kbName ? `当前主知识库：${kbName}` : '选择主知识库'}
                 className={cn(CHAT_COMPOSER_MODEL_BTN_CLASS)}
               >
                 <span className="grid size-[14px] shrink-0 place-items-center" aria-hidden>
                   <AppIcon name="database" size={14} />
                 </span>
-                <SelectValue className="min-w-0 truncate" />
+                <SelectValue placeholder="选择主知识库" className="min-w-0 truncate" />
               </SelectTrigger>
               <SelectContent
                 position="popper"

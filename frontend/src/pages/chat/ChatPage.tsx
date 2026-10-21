@@ -1025,6 +1025,7 @@ export default function ChatPage({
           knowledgePurpose={knowledgePurpose}
           selectedKnowledgeBaseIds={selectedKnowledgeBaseIds}
           onKnowledgeScopeChange={handleKnowledgeScopeChange}
+          onPrimaryKnowledgeBaseChange={handleKbChange}
           knowledgeScopeDisabled={streaming}
           /* 导出任务中心嵌入页头,避免悬浮按钮遮挡右侧会话侧栏的新建按钮 */
           actions={<ExportTaskCenter variant="embedded" />}

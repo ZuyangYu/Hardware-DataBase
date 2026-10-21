@@ -265,8 +265,14 @@ describe('Composer document context', () => {
   it('keeps the knowledge-base selector usable while a turn is streaming', () => {
     const markup = renderComposer({ streaming: true });
 
-    expect(markup).toMatch(/aria-label="挂载知识库"/);
-    expect(markup).not.toMatch(/<button[^>]*\bdisabled(?:=""|(?=\s|>))[^>]*aria-label="挂载知识库"/);
+    expect(markup).toMatch(/aria-label="选择主知识库"/);
+    expect(markup).not.toMatch(/<button[^>]*\bdisabled(?:=""|(?=\s|>))[^>]*aria-label="选择主知识库"/);
+  });
+
+  it('shows an explicit primary-knowledge-base prompt when nothing is mounted', () => {
+    const markup = renderComposer({ kbName: '' });
+
+    expect(markup).toContain('选择主知识库');
   });
 
   it('does not render a legacy generation-mode toggle when no document context is attached', () => {

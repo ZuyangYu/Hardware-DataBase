@@ -55,6 +55,7 @@ type Props = {
   knowledgePurpose?: KnowledgePurpose;
   selectedKnowledgeBaseIds?: number[];
   onKnowledgeScopeChange?: (purpose: KnowledgePurpose, kbIds: number[]) => void;
+  onPrimaryKnowledgeBaseChange?: (kbName: string) => void;
   knowledgeScopeDisabled?: boolean;
 };
 
@@ -113,6 +114,7 @@ export default function ChatHeader({
   knowledgePurpose = 'answer',
   selectedKnowledgeBaseIds = [],
   onKnowledgeScopeChange,
+  onPrimaryKnowledgeBaseChange,
   knowledgeScopeDisabled = false,
 }: Props) {
   const [toggling, setToggling] = useState(false);
@@ -161,8 +163,8 @@ export default function ChatHeader({
         {onKnowledgeScopeChange && selectableKbs.length > 1 && selectableKbs.some((kb) => kb.name === kbName) && (
           <Popover.Root>
             <Popover.Trigger asChild>
-              <button type="button" className="shrink-0 whitespace-nowrap rounded-[8px] px-[8px] py-[4px] text-[11px] text-[#68728a] hover:bg-[#f6f7fa]">
-                多库范围 · {selectedKbs.length}
+              <button type="button" className="shrink-0 whitespace-nowrap rounded-[8px] px-[8px] py-[4px] text-[11px] text-[#68728a] hover:bg-[#f6f7fa]" title={`主库：${kbName}`}>
+                检索范围 · {selectedKbs.length}
               </button>
             </Popover.Trigger>
             <Popover.Portal>
@@ -192,15 +194,28 @@ export default function ChatHeader({
                       <li key={id} className="flex items-center gap-[7px] rounded-[6px] bg-[#f6f7fa] px-[7px] py-[5px] text-[11px] text-[#464c5e]">
                         <span className="min-w-0 flex-1 truncate" title={kb.name}>{kb.name}</span>
                         {anchor ? <span className="shrink-0 text-[10px] text-[#8a92a5]">主库</span> : (
-                          <button
-                            type="button"
-                            aria-label={`移除知识库 ${kb.name}`}
-                            disabled={knowledgeScopeDisabled}
-                            onClick={() => onKnowledgeScopeChange(knowledgePurpose, selectedKnowledgeBaseIds.filter((value) => value !== id))}
-                            className="shrink-0 rounded px-[4px] text-[#68728a] hover:bg-[#e5e8f0] disabled:opacity-45"
-                          >
-                            移除
-                          </button>
+                          <>
+                            {onPrimaryKnowledgeBaseChange ? (
+                              <button
+                                type="button"
+                                aria-label={`设为主库 ${kb.name}`}
+                                disabled={knowledgeScopeDisabled}
+                                onClick={() => onPrimaryKnowledgeBaseChange(kb.name)}
+                                className="shrink-0 rounded px-[4px] text-[#68728a] hover:bg-[#e5e8f0] disabled:opacity-45"
+                              >
+                                设为主库
+                              </button>
+                            ) : null}
+                            <button
+                              type="button"
+                              aria-label={`移除知识库 ${kb.name}`}
+                              disabled={knowledgeScopeDisabled}
+                              onClick={() => onKnowledgeScopeChange(knowledgePurpose, selectedKnowledgeBaseIds.filter((value) => value !== id))}
+                              className="shrink-0 rounded px-[4px] text-[#68728a] hover:bg-[#e5e8f0] disabled:opacity-45"
+                            >
+                              移除
+                            </button>
+                          </>
                         )}
                       </li>
                     );
