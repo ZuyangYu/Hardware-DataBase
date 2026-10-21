@@ -70,6 +70,10 @@ jobs:
           cache-dependency-glob: uv.lock
       - name: Install dependencies
         run: uv sync --frozen --all-groups
+      - name: Install CJK font for PDF export tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-droid-fallback
       - name: Backend test suite
         run: uv run python -m pytest -q --disable-warnings -ra
 
