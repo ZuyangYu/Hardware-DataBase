@@ -85,8 +85,8 @@ const ATTACHMENT_MAX_FILES = (() => {
   return Number.isFinite(configured) && configured > 0 ? configured : 20;
 })();
 
-function kbOptionLabel(kb: KbView): string {
-  return kb.department_name ? `${kb.name} · ${kb.department_name}` : kb.name;
+export function kbOptionLabel(kb: KbView, showDepartment: boolean): string {
+  return showDepartment && kb.department_name ? `${kb.name} · ${kb.department_name}` : kb.name;
 }
 
 function attachmentStateLabel(attachment: AttachmentView): string {
@@ -143,6 +143,9 @@ export default function Composer({
   const attachmentCount = draftAttachments.length;
   const attachmentLimitReached = attachmentCount >= ATTACHMENT_MAX_FILES;
   const uploadBlocked = streaming || disabled || attachmentUploadPending;
+  const showDepartmentInKbOptions = new Set(
+    availableKbs.map((item) => item.department_name).filter(Boolean),
+  ).size > 1;
 
   // 自适应高度
   useEffect(() => {
@@ -189,7 +192,7 @@ export default function Composer({
               >
                 <SelectItem value="__none__">不挂载知识库</SelectItem>
                 {availableKbs.map((kb) => {
-                  const label = kbOptionLabel(kb);
+                  const label = kbOptionLabel(kb, showDepartmentInKbOptions);
                   return (
                     <SelectItem key={kb.kb_id ?? `${kb.department_id ?? 'none'}:${kb.name}`} value={kb.name}>
                       <span className="block max-w-[480px] truncate" title={label}>{label}</span>

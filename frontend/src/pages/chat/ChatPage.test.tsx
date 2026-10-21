@@ -14,7 +14,7 @@ import ChatPage, {
   resolveTemplateAttachmentRoute,
   retainExistingAttachmentIds,
 } from './ChatPage';
-import Composer from './components/Composer';
+import Composer, { kbOptionLabel } from './components/Composer';
 
 const auth: AuthSession = {
   token: 'test-token',
@@ -273,6 +273,11 @@ describe('Composer document context', () => {
     const markup = renderComposer({ kbName: '' });
 
     expect(markup).toContain('选择主知识库');
+  });
+
+  it('hides the department suffix when all knowledge bases share one department', () => {
+    expect(kbOptionLabel(writableKb, false)).toBe('shared');
+    expect(kbOptionLabel(writableKb, true)).toBe('shared · 研发部');
   });
 
   it('does not render a legacy generation-mode toggle when no document context is attached', () => {

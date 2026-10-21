@@ -163,8 +163,8 @@ export default function ChatHeader({
         {onKnowledgeScopeChange && selectableKbs.length > 1 && selectableKbs.some((kb) => kb.name === kbName) && (
           <Popover.Root>
             <Popover.Trigger asChild>
-              <button type="button" className="shrink-0 whitespace-nowrap rounded-[8px] px-[8px] py-[4px] text-[11px] text-[#68728a] hover:bg-[#f6f7fa]" title={`主库：${kbName}`}>
-                检索范围 · {selectedKbs.length}
+              <button type="button" className="shrink-0 whitespace-nowrap rounded-[8px] px-[8px] py-[4px] text-[11px] text-[#68728a] hover:bg-[#f6f7fa]" title={`主库：${kbName}；点击添加或管理参考知识库`}>
+                挂载知识库 · {selectedKbs.length}
               </button>
             </Popover.Trigger>
             <Popover.Portal>
