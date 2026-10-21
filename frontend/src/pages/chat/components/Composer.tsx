@@ -175,7 +175,11 @@ export default function Composer({
                 <span className="grid size-[14px] shrink-0 place-items-center" aria-hidden>
                   <AppIcon name="database" size={14} />
                 </span>
-                <SelectValue placeholder="选择主知识库" className="min-w-0 truncate" />
+                {kbName ? (
+                  <SelectValue className="min-w-0 truncate" />
+                ) : (
+                  <span className="min-w-0 truncate">选择主知识库</span>
+                )}
               </SelectTrigger>
               <SelectContent
                 position="popper"
@@ -183,7 +187,7 @@ export default function Composer({
                 sideOffset={6}
                 className="min-w-[240px] max-w-[min(560px,calc(100vw-48px))]"
               >
-                <SelectItem value="__none__">不挂载</SelectItem>
+                <SelectItem value="__none__">不挂载知识库</SelectItem>
                 {availableKbs.map((kb) => {
                   const label = kbOptionLabel(kb);
                   return (
