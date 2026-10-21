@@ -101,6 +101,12 @@ class AssetService:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    def _for_update(self, sql: str) -> str:
+        """PG 行锁；SQLite 由 ``BEGIN IMMEDIATE`` 写锁兜底（见 domain_pg）。"""
+        from src.storage import domain_pg
+
+        return domain_pg.for_update(self, sql)
+
     def _init_db(self) -> None:
         with closing(self._connect()) as conn:
             conn.executescript(
@@ -366,7 +372,9 @@ class AssetService:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 candidate = conn.execute(
-                    "SELECT * FROM asset_candidates WHERE id = ? AND kb_id = ? AND department_id = ?",
+                    self._for_update(
+                        "SELECT * FROM asset_candidates WHERE id = ? AND kb_id = ? AND department_id = ?"
+                    ),
                     (candidate_id, kb_id, department_id),
                 ).fetchone()
                 if candidate is None:

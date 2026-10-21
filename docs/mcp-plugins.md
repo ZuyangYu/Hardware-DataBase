@@ -10,7 +10,8 @@ Sandbox Runner/Gateway 的部署要求见 [`deploy/mcp-sandbox/README.md`](../de
 ## 适用范围与边界
 
 - **远程 MCP 插件**：HDB 使用 `streamable_http`（推荐；`sse` 已被 MCP 规范标记为已弃用，仅保留
-  既有服务兼容）连接管理员登记的远程服务；HDB 不启动 stdio 或任何本地第三方进程。工具结果是
+  既有服务兼容）连接管理员登记的远程服务；MCP 通道不启动 stdio 或本地第三方进程（附件 OCR
+  的本地 `pdftoppm`/`tesseract` 属于独立能力，不在此通道）。工具结果是
   不可信外部数据。
 - **Sandbox MCP / 执行型 Skill**：由独立部署的 Gateway/Runner 承载；HDB API/Worker
   只调用认证 API，不持有 Docker/OCI 控制权。新环境默认关闭。仓库内有 dev-l1 参考部署，

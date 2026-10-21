@@ -295,6 +295,12 @@ class ArtifactRevisionStore:
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
+    def _for_update(self, sql: str) -> str:
+        """PG 行锁；SQLite 由 ``BEGIN IMMEDIATE`` 写锁兜底（见 pg_support）。"""
+        from src.document_authoring import pg_support
+
+        return pg_support.for_update(self, sql)
+
     def _init_db(self) -> None:
         with closing(self._connect()) as conn:
             conn.executescript(
@@ -480,7 +486,9 @@ class ArtifactRevisionStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM artifact_revisions WHERE revision_id = ?",
+                    self._for_update(
+                        "SELECT * FROM artifact_revisions WHERE revision_id = ?"
+                    ),
                     (str(revision_id or "").strip(),),
                 ).fetchone()
                 current = self._from_row(row)

@@ -804,6 +804,7 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
                 rt,
                 "当前知识库没有可用的 SQL 物化表。",
                 budget_blocked=bool(getattr(items, "budget_blocked", False)),
+                items=items,
             )
         from src.agents.tools.runtime import format_tool_result
 

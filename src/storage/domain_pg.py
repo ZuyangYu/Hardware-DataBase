@@ -265,6 +265,43 @@ def open_pg_connection(dsn: str):
     )
 
 
+def for_update(store: Any, sql: str) -> str:
+    """Append ``FOR UPDATE`` when the store runs on PostgreSQL.
+
+    The ported SQLite repositories rely on ``BEGIN IMMEDIATE`` for write
+    serialisation: it takes a database-wide write lock, so a read-check-write
+    section cannot interleave with another writer.  The PG adapter rewrites
+    that statement to a plain ``BEGIN`` (PostgreSQL has no equivalent), so the
+    implicit serialisation disappears and two transactions can read the same
+    row, both pass their checks and both write -- a silent lost update.
+
+    Wrap the SELECT that guards a later write in the same transaction with
+    this helper.  On SQLite the clause would be a syntax error, so it is only
+    emitted for the PG backend.
+    """
+    if getattr(store, "_backend", "sqlite") == "postgres":
+        return sql.rstrip() + " FOR UPDATE"
+    return sql
+
+
+def advisory_xact_lock(conn: Any, key: str) -> None:
+    """Take a transaction-scoped advisory lock on PostgreSQL.
+
+    ``FOR UPDATE`` only locks rows that already exist.  Read-then-insert
+    sections (for example the audit hash chain, where the previous row is read
+    before appending the next one) have nothing to lock when the table is
+    empty, so they need a logical lock instead.  One lock per key serialises
+    only the writers that share that key.
+
+    No-op on SQLite, where ``BEGIN IMMEDIATE`` already serialises writers.
+    """
+    if not isinstance(conn, PgSqlAdapterConnection):
+        return
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", (str(key),)
+    )
+
+
 def resolve_domain_backend(prefix: str) -> tuple[str, str]:
     """返回域 store 的 ``(backend, dsn)``。
 

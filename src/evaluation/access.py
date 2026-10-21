@@ -31,6 +31,10 @@ class KnowledgeBaseBinding:
     kb_name: str
     department_id: int | None
     department_name: str | None = None
+    # Data owner registered on the knowledge base.  Evaluation retrieval runs
+    # under this employee's authorization; a system_admin schedules the run but
+    # never gains KB read access themselves.
+    owner_user_id: int | None = None
     registered: bool = True
     physical_exists: bool = False
 
@@ -119,11 +123,20 @@ def resolve_knowledge_base(
             normalized_department_id = int(department_id)
         except (TypeError, ValueError) as exc:
             raise ValueError("知识库 department_id 无效") from exc
+    owner_user_id = _summary_value(row, "owner_user_id")
+    if owner_user_id in (None, ""):
+        normalized_owner_id = None
+    else:
+        try:
+            normalized_owner_id = int(owner_user_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("知识库 owner_user_id 无效") from exc
     return KnowledgeBaseBinding(
         kb_id=wanted_id,
         kb_name=row_name,
         department_id=normalized_department_id,
         department_name=_summary_value(row, "department_name"),
+        owner_user_id=normalized_owner_id,
         registered=bool(_summary_value(row, "registered")),
         physical_exists=bool(_summary_value(row, "physical_exists")),
     )
@@ -186,16 +199,26 @@ def normalize_sample_for_binding(
     expected_access = sample.expected_access
     allowed = expected_access == "allowed" and _dataset_allows_selected(raw, binding)
     scope = binding.scope_key
+    # The dataset may describe the historical actor, but it must never choose
+    # the runtime identity used for an evaluation request.  Retrieval runs as
+    # the KB's registered data owner: a system_admin can schedule and read
+    # metrics, but never gains KB read access through this path.
+    runtime_user_id = (
+        str(binding.owner_user_id) if binding.owner_user_id is not None else "evaluation"
+    )
     context: dict[str, Any] = {
-        # The dataset may describe the historical actor, but it must never
-        # choose the runtime identity used for an evaluation request.
-        "user_id": "evaluation",
+        "user_id": runtime_user_id,
         "session_id": session_id,
         "department_id": binding.department_id,
         "roles": ["employee"],
         "allowed_kbs": [scope] if allowed else [],
         "kb_permissions": {scope: "read"} if allowed else {},
     }
+    if binding.owner_user_id is not None:
+        # Trusted marker: the runtime identity below comes from the
+        # server-side KB binding, not from the dataset.  build_evaluation_context
+        # only honours the user_id when this marker is present.
+        context["identity_source"] = "kb_owner"
     context = {key: value for key, value in context.items() if value not in (None, "")}
     return sample.model_copy(update={"request_context": context})
 
@@ -209,10 +232,19 @@ def build_evaluation_context(sample: EvaluationSample) -> RequestContext:
     if department_id not in (None, ""):
         metadata["department_id"] = department_id
     declared_user = _normalized_name(raw.get("user_id"))
-    if declared_user:
-        metadata["declared_user"] = declared_user
+    # Retrieval runs under the KB owner only when the server-side binding put
+    # that identity in place (identity_source=kb_owner).  A dataset-supplied
+    # identity is untrusted and stays pinned to the synthetic "evaluation"
+    # user; the declared value survives as metadata only.
+    if raw.get("identity_source") == "kb_owner" and declared_user:
+        runtime_user_id = declared_user
+        metadata["authorized_by_user_id"] = declared_user
+    else:
+        runtime_user_id = "evaluation"
+        if declared_user:
+            metadata["declared_user"] = declared_user
     return RequestContext(
-        user_id="evaluation",
+        user_id=runtime_user_id,
         session_id=_normalized_name(raw.get("session_id")) or f"eval-{sample.id}",
         roles=["employee"],
         allowed_kbs=[_normalized_name(value) for value in _iter_values(raw.get("allowed_kbs")) if _normalized_name(value)],

@@ -136,6 +136,12 @@ class DocumentAssetService:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    def _for_update(self, sql: str) -> str:
+        """PG 行锁；SQLite 由 ``BEGIN IMMEDIATE`` 写锁兜底（见 domain_pg）。"""
+        from src.storage import domain_pg
+
+        return domain_pg.for_update(self, sql)
+
     def _init_db(self) -> None:
         with closing(self._connect()) as conn:
             conn.executescript(
@@ -417,7 +423,7 @@ class DocumentAssetService:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                row = self._scoped_asset(conn, asset_id, kb_id, department_id)
+                row = self._scoped_asset(conn, asset_id, kb_id, department_id, lock=True)
                 # 认领动作(改标题/类别/项目)自动摘掉影子档标记
                 if {"title", "category", "project"} & set(updates):
                     tags = json.loads(row["tags_json"] or "[]")
@@ -457,7 +463,13 @@ class DocumentAssetService:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                asset = self._scoped_asset(conn, asset_id, kb_id, department_id)
+                # Lock the asset row: the version number is allocated with
+                # MAX(version_no)+1 below, and the unique index would otherwise
+                # turn a concurrent upload into an IntegrityError instead of the
+                # serialised success SQLite produced via BEGIN IMMEDIATE.
+                asset = self._scoped_asset(
+                    conn, asset_id, kb_id, department_id, lock=True
+                )
                 if asset["lifecycle_status"] in {"obsolete", "archived"}:
                     raise DocumentAssetError("已废止或归档的资产不能添加版本")
                 dup = conn.execute(
@@ -758,11 +770,19 @@ class DocumentAssetService:
 
     # -- internals -----------------------------------------------------------
 
-    def _scoped_asset(self, conn: sqlite3.Connection, asset_id: int, kb_id: int, department_id: int) -> sqlite3.Row:
-        row = conn.execute(
-            "SELECT * FROM doc_assets WHERE id = ? AND kb_id = ? AND department_id = ?",
-            (asset_id, kb_id, department_id),
-        ).fetchone()
+    def _scoped_asset(
+        self,
+        conn: sqlite3.Connection,
+        asset_id: int,
+        kb_id: int,
+        department_id: int,
+        *,
+        lock: bool = False,
+    ) -> sqlite3.Row:
+        sql = "SELECT * FROM doc_assets WHERE id = ? AND kb_id = ? AND department_id = ?"
+        if lock:
+            sql = self._for_update(sql)
+        row = conn.execute(sql, (asset_id, kb_id, department_id)).fetchone()
         if row is None:
             raise LookupError("文档资产不存在")
         return row

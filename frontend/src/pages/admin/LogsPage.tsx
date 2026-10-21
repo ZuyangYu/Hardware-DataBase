@@ -183,7 +183,9 @@ function AuditPanel() {
         title: '结果',
         width: 80,
         render: (e) =>
-          e.success ? (
+          e.action.endsWith('.requested') ? (
+            <span className="text-[#b26a00]">已发起</span>
+          ) : e.success ? (
             <span className="text-[#2cb360]">成功</span>
           ) : (
             <span className="text-[#d20b0b]">失败</span>
@@ -231,7 +233,12 @@ function AuditPanel() {
         <div className="flex flex-wrap items-stretch gap-[20px]">
           <StatCard label="总数" value={stats?.total ?? 0} />
           <StatCard label="成功" value={stats?.breakdown?.success ?? 0} tone="green" />
-          <StatCard label="失败" value={stats?.breakdown?.failure ?? 0} tone="red" />
+          <StatCard label="失败" value={stats?.breakdown?.failed ?? 0} tone="red" />
+          <StatCard
+            label="已发起"
+            value={stats?.breakdown?.requested ?? 0}
+            title="写前意图已记录、最终结果尚未落盘；崩溃后可见，但不算成功或失败"
+          />
         </div>
 
         {!loaded ? (
@@ -272,7 +279,16 @@ function AuditDetailDialog({ event, onClose }: { event: AuditEventView | null; o
               <Field label="动作" value={event.action} />
               <Field label="目标" value={`${event.target_type}${event.target_id ? `/${event.target_id}` : ''}`} />
               <Field label="知识库" value={event.kb_name || '-'} />
-              <Field label="结果" value={event.success ? '成功' : '失败'} />
+              <Field
+                label="结果"
+                value={
+                  event.action.endsWith('.requested')
+                    ? '已发起（等待最终结果）'
+                    : event.success
+                      ? '成功'
+                      : '失败'
+                }
+              />
               {event.error_message && <Field label="错误" value={event.error_message} />}
               <div className="grid min-w-0 gap-[4px]">
                 <span className="text-[11px] text-[#858b9c]">元数据</span>

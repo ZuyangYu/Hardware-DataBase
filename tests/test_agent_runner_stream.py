@@ -443,3 +443,16 @@ def test_runner_prefetches_bounded_memory_context_before_agent_creation():
     assert "仅作历史线索" in context
     assert len(services) == 1
     assert services[0].closed is True
+
+
+def test_turn_preparation_stays_synchronous():
+    """架构约束：准备阶段必须是普通函数，不能重新长出 yield。
+
+    ``_stream_impl`` 原本 1602 行，前 82% 不参与流式。拆成
+    ``_prepare_turn`` 的目的就是让准备阶段可单测、可独立评审；如果这里
+    变回生成器，拆分就失去意义。
+    """
+    from inspect import isgeneratorfunction
+
+    assert not isgeneratorfunction(MultiSourceAgentRunner._prepare_turn)
+    assert isgeneratorfunction(MultiSourceAgentRunner._stream_impl)

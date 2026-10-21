@@ -82,6 +82,17 @@ def connect(store: Any):
     return open_pg_connection(store._dsn)
 
 
+def for_update(store: Any, sql: str) -> str:
+    """Append ``FOR UPDATE`` when the store runs on PostgreSQL.
+
+    Thin re-export of ``src.storage.domain_pg.for_update`` for the
+    document-authoring stores (see that function for the full rationale).
+    """
+    from src.storage import domain_pg
+
+    return domain_pg.for_update(store, sql)
+
+
 # ---------------------------------------------------------------------------
 # 文档生成兼容库（独立文件 document_authoring_compatibility.sqlite）
 # ---------------------------------------------------------------------------

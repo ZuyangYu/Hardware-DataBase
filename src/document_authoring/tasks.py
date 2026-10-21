@@ -131,6 +131,12 @@ class DocumentTaskStore:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    def _for_update(self, sql: str) -> str:
+        """PG 行锁；SQLite 由 ``BEGIN IMMEDIATE`` 写锁兜底（见 pg_support）。"""
+        from src.document_authoring import pg_support
+
+        return pg_support.for_update(self, sql)
+
     def _init_db(self) -> None:
         with closing(self._connect()) as conn:
             conn.executescript(
@@ -551,8 +557,10 @@ class DocumentTaskStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 current = conn.execute(
-                    """SELECT current_task_id FROM conversation_document_states
-                        WHERE tenant_id = ? AND user_id = ? AND conversation_id = ?""",
+                    self._for_update(
+                        """SELECT current_task_id FROM conversation_document_states
+                        WHERE tenant_id = ? AND user_id = ? AND conversation_id = ?"""
+                    ),
                     (tenant, owner, conversation),
                 ).fetchone()
                 if current is None or str(current["current_task_id"]) != normalized_task_id:
@@ -658,7 +666,10 @@ class DocumentTaskStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM document_tasks WHERE task_id = ?", (task_id,)
+                    self._for_update(
+                        "SELECT * FROM document_tasks WHERE task_id = ?"
+                    ),
+                    (task_id,),
                 ).fetchone()
                 if row is None:
                     raise KeyError("document task not found")
@@ -725,7 +736,10 @@ class DocumentTaskStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM document_tasks WHERE task_id = ?", (task_id,)
+                    self._for_update(
+                        "SELECT * FROM document_tasks WHERE task_id = ?"
+                    ),
+                    (task_id,),
                 ).fetchone()
                 if row is None:
                     raise KeyError("document task not found")
@@ -787,7 +801,10 @@ class DocumentTaskStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM document_tasks WHERE task_id = ?", (task_id,)
+                    self._for_update(
+                        "SELECT * FROM document_tasks WHERE task_id = ?"
+                    ),
+                    (task_id,),
                 ).fetchone()
                 if row is None:
                     raise KeyError("document task not found")
@@ -829,7 +846,10 @@ class DocumentTaskStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM document_tasks WHERE task_id = ?", (task_id,)
+                    self._for_update(
+                        "SELECT * FROM document_tasks WHERE task_id = ?"
+                    ),
+                    (task_id,),
                 ).fetchone()
                 if row is None:
                     raise KeyError("document task not found")
@@ -874,7 +894,10 @@ class DocumentTaskStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM document_tasks WHERE task_id = ?", (str(task_id),)
+                    self._for_update(
+                        "SELECT * FROM document_tasks WHERE task_id = ?"
+                    ),
+                    (str(task_id),),
                 ).fetchone()
                 if row is None:
                     raise KeyError("document task not found")
@@ -932,7 +955,10 @@ class DocumentTaskStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM document_tasks WHERE task_id = ?", (str(task_id),)
+                    self._for_update(
+                        "SELECT * FROM document_tasks WHERE task_id = ?"
+                    ),
+                    (str(task_id),),
                 ).fetchone()
                 if row is None:
                     raise KeyError("document task not found")
@@ -1008,7 +1034,10 @@ class DocumentTaskStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT * FROM document_tasks WHERE task_id = ?", (normalized,)
+                    self._for_update(
+                        "SELECT * FROM document_tasks WHERE task_id = ?"
+                    ),
+                    (normalized,),
                 ).fetchone()
                 if row is None:
                     raise KeyError("document task not found")

@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 import uuid
 from contextlib import closing
@@ -156,6 +157,54 @@ class AuthDomainPostgresTests(unittest.TestCase):
         self.assertGreaterEqual(logs.count_audit_events(actor), 1)
         events = logs.list_audit_events(actor, limit=5)
         self.assertTrue(any(event.action == "login_success" for event in events))
+
+    def test_concurrent_audit_append_keeps_hash_chain_linear(self) -> None:
+        """Concurrent appends must not fork the audit hash chain.
+
+        ``record_audit`` reads the previous ``integrity_hash`` before inserting
+        the next row.  Without a transaction-scoped lock both writers read the
+        same predecessor and the chain forks silently.
+        """
+        logs = AppLogService()
+        actor = AuthService().get_user_by_username("admin")
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+        lock = threading.Lock()
+
+        def write(index: int) -> None:
+            barrier.wait(timeout=10)
+            try:
+                logs.record_audit(
+                    f"concurrent_audit_{index}",
+                    actor=actor,
+                    target_type="user",
+                    target_id=str(index),
+                )
+            except BaseException as exc:  # noqa: BLE001 - asserted below
+                with lock:
+                    errors.append(exc)
+
+        threads = [
+            threading.Thread(target=write, args=(index,)) for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertEqual(errors, [])
+        with closing(logs._connect()) as conn:
+            rows = conn.execute(
+                "SELECT id, previous_hash, integrity_hash FROM audit_events ORDER BY id"
+            ).fetchall()
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertEqual(rows[0]["previous_hash"], "")
+        for previous, current in zip(rows, rows[1:]):
+            self.assertEqual(
+                current["previous_hash"],
+                previous["integrity_hash"],
+                f"audit hash chain forked at id={current['id']}",
+            )
 
     def test_mirror_is_noop_when_auth_domain_runs_on_postgres(self) -> None:
         from src.core import auth as auth_module

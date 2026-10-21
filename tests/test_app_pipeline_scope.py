@@ -208,9 +208,12 @@ class AppPipelineScopeTests(unittest.TestCase):
         msg = pipeline.delete_document("d1", "kb", ctx=ctx)
         self.assertEqual(msg, "Document mapping was not found.")
 
-        # The audit call must have success=False because BackendResult.ok is False.
-        pipeline._audit.assert_called_once()
-        call_kwargs = pipeline._audit.call_args[1]
+        # Write-ahead intent + final outcome: the outcome row must have
+        # success=False because BackendResult.ok is False.
+        self.assertEqual(pipeline._audit.call_count, 2)
+        requested_args = pipeline._audit.call_args_list[0][0]
+        self.assertEqual(requested_args[0], "delete_document.requested")
+        call_kwargs = pipeline._audit.call_args_list[-1][1]
         self.assertFalse(call_kwargs.get("success", True))
         self.assertIn("not found", call_kwargs.get("error_message", ""))
 

@@ -201,6 +201,25 @@ def _admin_kb_summaries(
     return auth.list_knowledge_base_summaries(existing)
 
 
+def _validate_data_owner(binding: KnowledgeBaseBinding, auth: AuthService) -> str:
+    """Evaluation retrieval must run under a KB data owner's authorization.
+
+    system_admin is a governance role and must not read KB content (CLAUDE.md
+    iron rule).  The run's retrieval identity is the KB owner, so a KB without
+    an active owner cannot be evaluated: there is nobody whose authorization
+    the read could be attributed to.
+    """
+    if binding.owner_user_id is None:
+        return (
+            f"知识库 {binding.kb_name} 未登记数据负责人（owner）；"
+            "评测读取需要负责人授权，请先在知识库管理页指定负责人"
+        )
+    owner = auth.get_user_by_id(binding.owner_user_id)
+    if owner is None or not owner.is_active:
+        return f"知识库 {binding.kb_name} 的数据负责人账号不存在或已停用，无法授权评测"
+    return ""
+
+
 def _resolve_request_binding(
     body: CreateEvaluationRunRequest,
     samples: list[EvaluationSample],
@@ -315,6 +334,9 @@ def _prepare_evaluation(
     )
     errors: list[str] = []
     warnings: list[str] = []
+    owner_error = _validate_data_owner(binding, auth)
+    if owner_error:
+        return _PreparedEvaluation(dataset_path, None, None, None, warnings, [owner_error])
     if selection.dataset_sample_count == 0:
         errors.append(f"所选知识库 {binding.kb_name} 没有匹配的评估样本")
 
@@ -562,6 +584,73 @@ def _load_sample_results(run_dir: Path) -> tuple[list[dict[str, Any]], str]:
     return rows, ""
 
 
+_RETRIEVAL_SUMMARY_SAFE_KEYS = (
+    "status",
+    "error_stage",
+    "error_message",
+    "retriever_type",
+    "final_top_k",
+    "retrieval_rounds",
+    "sufficiency_status",
+)
+
+
+def _redact_retrieval_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    safe = {key: summary[key] for key in _RETRIEVAL_SUMMARY_SAFE_KEYS if key in summary}
+    queries = summary.get("rewritten_queries")
+    if isinstance(queries, list):
+        safe["rewritten_queries"] = [str(item)[:200] for item in queries]
+    diagnostics = summary.get("tool_diagnostics")
+    if isinstance(diagnostics, list):
+        safe["tool_diagnostics"] = [
+            {key: entry.get(key) for key in ("tool_name", "status", "latency_ms", "hit_count") if key in entry}
+            for entry in diagnostics
+            if isinstance(entry, dict)
+        ]
+    return safe
+
+
+def _redact_sample_results_for_governance(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip knowledge-base content from the sample diagnostics payload.
+
+    ``/evaluation`` is a system_admin surface, and system_admin is a
+    governance role that must never read KB content (CLAUDE.md iron rule).
+    Retrieval happens under the KB owner's authorization; the metrics, sample
+    statuses and evidence counts remain visible, while answers, retrieved
+    contexts and judge rationales (all of which can quote KB text) are
+    removed.  The UI shows the redaction notice from ``content_redacted``.
+    """
+    redacted: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        context_count = len(item.get("retrieved_contexts") or [])
+        item["response"] = ""
+        item["scored_response"] = ""
+        item["retrieved_contexts"] = []
+        item["metrics"] = [
+            {**dict(metric), "reason": "", "details": {}}
+            for metric in (item.get("metrics") or [])
+        ]
+        metadata = dict(item.get("metadata") or {})
+        metadata["content_redacted"] = True
+        metadata["retrieved_context_count"] = context_count
+        scoring = metadata.get("ragas_scoring")
+        if isinstance(scoring, dict):
+            scoring = dict(scoring)
+            scored_contexts = scoring.get("scored_contexts")
+            if isinstance(scored_contexts, list):
+                scoring["scored_context_count"] = len(scored_contexts)
+            scoring["scored_contexts"] = []
+            scoring.pop("full_contexts_for_scoring", None)
+            metadata["ragas_scoring"] = scoring
+        retrieval_summary = metadata.get("retrieval_summary")
+        if isinstance(retrieval_summary, dict):
+            metadata["retrieval_summary"] = _redact_retrieval_summary(retrieval_summary)
+        item["metadata"] = metadata
+        redacted.append(item)
+    return redacted
+
+
 @router.get(
     "/evaluation/knowledge-bases",
     response_model=list[EvaluationKnowledgeBaseView],
@@ -573,18 +662,33 @@ def list_evaluation_knowledge_bases(
 ) -> list[EvaluationKnowledgeBaseView]:
     """List selectable registered KB identities for the system admin UI."""
 
-    return [
-        EvaluationKnowledgeBaseView(
+    rows: list[EvaluationKnowledgeBaseView] = []
+    for summary in _admin_kb_summaries(_actor, pipeline, auth):
+        if not summary.registered or summary.kb_id is None:
+            continue
+        binding = KnowledgeBaseBinding(
             kb_id=int(summary.kb_id),
             kb_name=summary.name,
             department_id=summary.department_id,
             department_name=summary.department_name,
-            physical_exists=summary.physical_exists,
+            owner_user_id=summary.owner_user_id,
             registered=summary.registered,
+            physical_exists=summary.physical_exists,
         )
-        for summary in _admin_kb_summaries(_actor, pipeline, auth)
-        if summary.registered and summary.kb_id is not None
-    ]
+        rows.append(
+            EvaluationKnowledgeBaseView(
+                kb_id=binding.kb_id,
+                kb_name=binding.kb_name,
+                department_id=binding.department_id,
+                department_name=binding.department_name,
+                physical_exists=binding.physical_exists,
+                registered=binding.registered,
+                owner_user_id=binding.owner_user_id,
+                owner_username=summary.owner_username,
+                evaluation_blocked_reason=_validate_data_owner(binding, auth),
+            )
+        )
+    return rows
 
 
 # Resolve from the repository location rather than the process CWD.  The API
@@ -813,6 +917,8 @@ def create_run(
                 "department_id": binding.department_id,
                 "sample_count": selection.dataset_sample_count,
                 "cohort_fingerprint": selection.cohort_fingerprint,
+                # The employee whose authorization the retrieval runs under.
+                "authorized_by_user_id": binding.owner_user_id,
                 "source": "api",
             },
         )
@@ -1109,7 +1215,8 @@ def get_run(
     else:
         result["summary"] = None
     if result["summary"] is not None:
-        result["sample_results"], result["sample_results_error"] = _load_sample_results(results_dir)
+        sample_rows, result["sample_results_error"] = _load_sample_results(results_dir)
+        result["sample_results"] = _redact_sample_results_for_governance(sample_rows)
     else:
         result["sample_results"] = []
         result["sample_results_error"] = ""

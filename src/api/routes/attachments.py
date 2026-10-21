@@ -25,6 +25,7 @@ from src.api.deps import (
 )
 from src.api.context import build_context_for_user
 from src.api.schemas import OkResponse
+from src.attachments.audit import begin_attachment_audit, finish_attachment_audit
 from src.core.auth import AuthService, AuthUser
 from src.core.conversation import ConversationService
 from src.observability.metrics import record_attachment
@@ -113,13 +114,49 @@ async def upload_attachment(
     auth: AuthService = Depends(get_auth_service),
 ):
     _require_enabled()
-    _require_session(user, auth, session_id)
+    session = _require_session(user, auth, session_id)
     service = _attachment_service()
+    attempt = begin_attachment_audit(
+        action="attachment.upload",
+        target_type="chat_attachment",
+        target_id=f"session:{session_id}",
+        actor=user,
+        kb_name=session.kb_name,
+        metadata={
+            "session_id": session_id,
+            "filename": str(getattr(file, "filename", "") or "")[:500],
+            "usage_hint": str(usage_hint or "")[:100],
+        },
+    )
     try:
         record = await run_upload(service, session_id=session_id, user_id=user.id, file=file,
                                   client_request_id=client_request_id, usage_hint=usage_hint)
     except AttachmentError as exc:
+        finish_attachment_audit(
+            attempt,
+            success=False,
+            error_message=str(exc),
+            metadata={
+                "session_id": session_id,
+                "filename": str(getattr(file, "filename", "") or "")[:500],
+                "usage_hint": str(usage_hint or "")[:100],
+            },
+        )
         raise _map_service_error(exc) from exc
+    finish_attachment_audit(
+        attempt,
+        success=True,
+        target_id=record.attachment_id,
+        metadata={
+            "session_id": session_id,
+            "filename": record.filename,
+            "size_bytes": record.size_bytes,
+            "media_type": record.media_type,
+            "sha256": record.sha256,
+            "parse_status": record.parse_status,
+            "usage_hint": record.usage_hint,
+        },
+    )
     record_attachment("upload", status="ok")
     return _attachment_view(record)
 
@@ -222,14 +259,33 @@ def delete_attachment(
     auth: AuthService = Depends(get_auth_service),
 ):
     _require_enabled()
-    _require_session(user, auth, session_id)
+    session = _require_session(user, auth, session_id)
     service = _attachment_service()
+    attempt = begin_attachment_audit(
+        action="attachment.delete",
+        target_type="chat_attachment",
+        target_id=attachment_id,
+        actor=user,
+        kb_name=session.kb_name,
+        metadata={"session_id": session_id},
+    )
     try:
         service.delete_attachment(
             attachment_id=attachment_id, session_id=session_id, user_id=user.id
         )
     except AttachmentError as exc:
+        finish_attachment_audit(
+            attempt,
+            success=False,
+            error_message=str(exc),
+            metadata={"session_id": session_id},
+        )
         raise _map_service_error(exc) from exc
+    finish_attachment_audit(
+        attempt,
+        success=True,
+        metadata={"session_id": session_id},
+    )
     record_attachment("cleanup", status="deleted")
     return OkResponse(ok=True)
 
@@ -242,14 +298,39 @@ def retry_attachment(
     auth: AuthService = Depends(get_auth_service),
 ):
     _require_enabled()
-    _require_session(user, auth, session_id)
+    session = _require_session(user, auth, session_id)
     service = _attachment_service()
+    attempt = begin_attachment_audit(
+        action="attachment.retry_parse",
+        target_type="chat_attachment",
+        target_id=attachment_id,
+        actor=user,
+        kb_name=session.kb_name,
+        metadata={"session_id": session_id},
+    )
     try:
         record = service.retry_parse(
             attachment_id=attachment_id, session_id=session_id, user_id=user.id
         )
     except AttachmentError as exc:
+        finish_attachment_audit(
+            attempt,
+            success=False,
+            error_message=str(exc),
+            metadata={"session_id": session_id},
+        )
         raise _map_service_error(exc) from exc
+    finish_attachment_audit(
+        attempt,
+        success=True,
+        target_id=record.attachment_id,
+        metadata={
+            "session_id": session_id,
+            "filename": record.filename,
+            "parse_status": record.parse_status,
+            "error_code": record.error_code,
+        },
+    )
     return _attachment_view(record)
 
 
@@ -368,16 +449,41 @@ def reparse_stale_attachments(
         item.strip().lower() for item in (extension or []) if item.strip()
     ] or None
     assets = service.list_stale_assets(extensions=extensions, limit=limit)
+    attempt = begin_attachment_audit(
+        action="attachment.reparse_stale",
+        target_type="attachment_batch",
+        target_id="reparse-stale",
+        actor=actor,
+        metadata={
+            "scanned": len(assets),
+            "limit": limit,
+            "extensions": [str(item)[:50] for item in (extensions or [])[:50]],
+        },
+    )
     queued: list[str] = []
-    for asset in assets:
-        session = conv.get_session_unscoped(asset.session_id)
-        if session is None or not session.kb_name:
-            continue
-        ctx = build_context_for_user(actor, session.kb_name, auth=auth)
-        if not ctx.has_kb_permission(session.kb_name, "write"):
-            continue
-        if service.reparse_asset(asset):
-            queued.append(asset.asset_id)
+    try:
+        for asset in assets:
+            session = conv.get_session_unscoped(asset.session_id)
+            if session is None or not session.kb_name:
+                continue
+            ctx = build_context_for_user(actor, session.kb_name, auth=auth)
+            if not ctx.has_kb_permission(session.kb_name, "write"):
+                continue
+            if service.reparse_asset(asset):
+                queued.append(asset.asset_id)
+    except Exception as exc:
+        finish_attachment_audit(attempt, success=False, error_message=str(exc))
+        raise
+    finish_attachment_audit(
+        attempt,
+        success=True,
+        metadata={
+            "scanned": len(assets),
+            "queued": len(queued),
+            "limit": limit,
+            "extensions": [str(item)[:50] for item in (extensions or [])[:50]],
+        },
+    )
     return {
         "scanned": len(assets),
         "queued": len(queued),
@@ -460,8 +566,20 @@ def request_attachment_release(
     """Record explicit release-review intent; never releases by itself."""
 
     _require_enabled()
-    _require_session(user, auth, session_id)
+    session = _require_session(user, auth, session_id)
     service = _attachment_service()
+    attempt = begin_attachment_audit(
+        action="attachment.release_request",
+        target_type="attachment_revision",
+        target_id=revision_id,
+        actor=user,
+        kb_name=session.kb_name,
+        metadata={
+            "session_id": session_id,
+            "source": "api",
+            "comment_length": len(payload.comment or ""),
+        },
+    )
     try:
         revision = service.request_attachment_release(
             revision_id=revision_id,
@@ -470,9 +588,33 @@ def request_attachment_release(
             comment=payload.comment,
         )
     except AttachmentError as exc:
+        finish_attachment_audit(
+            attempt,
+            success=False,
+            error_message=str(exc),
+            metadata={"session_id": session_id, "source": "api"},
+        )
         raise _map_service_error(exc) from exc
     except ValueError as exc:
+        finish_attachment_audit(
+            attempt,
+            success=False,
+            error_message=str(exc),
+            metadata={"session_id": session_id, "source": "api"},
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finish_attachment_audit(
+        attempt,
+        success=True,
+        target_id=revision.revision_id,
+        metadata={
+            "session_id": session_id,
+            "operation": revision.operation,
+            "release_state": revision.release_state,
+            "comment_length": len(payload.comment or ""),
+            "source": "api",
+        },
+    )
     return _revision_view(revision)
 
 
@@ -489,11 +631,23 @@ def review_attachment_release(
     """Approve (creates a separate released copy) or reject a pending request."""
 
     _require_enabled()
-    _reviewer_ctx(user, auth, session_id)
+    session = _reviewer_ctx(user, auth, session_id)
     decision = str(payload.decision or "").strip().lower()
     if decision not in {"approve", "reject"}:
         raise HTTPException(status_code=400, detail="decision must be approve or reject")
     service = _attachment_service()
+    attempt = begin_attachment_audit(
+        action="attachment.release_review",
+        target_type="attachment_revision",
+        target_id=revision_id,
+        actor=user,
+        kb_name=session.kb_name,
+        metadata={
+            "session_id": session_id,
+            "decision": decision,
+            "source": "api",
+        },
+    )
     try:
         revision = service.review_attachment_release(
             revision_id=revision_id,
@@ -503,9 +657,42 @@ def review_attachment_release(
             comment=payload.comment,
         )
     except AttachmentError as exc:
+        finish_attachment_audit(
+            attempt,
+            success=False,
+            error_message=str(exc),
+            metadata={
+                "session_id": session_id,
+                "decision": decision,
+                "source": "api",
+            },
+        )
         raise _map_service_error(exc) from exc
     except ValueError as exc:
+        finish_attachment_audit(
+            attempt,
+            success=False,
+            error_message=str(exc),
+            metadata={
+                "session_id": session_id,
+                "decision": decision,
+                "source": "api",
+            },
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finish_attachment_audit(
+        attempt,
+        success=True,
+        target_id=revision.revision_id,
+        metadata={
+            "session_id": session_id,
+            "decision": decision,
+            "operation": revision.operation,
+            "release_state": revision.release_state,
+            "comment_length": len(payload.comment or ""),
+            "source": "api",
+        },
+    )
     return _revision_view(revision)
 
 

@@ -8,7 +8,12 @@
 import unittest
 
 from src.agents.schemas import Evidence
-from src.agents.tools.runtime import ToolRuntime, format_tool_result, timed_tool_call
+from src.agents.tools.runtime import (
+    ToolRuntime,
+    empty_result_message,
+    format_tool_result,
+    timed_tool_call,
+)
 from src.agents.tools.spreadsheet_tools import _sql_evidence_id
 
 
@@ -168,6 +173,62 @@ class SqlEvidenceIdTests(unittest.TestCase):
             _sql_evidence_id("SELECT a FROM t1", "result"),
             _sql_evidence_id("SELECT a FROM t1", "error"),
         )
+
+
+class ToolFailureMessageTests(unittest.TestCase):
+    """回归：工具故障不能被渲染成“没有资料”。
+
+    故障（超时/后端不可用/权限拒绝）和“检索结果为空”是两种事实。前者若被
+    压成"（未找到相关内容）"，模型会自信地回答“知识库里没有”，而真实原因
+    可能只是 RAGFlow 挂了。
+    """
+
+    def test_failed_tool_renders_failure_not_empty(self):
+        rt = ToolRuntime(kb_name="kb", ctx=None)
+
+        def _boom() -> list[Evidence]:
+            raise TimeoutError("ragflow timeout")
+
+        items, adds_nothing = timed_tool_call(
+            rt, "document_search", "电源方案", None, _boom
+        )
+        rendered = format_tool_result(rt, adds_nothing, items)
+
+        self.assertIn("本次调用 document_search 失败", rendered)
+        self.assertIn("不代表知识库/附件中没有相关内容", rendered)
+        self.assertNotIn("未找到相关内容", rendered)
+
+    def test_failed_tool_renders_failure_through_empty_result_message(self):
+        rt = ToolRuntime(kb_name="kb", ctx=None)
+
+        def _boom() -> list[Evidence]:
+            raise ConnectionError("backend unavailable")
+
+        items, _ = timed_tool_call(rt, "attachment_search", "q", None, _boom)
+        rendered = empty_result_message(rt, "附件中没有找到相关内容。", items=items)
+
+        self.assertIn("本次调用 attachment_search 失败", rendered)
+        self.assertNotIn("附件中没有找到相关内容", rendered)
+
+    def test_genuinely_empty_result_keeps_no_content_wording(self):
+        rt = ToolRuntime(kb_name="kb", ctx=None)
+        items, adds_nothing = timed_tool_call(
+            rt, "document_search", "不存在的主题", None, lambda: []
+        )
+        rendered = format_tool_result(rt, adds_nothing, items)
+        self.assertEqual(rendered, "（未找到相关内容）")
+
+    def test_budget_blocked_still_explains_execution_limit(self):
+        rt = ToolRuntime(kb_name="kb", ctx=None, evidence_budget=1)
+        timed_tool_call(
+            rt, "document_search", "q1", None, lambda: [_evidence("document:1")]
+        )
+        items, adds_nothing = timed_tool_call(
+            rt, "document_search", "q2", None, lambda: [_evidence("document:2")]
+        )
+        rendered = format_tool_result(rt, adds_nothing, items)
+        self.assertIn("证据已达上限", rendered)
+        self.assertNotIn("未找到相关内容", rendered)
 
 
 if __name__ == "__main__":

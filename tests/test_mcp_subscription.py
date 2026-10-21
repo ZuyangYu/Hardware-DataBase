@@ -260,7 +260,17 @@ class McpSubscriptionTests(unittest.TestCase):
             )
             self.assertEqual(revoked.status_code, 200, revoked.text)
             self.assertFalse(revoked.json()["subscription"]["allow_write"])
-        self.assertEqual(self._audit_actions().count("plugins.mcp.write_consent"), 2)
+        actions = self._audit_actions()
+        self.assertEqual(actions.count("plugins.mcp.write_consent"), 3)
+        self.assertEqual(actions.count("plugins.mcp.write_consent.requested"), 3)
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT success, COUNT(*) FROM audit_events "
+                "WHERE action = ? GROUP BY success",
+                ("plugins.mcp.write_consent",),
+            ).fetchall()
+        counts = {int(success): int(count) for success, count in rows}
+        self.assertEqual(counts, {1: 2, 0: 1})
 
 
 if __name__ == "__main__":
