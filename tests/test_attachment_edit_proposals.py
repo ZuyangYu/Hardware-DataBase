@@ -15,6 +15,8 @@ from src.agents.orchestration.contracts import ActionSpec, compile_deterministic
 from src.agents.runner import _direct_attachment_proposal_answer
 from src.attachments.service import AttachmentService
 from src.attachments.store import AttachmentStore
+from src.core.app_logs import AppLogService
+from src.core.auth import ROLE_SYSTEM_ADMIN, AuthUser
 
 
 def _service(tmp_path, monkeypatch):
@@ -164,6 +166,30 @@ def test_plan_executor_creates_a_proposal_only_with_cited_evidence(tmp_path, mon
     assert outcome["status"] == "accepted"
     assert outcome["data"]["proposal_id"].startswith("attachment-proposal-")
     assert service.get_pending_attachment_proposal(session_id=7, user_id=11) is not None
+
+    admin = AuthUser(
+        id=999,
+        username="root",
+        role=ROLE_SYSTEM_ADMIN,
+        is_active=True,
+        department_id=None,
+    )
+    logs = AppLogService()
+    finalized = logs.list_audit_events(
+        admin,
+        action="attachment.proposal_create",
+        keyword=outcome["data"]["proposal_id"],
+    )
+    started = logs.list_audit_events(
+        admin,
+        action="attachment.proposal_create.requested",
+        keyword=parent.attachment_id,
+    )
+    assert len(finalized) == 1
+    assert finalized[0].success is True
+    assert finalized[0].target_id == outcome["data"]["proposal_id"]
+    assert started
+    assert '"phase": "requested"' in started[0].metadata_json
 
 
 def test_plan_guard_marks_section_requests_without_writing():

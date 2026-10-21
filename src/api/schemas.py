@@ -1114,6 +1114,11 @@ class EvaluationKnowledgeBaseView(BaseModel):
     department_name: str | None = None
     physical_exists: bool = False
     registered: bool = True
+    owner_user_id: int | None = None
+    owner_username: str | None = None
+    # Empty when the KB has an active owner; otherwise the preflight reason
+    # shown before the system admin submits a run.
+    evaluation_blocked_reason: str = ""
 
 
 class EvaluationPreflightResponse(BaseModel):

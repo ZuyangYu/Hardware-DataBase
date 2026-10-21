@@ -81,7 +81,11 @@ def make_circuit_search(rt, circuit_service: CircuitIndexService):
 
         items, adds_nothing = timed_tool_call(rt, "circuit_search", query, None, lambda: run(query, max(1, min(int(top_k), 20))))
         text = format_tool_result(rt, adds_nothing, items)
-        if not items and not getattr(items, "budget_blocked", False):
+        if (
+            not items
+            and not getattr(items, "budget_blocked", False)
+            and not getattr(items, "failure", "")
+        ):
             text += (
                 "\n本次未命中任何电路事实（知识库也可能没有电路资料）。"
                 "若问题同时涉及表格页面（如 Page2）、表内数值/位号/容值，"

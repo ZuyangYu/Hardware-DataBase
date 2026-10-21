@@ -1311,16 +1311,13 @@ class DocumentAuthoringStore:
 
     def claim_harness_run(self, run_id: str, lease_owner: str, lease_seconds: int) -> HarnessRun:
         """Claim a queued/retrying run and advance its fencing token atomically."""
-        now = datetime.now(timezone.utc)
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                row = conn.execute(
-                    "SELECT payload_json FROM harness_runs WHERE harness_run_id = ?", (run_id,)
-                ).fetchone()
-                if row is None:
-                    raise KeyError(f"harness run not found: {run_id}")
-                current = HarnessRun.model_validate(_payload(row))
+                current = self._get_run_for_update(conn, run_id)
+                # Timestamp after the row lock: a worker that waited on another
+                # claim must judge lease expiry against the current clock.
+                now = datetime.now(timezone.utc)
                 if current.status not in {"planned", "queued", "retrying"}:
                     raise ValueError(f"harness run cannot be claimed from status {current.status}")
                 if current.lease_expires_at and current.lease_expires_at > now:
@@ -1349,16 +1346,11 @@ class DocumentAuthoringStore:
         **updates: Any,
     ) -> HarnessRun:
         """Update a run only while the caller owns its unexpired fencing lease."""
-        now = datetime.now(timezone.utc)
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                row = conn.execute(
-                    "SELECT payload_json FROM harness_runs WHERE harness_run_id = ?", (run_id,)
-                ).fetchone()
-                if row is None:
-                    raise KeyError(f"harness run not found: {run_id}")
-                current = HarnessRun.model_validate(_payload(row))
+                current = self._get_run_for_update(conn, run_id)
+                now = datetime.now(timezone.utc)
                 self._require_active_lease(current, owner, token, now)
                 revised = current.model_copy(update={**updates, "updated_at": now})
                 conn.execute(
@@ -1391,16 +1383,11 @@ class DocumentAuthoringStore:
         """Pause/cancel a run and revoke any old worker lease via fencing."""
         if target_status not in {"paused", "cancelled"}:
             raise ValueError("only paused or cancelled HarnessRun states may be requested")
-        now = datetime.now(timezone.utc)
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                row = conn.execute(
-                    "SELECT payload_json FROM harness_runs WHERE harness_run_id = ?", (run_id,)
-                ).fetchone()
-                if row is None:
-                    raise KeyError(f"harness run not found: {run_id}")
-                current = HarnessRun.model_validate(_payload(row))
+                current = self._get_run_for_update(conn, run_id)
+                now = datetime.now(timezone.utc)
                 if current.status in {"completed", "cancelled"}:
                     raise ValueError(f"harness run cannot be changed from status {current.status}")
                 revised = current.model_copy(update={
@@ -1422,12 +1409,7 @@ class DocumentAuthoringStore:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                row = conn.execute(
-                    "SELECT payload_json FROM harness_runs WHERE harness_run_id = ?", (run_id,)
-                ).fetchone()
-                if row is None:
-                    raise KeyError(f"harness run not found: {run_id}")
-                current = HarnessRun.model_validate(_payload(row))
+                current = self._get_run_for_update(conn, run_id)
                 if current.status not in {"failed", "paused", "waiting_human"}:
                     raise ValueError(f"harness run cannot be retried from status {current.status}")
                 if current.status != "waiting_human" and current.retry_count >= max_retries:
@@ -1475,13 +1457,7 @@ class DocumentAuthoringStore:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                row = conn.execute(
-                    "SELECT payload_json FROM harness_runs WHERE harness_run_id = ?",
-                    (run_id,),
-                ).fetchone()
-                if row is None:
-                    raise KeyError(f"harness run not found: {run_id}")
-                current = HarnessRun.model_validate(_payload(row))
+                current = self._get_run_for_update(conn, run_id)
                 existing_row = conn.execute(
                     "SELECT payload_json FROM authoring_execution_events "
                     "WHERE harness_run_id = ? AND idempotency_key = ?",
@@ -1659,6 +1635,11 @@ class DocumentAuthoringStore:
                     stored = AuthoringExecutionEvent.model_validate(_payload(row))
                     conn.execute("COMMIT")
                     return stored
+                # Serialise the sequence allocation on the run row.  Without a
+                # lock two concurrent appends read the same MAX(sequence) and
+                # write duplicate sequence numbers (the unique index only
+                # covers idempotency_key).
+                self._get_run_for_update(conn, event.harness_run_id)
                 sequence = conn.execute(
                     "SELECT COALESCE(MAX(sequence), 0) + 1 FROM authoring_execution_events "
                     "WHERE harness_run_id = ?",
@@ -1920,9 +1901,19 @@ class DocumentAuthoringStore:
         ):
             raise HarnessLeaseLost("harness lease is no longer active")
 
-    @staticmethod
-    def _get_run_for_update(conn, run_id: str) -> HarnessRun:
-        row = conn.execute("SELECT payload_json FROM harness_runs WHERE harness_run_id = ?", (run_id,)).fetchone()
+    def _for_update(self, sql: str) -> str:
+        """Append ``FOR UPDATE`` on PostgreSQL (see ``pg_support.for_update``)."""
+        from src.document_authoring import pg_support
+
+        return pg_support.for_update(self, sql)
+
+    def _get_run_for_update(self, conn, run_id: str) -> HarnessRun:
+        row = conn.execute(
+            self._for_update(
+                "SELECT payload_json FROM harness_runs WHERE harness_run_id = ?"
+            ),
+            (run_id,),
+        ).fetchone()
         if row is None:
             raise KeyError(f"harness run not found: {run_id}")
         return HarnessRun.model_validate(_payload(row))
@@ -2039,7 +2030,9 @@ class DocumentAuthoringStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT payload_json FROM document_artifacts WHERE artifact_id = ?",
+                    self._for_update(
+                        "SELECT payload_json FROM document_artifacts WHERE artifact_id = ?"
+                    ),
                     (str(artifact_id or "").strip(),),
                 ).fetchone()
                 if row is None:
@@ -2156,8 +2149,12 @@ class DocumentAuthoringStore:
                     if str(_payload(row).get("storage_ref") or "")
                 )
                 run_rows = conn.execute(
-                    """SELECT harness_run_id, payload_json FROM harness_runs
-                       WHERE work_order_id IN (""" + placeholders + ")",
+                    self._for_update(
+                        """SELECT harness_run_id, payload_json FROM harness_runs
+                       WHERE work_order_id IN ("""
+                        + placeholders
+                        + ")"
+                    ),
                     ids,
                 ).fetchall()
                 for row in run_rows:
@@ -2469,7 +2466,10 @@ class DocumentAuthoringStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 row = conn.execute(
-                    "SELECT payload_json FROM document_outbox_events WHERE event_id = ?", (event_id,)
+                    self._for_update(
+                        "SELECT payload_json FROM document_outbox_events WHERE event_id = ?"
+                    ),
+                    (event_id,),
                 ).fetchone()
                 if row is None:
                     raise KeyError(f"outbox event not found: {event_id}")

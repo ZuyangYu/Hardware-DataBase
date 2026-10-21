@@ -105,9 +105,11 @@ _PATH_SETTINGS = {
 
 # Apply isolation before collecting test modules: unittest.setUpClass and
 # module-level app factories run before function-scoped autouse fixtures.
-_TEST_STORAGE = tempfile.TemporaryDirectory(
-    prefix="hdb-tests-", dir="/tmp/opencode" if os.path.isdir("/tmp/opencode") else None,
-)
+# 共享机器上 /tmp/opencode 可能属于其他用户（存在但不可写），此时必须回落系统临时目录。
+_TEST_TMP_BASE = "/tmp/opencode"
+if not os.path.isdir(_TEST_TMP_BASE) or not os.access(_TEST_TMP_BASE, os.W_OK):
+    _TEST_TMP_BASE = None
+_TEST_STORAGE = tempfile.TemporaryDirectory(prefix="hdb-tests-", dir=_TEST_TMP_BASE)
 os.environ.setdefault("HDB_TEST_REDIS_URL", "redis://127.0.0.1:1/15")
 os.environ.update(_SQLITE_BACKENDS)
 os.environ.update({

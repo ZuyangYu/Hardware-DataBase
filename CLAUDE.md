@@ -122,8 +122,10 @@ agent). `query` streams answer deltas; `upload_files` routes by `source_group`
 (see Ingestion) into the circuit pipeline or the RAGFlow backend.
 
 ### External MCP plugins (`src/agents/mcp/`)
-Governed external tool federation, default off. Remote-only (stdio rejected),
-read-only tools only in phase 1. Flow: system admin registers a server
+Governed external tool federation, default on for remote read-only federation
+(`MCP_ENABLED=true` is only the emergency kill switch; with no enabled server
+there are zero connections/tools/events). The write channel and sandbox are
+default off. Remote-only (stdio rejected), read-only tools only in phase 1. Flow: system admin registers a server
 (`/api/v1/plugins/mcp/*`) → test connection (bound to the config fingerprint) →
 enable → employees subscribe on the 扩展 page. Visibility = enabled ∧
 department scope ∧ subscription, resolved **before** capability resolution;
@@ -139,11 +141,14 @@ validated candidate without overwriting the original; see `docs/mcp-plugins.md`.
 
 ### Sandbox / Gateway / text Skill boundary
 
-The HDB API and workers are control-plane clients only. They never launch
-third-party processes and never open a Docker/OCI socket. `src/sandbox/` uses
-an authenticated API adapter to an independently deployed Sandbox Runner (and
-an MCP Gateway for sandboxed stdio); the Runner is the only component allowed
-to control a runtime. `SANDBOX_BACKEND=disabled` and all sandbox/Gateway
+The HDB API and workers are control-plane clients only for external runtimes:
+they do not launch third-party services or sandbox workloads, and never open a
+Docker/OCI socket. The one local-process exception is optional attachment OCR
+(`src/attachments/ocr.py`), which invokes locally installed `pdftoppm` and
+`tesseract` without a shell; it never executes remote/sandbox code.
+`src/sandbox/` uses an authenticated API adapter to an independently deployed
+Sandbox Runner (and an MCP Gateway for sandboxed stdio); the Runner is the only
+component allowed to control a runtime. `SANDBOX_BACKEND=disabled` and all sandbox/Gateway
 switches are off by default, and an unavailable or unvalidated backend fails
 closed rather than falling back to a local process/container.
 
@@ -272,12 +277,15 @@ rules (`hardware_metrics.py`) + 5 RAGAS metrics, gates via `gates.py`
 `summary.csv` / `report.html` to `storage/evaluations/<run_id>/`. Built-in
 25-sample dataset at `evaluation/datasets/hardware_qa_v1.jsonl`; the frontend
 "RAGAS 评估" admin page is system-admin-only and wraps `EvaluationService` via
-`src/api/routes/evaluation.py`.
+`src/api/routes/evaluation.py`. Retrieval runs under the KB data owner's
+identity; a KB without an active owner is listed as evaluation-unavailable and
+blocked by preflight until an owner is assigned (system_admin never reads KB
+content directly).
 
 ### API 层 (`src/api/`)
 前后端分离的后端。`src/api/` 是 FastAPI 服务(**就是后端**),只在 `AppPipeline` 外包一层 HTTP,不重写业务。所有业务路由挂在 `/api/v1` 前缀下(`/health` 保留根路径探针)。CORS 由 `HDB_API_CORS_ORIGINS`(逗号分隔)配置,默认放行本地开发 origin(5173/5174/3000),**生产部署必须显式设为前端实际域名**。RAGFlow key / `.env` / `auth.db` 只在服务侧。权限复用 `RAGFlowBackend._check_kb_access` 与 `RequestContext.has_kb_permission`:知识库默认私有(仅所有者可见可管理),所有者可通过 `PATCH /kbs/{kb}/sharing` 开启部门共享,共享后本部门其他员工获得 admin;系统管理员不参与内容访问。`src/api/context.py::build_context_for_user` 把已认证 `AuthUser` 转成 `RequestContext`(复用 `build_request_context`,不重复权限逻辑)。查询走 **turns 执行模型**:`POST /conversations/{id}/turns` 创建轮次(服务端自动落库 user 消息)-> `POST /turns/{turn_id}/start` 由 worker 轮询执行 -> `GET /turns/{turn_id}/events` SSE 流式返回。上传 `POST /kbs/{kb}/files`(multipart,分片写盘 + 大小上限 `HDB_API_MAX_UPLOAD_BYTES`)。
 
-**审计下沉**:管理写操作的 `record_audit` 住在 `AuthService._audit` / `AppPipeline._audit` 内部(fail-soft),所有入口自动覆盖、无双写。唯一例外是 `change_settings`(`apply_settings` 是 staticmethod 无 actor),由 `PUT /config` 路由层记一次。
+**审计下沉**:管理写操作的 `record_audit` 主要住在 `AuthService._audit` / `AppPipeline._audit` 内部(fail-soft),入口自动覆盖。例外:`change_settings`(`apply_settings` 是 staticmethod 无 actor)由 `PUT /config` 路由层记一次;附件与长期记忆的 HTTP/工具写入由 `src/attachments/audit.py` / `src/api/routes/memories.py` 记录(`AttachmentService` / `MemoryService` 只持有数字 user id,不持有 `AuthUser`),先写 `*.requested` 意图行(附件/记忆带 `attempt_id`),变更后再写结果行,成功和失败都记;`AppPipeline` 的上传/删文档/建删库/解析任务等主写操作、`AuthService` 账号/部门/共享治理和 MCP 插件管理也先写 `*.requested`。文件名/哈希/操作类型等结构化信息可入 metadata,文件内容和记忆正文/理由不落审计。
 
 **角色权力分离**(两级角色,与前端 admin 页面严格对齐):
 - `system_admin` = **治理角色**,只碰元数据。可用:部门管理、创建账号(已启用的系统管理员可创建 `employee` 或 `system_admin`; 员工绑定业务部门, 管理员归属 system 部门; 首个管理员由部署环境 `AUTH_DEFAULT_ADMIN_*` 初始化)、KB 挂载(`assign_kb`)、系统配置、日志中心、RAGAS 评估、治理面板。**不能**访问任何 KB 内容(检索、上传、看文件、删文件、看解析任务)。`RequestContext.has_kb_permission` 对 sysadmin 恒返回 False;API 路由用 `deps.reject_system_admin_kb_access(ctx)` 提前拒并给明确错误信息("system_admin 是治理角色,不能访问知识库内容")。这条铁律的目的是防"平台管理员静默窥视各部门私有数据"。
@@ -329,6 +337,9 @@ pointing at a disposable database such as `hdb_rehearsal`.
 
 ## Conventions
 
+- Architecture is ratcheted by `scripts/architecture_check.py` (new cycles,
+  reverse-layer imports, god-class line budgets, runtime `ALTER TABLE`).
+  Baseline updates are deliberate: see `ARCHITECTURE_GATE.md`.
 - Source modules are organized by subsystem (`src/<subsystem>/`). **Tests are
   flat** - one `tests/test_<topic>.py` per module, `unittest.TestCase`-based, with
   `tests/evaluation/` as the only subsystem subdir. Mirror that when adding tests.

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from src.agents.orchestration.contracts import ActionReceipt, ActionSpec
+from src.attachments.audit import begin_attachment_audit, finish_attachment_audit
 from src.attachments.models import AttachmentError
 
 
@@ -401,6 +402,18 @@ class GovernedToolActionAdapters:
                 "attachment_target_unresolved",
                 "章节提案需要 attachment_id 或 attachment 引用",
             )
+        attempt = begin_attachment_audit(
+            action="attachment.proposal_create",
+            target_type="chat_attachment",
+            target_id=attachment_id,
+            actor_user_id=self.attachment_user_id,
+            metadata={
+                "session_id": int(self.attachment_session_id),
+                "operation": "replace_section",
+                "evidence_ref_count": len(evidence_refs),
+                "source": "action_plan",
+            },
+        )
         try:
             proposal = self.attachment_service.create_attachment_edit_proposal(
                 session_id=int(self.attachment_session_id),
@@ -414,9 +427,28 @@ class GovernedToolActionAdapters:
                 note=str(parameters.get("request") or self.query or ""),
             )
         except (ValueError, AttachmentError) as exc:
+            finish_attachment_audit(
+                attempt, success=False, error_message=str(exc)
+            )
             return self._blocked("attachment_proposal_rejected", str(exc)[:500])
         except Exception as exc:  # noqa: BLE001 - executor must stay fail-soft
+            finish_attachment_audit(
+                attempt, success=False, error_message=str(exc)
+            )
             return self._blocked("attachment_proposal_unavailable", str(exc)[:300])
+        finish_attachment_audit(
+            attempt,
+            success=True,
+            target_type="attachment_edit_proposal",
+            target_id=proposal.proposal_id,
+            metadata={
+                "session_id": int(self.attachment_session_id),
+                "parent_attachment_id": attachment_id,
+                "operation": proposal.operation,
+                "evidence_ref_count": len(evidence_refs),
+                "source": "action_plan",
+            },
+        )
         return _outcome({
             "status": "accepted",
             "proposal_id": proposal.proposal_id,

@@ -20,6 +20,7 @@ from src.agents.tools.runtime import (
     format_tool_result,
     timed_tool_call,
 )
+from src.attachments.audit import begin_attachment_audit, finish_attachment_audit
 from src.attachments.evidence import evidence_from_chunk, evidence_from_part
 from src.attachments.models import AttachmentError
 from src.attachments.retrieval import AttachmentRetrievalService
@@ -376,6 +377,7 @@ def make_attachment_search(rt: ToolRuntime, retrieval: AttachmentRetrievalServic
                 rt,
                 "附件中没有找到相关内容。可尝试型号、位号、网络名或换一种问法。",
                 budget_blocked=bool(getattr(items, "budget_blocked", False)),
+                items=items,
             )
         return format_tool_result(rt, adds_nothing, items)
 
@@ -431,7 +433,10 @@ def make_attachment_read(rt: ToolRuntime):
         record_attachment("read", status="ok" if items else "empty")
         if not items:
             blocked = empty_result_message(
-                rt, "", budget_blocked=bool(getattr(items, "budget_blocked", False))
+                rt,
+                "",
+                budget_blocked=bool(getattr(items, "budget_blocked", False)),
+                items=items,
             )
             if blocked:
                 return blocked
@@ -576,6 +581,7 @@ def make_attachment_table_query(rt: ToolRuntime):
                 rt,
                 "本轮附件中没有可查询的 Excel 表格（仅支持 .xlsx/.xlsm）。",
                 budget_blocked=bool(getattr(items, "budget_blocked", False)),
+                items=items,
             )
         return format_tool_result(rt, adds_nothing, items)
 
@@ -646,6 +652,7 @@ def make_attachment_circuit_search(rt: ToolRuntime):
                 rt,
                 "附件中没有找到电路设计或相关网络/器件信息。",
                 budget_blocked=bool(getattr(items, "budget_blocked", False)),
+                items=items,
             )
         return format_tool_result(rt, adds_nothing, items)
 
@@ -704,6 +711,7 @@ def make_attachment_visual_analyze(rt: ToolRuntime, analyzer: Any | None = None)
                 rt,
                 "未返回视觉分析证据；远程视觉能力可能未启用、页面不可用或供应商失败。",
                 budget_blocked=bool(getattr(items, "budget_blocked", False)),
+                items=items,
             )
         return format_tool_result(rt, adds_nothing, items)
 
@@ -835,11 +843,25 @@ def make_attachment_edit(rt: ToolRuntime):
                 "error_code": "attachment_target_unresolved",
                 "message": "无法确定要修改的附件版本。",
             })
+        session_id = int(getattr(rt, "attachment_session_id", 0) or 0)
+        user_id = int(getattr(rt, "attachment_user_id", 0) or 0)
+        attempt = begin_attachment_audit(
+            action="attachment.revision_create",
+            target_type="attachment_revision",
+            target_id=normalized_id,
+            actor_user_id=user_id,
+            kb_name=str(getattr(rt, "kb_name", "") or ""),
+            metadata={
+                "session_id": session_id,
+                "parent_attachment_id": normalized_id,
+                "operation": str(operation or "replace_text")[:100],
+            },
+        )
         try:
             revision = _service(rt).create_attachment_revision(
                 parent_attachment_id=normalized_id,
-                session_id=int(getattr(rt, "attachment_session_id", 0) or 0),
-                user_id=int(getattr(rt, "attachment_user_id", 0) or 0),
+                session_id=session_id,
+                user_id=user_id,
                 before=before,
                 after=after,
                 client_request_id=client_request_id,
@@ -853,18 +875,34 @@ def make_attachment_edit(rt: ToolRuntime):
                 values=values,
                 preserve_embedded=bool(preserve_embedded),
             )
-        except AttachmentError as exc:
+        except (AttachmentError, ValueError) as exc:
+            finish_attachment_audit(
+                attempt,
+                success=False,
+                error_message=str(exc),
+                metadata={
+                    "session_id": session_id,
+                    "parent_attachment_id": normalized_id,
+                    "operation": str(operation or "replace_text")[:100],
+                },
+            )
             return _blocked({
                 "error_code": "attachment_revision_rejected",
                 "message": str(exc)[:500],
             })
-        except ValueError as exc:
-            return _blocked({
-                "error_code": "attachment_revision_rejected",
-                "message": str(exc)[:500],
-            })
-        session_id = int(getattr(rt, "attachment_session_id", 0) or 0)
         change_summary = revision_change_summary(revision)
+        finish_attachment_audit(
+            attempt,
+            success=True,
+            target_id=revision.revision_id,
+            metadata={
+                "session_id": session_id,
+                "parent_attachment_id": revision.parent_attachment_id,
+                "child_attachment_id": revision.child_attachment_id,
+                "operation": revision.operation,
+                "change_summary": change_summary,
+            },
+        )
         if revision.operation == "replace_section":
             message = (
                 f"已替换章节正文并创建候选（变更：{change_summary}）；"
@@ -972,6 +1010,18 @@ def make_attachment_release(rt: ToolRuntime):
                 }),
             }, ensure_ascii=False)
 
+        attempt = begin_attachment_audit(
+            action="attachment.release_request",
+            target_type="attachment_revision",
+            target_id=target.revision_id,
+            actor_user_id=user_id,
+            kb_name=str(getattr(rt, "kb_name", "") or ""),
+            metadata={
+                "session_id": session_id,
+                "source": "chat_tool",
+                "comment_length": len(comment or ""),
+            },
+        )
         try:
             revision = service.request_attachment_release(
                 revision_id=target.revision_id,
@@ -980,11 +1030,34 @@ def make_attachment_release(rt: ToolRuntime):
                 comment=comment,
             )
         except (AttachmentError, ValueError) as exc:
+            finish_attachment_audit(
+                attempt,
+                success=False,
+                error_message=str(exc),
+                metadata={
+                    "session_id": session_id,
+                    "source": "chat_tool",
+                    "comment_length": len(comment or ""),
+                },
+            )
             return json.dumps({
                 "status": "blocked",
                 "error_code": "attachment_release_rejected",
                 "message": str(exc)[:500],
             }, ensure_ascii=False)
+
+        finish_attachment_audit(
+            attempt,
+            success=True,
+            target_id=revision.revision_id,
+            metadata={
+                "session_id": session_id,
+                "source": "chat_tool",
+                "operation": revision.operation,
+                "release_state": revision.release_state,
+                "comment_length": len(comment or ""),
+            },
+        )
 
         session_id_for_url = int(getattr(rt, "attachment_session_id", 0) or 0)
         download_url = (

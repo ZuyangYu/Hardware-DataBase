@@ -74,6 +74,23 @@ def _record_audit(
         pass
 
 
+def _record_audit_requested(
+    user: AuthUser,
+    *,
+    action: str,
+    target_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Write the pre-mutation intent row for a plugin governance write."""
+
+    _record_audit(
+        user,
+        action=f"{action}.requested",
+        target_id=target_id,
+        metadata={**(metadata or {}), "phase": "requested"},
+    )
+
+
 def _server_view(record: McpServerRecord) -> McpServerResponse:
     return McpServerResponse(server=record.admin_view())
 
@@ -129,6 +146,12 @@ def subscribe(
     auth: AuthService = Depends(get_auth_service),
     service: McpPluginService = Depends(get_mcp_plugin_service),
 ):
+    _record_audit_requested(
+        user,
+        action="plugins.mcp.user_subscribe",
+        target_id=slug,
+        metadata={"allow_write": bool(body.allow_write)},
+    )
     try:
         subscription = service.subscribe(
             user.id,
@@ -161,9 +184,19 @@ def unsubscribe(
     user: AuthUser = Depends(require_employee),
     service: McpPluginService = Depends(get_mcp_plugin_service),
 ):
+    _record_audit_requested(
+        user, action="plugins.mcp.user_unsubscribe", target_id=slug
+    )
     try:
         removed = service.unsubscribe(user.id, slug)
     except McpServiceError as exc:
+        _record_audit(
+            user,
+            action="plugins.mcp.user_unsubscribe",
+            target_id=slug,
+            success=False,
+            error_message=str(exc),
+        )
         _raise_service_error(exc)
     _record_audit(user, action="plugins.mcp.user_unsubscribe", target_id=slug)
     return OkResponse(ok=True, message="已退订" if removed else "未订阅")
@@ -177,6 +210,12 @@ def set_write_consent(
     auth: AuthService = Depends(get_auth_service),
     service: McpPluginService = Depends(get_mcp_plugin_service),
 ):
+    _record_audit_requested(
+        user,
+        action="plugins.mcp.write_consent",
+        target_id=slug,
+        metadata={"allow_write": bool(body.allow_write)},
+    )
     try:
         subscription = service.set_write_consent(
             user.id,
@@ -185,6 +224,14 @@ def set_write_consent(
             department_id=_department_id(user, auth),
         )
     except McpServiceError as exc:
+        _record_audit(
+            user,
+            action="plugins.mcp.write_consent",
+            target_id=slug,
+            success=False,
+            error_message=str(exc),
+            metadata={"allow_write": bool(body.allow_write)},
+        )
         _raise_service_error(exc)
     _record_audit(
         user,
@@ -220,6 +267,9 @@ def confirm_write_proposal(
     user: AuthUser = Depends(require_employee),
     service: McpPluginService = Depends(get_mcp_plugin_service),
 ):
+    _record_audit_requested(
+        user, action="plugins.mcp.write_confirm", target_id=proposal_id
+    )
     try:
         proposal = service.confirm_write_proposal(user.id, proposal_id)
     except McpServiceError as exc:
@@ -243,9 +293,19 @@ def reject_write_proposal(
     user: AuthUser = Depends(require_employee),
     service: McpPluginService = Depends(get_mcp_plugin_service),
 ):
+    _record_audit_requested(
+        user, action="plugins.mcp.write_reject", target_id=proposal_id
+    )
     try:
         proposal = service.reject_write_proposal(user.id, proposal_id)
     except McpServiceError as exc:
+        _record_audit(
+            user,
+            action="plugins.mcp.write_reject",
+            target_id=proposal_id,
+            success=False,
+            error_message=str(exc),
+        )
         _raise_service_error(exc)
     _record_audit(user, action="plugins.mcp.write_reject", target_id=proposal_id)
     return McpWriteProposalResponse(proposal=proposal.to_dict())
@@ -281,6 +341,12 @@ def create_plugin(
     actor: AuthUser = Depends(require_system_admin),
     service: McpPluginService = Depends(get_mcp_plugin_service),
 ):
+    _record_audit_requested(
+        actor,
+        action="plugins.mcp.create",
+        target_id=str(body.slug),
+        metadata={"transport": body.transport},
+    )
     try:
         record = service.create_server(
             slug=body.slug,
@@ -337,6 +403,12 @@ def update_plugin(
     service: McpPluginService = Depends(get_mcp_plugin_service),
 ):
     fields = body.model_dump(exclude_unset=True)
+    _record_audit_requested(
+        actor,
+        action="plugins.mcp.update",
+        target_id=slug,
+        metadata={"fields": sorted(fields)},
+    )
     try:
         record = service.update_server(slug, fields, actor=actor.username)
     except McpServiceError as exc:
@@ -366,9 +438,17 @@ def delete_plugin(
     actor: AuthUser = Depends(require_system_admin),
     service: McpPluginService = Depends(get_mcp_plugin_service),
 ):
+    _record_audit_requested(actor, action="plugins.mcp.delete", target_id=slug)
     try:
         removed = service.delete_server(slug)
     except McpServiceError as exc:
+        _record_audit(
+            actor,
+            action="plugins.mcp.delete",
+            target_id=slug,
+            success=False,
+            error_message=str(exc),
+        )
         _raise_service_error(exc)
     _record_audit(actor, action="plugins.mcp.delete", target_id=slug)
     return OkResponse(ok=bool(removed), message="已删除" if removed else "未找到")
@@ -381,6 +461,11 @@ def set_plugin_status(
     actor: AuthUser = Depends(require_system_admin),
     service: McpPluginService = Depends(get_mcp_plugin_service),
 ):
+    _record_audit_requested(
+        actor,
+        action="plugins.mcp.enable" if body.enabled else "plugins.mcp.disable",
+        target_id=slug,
+    )
     try:
         record = service.set_enabled(slug, body.enabled, actor=actor.username)
     except McpServiceError as exc:
@@ -406,6 +491,7 @@ def test_plugin(
     actor: AuthUser = Depends(require_system_admin),
     service: McpPluginService = Depends(get_mcp_plugin_service),
 ):
+    _record_audit_requested(actor, action="plugins.mcp.test", target_id=slug)
     try:
         result = service.test_server(slug)
     except McpServiceError as exc:
@@ -447,6 +533,7 @@ def refresh_plugin_tools(
 ):
     """Force re-discovery after clearing this process's cache entry."""
 
+    _record_audit_requested(actor, action="plugins.mcp.refresh", target_id=slug)
     try:
         infos = service.refresh_tools(slug)
     except McpServiceError as exc:
@@ -474,10 +561,24 @@ def toggle_plugin_tool(
     actor: AuthUser = Depends(require_system_admin),
     service: McpPluginService = Depends(get_mcp_plugin_service),
 ):
+    _record_audit_requested(
+        actor,
+        action="plugins.mcp.tool_toggle",
+        target_id=slug,
+        metadata={"tool": tool_name},
+    )
     try:
         _enabled, _record = service.toggle_tool(slug, tool_name, actor=actor.username)
         infos = service.list_tools(slug)
     except McpServiceError as exc:
+        _record_audit(
+            actor,
+            action="plugins.mcp.tool_toggle",
+            target_id=slug,
+            success=False,
+            error_message=str(exc),
+            metadata={"tool": tool_name},
+        )
         _raise_service_error(exc)
     _record_audit(
         actor,
@@ -495,9 +596,22 @@ def set_plugin_write_tools(
     actor: AuthUser = Depends(require_system_admin),
     service: McpPluginService = Depends(get_mcp_plugin_service),
 ):
+    _record_audit_requested(
+        actor,
+        action="plugins.mcp.write_tools",
+        target_id=slug,
+        metadata={"write_tools": list(body.write_tools)},
+    )
     try:
         record = service.set_write_tools(slug, body.write_tools, actor=actor.username)
     except McpServiceError as exc:
+        _record_audit(
+            actor,
+            action="plugins.mcp.write_tools",
+            target_id=slug,
+            success=False,
+            error_message=str(exc),
+        )
         _raise_service_error(exc)
     _record_audit(
         actor,

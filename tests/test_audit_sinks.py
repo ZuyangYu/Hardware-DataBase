@@ -118,24 +118,31 @@ class AuditSinkTests(unittest.TestCase):
         # Exactly one create_user audit row -- the UI call was removed, so only
         # the sunk backend audit remains.
         self.assertEqual(new_events.count("create_user"), 1)
+        self.assertIn("create_user.requested", new_events)
 
     def test_create_department_records_audit(self):
         sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         before = len(self._audit_actions())
         self.auth.create_department_as(sysadmin, "newdept")
-        self.assertIn("create_department", self._new_actions(before))
+        actions = self._new_actions(before)
+        self.assertIn("create_department", actions)
+        self.assertIn("create_department.requested", actions)
 
     def test_set_user_active_records_audit(self):
         sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         before = len(self._audit_actions())
         self.auth.set_user_active_as(sysadmin, self.user.id, False)
-        self.assertIn("set_user_active", self._new_actions(before))
+        actions = self._new_actions(before)
+        self.assertIn("set_user_active", actions)
+        self.assertIn("set_user_active.requested", actions)
 
     def test_reset_password_records_audit(self):
         sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
         before = len(self._audit_actions())
         self.auth.reset_user_password_as(sysadmin, self.user.id, "newpass12345")
-        self.assertIn("reset_user_password", self._new_actions(before))
+        actions = self._new_actions(before)
+        self.assertIn("reset_user_password", actions)
+        self.assertIn("reset_user_password.requested", actions)
 
     def test_assign_kb_records_audit(self):
         # assign_knowledge_base_as (sysadmin KB mounting) must be audited.
@@ -144,6 +151,7 @@ class AuditSinkTests(unittest.TestCase):
         self.auth.assign_knowledge_base_as(sysadmin, "shared", self.dept.id)
         new_events = self._new_actions(before)
         self.assertIn("assign_kb", new_events)
+        self.assertIn("assign_kb.requested", new_events)
         metadata = self._latest_metadata("assign_kb")
         self.assertEqual(metadata.get("department_id"), self.dept.id)
 
@@ -167,7 +175,9 @@ class AuditSinkTests(unittest.TestCase):
             headers=self._auth(token),
         )
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertIn("update_kb_sharing", self._new_actions(before))
+        actions = self._new_actions(before)
+        self.assertIn("update_kb_sharing", actions)
+        self.assertIn("update_kb_sharing.requested", actions)
         metadata = self._latest_metadata("update_kb_sharing")
         self.assertEqual(metadata.get("is_shared"), False)
         self.assertEqual(metadata.get("owner_user_id"), self.admin.id)

@@ -544,8 +544,13 @@ class GenerationSessionStore:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                from src.document_authoring import pg_support
+
                 row = conn.execute(
-                    "SELECT * FROM document_generation_sessions WHERE session_id = ?",
+                    pg_support.for_update(
+                        self,
+                        "SELECT * FROM document_generation_sessions WHERE session_id = ?",
+                    ),
                     (session_id,),
                 ).fetchone()
                 if row is None:

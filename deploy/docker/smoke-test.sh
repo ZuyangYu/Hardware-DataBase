@@ -137,6 +137,27 @@ else
   ok "会话清理无围栏错误"
 fi
 
+log "4c) 前端 SPA 路由与构建产物目录（/assets 冲突回归）"
+# 资产中心路由与 Vite 产物目录 dist/assets/ 同名：刷新必须回 index.html，
+# 修复前会被 nginx 当作目录 301（且丢失外部端口）→ 404。
+spa_code="$(curl -s -o "$TMP/spa.html" -w '%{http_code}' --max-time 10 "$BASE/assets")"
+expect "资产中心路由 /assets 刷新" 200 "$spa_code"
+grep -qi '<div id="root"' "$TMP/spa.html" 2>/dev/null && ok "SPA 入口返回 index.html" || bad "SPA 入口内容异常"
+asset_js="$(grep -oE 'src="/assets/[^"]+\.js"' "$TMP/spa.html" | head -1 | cut -d'"' -f2)"
+if [ -n "$asset_js" ]; then
+  js_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$BASE$asset_js")"
+  expect "构建产物 $asset_js" 200 "$js_code"
+else
+  warn "index.html 中未找到 /assets/*.js 引用（构建格式变化？）"
+fi
+# nginx 目录 301 必须用相对 Location，不能丢失端口映射（8080 → 80）
+loc="$(curl -s -o /dev/null -w '%{redirect_url}' --max-time 10 "$BASE/help-assets")"
+case "$loc" in
+  *":${HTTP_PORT}/"*) ok "目录跳转保留端口（$loc）" ;;
+  "") ok "目录跳转未触发（help-assets 缺失，跳过）" ;;
+  *) bad "目录跳转丢失端口：$loc" ;;
+esac
+
 log "5) 数据库表形状（控制面语义类型）"
 pgq() { ${COMPOSE[@]} exec -T postgres psql -U hdb -d hdb -tAc "$1" 2>/dev/null | tr -d ' '; }
 expect "memory_sources.source_valid 类型" boolean "$(pgq "select data_type from information_schema.columns where table_name='memory_sources' and column_name='source_valid'")"

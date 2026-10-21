@@ -12,6 +12,8 @@ pretending that an authorization decision was made.
 """
 from __future__ import annotations
 
+import logging
+import uuid
 from collections.abc import Callable, Generator
 from typing import Any
 
@@ -36,6 +38,7 @@ from src.api.schemas import (
     UserMemorySettingsView,
     VerifyMemoryRequest,
 )
+from src.core.app_logs import AppLogService
 from src.core.auth import AuthUser
 
 try:  # The service is implemented in a separate workstream.
@@ -92,6 +95,111 @@ def _call(service: Any, method: str, **kwargs: Any) -> Any:
         raise HTTPException(status_code=409, detail=str(exc) or "memory operation rejected") from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc) or "memory operation rejected") from exc
+
+
+logger = logging.getLogger(__name__)
+
+
+def _audit_memory(
+    user: AuthUser,
+    *,
+    action: str,
+    target_type: str,
+    target_id: str,
+    success: bool = True,
+    error_message: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Append one central audit event for a memory mutation.
+
+    ``MemoryService`` keeps its own domain audit table; this closes the
+    separate, cross-domain governance trail required by the API boundary.
+    Audit metadata must stay structural: never include memory content,
+    evidence text, reason text, or consent payloads.
+    """
+
+    try:
+        AppLogService().record_audit(
+            action=action,
+            actor=user,
+            target_type=target_type,
+            target_id=target_id,
+            success=success,
+            error_message=str(error_message or "")[:500],
+            metadata=metadata or {},
+        )
+    except Exception:  # noqa: BLE001 - audit must not fail the operation
+        logger.exception("failed to append memory audit event: %s", action)
+
+
+def _audited_call(
+    service: Any,
+    method: str,
+    *,
+    actor: AuthUser,
+    action: str,
+    target_type: str,
+    target_id: str,
+    audit_metadata: dict[str, Any] | None = None,
+    result_target_key: str = "",
+    **kwargs: Any,
+) -> Any:
+    """Call one write operation and record both its success and failure.
+
+    Reads deliberately stay unaudited; the governance requirement is for
+    mutations.  A ``*.requested`` row is written before the service call and
+    the final outcome row afterwards, so a process crash leaves a visible
+    attempt instead of losing the operation entirely.
+    """
+
+    attempt_id = uuid.uuid4().hex
+    requested_metadata = {
+        **(audit_metadata or {}),
+        "attempt_id": attempt_id,
+        "phase": "requested",
+    }
+    _audit_memory(
+        actor,
+        action=f"{action}.requested",
+        target_type=target_type,
+        target_id=target_id,
+        metadata=requested_metadata,
+    )
+    try:
+        result = _call(service, method, actor=actor, **kwargs)
+    except Exception as exc:
+        detail = getattr(exc, "detail", None) or str(exc)
+        _audit_memory(
+            actor,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            success=False,
+            error_message=str(detail),
+            metadata={
+                **(audit_metadata or {}),
+                "attempt_id": attempt_id,
+                "phase": "finished",
+            },
+        )
+        raise
+    payload = _payload(result)
+    metadata = dict(audit_metadata or {})
+    if isinstance(payload, dict):
+        if payload.get("operation_id"):
+            metadata["operation_id"] = str(payload["operation_id"])[:200]
+        if result_target_key and payload.get(result_target_key):
+            target_id = str(payload[result_target_key])
+    metadata["attempt_id"] = attempt_id
+    metadata["phase"] = "finished"
+    _audit_memory(
+        actor,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        metadata=metadata,
+    )
+    return result
 
 
 def _list_response(value: Any, *, cursor: str | None = None, limit: int = 0) -> MemoryListResponse:
@@ -166,10 +274,18 @@ def update_memory_draft(
     user: AuthUser = Depends(current_user),
     service: Any = Depends(get_memory_service),
 ) -> MemoryOperationResponse:
-    result = _call(
+    result = _audited_call(
         service,
         "update_draft",
         actor=user,
+        action="memory.update_draft",
+        target_type="memory",
+        target_id=memory_id,
+        audit_metadata={
+            "expected_revision": body.expected_revision,
+            "request_id": body.request_id,
+            "content_key_count": len(body.content),
+        },
         memory_id=memory_id,
         content=body.content,
         expected_revision=body.expected_revision,
@@ -186,10 +302,18 @@ def verify_memory(
     user: AuthUser = Depends(current_user),
     service: Any = Depends(get_memory_service),
 ) -> MemoryOperationResponse:
-    result = _call(
+    result = _audited_call(
         service,
         "verify_memory",
         actor=user,
+        action="memory.verify",
+        target_type="memory",
+        target_id=memory_id,
+        audit_metadata={
+            "expected_revision": body.expected_revision,
+            "request_id": body.request_id,
+            "evidence_ref_count": len(body.evidence_refs or []),
+        },
         memory_id=memory_id,
         expected_revision=body.expected_revision,
         reason=body.reason,
@@ -206,10 +330,18 @@ def reject_memory(
     user: AuthUser = Depends(current_user),
     service: Any = Depends(get_memory_service),
 ) -> MemoryOperationResponse:
-    result = _call(
+    result = _audited_call(
         service,
         "reject_memory",
         actor=user,
+        action="memory.reject",
+        target_type="memory",
+        target_id=memory_id,
+        audit_metadata={
+            "expected_revision": body.expected_revision,
+            "request_id": body.request_id,
+            "evidence_ref_count": len(body.evidence_refs or []),
+        },
         memory_id=memory_id,
         expected_revision=body.expected_revision,
         reason=body.reason,
@@ -226,10 +358,19 @@ def supersede_memory(
     user: AuthUser = Depends(current_user),
     service: Any = Depends(get_memory_service),
 ) -> MemoryOperationResponse:
-    result = _call(
+    result = _audited_call(
         service,
         "supersede_memory",
         actor=user,
+        action="memory.supersede",
+        target_type="memory",
+        target_id=memory_id,
+        audit_metadata={
+            "expected_revision": body.expected_revision,
+            "request_id": body.request_id,
+            "evidence_ref_count": len(body.evidence_refs or []),
+            "successor_memory_id": body.successor_memory_id or "",
+        },
         memory_id=memory_id,
         expected_revision=body.expected_revision,
         reason=body.reason,
@@ -247,10 +388,18 @@ def delete_memory(
     user: AuthUser = Depends(current_user),
     service: Any = Depends(get_memory_service),
 ) -> MemoryOperationResponse:
-    result = _call(
+    result = _audited_call(
         service,
         "delete_memory",
         actor=user,
+        action="memory.delete",
+        target_type="memory",
+        target_id=memory_id,
+        audit_metadata={
+            "expected_revision": body.expected_revision,
+            "request_id": body.request_id,
+            "evidence_ref_count": len(body.evidence_refs or []),
+        },
         memory_id=memory_id,
         expected_revision=body.expected_revision,
         reason=body.reason,
@@ -269,10 +418,18 @@ def extract_memory(
 ) -> MemoryOperationResponse:
     """Queue an explicit project reflection for a completed conversation."""
 
-    result = _call(
+    result = _audited_call(
         service,
         "extract_memory",
         actor=user,
+        action="memory.extract",
+        target_type="conversation",
+        target_id=str(session_id),
+        audit_metadata={
+            "session_id": session_id,
+            "request_id": body.request_id,
+            "message_count": len(body.message_ids or []),
+        },
         session_id=session_id,
         reason=body.reason,
         request_id=body.request_id,
@@ -289,10 +446,17 @@ def update_user_memory_settings(
 ) -> UserMemorySettingsView:
     """Change only the authenticated user's opt-in state."""
 
-    result = _call(
+    result = _audited_call(
         service,
         "set_user_memory_settings",
         actor=user,
+        action="memory.settings_update",
+        target_type="user_memory_settings",
+        target_id=str(user.id),
+        audit_metadata={
+            "opt_in": bool(body.opt_in),
+            "request_id": body.request_id,
+        },
         opt_in=body.opt_in,
         reason=body.reason,
         request_id=body.request_id,
@@ -318,10 +482,19 @@ def create_memory_consent(
 ) -> MemoryConsentView:
     """Create a server-bound immutable source manifest for the current user."""
 
-    result = _call(
+    result = _audited_call(
         service,
         "create_memory_consent",
         actor=user,
+        action="memory.consent_create",
+        target_type="memory_consent",
+        target_id=f"session:{session_id}",
+        result_target_key="consent_event_id",
+        audit_metadata={
+            "session_id": session_id,
+            "request_id": body.request_id,
+            "message_count": len(body.message_ids or []),
+        },
         session_id=session_id,
         message_ids=body.message_ids,
         reason=body.reason,
@@ -352,10 +525,14 @@ def revoke_memory_consent(
     user: AuthUser = Depends(current_user),
     service: Any = Depends(get_memory_service),
 ) -> MemoryOperationResponse:
-    result = _call(
+    result = _audited_call(
         service,
         "revoke_memory_consent",
         actor=user,
+        action="memory.consent_revoke",
+        target_type="memory_consent",
+        target_id=consent_event_id,
+        audit_metadata={"request_id": body.request_id},
         consent_event_id=consent_event_id,
         reason=body.reason,
         request_id=body.request_id,

@@ -491,6 +491,32 @@ class AppPipeline:
         except Exception as audit_error:
             warn(f"AppPipeline audit failed: {audit_error}")
 
+    def _audit_requested(
+        self,
+        action: str,
+        ctx: RequestContext | None,
+        target_type: str = "",
+        target_id: str = "",
+        kb_name: str = "",
+        metadata: dict | None = None,
+    ) -> None:
+        """Write the pre-mutation intent row for a destructive/write operation.
+
+        The outcome row still uses the original action.  If the process dies
+        between the mutation and that row, the ``*.requested`` event remains
+        visible instead of the operation disappearing from the audit trail.
+        """
+
+        self._audit(
+            f"{action}.requested",
+            ctx,
+            target_type=target_type,
+            target_id=target_id,
+            kb_name=kb_name,
+            success=True,
+            metadata={**(metadata or {}), "phase": "requested"},
+        )
+
     def list_knowledge_bases(self, ctx: RequestContext | None = None) -> List[str]:
         auth_service = AuthService()
         kbs = self.backend.list_knowledge_bases()
@@ -634,6 +660,14 @@ class AppPipeline:
                     file_paths.append(temp_path)
                 else:
                     raise TypeError(f"Unsupported file argument: {type(file_obj).__name__}")
+            self._audit_requested(
+                "upload_document",
+                ctx,
+                target_type="document",
+                target_id=", ".join(os.path.basename(p) for p in file_paths),
+                kb_name=target_kb,
+                metadata={"file_count": len(file_paths), "source_group": source_group},
+            )
             result = self.documents.upload_files(
                 file_paths,
                 target_kb,
@@ -775,6 +809,14 @@ class AppPipeline:
 
     def delete_document(self, filename: str, kb_name: str, ctx: RequestContext | None = None) -> str:
         try:
+            self._audit_requested(
+                "delete_document",
+                ctx,
+                target_type="document",
+                target_id=filename,
+                kb_name=kb_name,
+                metadata=self._kb_sharing_audit_metadata(kb_name, ctx),
+            )
             result = self.documents.delete_document(filename, kb_name, ctx=ctx)
             # DocumentManager now returns the full BackendResult; branch on .ok
             # instead of sniffing error prefixes out of the message string.
@@ -823,6 +865,13 @@ class AppPipeline:
                 self._audit("create_kb", ctx, target_type="knowledge_base", target_id=name, kb_name=name, success=False, error_message="知识库已存在")
                 return False, "知识库已存在"
 
+            self._audit_requested(
+                "create_kb",
+                ctx,
+                target_type="knowledge_base",
+                target_id=name,
+                kb_name=name,
+            )
             self.backend.create_kb_storage(scope.kb_name, ctx=ctx)
 
             if ctx and ctx.user_id:
@@ -866,6 +915,13 @@ class AppPipeline:
 
         log(f"准备彻底删除知识库: {kb_name}")
         try:
+            self._audit_requested(
+                "delete_kb",
+                ctx,
+                target_type="knowledge_base",
+                target_id=kb_name,
+                kb_name=kb_name,
+            )
             result = self.documents.delete_knowledge_base_documents(kb_name, ctx=ctx)
             if not result.ok:
                 self._audit("delete_kb", ctx, target_type="knowledge_base", target_id=kb_name, kb_name=kb_name, success=False, error_message=result.message)
@@ -994,6 +1050,13 @@ class AppPipeline:
 
     def requeue_dead_letter_parse_tasks(self, kb_name: str, ctx: RequestContext | None = None) -> list[str]:
         try:
+            self._audit_requested(
+                "requeue_dead_letter_parse_tasks",
+                ctx,
+                target_type="parse_task",
+                target_id=kb_name,
+                kb_name=kb_name,
+            )
             names = self.documents.requeue_dead_letter_parse_tasks(kb_name, ctx=ctx)
             self._audit(
                 "requeue_dead_letter_parse_tasks",
@@ -1021,6 +1084,12 @@ class AppPipeline:
         # Stopping a parse task deletes the remote RAGFlow document + local
         # archive; audit it so the governance log can trace who cancelled what.
         try:
+            self._audit_requested(
+                "delete_parse_task",
+                ctx,
+                target_type="parse_task",
+                target_id=str(task_id),
+            )
             result = self.documents.delete_parse_task(task_id, ctx=ctx)
             self._audit(
                 "delete_parse_task",
@@ -1043,6 +1112,13 @@ class AppPipeline:
 
     def clear_finished_parse_tasks(self, kb_name: str | None = None, ctx: RequestContext | None = None):
         try:
+            self._audit_requested(
+                "clear_parse_tasks",
+                ctx,
+                target_type="parse_task",
+                target_id=kb_name or "",
+                kb_name=kb_name or "",
+            )
             self.documents.clear_finished_parse_tasks(kb_name, ctx=ctx)
             self._audit(
                 "clear_parse_tasks",

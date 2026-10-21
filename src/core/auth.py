@@ -220,6 +220,33 @@ class AuthService:
 
             warn(f"AuthService audit failed: {audit_error}")
 
+    def _audit_requested(
+        self,
+        action: str,
+        *,
+        actor: AuthUser | None = None,
+        target_type: str = "",
+        target_id: str = "",
+        kb_name: str = "",
+        metadata: dict | None = None,
+    ) -> None:
+        """Write the pre-mutation intent row for a governance write.
+
+        The final row keeps the original action.  If the process dies after
+        the mutation but before that row, the ``*.requested`` event remains
+        visible instead of the change disappearing from the trail.
+        """
+
+        self._audit(
+            f"{action}.requested",
+            actor=actor,
+            target_type=target_type,
+            target_id=target_id,
+            kb_name=kb_name,
+            success=True,
+            metadata={**(metadata or {}), "phase": "requested"},
+        )
+
     def _init_db(self):
         with closing(self._connect()) as conn:
             conn.execute("""
@@ -429,6 +456,13 @@ class AuthService:
             elif department_id is None or department_id == system_department_id:
                 raise ValueError("员工必须归属到业务部门，不能归属 system 部门")
 
+            self._audit_requested(
+                "create_user",
+                actor=actor,
+                target_type="user",
+                target_id=username.strip(),
+                metadata={"role": role, "scope": scope},
+            )
             created = self._create_user_record(username, password, role, department_id)
         except Exception as exc:
             self._audit(
@@ -738,6 +772,13 @@ class AuthService:
                     raise PermissionError("Cannot change the active state of the current account here.")
                 if actor.role != ROLE_SYSTEM_ADMIN:
                     raise PermissionError("Account activation requires the system administrator role.")
+            self._audit_requested(
+                "set_user_active",
+                actor=actor,
+                target_type="user",
+                target_id=str(user_id),
+                metadata={"is_active": is_active, "scope": scope},
+            )
             self.set_user_active(user_id, is_active)
         except Exception as exc:
             self._audit(
@@ -766,6 +807,13 @@ class AuthService:
             if len(new_password) < 8:
                 raise ValueError("密码长度不能少于 8 位")
 
+            self._audit_requested(
+                "reset_user_password",
+                actor=actor,
+                target_type="user",
+                target_id=str(user_id),
+                metadata={"scope": scope},
+            )
             with closing(self._connect()) as conn:
                 target = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
                 if target is None:
@@ -829,6 +877,12 @@ class AuthService:
             if new_password == current_password:
                 raise ValueError("新密码不能与当前密码相同")
 
+            self._audit_requested(
+                "change_own_password",
+                actor=user,
+                target_type="user",
+                target_id=user.username,
+            )
             with closing(self._connect()) as conn:
                 row = conn.execute("SELECT * FROM users WHERE id = ?", (user.id,)).fetchone()
                 if row is None:
@@ -885,6 +939,12 @@ class AuthService:
         try:
             if actor.role != ROLE_SYSTEM_ADMIN:
                 raise PermissionError("Department creation requires a system administrator role.")
+            self._audit_requested(
+                "create_department",
+                actor=actor,
+                target_type="department",
+                target_id=name.strip(),
+            )
             dept = self.create_department(name)
         except Exception as exc:
             self._audit(
@@ -930,6 +990,12 @@ class AuthService:
         try:
             if actor.role != ROLE_SYSTEM_ADMIN:
                 raise PermissionError("Department deletion requires a system administrator role.")
+            self._audit_requested(
+                "delete_department",
+                actor=actor,
+                target_type="department",
+                target_id=str(department_id),
+            )
             self.delete_department(department_id)
         except Exception as exc:
             self._audit(
@@ -1059,6 +1125,14 @@ class AuthService:
         try:
             if actor is None or actor.role != ROLE_EMPLOYEE:
                 raise PermissionError("只有部门员工可以调整知识库共享状态。")
+            self._audit_requested(
+                "update_kb_sharing",
+                actor=actor,
+                target_type="knowledge_base",
+                target_id=target_id,
+                kb_name=target_id,
+                metadata={"is_shared": bool(is_shared)},
+            )
             with closing(self._connect()) as conn:
                 kb = self._get_kb_row(conn, kb_name, department_id, kb_id)
                 if kb is None:
@@ -1188,6 +1262,18 @@ class AuthService:
                 raise ValueError("知识库名称不能为空")
 
             kb_name = kb_name.strip()
+            self._audit_requested(
+                "assign_kb",
+                actor=actor,
+                target_type="knowledge_base",
+                target_id=kb_name,
+                kb_name=kb_name,
+                metadata={
+                    "department_id": department_id,
+                    "owner_user_id": owner_user_id,
+                    "source_kb_id": source_kb_id,
+                },
+            )
             with closing(self._connect()) as conn:
                 department = conn.execute("SELECT id, name FROM departments WHERE id = ?", (department_id,)).fetchone()
                 if department is None:

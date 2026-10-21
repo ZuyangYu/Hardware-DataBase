@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ import src.settings
 from src.attachments.store import AttachmentStore
 from src.api.app import create_app
 from src.api.deps import get_auth_service
+from src.core.app_logs import AppLogService
 from src.core.conversation import ConversationService
 
 from tests._api_stub import Server, make_auth
@@ -116,6 +118,54 @@ class AttachmentApiTests(unittest.TestCase):
             headers=self._headers(token),
         )
         self.assertEqual(missing.status_code, 404)
+
+    def test_attachment_mutations_are_centrally_audited(self):
+        token = self._token()
+        created = self._upload(token)
+        self.assertEqual(created.status_code, 201, created.text)
+        attachment_id = created.json()["attachment_id"]
+        deleted = self.client.delete(
+            f"/api/v1/conversations/{self.session.id}/attachments/{attachment_id}",
+            headers=self._headers(token),
+        )
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        rejected = self._upload(token, filename="legacy.xls", content=b"old")
+        self.assertEqual(rejected.status_code, 400, rejected.text)
+
+        sysadmin = self.auth.get_user_by_username(src.settings.AUTH_DEFAULT_ADMIN_USERNAME)
+        logs = AppLogService(self.db_path)
+        uploads = logs.list_audit_events(sysadmin, action="attachment.upload")
+        deletes = logs.list_audit_events(sysadmin, action="attachment.delete")
+        upload_started = logs.list_audit_events(
+            sysadmin, action="attachment.upload.requested"
+        )
+        delete_started = logs.list_audit_events(
+            sysadmin, action="attachment.delete.requested"
+        )
+
+        self.assertEqual(len(uploads), 2)
+        self.assertEqual(len(upload_started), 2)
+        self.assertEqual(len(deletes), 1)
+        self.assertEqual(len(delete_started), 1)
+        self.assertEqual({event.success for event in uploads}, {True, False})
+        succeeded = next(event for event in uploads if event.success)
+        self.assertEqual(succeeded.actor_username, "user1")
+        self.assertEqual(succeeded.target_id, attachment_id)
+        self.assertEqual(succeeded.kb_name, "shared")
+        failed = next(event for event in uploads if not event.success)
+        self.assertIn("legacy.xls", failed.metadata_json)
+        self.assertEqual(failed.target_id, f"session:{self.session.id}")
+        self.assertTrue(deletes[0].success)
+        self.assertEqual(deletes[0].target_id, attachment_id)
+
+        def _attempt(event):
+            return json.loads(event.metadata_json)["attempt_id"]
+
+        self.assertEqual(
+            {_attempt(event) for event in uploads},
+            {_attempt(event) for event in upload_started},
+        )
+        self.assertEqual(_attempt(deletes[0]), _attempt(delete_started[0]))
 
     def test_attachment_detail_exposes_manifest_and_degraded_reasons(self):
         token = self._token()
