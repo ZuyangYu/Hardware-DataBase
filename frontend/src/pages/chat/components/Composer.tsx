@@ -164,7 +164,7 @@ export default function Composer({
     <div className={CHAT_INPUT_SHELL_CLASS}>
       <div className={CHAT_COMPOSER_STAGE_CLASS}>
         <form className={CHAT_COMPOSER_FORM_CLASS} onSubmit={handleSubmit}>
-          <div className="mb-[10px] flex flex-wrap items-center justify-center gap-[8px] border-b border-[#eef0f4] pb-[8px]">
+          <div className="mb-[6px] flex flex-wrap items-center gap-[8px]">
             <span className="text-[11px] font-medium text-[#5b6378]">主知识库</span>
             <Select
               value={kbName || '__none__'}
