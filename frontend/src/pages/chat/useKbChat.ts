@@ -434,7 +434,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       version: 1,
       ...(knowledgeScopeAuto ? {} : { purpose: knowledgeScope.purpose }),
       sources: knowledgeScope.sources
-        .map((source) => [source.kb_id, source.role])
+        .map((source) => (knowledgeScopeAuto ? [source.kb_id] : [source.kb_id, source.role]))
         .sort((a, b) => Number(a[0]) - Number(b[0])),
     })
     : '';
@@ -609,11 +609,11 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
             if (!stored) return false;
             if (!knowledgeScopeAuto && stored.purpose !== knowledgeScope.purpose) return false;
             const expected = knowledgeScope.sources
-              .map((source) => `${source.kb_id}:${source.role}`)
+              .map((source) => (knowledgeScopeAuto ? String(source.kb_id) : `${source.kb_id}:${source.role}`))
               .sort()
               .join('|');
             const actual = stored.sources
-              .map((source) => `${source.kb_id}:${source.role}`)
+              .map((source) => (knowledgeScopeAuto ? String(source.kb_id) : `${source.kb_id}:${source.role}`))
               .sort()
               .join('|');
             return expected === actual;
@@ -1401,7 +1401,11 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   ) => {
     const query = input.trim();
     if (!query || streaming) return;
-    const turnKnowledgeScope = resolveKnowledgeScope?.(query) ?? knowledgeScope;
+    const activeSession = sessions.find((session) => session.id === activeSessionId);
+    const sendScope = activeSessionId == null || !activeSession?.knowledge_scope;
+    const turnKnowledgeScope = sendScope
+      ? (resolveKnowledgeScope?.(query) ?? knowledgeScope)
+      : undefined;
     const generation = streamTokenRef.current + 1;
     streamTokenRef.current = generation;
     sendingGenerationRef.current = generation;
@@ -1638,7 +1642,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         setTurnQueueNotice(null);
       }
     }
-  }, [input, streaming, activeSessionId, createSession, scopeKbName, documentContextEnabled, documentContext, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary, applyTurnQueueNotice, knowledgeScope, resolveKnowledgeScope]);
+  }, [input, streaming, sessions, activeSessionId, createSession, scopeKbName, documentContextEnabled, documentContext, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary, applyTurnQueueNotice, knowledgeScope, resolveKnowledgeScope]);
 
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
