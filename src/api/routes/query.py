@@ -620,6 +620,40 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         for event in finalization.terminal_events:
             _publish_turn_event(turn_id, event.seq, event.event_type, event.payload)
 
+    # Hard turn budget: provider retries (notably repeated 502/503/504) can
+    # otherwise keep one turn in ``streaming`` for many minutes.  The deadline
+    # finalises the durable turn and sets the cancel event; late worker writes
+    # are fenced, so the next question is never blocked indefinitely.
+    deadline_event = threading.Event()
+    # Cap by the provider's own retry budget as well: a single turn should not
+    # outlive ``timeout × (retries + 2)`` even if the queue deadline is larger.
+    deadline_seconds = max(
+        60,
+        min(
+            int(getattr(src.settings, "CHAT_QUEUE_DEADLINE_SECONDS", 600)),
+            int(getattr(src.settings, "AGENT_TIMEOUT_SECONDS", 120))
+            * (int(getattr(src.settings, "AGENT_RATE_LIMIT_MAX_RETRIES", 4)) + 2),
+        ),
+    )
+
+    def _deadline_exceeded() -> None:
+        deadline_event.set()
+        cancel.set()
+        _fail_owned("生成超时，请稍后重试")
+        # Release the session lease immediately.  The main worker thread may
+        # still be blocked inside a provider/tool call; it must not keep the
+        # next question queued behind a turn that is already terminal.
+        try:
+            conv.release_turn_ownership(
+                turn_id, worker_id, fencing_token=ownership_token
+            )
+        except Exception:
+            pass
+
+    deadline_timer = threading.Timer(deadline_seconds, _deadline_exceeded)
+    deadline_timer.daemon = True
+    deadline_timer.start()
+
     heartbeat_thread = start_thread_with_current_context(
         heartbeat_loop,
         daemon=True,
@@ -825,6 +859,10 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         token_usage_summary = pipeline.get_last_token_usage_summary()
 
         _flush_deltas()
+        if deadline_event.is_set():
+            # The watchdog already persisted the terminal failure event.
+            outcome_status = "failed"
+            return
         if cancelled():
             _fail_owned("已停止生成", cancelled_turn=True)
             outcome_status = "cancelled"
@@ -918,7 +956,9 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             completed = completion.turn
         except StaleTurnOwner:
             # Cancel revoked the business commit, or a newer attempt took over.
-            if cancelled():
+            if deadline_event.is_set():
+                outcome_status = "failed"
+            elif cancelled():
                 _fail_owned("已停止生成", cancelled_turn=True)
                 outcome_status = "cancelled"
             else:
@@ -971,6 +1011,10 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         )
     except Exception as exc:
         turn_observation.error(exc)
+        if deadline_event.is_set():
+            # The watchdog already persisted the terminal failure event.
+            outcome_status = "failed"
+            return
         if cancelled():
             _fail_owned("已停止生成", cancelled_turn=True)
             outcome_status = "cancelled"
@@ -995,6 +1039,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 turn_id=turn_id,
             )
     finally:
+        deadline_timer.cancel()
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=1)
         duration_s = max(0.0, time.monotonic() - start)

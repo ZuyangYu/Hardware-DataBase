@@ -172,6 +172,30 @@ class BuildChatModelTests(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             list(_iter_with_idle_timeout(slow(), 0.2))
 
+    def test_stream_cancel_returns_without_waiting_for_provider(self) -> None:
+        import time
+
+        from src.core.model_gateway import _iter_with_idle_timeout
+
+        def slow():
+            yield "a"
+            time.sleep(5)
+            yield "b"
+
+        checks = 0
+
+        def should_cancel() -> bool:
+            nonlocal checks
+            checks += 1
+            return checks >= 2
+
+        started = time.monotonic()
+        self.assertEqual(
+            list(_iter_with_idle_timeout(slow(), 0, should_cancel=should_cancel)),
+            ["a"],
+        )
+        self.assertLess(time.monotonic() - started, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

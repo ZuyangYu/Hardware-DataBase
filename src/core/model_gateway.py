@@ -30,6 +30,7 @@ from langchain_openai import ChatOpenAI
 
 import src.settings as settings
 from src.costs.capture import leaf_call
+from src.core.cancellation import current_cancel_check
 from src.core.llm_governor import (
     PRIORITY_BATCH,
     PRIORITY_INTERACTIVE,
@@ -190,18 +191,38 @@ def get_persisted_usage() -> dict[str, Any]:
     return {"total": total, "by_channel": by_channel}
 
 
-def _iter_with_idle_timeout(iterator: Any, timeout_seconds: float) -> Any:
-    """迭代 LLM 流并施加空闲超时: 超过 N 秒没有新块则中断, 防止挂死吃满槽位。"""
+def _iter_with_idle_timeout(
+    iterator: Any,
+    timeout_seconds: float,
+    *,
+    should_cancel: Any = None,
+) -> Any:
+    """迭代 LLM 流并施加空闲超时: 超过 N 秒没有新块则中断, 防止挂死吃满槽位。
+
+    ``should_cancel`` is polled while waiting for the next provider chunk.  A
+    Stop request therefore releases the model governor slot immediately, even
+    when the provider is in a long reasoning gap and has not produced a chunk
+    that the agent loop could check.
+    """
     timeout_seconds = float(timeout_seconds or 0)
-    if timeout_seconds <= 0:
+    if timeout_seconds <= 0 and should_cancel is None:
         yield from iterator
         return
     import queue as _queue
     import threading as _threading
+    import time as _time
 
     box: "_queue.Queue[Any]" = _queue.Queue(maxsize=16)
     sentinel = object()
     stopped = _threading.Event()
+
+    def _close_iterator() -> None:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - teardown must stay fail-soft
+                pass
 
     def pump() -> None:
         try:
@@ -221,29 +242,37 @@ def _iter_with_idle_timeout(iterator: Any, timeout_seconds: float) -> Any:
                 except _queue.Full:
                     pass
         finally:
-            if not stopped.is_set():
-                try:
-                    box.put(sentinel, timeout=0.5)
-                except _queue.Full:
-                    pass
+            if stopped.is_set():
+                _close_iterator()
+                return
+            try:
+                box.put(sentinel, timeout=0.5)
+            except _queue.Full:
+                pass
 
     from contextvars import copy_context
 
     context = copy_context()
     _threading.Thread(target=lambda: context.run(pump), daemon=True, name="llm-stream-pump").start()
+    deadline = _time.monotonic() + timeout_seconds if timeout_seconds > 0 else None
     try:
         while True:
+            if should_cancel is not None and should_cancel():
+                return
+            wait_seconds = 0.25
+            if deadline is not None:
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    stopped.set()
+                    _close_iterator()
+                    raise TimeoutError(
+                        f"LLM stream idle for more than {timeout_seconds:.0f}s"
+                    ) from None
+                wait_seconds = min(wait_seconds, remaining)
             try:
-                item = box.get(timeout=timeout_seconds)
+                item = box.get(timeout=max(0.01, wait_seconds))
             except _queue.Empty:
-                stopped.set()
-                close = getattr(iterator, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                raise TimeoutError(f"LLM stream idle for more than {timeout_seconds:.0f}s") from None
+                continue
             if item is sentinel:
                 return
             if isinstance(item, BaseException):
@@ -394,7 +423,11 @@ class _GovernedChatOpenAI(ChatOpenAI):
         ):
             timeout = float(getattr(settings, "LLM_STREAM_IDLE_TIMEOUT_SECONDS", 0) or 0)
             with leaf_call(self) as call:
-                for chunk in _iter_with_idle_timeout(super()._stream(*args, **kwargs), timeout):
+                for chunk in _iter_with_idle_timeout(
+                    super()._stream(*args, **kwargs),
+                    timeout,
+                    should_cancel=current_cancel_check(),
+                ):
                     if call:
                         call.chunk(chunk)
                     yield chunk
@@ -455,7 +488,11 @@ class _GovernedChatOllama(ChatOllama):
         ):
             timeout = float(getattr(settings, "LLM_STREAM_IDLE_TIMEOUT_SECONDS", 0) or 0)
             with leaf_call(self) as call:
-                for chunk in _iter_with_idle_timeout(super()._stream(*args, **kwargs), timeout):
+                for chunk in _iter_with_idle_timeout(
+                    super()._stream(*args, **kwargs),
+                    timeout,
+                    should_cancel=current_cancel_check(),
+                ):
                     if call:
                         call.chunk(chunk)
                     yield chunk

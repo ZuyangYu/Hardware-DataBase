@@ -262,10 +262,13 @@ class PostgresExecutionStore:
         *,
         emit_events: bool = True,
     ) -> None:
-        """Finalize a cancelled turn.  A never-started turn emits no events
-        (matching the SQLite cancel path); a reclaimed running turn does, so
-        replay subscribers see the terminal event."""
-        conn.execute(
+        """Finalize a cancelled turn and emit its terminal event pair.
+
+        ``emit_events=False`` is kept for internal convergence paths that
+        already published the terminal events; the user-facing cancel path
+        always emits them so replay subscribers close cleanly.
+        """
+        cursor = conn.execute(
             """
             UPDATE chat_turns
             SET status = 'cancelled',
@@ -275,6 +278,10 @@ class PostgresExecutionStore:
             """,
             (turn_id,),
         )
+        if int(cursor.rowcount or 0) == 0:
+            # Another request already finalised the turn; do not append a
+            # second terminal event pair.
+            return
         if assistant_message_id is not None:
             conn.execute(
                 "UPDATE chat_messages SET content = '已停止生成' WHERE id = %s AND content = ''",
@@ -1778,7 +1785,7 @@ class PostgresExecutionStore:
             status = str(current["status"])
             if status in {"completed", "failed", "cancelled"}:
                 return self.get_turn(turn_id)
-            if status == "streaming":
+            if status in {"streaming", "cancelling"}:
                 conn.execute(
                     "UPDATE conversation_execution_state"
                     " SET generation = generation + 1, revision = revision + 1,"
@@ -1786,17 +1793,29 @@ class PostgresExecutionStore:
                     (session_id,),
                 )
                 conn.execute(
-                    "UPDATE chat_turns SET cancel_requested = TRUE, status = 'cancelling'"
-                    " WHERE id = %s AND status = 'streaming'",
+                    "UPDATE chat_turns SET cancel_requested = TRUE WHERE id = %s",
                     (str(turn_id),),
                 )
-            elif status in {"pending", "waiting_for_attachments"}:
+                # Cancel is terminal immediately.  The browser can submit its
+                # next turn without waiting for the worker to unwind; late
+                # worker writes are fenced by the cleared lease and advanced
+                # session generation.
                 self._converge_cancelled_locked(
                     conn,
                     str(turn_id),
                     session_id,
                     current["assistant_message_id"],
-                    emit_events=False,
+                )
+            elif status in {"pending", "waiting_for_attachments"}:
+                conn.execute(
+                    "UPDATE chat_turns SET cancel_requested = TRUE WHERE id = %s",
+                    (str(turn_id),),
+                )
+                self._converge_cancelled_locked(
+                    conn,
+                    str(turn_id),
+                    session_id,
+                    current["assistant_message_id"],
                 )
         return self.get_turn(turn_id)
 
@@ -1961,8 +1980,13 @@ class PostgresExecutionStore:
                 SELECT id, session_id, cancel_requested, retry_count, assistant_message_id
                 FROM chat_turns
                 WHERE status IN ('streaming', 'cancelling')
-                  AND worker_heartbeat_at IS NOT NULL
-                  AND worker_heartbeat_at < clock_timestamp() - make_interval(secs => %s)
+                  AND (
+                    cancel_requested = TRUE
+                    OR (
+                      worker_heartbeat_at IS NOT NULL
+                      AND worker_heartbeat_at < clock_timestamp() - make_interval(secs => %s)
+                    )
+                  )
                 """,
                 (stale_after_seconds,),
             ).fetchall()
