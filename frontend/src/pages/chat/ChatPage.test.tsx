@@ -303,7 +303,8 @@ describe('Composer document context', () => {
 
     expect(markup).toContain('aria-label="选择主知识库"');
     expect(markup).toContain('aria-label="添加参考知识库"');
-    expect(markup).toContain('移除参考知识库 reference');
+    expect(markup).toContain('参考知识库 1');
+    expect(markup).not.toContain('移除参考知识库 reference');
     expect(markup).not.toContain('已选 2 个知识库');
   });
 

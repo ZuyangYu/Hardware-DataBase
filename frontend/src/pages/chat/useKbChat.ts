@@ -420,7 +420,7 @@ export type UseKbChatOptions = {
   knowledgeScope?: KnowledgeSelectionInput | null;
   /** Resolve the concrete scope for a query; used by automatic purpose mode. */
   resolveKnowledgeScope?: (query: string) => KnowledgeSelectionInput | null;
-  /** Ignore the purpose when grouping sessions so auto mode can share a list. */
+  /** In auto mode, resolve purpose per query instead of freezing it on a new session. */
   knowledgeScopeAuto?: boolean;
 };
 
@@ -429,16 +429,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const knowledgeScope = options.knowledgeScope ?? null;
   const resolveKnowledgeScope = options.resolveKnowledgeScope;
   const knowledgeScopeAuto = options.knowledgeScopeAuto === true;
-  const knowledgeScopeKey = knowledgeScope
-    ? JSON.stringify({
-      version: 1,
-      ...(knowledgeScopeAuto ? {} : { purpose: knowledgeScope.purpose }),
-      sources: knowledgeScope.sources
-        .map((source) => (knowledgeScopeAuto ? [source.kb_id] : [source.kb_id, source.role]))
-        .sort((a, b) => Number(a[0]) - Number(b[0])),
-    })
-    : '';
-  const selectedSessionKey = `hdb_chat_session:${encodeURIComponent(options.username ?? 'anonymous')}:${encodeURIComponent(scopeKbName)}:${encodeURIComponent(knowledgeScopeKey)}`;
+  const selectedSessionKey = `hdb_chat_session:${encodeURIComponent(options.username ?? 'anonymous')}:${encodeURIComponent(scopeKbName)}`;
   const loadedSessionKey = useRef<string | null>(null);
   const documentContextEnabled = options.documentContextEnabled ?? false;
   const [sessions, setSessions] = useState<SessionView[]>([]);
@@ -603,38 +594,25 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       .get<SessionView[]>(`/api/v1/conversations?kb_name=${encodeURIComponent(scopeKbName)}`)
       .then((rows) => {
         if (cancelled) return;
-        const scopedRows = knowledgeScope
-          ? rows.filter((session) => {
-            const stored = session.knowledge_scope;
-            if (!stored) return false;
-            if (!knowledgeScopeAuto && stored.purpose !== knowledgeScope.purpose) return false;
-            const expected = knowledgeScope.sources
-              .map((source) => (knowledgeScopeAuto ? String(source.kb_id) : `${source.kb_id}:${source.role}`))
-              .sort()
-              .join('|');
-            const actual = stored.sources
-              .map((source) => (knowledgeScopeAuto ? String(source.kb_id) : `${source.kb_id}:${source.role}`))
-              .sort()
-              .join('|');
-            return expected === actual;
-          })
-          : rows.filter((session) => !session.knowledge_scope && !session.knowledge_selection_hash);
+        // A session belongs to its primary knowledge base. Reference KB
+        // choices are a per-session detail and must not hide other sessions.
+        const sessionRows = rows;
         loadedSessionKey.current = selectedSessionKey;
         // A session created while this fetch was in flight is not in ``rows``.
         // Keep the new conversation in the list (and selected) instead of
         // dropping it and falling back to an unrelated session.
         setSessions((prev) => {
-          const ids = new Set(scopedRows.map((row) => row.id));
+          const ids = new Set(sessionRows.map((row) => row.id));
           const localSelection = prev.filter(
             (session) => session.id === activeSessionRef.current && !ids.has(session.id),
           );
-          return localSelection.length ? [...localSelection, ...scopedRows] : scopedRows;
+          return localSelection.length ? [...localSelection, ...sessionRows] : sessionRows;
         });
         setActiveSessionId((current) => {
           if (current != null) return current;
           const preferred = savedSessionId;
-          const next = scopedRows.some((session) => session.id === preferred) ? preferred : scopedRows[0]?.id ?? null;
-          const restoredContext = scopedRows.find((session) => session.id === next)?.document_context;
+          const next = sessionRows.some((session) => session.id === preferred) ? preferred : sessionRows[0]?.id ?? null;
+          const restoredContext = sessionRows.find((session) => session.id === next)?.document_context;
           if (restoredContext) {
             // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
             setDocumentContextState(restoredContext);
@@ -656,7 +634,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     return () => {
       cancelled = true;
     };
-  }, [knowledgeScope, knowledgeScopeAuto, scopeKbName, selectedSessionKey]);
+  }, [scopeKbName, selectedSessionKey]);
 
   useEffect(() => {
     if (loadedSessionKey.current !== selectedSessionKey || !sessionsLoaded || (activeSessionId !== null && !sessions.some(

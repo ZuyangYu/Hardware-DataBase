@@ -240,24 +240,6 @@ export default function Composer({
             {showReferencePicker && (
               <div className="flex min-w-0 flex-wrap items-center gap-[6px]">
                 <span className="text-[11px] text-[#858b9c]">参考知识库</span>
-                {referenceKbs.map((kb) => (
-                  <span
-                    key={kb.kb_id}
-                    className="inline-flex h-[32px] max-w-[220px] items-center gap-[4px] rounded-[9px] border border-[#e3e7f1] bg-[#f6f7fa] px-[8px] text-[11px] text-[#464c5e]"
-                  >
-                    <span className="min-w-0 truncate" title={kb.name}>{kb.name}</span>
-                    <button
-                      type="button"
-                      aria-label={`移除参考知识库 ${kb.name}`}
-                      title="移除参考知识库"
-                      disabled={scopeDisabled}
-                      onClick={() => updateReferences(Number(kb.kb_id), false)}
-                      className="inline-grid size-[16px] shrink-0 place-items-center rounded-full border-0 bg-transparent p-0 text-[14px] leading-none text-[#8a92a5] hover:bg-[#e5e8f0] hover:text-[#18181a] disabled:cursor-not-allowed disabled:opacity-45"
-                    >
-                      ×
-                    </button>
-                  </span>
-                ))}
                 <Popover.Root>
                   <Popover.Trigger asChild>
                     <button
@@ -268,7 +250,9 @@ export default function Composer({
                           ? '请先选择主知识库'
                           : referenceCandidates.length === 0
                             ? '暂无其他可用知识库'
-                            : '添加参考知识库'
+                            : referenceKbs.length > 0
+                              ? `已添加 ${referenceKbs.length} 个参考知识库，点击继续添加`
+                              : '添加参考知识库'
                       }
                       disabled={referencePickerDisabled}
                       className={cn(
@@ -277,7 +261,9 @@ export default function Composer({
                       )}
                     >
                       <span className="text-[14px] leading-none" aria-hidden>+</span>
-                      <span className="min-w-0 truncate">添加参考知识库</span>
+                      <span className="min-w-0 truncate">
+                        {referenceKbs.length > 0 ? `参考知识库 ${referenceKbs.length}` : '添加参考知识库'}
+                      </span>
                     </button>
                   </Popover.Trigger>
                   <Popover.Portal>
