@@ -227,6 +227,18 @@ describe('ChatPage document authoring bridge', () => {
     expect(markup).not.toContain('上传模板');
     expect(markup).not.toContain('chat-document-template-upload');
   });
+
+  it('shows a retrieval-scope control when multiple knowledge bases are available', () => {
+    const markup = renderChat(true, [
+      writableKb,
+      { ...writableKb, name: 'reference', kb_id: 2, permission: 'read' },
+    ]);
+
+    expect(markup).toContain('检索范围');
+    expect(markup).toContain('配置检索范围');
+    expect(markup).not.toContain('aria-label="知识库范围"');
+    expect(markup).not.toContain('挂载知识库');
+  });
 });
 
 const attachedContext: DocumentContext = {
@@ -263,17 +275,41 @@ describe('Composer document context', () => {
     expect(markup).toContain('修改计划');
   });
 
-  it('keeps the knowledge-base selector usable while a turn is streaming', () => {
+  it('disables the primary knowledge-base selector while a turn is streaming', () => {
     const markup = renderComposer({ streaming: true });
 
     expect(markup).toMatch(/aria-label="选择主知识库"/);
-    expect(markup).not.toMatch(/<button[^>]*\bdisabled(?:=""|(?=\s|>))[^>]*aria-label="选择主知识库"/);
+    expect(markup).toMatch(/<button[^>]*\bdisabled(?:=""|(?=\s|>))[^>]*aria-label="选择主知识库"/);
+  });
+
+  it('labels the selector as the retrieval scope', () => {
+    const markup = renderComposer();
+
+    expect(markup).toContain('检索范围');
+    expect(markup).toContain('主知识库');
+  });
+
+  it('summarizes multiple selected libraries in one scope control', () => {
+    const markup = renderComposer({
+      availableKbs: [
+        writableKb,
+        { ...writableKb, name: 'reference', kb_id: 2, permission: 'read' },
+      ],
+      selectedKnowledgeBaseIds: [1, 2],
+      knowledgePurpose: 'compare',
+      onKnowledgeScopeChange: () => undefined,
+    });
+
+    expect(markup).toContain('已选 2 个知识库');
+    expect(markup).toContain('配置检索范围');
+    expect(markup).not.toContain('主库：shared');
   });
 
   it('shows an explicit primary-knowledge-base prompt when nothing is mounted', () => {
     const markup = renderComposer({ kbName: '' });
 
     expect(markup).toContain('选择主知识库');
+    expect(markup).toContain('未选择知识库');
   });
 
   it('hides the department suffix when all knowledge bases share one department', () => {
@@ -363,6 +399,6 @@ describe('Composer attachment status', () => {
     expect(markup).toContain('aria-label="添加附件"');
     expect(markup).toContain('chat-attachment-upload');
     expect(markup).toContain('主知识库');
-    expect(markup).not.toContain('检索范围');
+    expect(markup).toContain('检索范围');
   });
 });

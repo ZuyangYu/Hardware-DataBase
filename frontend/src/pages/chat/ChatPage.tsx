@@ -273,7 +273,13 @@ export default function ChatPage({
       return;
     }
     if (anchorChanged) {
-      setSelectedKnowledgeBaseIds([anchorKnowledgeBaseId]);
+      setSelectedKnowledgeBaseIds((previous) => {
+        const allowed = new Set(
+          visibleKbs.map((item) => item.kb_id).filter((value): value is number => value != null),
+        );
+        const retained = previous.filter((value) => allowed.has(value));
+        return retained.includes(anchorKnowledgeBaseId) ? retained : [anchorKnowledgeBaseId, ...retained];
+      });
       return;
     }
     setSelectedKnowledgeBaseIds((previous) => {
@@ -437,9 +443,25 @@ export default function ChatPage({
   } = chat;
 
   const handleKnowledgeScopeChange = (purpose: KnowledgePurpose | 'auto', kbIds: number[]) => {
-    if (streaming || anchorKnowledgeBaseId == null) return;
+    if (streaming) return;
+    const unique = [...new Set(kbIds)];
     setKnowledgePurpose(purpose);
-    setSelectedKnowledgeBaseIds([...new Set([anchorKnowledgeBaseId, ...kbIds])]);
+    if (unique.length === 0) {
+      setSelectedKnowledgeBaseIds([]);
+      if (mountedKbName) handleKbChange('');
+      return;
+    }
+    const anchorId = anchorKnowledgeBaseId != null && unique.includes(anchorKnowledgeBaseId)
+      ? anchorKnowledgeBaseId
+      : unique[0];
+    const anchor = visibleKbs.find((item) => Number(item.kb_id) === anchorId);
+    setSelectedKnowledgeBaseIds(unique);
+    if (anchor && anchor.name !== mountedKbName) {
+      // Keep the scope popover mounted while the user checks several KBs.
+      setMountedKbName(anchor.name);
+      clearDocumentContext();
+      window.history.replaceState(null, '', `/chat?kb=${encodeURIComponent(anchor.name)}`);
+    }
   };
 
   useEffect(() => {
@@ -1015,7 +1037,7 @@ export default function ChatPage({
   }
 
   function handleKbChange(nextKbName: string) {
-    if (documentUploadPending) return;
+    if (streaming || documentUploadPending) return;
     setMountedKbName(nextKbName);
     clearDocumentContext();
     navigate(nextKbName ? `/chat?kb=${encodeURIComponent(nextKbName)}` : '/chat', { replace: true });
@@ -1042,7 +1064,7 @@ export default function ChatPage({
       <main className={cn(CHAT_MAIN_CLASS, 'flex-1')}>
         <ChatHeader
           title={activeSession?.title || '新对话'}
-          kbName={mountedKbName || '未挂载'}
+          kbName={mountedKbName || '未选择知识库'}
           onExtractMemory={mountedKbName ? () => setExtractConfirmOpen(true) : undefined}
           extractDisabled={activeSessionId == null || streaming || extracting}
           memorySummary={memorySummary}
@@ -1052,12 +1074,6 @@ export default function ChatPage({
           wikiAssist={mountedKbName ? wikiAssist : undefined}
           onWikiAssistChange={mountedKbName ? updateWikiAssist : undefined}
           wikiAvailable={mountedKbName ? wikiAvailable : undefined}
-          availableKbs={visibleKbs}
-          knowledgePurpose={knowledgePurpose}
-          selectedKnowledgeBaseIds={selectedKnowledgeBaseIds}
-          onKnowledgeScopeChange={handleKnowledgeScopeChange}
-          onPrimaryKnowledgeBaseChange={handleKbChange}
-          knowledgeScopeDisabled={streaming}
           /* 导出任务中心嵌入页头,避免悬浮按钮遮挡右侧会话侧栏的新建按钮 */
           actions={<ExportTaskCenter variant="embedded" />}
         />
@@ -1145,6 +1161,9 @@ export default function ChatPage({
           setInput={setInput}
           streaming={streaming}
           onKbChange={handleKbChange}
+          knowledgePurpose={knowledgePurpose}
+          selectedKnowledgeBaseIds={selectedKnowledgeBaseIds}
+          onKnowledgeScopeChange={handleKnowledgeScopeChange}
           onSend={handleSendWithAttachments}
           onStop={abortStream}
           quickReplies={documentQuickReplies}
