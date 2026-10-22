@@ -164,7 +164,8 @@ export default function Composer({
     <div className={CHAT_INPUT_SHELL_CLASS}>
       <div className={CHAT_COMPOSER_STAGE_CLASS}>
         <form className={CHAT_COMPOSER_FORM_CLASS} onSubmit={handleSubmit}>
-          <div className="flex min-w-0 flex-wrap items-center gap-[8px]">
+          <div className="mb-[10px] flex flex-wrap items-center justify-center gap-[8px] border-b border-[#eef0f4] pb-[8px]">
+            <span className="text-[11px] font-medium text-[#5b6378]">主知识库</span>
             <Select
               value={kbName || '__none__'}
               onValueChange={(value) => onKbChange(value === '__none__' ? '' : value)}
@@ -173,7 +174,7 @@ export default function Composer({
               <SelectTrigger
                 aria-label="选择主知识库"
                 title={kbName ? `当前主知识库：${kbName}` : '选择主知识库'}
-                className={cn(CHAT_COMPOSER_MODEL_BTN_CLASS)}
+                className={cn(CHAT_COMPOSER_MODEL_BTN_CLASS, 'min-w-[240px]')}
               >
                 <span className="grid size-[14px] shrink-0 place-items-center" aria-hidden>
                   <AppIcon name="database" size={14} />
@@ -201,6 +202,11 @@ export default function Composer({
                 })}
               </SelectContent>
             </Select>
+            <span className="text-[10px] text-[#8a92a5]">
+              {kbName ? '已选择，可继续添加参考库' : '请选择后开始检索'}
+            </span>
+          </div>
+          <div className="flex min-w-0 flex-wrap items-center gap-[8px]">
             {attachmentsEnabled && attachmentCount > 0 && (
               <div className={CHAT_COMPOSER_ATTACHMENTS_CLASS} aria-label="会话附件">
                 {draftAttachments.map((attachment) => {

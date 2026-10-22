@@ -362,8 +362,7 @@ describe('Composer attachment status', () => {
     // 静态标记只断言入口与"不再有内联附件 chip / 检索范围选择"。
     expect(markup).toContain('aria-label="添加附件"');
     expect(markup).toContain('chat-attachment-upload');
+    expect(markup).toContain('主知识库');
     expect(markup).not.toContain('检索范围');
-    expect(markup).not.toContain('已选');
-    expect(markup).not.toContain('未选');
   });
 });
