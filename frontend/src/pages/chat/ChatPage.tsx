@@ -4,7 +4,7 @@
  * 数据层在 useKbChat;渲染在各 chat/components 子组件。
  */
 import type { CSSProperties } from 'react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import type { AuthSession } from '../../auth';
@@ -55,6 +55,19 @@ type Props = {
 const DOCUMENT_TEMPLATE_EXTENSIONS = ['.xlsx', '.xlsm', '.docx'];
 const ATTACHMENT_STATUS_POLL_INTERVAL_MS = 2_000;
 const DOCUMENT_COMPARISON_PATTERN = /对比|比较|区别|差异|差别|异同|对照|compare|comparison|difference|diff/i;
+const DOCUMENT_COMPOSE_PATTERN = /(?:生成|创建|撰写|起草|整理成|汇总成|导出|输出)[\s\S]{0,30}(?:文档|报告|说明书|word|docx|pdf|excel|xlsx|pptx)/i;
+
+export function inferKnowledgePurpose(
+  query: string,
+  selected: KnowledgePurpose | 'auto',
+): KnowledgePurpose {
+  if (selected !== 'auto') return selected;
+  const text = String(query || '').trim();
+  if (!text) return 'answer';
+  if (DOCUMENT_COMPARISON_PATTERN.test(text)) return 'compare';
+  if (isTemplateGenerationChatIntent(text) || DOCUMENT_COMPOSE_PATTERN.test(text)) return 'compose';
+  return 'answer';
+}
 
 /**
  * Attachments stay mounted for the whole session: opening a session selects
@@ -218,7 +231,7 @@ export default function ChatPage({
 }: Props) {
   const navigate = useNavigate();
   const [mountedKbName, setMountedKbName] = useState(kbName);
-  const [knowledgePurpose, setKnowledgePurpose] = useState<KnowledgePurpose>('answer');
+  const [knowledgePurpose, setKnowledgePurpose] = useState<KnowledgePurpose | 'auto'>('auto');
   const [selectedKnowledgeBaseIds, setSelectedKnowledgeBaseIds] = useState<number[]>([]);
   const [documentContextLabel, setDocumentContextLabel] = useState<string | null>(null);
   const [documentUploadPending, setDocumentUploadPending] = useState(false);
@@ -272,25 +285,41 @@ export default function ChatPage({
     });
   }, [anchorKnowledgeBaseId, visibleKbs]);
 
-  const knowledgeScope = useMemo<KnowledgeSelectionInput | null>(() => {
-    if (anchorKnowledgeBaseId == null || selectedKnowledgeBaseIds.length < 2) return null;
-    const ids = [...new Set(selectedKnowledgeBaseIds)];
-    if (knowledgePurpose === 'compare') {
+  const buildKnowledgeScope = useCallback(
+    (purpose: KnowledgePurpose, kbIds: number[]): KnowledgeSelectionInput | null => {
+      if (anchorKnowledgeBaseId == null || kbIds.length < 2) return null;
+      const ids = [...new Set(kbIds)];
+      if (purpose === 'compare') {
+        return {
+          version: 1,
+          purpose: 'compare',
+          sources: ids.map((kb_id) => ({ kb_id, role: 'peer' as const })),
+        };
+      }
       return {
         version: 1,
-        purpose: 'compare',
-        sources: ids.map((kb_id) => ({ kb_id, role: 'peer' as const })),
+        purpose,
+        sources: ids.map((kb_id) => ({
+          kb_id,
+          role: kb_id === anchorKnowledgeBaseId ? 'primary' as const : 'reference' as const,
+        })),
       };
-    }
-    return {
-      version: 1,
-      purpose: knowledgePurpose,
-      sources: ids.map((kb_id) => ({
-        kb_id,
-        role: kb_id === anchorKnowledgeBaseId ? 'primary' as const : 'reference' as const,
-      })),
-    };
-  }, [anchorKnowledgeBaseId, knowledgePurpose, selectedKnowledgeBaseIds]);
+    },
+    [anchorKnowledgeBaseId],
+  );
+
+  const knowledgeScope = useMemo<KnowledgeSelectionInput | null>(() => {
+    const purpose = knowledgePurpose === 'auto' ? 'answer' : knowledgePurpose;
+    return buildKnowledgeScope(purpose, selectedKnowledgeBaseIds);
+  }, [buildKnowledgeScope, knowledgePurpose, selectedKnowledgeBaseIds]);
+
+  const resolveKnowledgeScope = useCallback(
+    (query: string): KnowledgeSelectionInput | null => {
+      const purpose = inferKnowledgePurpose(query, knowledgePurpose);
+      return buildKnowledgeScope(purpose, selectedKnowledgeBaseIds);
+    },
+    [buildKnowledgeScope, knowledgePurpose, selectedKnowledgeBaseIds],
+  );
 
   useEffect(() => {
     setMountedKbName(kbName);
@@ -361,6 +390,8 @@ export default function ChatPage({
     username: auth.user.username,
     documentContextEnabled: documentAuthoringEnabled,
     knowledgeScope,
+    resolveKnowledgeScope,
+    knowledgeScopeAuto: knowledgePurpose === 'auto',
   });
   const {
     sessions,
@@ -405,7 +436,7 @@ export default function ChatPage({
     refreshMcpWriteCards,
   } = chat;
 
-  const handleKnowledgeScopeChange = (purpose: KnowledgePurpose, kbIds: number[]) => {
+  const handleKnowledgeScopeChange = (purpose: KnowledgePurpose | 'auto', kbIds: number[]) => {
     if (streaming || anchorKnowledgeBaseId == null) return;
     setKnowledgePurpose(purpose);
     setSelectedKnowledgeBaseIds([...new Set([anchorKnowledgeBaseId, ...kbIds])]);

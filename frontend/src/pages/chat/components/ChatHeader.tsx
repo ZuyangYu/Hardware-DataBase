@@ -52,9 +52,9 @@ type Props = {
   actions?: ReactNode;
   /** Optional multi-KB selector; the selected set is fixed when a session starts. */
   availableKbs?: KbView[];
-  knowledgePurpose?: KnowledgePurpose;
+  knowledgePurpose?: KnowledgePurpose | 'auto';
   selectedKnowledgeBaseIds?: number[];
-  onKnowledgeScopeChange?: (purpose: KnowledgePurpose, kbIds: number[]) => void;
+  onKnowledgeScopeChange?: (purpose: KnowledgePurpose | 'auto', kbIds: number[]) => void;
   onPrimaryKnowledgeBaseChange?: (kbName: string) => void;
   knowledgeScopeDisabled?: boolean;
 };
@@ -176,11 +176,12 @@ export default function ChatHeader({
                     value={knowledgePurpose}
                     disabled={knowledgeScopeDisabled}
                     onChange={(event) => onKnowledgeScopeChange(
-                      event.target.value as KnowledgePurpose,
+                      event.target.value as KnowledgePurpose | 'auto',
                       selectedKnowledgeBaseIds,
                     )}
                     className="rounded border border-[#e5e8f0] px-[5px] py-[3px] text-[11px]"
                   >
+                    <option value="auto">自动（推荐）</option>
                     <option value="answer">问答</option>
                     <option value="compare">对比</option>
                     <option value="compose">编写文档</option>
@@ -238,7 +239,7 @@ export default function ChatHeader({
                   </SelectContent>
                 </Select>
                 <p className="mt-[8px] text-[10px] leading-4 text-[#8a92a5]">
-                  仅选主库即可单库检索；逐个添加其他知识库进行联合检索。范围变化后新建会话。
+                  自动模式按首个问题判断问答/对比/文档用途；仅选主库即可单库检索。范围变化后新建会话。
                 </p>
               </Popover.Content>
             </Popover.Portal>

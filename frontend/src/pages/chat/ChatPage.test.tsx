@@ -9,6 +9,7 @@ import ChatPage, {
   isChatAttachmentsUiEnabled,
   isDocumentAuthoringChatEnabled,
   isTemplateGenerationChatIntent,
+  inferKnowledgePurpose,
   listTemplateCandidateAttachments,
   pickAutoTemplateAttachment,
   resolveTemplateAttachmentRoute,
@@ -278,6 +279,13 @@ describe('Composer document context', () => {
   it('hides the department suffix when all knowledge bases share one department', () => {
     expect(kbOptionLabel(writableKb, false)).toBe('shared');
     expect(kbOptionLabel(writableKb, true)).toBe('shared · 研发部');
+  });
+
+  it('infers knowledge purpose from the first question in auto mode', () => {
+    expect(inferKnowledgePurpose('对比 AP230060 和 AP230062 的供电范围', 'auto')).toBe('compare');
+    expect(inferKnowledgePurpose('生成一份 Word 报告', 'auto')).toBe('compose');
+    expect(inferKnowledgePurpose('AP230060 的静态电流是多少', 'auto')).toBe('answer');
+    expect(inferKnowledgePurpose('对比这两个项目', 'answer')).toBe('answer');
   });
 
   it('does not render a legacy generation-mode toggle when no document context is attached', () => {
