@@ -228,14 +228,15 @@ describe('ChatPage document authoring bridge', () => {
     expect(markup).not.toContain('chat-document-template-upload');
   });
 
-  it('shows a retrieval-scope control when multiple knowledge bases are available', () => {
+  it('shows separate primary and reference knowledge-base controls', () => {
     const markup = renderChat(true, [
       writableKb,
       { ...writableKb, name: 'reference', kb_id: 2, permission: 'read' },
     ]);
 
     expect(markup).toContain('检索范围');
-    expect(markup).toContain('配置检索范围');
+    expect(markup).toContain('aria-label="选择主知识库"');
+    expect(markup).toContain('aria-label="添加参考知识库"');
     expect(markup).not.toContain('aria-label="知识库范围"');
     expect(markup).not.toContain('挂载知识库');
   });
@@ -289,7 +290,7 @@ describe('Composer document context', () => {
     expect(markup).toContain('主知识库');
   });
 
-  it('summarizes multiple selected libraries in one scope control', () => {
+  it('separates primary and reference knowledge-base selection', () => {
     const markup = renderComposer({
       availableKbs: [
         writableKb,
@@ -300,9 +301,24 @@ describe('Composer document context', () => {
       onKnowledgeScopeChange: () => undefined,
     });
 
-    expect(markup).toContain('已选 2 个知识库');
-    expect(markup).toContain('配置检索范围');
-    expect(markup).not.toContain('主库：shared');
+    expect(markup).toContain('aria-label="选择主知识库"');
+    expect(markup).toContain('aria-label="添加参考知识库"');
+    expect(markup).toContain('移除参考知识库 reference');
+    expect(markup).not.toContain('已选 2 个知识库');
+  });
+
+  it('disables the reference picker until a primary knowledge base is selected', () => {
+    const markup = renderComposer({
+      kbName: '',
+      availableKbs: [
+        writableKb,
+        { ...writableKb, name: 'reference', kb_id: 2, permission: 'read' },
+      ],
+      onKnowledgeScopeChange: () => undefined,
+    });
+
+    expect(markup).toContain('选择主知识库');
+    expect(markup).toMatch(/<button[^>]*aria-label="添加参考知识库"[^>]*\bdisabled(?:=""|(?=\s|>))/);
   });
 
   it('shows an explicit primary-knowledge-base prompt when nothing is mounted', () => {

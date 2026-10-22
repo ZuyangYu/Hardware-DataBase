@@ -273,13 +273,7 @@ export default function ChatPage({
       return;
     }
     if (anchorChanged) {
-      setSelectedKnowledgeBaseIds((previous) => {
-        const allowed = new Set(
-          visibleKbs.map((item) => item.kb_id).filter((value): value is number => value != null),
-        );
-        const retained = previous.filter((value) => allowed.has(value));
-        return retained.includes(anchorKnowledgeBaseId) ? retained : [anchorKnowledgeBaseId, ...retained];
-      });
+      setSelectedKnowledgeBaseIds([anchorKnowledgeBaseId]);
       return;
     }
     setSelectedKnowledgeBaseIds((previous) => {

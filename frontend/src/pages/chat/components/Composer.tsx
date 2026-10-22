@@ -153,15 +153,27 @@ export default function Composer({
     availableKbs.map((item) => item.department_name).filter(Boolean),
   ).size > 1;
   const selectableKbs = availableKbs.filter((kb) => kb.permission && kb.kb_id != null);
-  const selectedKbs = selectableKbs.filter((kb) => selectedKnowledgeBaseIds.includes(Number(kb.kb_id)));
+  const primaryKb = availableKbs.find((kb) => kb.name === kbName) ?? null;
+  const primaryKbId = primaryKb?.kb_id != null ? Number(primaryKb.kb_id) : null;
+  const effectiveSelectedIds = primaryKbId != null && !selectedKnowledgeBaseIds.includes(primaryKbId)
+    ? [primaryKbId, ...selectedKnowledgeBaseIds]
+    : selectedKnowledgeBaseIds;
+  const selectedKbs = selectableKbs.filter((kb) => effectiveSelectedIds.includes(Number(kb.kb_id)));
+  const referenceKbs = selectedKbs.filter((kb) => Number(kb.kb_id) !== primaryKbId);
+  const referenceCandidates = selectableKbs.filter((kb) => Number(kb.kb_id) !== primaryKbId);
   const scopeDisabled = disabled || streaming;
-  const showScopePopover = Boolean(onKnowledgeScopeChange && selectableKbs.length > 0);
+  const showReferencePicker = Boolean(onKnowledgeScopeChange);
+  const referencePickerDisabled = scopeDisabled
+    || primaryKbId == null
+    || referenceCandidates.length === 0;
 
-  const toggleKnowledgeBase = (kbId: number, checked: boolean) => {
-    const next = checked
-      ? [...selectedKnowledgeBaseIds, kbId]
-      : selectedKnowledgeBaseIds.filter((value) => value !== kbId);
-    onKnowledgeScopeChange?.(knowledgePurpose, [...new Set(next)]);
+  const updateReferences = (kbId: number, checked: boolean) => {
+    if (primaryKbId == null) return;
+    const referenceIds = effectiveSelectedIds.filter((value) => value !== primaryKbId);
+    const nextReferenceIds = checked
+      ? [...referenceIds, kbId]
+      : referenceIds.filter((value) => value !== kbId);
+    onKnowledgeScopeChange?.(knowledgePurpose, [primaryKbId, ...new Set(nextReferenceIds)]);
   };
 
   // 自适应高度
@@ -181,102 +193,10 @@ export default function Composer({
     <div className={CHAT_INPUT_SHELL_CLASS}>
       <div className={CHAT_COMPOSER_STAGE_CLASS}>
         <form className={CHAT_COMPOSER_FORM_CLASS} onSubmit={handleSubmit}>
-          <div className="mb-[6px] flex flex-wrap items-center gap-[8px]">
+          <div className="mb-[6px] flex flex-wrap items-center gap-x-[12px] gap-y-[6px]">
             <span className="text-[11px] font-medium text-[#5b6378]">检索范围</span>
-            {showScopePopover ? (
-              <Popover.Root>
-                <Popover.Trigger asChild>
-                  <button
-                    type="button"
-                    aria-label="配置检索范围"
-                    title={selectedKbs.length ? `已选：${selectedKbs.map((kb) => kb.name).join('、')}` : '选择知识库'}
-                    disabled={scopeDisabled}
-                    className={cn(
-                      CHAT_COMPOSER_MODEL_BTN_CLASS,
-                      'min-w-[240px] max-w-[min(560px,calc(100vw-48px))] disabled:cursor-not-allowed disabled:opacity-45',
-                    )}
-                  >
-                    <span className="grid size-[14px] shrink-0 place-items-center" aria-hidden>
-                      <AppIcon name="database" size={14} />
-                    </span>
-                    <span className="min-w-0 flex-1 truncate text-left">
-                      {selectedKbs.length ? `已选 ${selectedKbs.length} 个知识库` : '选择知识库'}
-                    </span>
-                    <AppIcon name="arrow" size={12} style={{ transform: 'rotate(90deg)' }} />
-                  </button>
-                </Popover.Trigger>
-                <Popover.Portal>
-                  <Popover.Content
-                    aria-label="检索范围"
-                    align="start"
-                    sideOffset={6}
-                    collisionPadding={12}
-                    className="z-50 w-[360px] max-w-[calc(100vw-24px)] rounded-[10px] border border-[#e5e8f0] bg-white p-[12px] shadow-lg"
-                  >
-                    <div className="mb-[10px] text-[12px] font-medium text-[#18181a]">选择知识库</div>
-                    <div className="grid gap-[4px]">
-                      {selectableKbs.map((kb) => {
-                        const id = Number(kb.kb_id);
-                        const checked = selectedKnowledgeBaseIds.includes(id);
-                        const label = kbOptionLabel(kb, showDepartmentInKbOptions);
-                        return (
-                          <label
-                            key={id}
-                            className="flex cursor-pointer items-center gap-[8px] rounded-[6px] px-[8px] py-[6px] text-[11px] text-[#464c5e] hover:bg-[#f6f7fa]"
-                          >
-                            <input
-                              type="checkbox"
-                              aria-label={`选择知识库 ${kb.name}`}
-                              checked={checked}
-                              disabled={scopeDisabled}
-                              onChange={(event) => toggleKnowledgeBase(id, event.target.checked)}
-                              className="size-[13px] accent-[#18181a]"
-                            />
-                            <span className="min-w-0 flex-1 truncate" title={label}>{label}</span>
-                          </label>
-                        );
-                      })}
-                      {selectedKbs.length > 0 && (
-                        <button
-                          type="button"
-                          disabled={scopeDisabled}
-                          onClick={() => onKnowledgeScopeChange?.(knowledgePurpose, [])}
-                          className="mt-[2px] w-full rounded-[6px] px-[8px] py-[5px] text-left text-[11px] text-[#68728a] hover:bg-[#f6f7fa] disabled:opacity-45"
-                        >
-                          不使用知识库（仅使用附件/普通对话）
-                        </button>
-                      )}
-                      {selectedKbs.length === 0 && (
-                        <p className="mt-[4px] text-[10px] leading-4 text-[#8a92a5]">
-                          未选择知识库时，可直接上传附件进行内容梳理或文档生成。
-                        </p>
-                      )}
-                    </div>
-                    <label className="mt-[12px] flex items-center justify-between gap-[8px] text-[11px] text-[#464c5e]">
-                      检索用途
-                      <select
-                        aria-label="检索用途"
-                        value={knowledgePurpose}
-                        disabled={scopeDisabled}
-                        onChange={(event) => onKnowledgeScopeChange?.(
-                          event.target.value as KnowledgePurpose | 'auto',
-                          selectedKnowledgeBaseIds,
-                        )}
-                        className="rounded border border-[#e5e8f0] px-[5px] py-[3px] text-[11px]"
-                      >
-                        <option value="auto">自动（推荐）</option>
-                        <option value="answer">问答</option>
-                        <option value="compare">对比</option>
-                        <option value="compose">编写文档</option>
-                      </select>
-                    </label>
-                    <p className="mt-[8px] text-[10px] leading-4 text-[#8a92a5]">
-                      范围变化后将打开新的会话上下文。
-                    </p>
-                  </Popover.Content>
-                </Popover.Portal>
-              </Popover.Root>
-            ) : (
+            <div className="flex items-center gap-[6px]">
+              <span className="text-[11px] text-[#858b9c]">主知识库</span>
               <Select
                 value={kbName || '__none__'}
                 onValueChange={(value) => onKbChange(value === '__none__' ? '' : value)}
@@ -285,7 +205,10 @@ export default function Composer({
                 <SelectTrigger
                   aria-label="选择主知识库"
                   title={kbName ? `当前主知识库：${kbName}` : '选择主知识库'}
-                  className={cn(CHAT_COMPOSER_MODEL_BTN_CLASS, 'min-w-[240px]')}
+                  className={cn(
+                    CHAT_COMPOSER_MODEL_BTN_CLASS,
+                    'min-w-[220px] max-w-[min(360px,calc(100vw-48px))]',
+                  )}
                 >
                   <span className="grid size-[14px] shrink-0 place-items-center" aria-hidden>
                     <AppIcon name="database" size={14} />
@@ -302,7 +225,7 @@ export default function Composer({
                   sideOffset={6}
                   className="min-w-[240px] max-w-[min(560px,calc(100vw-48px))]"
                 >
-                  <SelectItem value="__none__">不使用知识库</SelectItem>
+                  <SelectItem value="__none__">不使用知识库（仅附件/普通对话）</SelectItem>
                   {availableKbs.map((kb) => {
                     const label = kbOptionLabel(kb, showDepartmentInKbOptions);
                     return (
@@ -313,7 +236,117 @@ export default function Composer({
                   })}
                 </SelectContent>
               </Select>
+            </div>
+            {showReferencePicker && (
+              <div className="flex min-w-0 flex-wrap items-center gap-[6px]">
+                <span className="text-[11px] text-[#858b9c]">参考知识库</span>
+                {referenceKbs.map((kb) => (
+                  <span
+                    key={kb.kb_id}
+                    className="inline-flex h-[32px] max-w-[220px] items-center gap-[4px] rounded-[9px] border border-[#e3e7f1] bg-[#f6f7fa] px-[8px] text-[11px] text-[#464c5e]"
+                  >
+                    <span className="min-w-0 truncate" title={kb.name}>{kb.name}</span>
+                    <button
+                      type="button"
+                      aria-label={`移除参考知识库 ${kb.name}`}
+                      title="移除参考知识库"
+                      disabled={scopeDisabled}
+                      onClick={() => updateReferences(Number(kb.kb_id), false)}
+                      className="inline-grid size-[16px] shrink-0 place-items-center rounded-full border-0 bg-transparent p-0 text-[14px] leading-none text-[#8a92a5] hover:bg-[#e5e8f0] hover:text-[#18181a] disabled:cursor-not-allowed disabled:opacity-45"
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+                <Popover.Root>
+                  <Popover.Trigger asChild>
+                    <button
+                      type="button"
+                      aria-label="添加参考知识库"
+                      title={
+                        primaryKbId == null
+                          ? '请先选择主知识库'
+                          : referenceCandidates.length === 0
+                            ? '暂无其他可用知识库'
+                            : '添加参考知识库'
+                      }
+                      disabled={referencePickerDisabled}
+                      className={cn(
+                        CHAT_COMPOSER_MODEL_BTN_CLASS,
+                        'min-w-[132px] max-w-[200px] px-[10px] text-[11px]',
+                      )}
+                    >
+                      <span className="text-[14px] leading-none" aria-hidden>+</span>
+                      <span className="min-w-0 truncate">添加参考知识库</span>
+                    </button>
+                  </Popover.Trigger>
+                  <Popover.Portal>
+                    <Popover.Content
+                      aria-label="选择参考知识库"
+                      align="start"
+                      sideOffset={6}
+                      collisionPadding={12}
+                      className="z-50 w-[320px] max-w-[calc(100vw-24px)] rounded-[10px] border border-[#e5e8f0] bg-white p-[10px] shadow-lg"
+                    >
+                      <div className="mb-[6px] flex items-center justify-between gap-[8px]">
+                        <span className="text-[12px] font-medium text-[#18181a]">添加参考知识库</span>
+                        <span className="text-[10px] text-[#8a92a5]">已选 {referenceKbs.length}</span>
+                      </div>
+                      <p className="mb-[6px] text-[10px] leading-4 text-[#8a92a5]">
+                        可多选；主知识库不会重复添加。
+                      </p>
+                      {referenceCandidates.length > 0 ? (
+                        <div className="grid max-h-[220px] gap-[2px] overflow-y-auto">
+                          {referenceCandidates.map((kb) => {
+                            const id = Number(kb.kb_id);
+                            const checked = referenceKbs.some((item) => Number(item.kb_id) === id);
+                            const label = kbOptionLabel(kb, showDepartmentInKbOptions);
+                            return (
+                              <label
+                                key={id}
+                                className="flex cursor-pointer items-center gap-[8px] rounded-[6px] px-[8px] py-[6px] text-[11px] text-[#464c5e] hover:bg-[#f6f7fa]"
+                              >
+                                <input
+                                  type="checkbox"
+                                  aria-label={`选择参考知识库 ${kb.name}`}
+                                  checked={checked}
+                                  disabled={scopeDisabled}
+                                  onChange={(event) => updateReferences(id, event.target.checked)}
+                                  className="size-[13px] accent-[#18181a]"
+                                />
+                                <span className="min-w-0 flex-1 truncate" title={label}>{label}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <p className="rounded-[6px] border border-dashed border-[#e5e8f0] px-[8px] py-[7px] text-[11px] text-[#a2a8b8]">
+                          暂无其他可用知识库
+                        </p>
+                      )}
+                    </Popover.Content>
+                  </Popover.Portal>
+                </Popover.Root>
+              </div>
             )}
+            <label className="flex items-center gap-[6px] text-[11px] text-[#858b9c]">
+              用途
+              <select
+                aria-label="检索用途"
+                value={knowledgePurpose}
+                disabled={scopeDisabled}
+                onChange={(event) => onKnowledgeScopeChange?.(
+                  event.target.value as KnowledgePurpose | 'auto',
+                  effectiveSelectedIds,
+                )}
+                className="rounded border border-[#e5e8f0] px-[5px] py-[3px] text-[11px] text-[#464c5e]"
+              >
+                <option value="auto">自动（推荐）</option>
+                <option value="answer">问答</option>
+                <option value="compare">对比</option>
+                <option value="compose">编写文档</option>
+              </select>
+            </label>
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-[8px]">
             {attachmentsEnabled && attachmentCount > 0 && (
