@@ -108,16 +108,35 @@ def test_new_protocol_replay_checks_request_and_range_fingerprints(api):
     assert "idempotency_conflict" in conflict.text
 
 
-def test_changed_purpose_or_role_requires_new_session(api):
+def test_changed_scope_updates_session_without_new_conversation(api):
     client, _, _, _, ids, _, _ = api
     session_id = create(client, ids).json()["id"]
     url = f"/api/v1/conversations/{session_id}/turns"
     assert client.post(url, json={"query": "first"}).status_code == 201
     for selection in [scope_fixtures.selection_payload(ids["A"], ids["B"], purpose="compare"),
-                      scope_fixtures.selection_payload(ids["A"], ids["B"], roles=["primary", "standard"])]:
+                      scope_fixtures.selection_payload(ids["A"], ids["B"], roles=["primary", "reference"])]:
         response = client.post(url, json={"query": "new purpose", "knowledge_scope": selection})
-        assert response.status_code == 409
-        assert "knowledge_scope_changed" in response.text
+        assert response.status_code == 201, response.text
+        session = client.get(f"/api/v1/conversations/{session_id}").json()
+        assert session["knowledge_scope"]["purpose"] == selection["purpose"]
+        assert [(source["kb_id"], source["role"]) for source in session["knowledge_scope"]["sources"]] == [
+            (source["kb_id"], source["role"]) for source in selection["sources"]
+        ]
+
+
+def test_reference_kb_can_be_added_without_new_session(api):
+    client, _, _, _, ids, _, _ = api
+    session = client.post("/api/v1/conversations", json={"kb_name": "A"}).json()
+    url = f"/api/v1/conversations/{session['id']}/turns"
+    assert client.post(url, json={"query": "first"}).status_code == 201
+    selection = scope_fixtures.selection_payload(ids["A"], ids["B"])
+    response = client.post(url, json={"query": "second", "knowledge_scope": selection})
+    assert response.status_code == 201, response.text
+    expected_hash = response.json()["turn"]["knowledge_scope"]["selection_hash"]
+    sessions = client.get("/api/v1/conversations", params={"kb_name": "A"}).json()
+    assert [row["id"] for row in sessions] == [session["id"]]
+    assert sessions[0]["knowledge_selection_hash"] == expected_hash
+    assert {source["kb_name"] for source in sessions[0]["knowledge_scope"]["sources"]} == {"A", "B"}
 
 
 def test_revoked_reference_blocks_new_turn_before_pipeline_execution(api):

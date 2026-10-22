@@ -164,49 +164,50 @@ def test_same_key_with_different_new_request_is_conflict(store, change):
     assert len(service.list_messages(user, session.id)) == 2
 
 
-def test_selection_is_fixed_after_first_turn_and_must_have_fresh_snapshot(store):
-    from src.services.knowledge_scope import KnowledgeScopeChanged
-
+def test_selection_can_change_between_turns_and_must_have_fresh_snapshot(store):
     service, user = store
     scope = snapshot(user)
     session = create(service, user, scope)
     with pytest.raises(ValueError, match="knowledge_scope_required"):
         service.create_turn(user, session.id, "missing scope")
-    service.create_turn(user, session.id, "first", knowledge_scope=scope)
-    with pytest.raises(KnowledgeScopeChanged):
-        service.create_turn(user, session.id, "second", knowledge_scope=snapshot(user, reference=306))
-    assert service.get_session(user, session.id).knowledge_selection_hash == scope.selection_hash
+    first = service.create_turn(user, session.id, "first", knowledge_scope=scope)
+    second_scope = snapshot(user, reference=306)
+    second = service.create_turn(user, session.id, "second", knowledge_scope=second_scope)
+    assert first.knowledge_scope["selection_hash"] == scope.selection_hash
+    assert second.knowledge_scope["selection_hash"] == second_scope.selection_hash
+    assert service.get_session(user, session.id).knowledge_selection_hash == second_scope.selection_hash
 
 
-def test_concurrent_first_turn_binds_exactly_one_selection(store):
-    from src.services.knowledge_scope import KnowledgeScopeChanged
-
+def test_concurrent_turns_keep_their_own_selection_snapshots(store):
     service, user = store
     session = create(service, user)
 
     def submit(reference):
         scope = snapshot(user, reference=reference)
-        try:
-            return service.create_turn(user, session.id, f"first-{reference}", knowledge_scope=scope)
-        except KnowledgeScopeChanged:
-            return None
+        return service.create_turn(user, session.id, f"first-{reference}", knowledge_scope=scope)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         turns = list(pool.map(submit, [205, 306]))
-    accepted = [t for t in turns if t is not None]
-    assert len(accepted) == 1
-    assert service.get_session(user, session.id).knowledge_selection_hash == accepted[0].knowledge_selection_hash
-    assert len(service.list_messages(user, session.id)) == 2
+    assert len(turns) == 2
+    assert {turn.knowledge_scope["selection_hash"] for turn in turns} == {
+        snapshot(user, reference=205).selection_hash,
+        snapshot(user, reference=306).selection_hash,
+    }
+    assert service.get_session(user, session.id).knowledge_selection_hash in {
+        turn.knowledge_scope["selection_hash"] for turn in turns
+    }
+    assert len(service.list_messages(user, session.id)) == 4
 
 
-def test_cannot_attach_multiscope_to_existing_legacy_history(store):
-    from src.services.knowledge_scope import KnowledgeScopeChanged
-
+def test_can_attach_multiscope_to_existing_legacy_history(store):
     service, user = store
     session = create(service, user)
     service.create_turn(user, session.id, "old")
-    with pytest.raises(KnowledgeScopeChanged):
-        service.create_turn(user, session.id, "new", knowledge_scope=snapshot(user))
+    scope = snapshot(user)
+    turn = service.create_turn(user, session.id, "new", knowledge_scope=scope)
+    assert turn.knowledge_scope["selection_hash"] == scope.selection_hash
+    assert service.get_session(user, session.id).knowledge_selection_hash == scope.selection_hash
+    assert len(service.list_messages(user, session.id)) == 4
 
 
 def test_snapshot_actor_anchor_and_hash_are_checked_before_any_writes(store):

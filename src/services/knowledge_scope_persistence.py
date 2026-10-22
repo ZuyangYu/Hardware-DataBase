@@ -6,7 +6,7 @@ import hashlib
 import json
 from typing import Any
 
-from src.services.knowledge_scope import KnowledgeScopeChanged, KnowledgeScopeInvalid
+from src.services.knowledge_scope import KnowledgeScopeInvalid
 from src.services.knowledge_scope_models import KnowledgeScopeSnapshot, KnowledgeSelectionInput, selection_hash
 
 
@@ -18,9 +18,9 @@ class IdempotencyConflict(ValueError):
 def initial_scope_summary(scope: dict[str, Any]) -> dict[str, Any]:
     """Authorize queued/streaming turns before the model produces its summary.
 
-    Source selection is pinned for the entire session, including its history.
-    Completed turns still use the execution summary and fail closed if that
-    summary omits complete dependencies.
+    Each turn snapshots its own source selection.  The session remains anchored
+    to its primary KB, but adding or removing reference KBs for a later turn
+    must not invalidate earlier turns' citations.
     """
     if not scope:
         return {}
@@ -73,9 +73,3 @@ def request_fingerprint(*, scope: dict, query: str, source_scope: str, attachmen
 def require_replay_fingerprint(existing_fingerprint: str, requested_fingerprint: str) -> None:
     if (existing_fingerprint or requested_fingerprint) and existing_fingerprint != requested_fingerprint:
         raise IdempotencyConflict()
-
-
-def require_scope_binding(stored_hash: str, requested_scope: dict[str, Any], *, has_history: bool) -> None:
-    requested_hash = requested_scope.get("selection_hash", "")
-    if has_history and stored_hash != requested_hash:
-        raise KnowledgeScopeChanged("knowledge_scope_changed")

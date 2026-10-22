@@ -1134,7 +1134,7 @@ class ConversationService:
                 if session_row is None:
                     raise PermissionError("chat session does not belong to current user")
                 from src.services.knowledge_scope_persistence import (
-                    turn_scope_payload, request_fingerprint, require_replay_fingerprint, require_scope_binding,
+                    turn_scope_payload, request_fingerprint, require_replay_fingerprint,
                     initial_scope_summary,
                 )
 
@@ -1149,8 +1149,6 @@ class ConversationService:
                         require_replay_fingerprint(existing["knowledge_request_fingerprint"], fingerprint)
                         conn.execute("COMMIT")
                         return row_to_turn(existing)
-                has_history = conn.execute("SELECT 1 FROM chat_messages WHERE session_id = ? LIMIT 1", (session_id,)).fetchone() is not None
-                require_scope_binding(session_row["knowledge_selection_hash"], scope, has_history=has_history)
                 if scope:
                     selection = {"version": scope["version"], "purpose": scope["purpose"], "sources": [{"kb_id": s["kb_id"], "role": s["role"]} for s in scope["sources"]]}
                     conn.execute("UPDATE chat_sessions SET knowledge_selection_json = ?, knowledge_selection_hash = ? WHERE id = ?", (json.dumps(selection, ensure_ascii=False), scope["selection_hash"], session_id))

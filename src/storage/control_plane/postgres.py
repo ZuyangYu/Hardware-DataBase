@@ -383,7 +383,7 @@ class PostgresExecutionStore:
             if session_row is None:
                 raise PermissionError("chat session does not belong to current user")
             from src.services.knowledge_scope_persistence import (
-                turn_scope_payload, request_fingerprint, require_replay_fingerprint, require_scope_binding,
+                turn_scope_payload, request_fingerprint, require_replay_fingerprint,
                 initial_scope_summary,
             )
 
@@ -397,8 +397,6 @@ class PostgresExecutionStore:
                 if existing is not None:
                     require_replay_fingerprint(existing["knowledge_request_fingerprint"], fingerprint)
                     return _turn_from_row(existing)
-            has_history = conn.execute("SELECT 1 FROM chat_messages WHERE session_id = %s LIMIT 1", (int(session_id),)).fetchone() is not None
-            require_scope_binding(session_row["knowledge_selection_hash"], scope, has_history=has_history)
             if scope:
                 initial_status = f"multi_kb_{initial_status}"
                 selection = {"version": scope["version"], "purpose": scope["purpose"], "sources": [{"kb_id": s["kb_id"], "role": s["role"]} for s in scope["sources"]]}

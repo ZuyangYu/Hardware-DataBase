@@ -407,13 +407,6 @@ function localAssistantMessage(sessionId: number, content: string): MessageView 
   };
 }
 
-function scopeSourceKey(scope: { sources: Array<{ kb_id: number; role: string }> } | null | undefined): string {
-  return (scope?.sources ?? [])
-    .map((source) => `${source.kb_id}:${source.role}`)
-    .sort()
-    .join('|');
-}
-
 export type UseKbChat = ReturnType<typeof useKbChat>;
 
 export type UseKbChatOptions = {
@@ -1388,17 +1381,16 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     if (!query || streaming) return;
     const activeSession = sessions.find((session) => session.id === activeSessionId);
     const hasActiveSession = activeSessionId != null && activeSession != null;
-    const requestedScope = resolveKnowledgeScope?.(query) ?? knowledgeScope;
-    const activeScopeKey = activeSession?.knowledge_scope
-      ? scopeSourceKey(activeSession.knowledge_scope)
-      : null;
     const activeHasScope = Boolean(activeSession?.knowledge_scope || activeSession?.knowledge_selection_hash);
-    // A session is anchored to its primary KB. If the reference set changed,
-    // keep the old session in history and start a new one under that primary.
-    const scopeChanged = hasActiveSession && (activeHasScope
-      ? activeScopeKey == null || activeScopeKey !== scopeSourceKey(requestedScope)
-      : Boolean(requestedScope));
-    const turnKnowledgeScope = !hasActiveSession || scopeChanged ? requestedScope : undefined;
+    const requestedScope = resolveKnowledgeScope?.(query) ?? knowledgeScope;
+    // Reference KBs can change between turns in the same primary-KB session.
+    // Only a session that currently has a scope and is being reduced to a
+    // single KB needs a fresh session, because "no scope" is represented by an
+    // omitted field on the turn request.
+    const mustStartNewSession = !hasActiveSession || (activeHasScope && requestedScope == null);
+    const turnKnowledgeScope = mustStartNewSession
+      ? requestedScope
+      : (requestedScope ?? undefined);
     const generation = streamTokenRef.current + 1;
     streamTokenRef.current = generation;
     sendingGenerationRef.current = generation;
@@ -1414,7 +1406,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     setDegradedNotes([]);
     setDocumentCardRefreshingId(null);
 
-    let sessionId = hasActiveSession && !scopeChanged ? activeSessionId : null;
+    let sessionId = mustStartNewSession ? null : activeSessionId;
     // 乐观更新:点发送立即上屏,不等建会话/建 turn 的两个往返(否则"思考中"
     // 会先于自己的消息出现,体感像页面卡了一下)。turn 建好后用服务端记录对账替换。
     const optimisticId = -Date.now();
@@ -1584,6 +1576,12 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           const updated = {
             ...target,
             title: target.title === '新对话' ? query.slice(0, 20) : target.title,
+            ...(created.turn.knowledge_scope
+              ? {
+                knowledge_scope: created.turn.knowledge_scope,
+                knowledge_selection_hash: created.turn.knowledge_selection_hash ?? target.knowledge_selection_hash,
+              }
+              : {}),
           };
           return [updated, ...prev.filter((s) => s.id !== sessionId)];
         });

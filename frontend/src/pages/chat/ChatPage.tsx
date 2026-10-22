@@ -436,6 +436,29 @@ export default function ChatPage({
     refreshMcpWriteCards,
   } = chat;
 
+  // Each session keeps its own reference-KB set.  When the user opens a
+  // different session, mirror that session's stored scope into the picker so
+  // the next turn edits the same session instead of silently changing it.
+  const syncedSessionScopeId = useRef<number | null>(null);
+  useEffect(() => {
+    if (activeSessionId == null) {
+      syncedSessionScopeId.current = null;
+      return;
+    }
+    if (syncedSessionScopeId.current === activeSessionId || !activeSession) return;
+    syncedSessionScopeId.current = activeSessionId;
+    const stored = activeSession.knowledge_scope;
+    const storedIds = stored?.sources
+      ?.map((source) => Number(source.kb_id))
+      .filter((value) => Number.isSafeInteger(value) && value > 0) ?? [];
+    if (stored && storedIds.length > 0) {
+      setSelectedKnowledgeBaseIds([...new Set(storedIds)]);
+      setKnowledgePurpose(stored.purpose);
+    } else {
+      setSelectedKnowledgeBaseIds(anchorKnowledgeBaseId != null ? [anchorKnowledgeBaseId] : []);
+    }
+  }, [activeSession, activeSessionId, anchorKnowledgeBaseId]);
+
   const handleKnowledgeScopeChange = (purpose: KnowledgePurpose | 'auto', kbIds: number[]) => {
     if (streaming) return;
     const unique = [...new Set(kbIds)];
