@@ -314,11 +314,6 @@ export default function Composer({
                 </SelectContent>
               </Select>
             )}
-            {!kbName && (
-              <span className="text-[10px] text-[#8a92a5]">
-                请选择主库后开始检索
-              </span>
-            )}
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-[8px]">
             {attachmentsEnabled && attachmentCount > 0 && (
