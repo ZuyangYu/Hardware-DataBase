@@ -74,7 +74,7 @@ from src.agents.tools.spreadsheet_tools import make_spreadsheet_sql_tools, make_
 from src.agents.tools.wiki_tools import make_wiki_search
 from src.attachments.audit import begin_attachment_audit, finish_attachment_audit
 from src.circuit.index_service import CircuitIndexService
-from src.core.cancellation import QueryCancelled
+from src.core.cancellation import QueryCancelled, bind_cancel_check
 from src.core.conversation import GENERAL_CHAT_KB_NAME
 from src.core.conversation_orchestrator import ConversationOrchestrator
 from src.core.intent import IntentPlan, classify_intent
@@ -3776,23 +3776,24 @@ class MultiSourceAgentRunner:
         )
         recursion_stopped = False
         try:
-            for chunk, metadata in agent.stream(
-                {"messages": messages},
-                config=config,
-                stream_mode="messages",
-            ):
-                rt.check_cancel()
-                node = str((metadata or {}).get("langgraph_node") or "")
-                _accumulate_usage(usage, chunk)
-                # Real providers stream AIMessageChunk pieces; fake/fallback
-                # paths deliver a whole AIMessage per model call. Empty-text
-                # chunks still matter: they may carry tool-call metadata that
-                # reclassifies the segment as narration.
-                if node != "model" or not isinstance(chunk, AIMessage):
-                    continue
-                delta = splitter.feed(chunk, _extract_text_delta(chunk))
-                if delta:
-                    yield delta
+            with bind_cancel_check(should_cancel):
+                for chunk, metadata in agent.stream(
+                    {"messages": messages},
+                    config=config,
+                    stream_mode="messages",
+                ):
+                    rt.check_cancel()
+                    node = str((metadata or {}).get("langgraph_node") or "")
+                    _accumulate_usage(usage, chunk)
+                    # Real providers stream AIMessageChunk pieces; fake/fallback
+                    # paths deliver a whole AIMessage per model call. Empty-text
+                    # chunks still matter: they may carry tool-call metadata that
+                    # reclassifies the segment as narration.
+                    if node != "model" or not isinstance(chunk, AIMessage):
+                        continue
+                    delta = splitter.feed(chunk, _extract_text_delta(chunk))
+                    if delta:
+                        yield delta
         except QueryCancelled:
             return
         except Exception as exc:

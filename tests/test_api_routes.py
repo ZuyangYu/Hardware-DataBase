@@ -617,6 +617,50 @@ class ApiRoutesTests(unittest.TestCase):
         ).json()
         self.assertEqual(messages[-1]["content"], "已停止生成")
 
+    def test_model_504_fails_turn_without_blocking_the_next_question(self):
+        token = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "504"},
+            headers=self._auth(token),
+        ).json()
+
+        def gateway_timeout(*_args, **_kwargs):
+            raise RuntimeError("504 Gateway Timeout")
+
+        with patch.object(self.stub, "query", side_effect=gateway_timeout):
+            turn = self.client.post(
+                f"/api/v1/conversations/{session['id']}/turns",
+                json={"query": "会超时的问题"},
+                headers=self._auth(token),
+            ).json()["turn"]
+            started = self.client.post(f"/api/v1/turns/{turn['id']}/start", headers=self._auth(token))
+            self.assertEqual(started.status_code, 202, started.text)
+            deadline = time.time() + 5
+            current = None
+            while time.time() < deadline:
+                current = self.client.get(
+                    f"/api/v1/turns/{turn['id']}", headers=self._auth(token)
+                ).json()
+                if current["status"] in {"completed", "failed", "cancelled"}:
+                    break
+                time.sleep(0.05)
+
+        self.assertIsNotNone(current)
+        self.assertEqual(current["status"], "failed")
+        self.assertIn("模型服务暂时不可用", current.get("error_message", ""))
+
+        follow_up = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={"query": "下一条"},
+            headers=self._auth(token),
+        )
+        self.assertEqual(follow_up.status_code, 201, follow_up.text)
+        self.assertNotEqual(
+            follow_up.json()["turn"].get("queue_reason"),
+            "queued_behind_previous_turn",
+        )
+
     def test_stale_turn_sse_subscriber_stays_read_only(self):
         token = self._token("user1")
         session = self.client.post(

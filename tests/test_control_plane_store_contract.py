@@ -177,7 +177,7 @@ class _StoreContractScenarios:
         turn = store.create_turn(self.user_id, session, "q1")
         claimed = store.claim_turn(turn.id, "worker-a")
         cancelled = store.request_turn_cancel(self.user_id, turn.id)
-        self.assertEqual(cancelled.status, "cancelling")
+        self.assertEqual(cancelled.status, "cancelled")
         with self.assertRaises(StaleTurnOwner):
             store.complete_turn(
                 self.user_id,
@@ -189,16 +189,17 @@ class _StoreContractScenarios:
                 fencing_token=claimed.turn.fencing_token,
                 expected_generation=claimed.turn.session_generation,
             )
-        finalised = store.fail_turn(
-            self.user_id,
-            turn.id,
-            "已停止生成",
-            cancelled=True,
-            worker_id="worker-a",
-            attempt_id=claimed.turn.attempt_id,
-            fencing_token=claimed.turn.fencing_token,
-        )
-        self.assertEqual(finalised.turn.status, "cancelled")
+        with self.assertRaises(StaleTurnOwner):
+            store.fail_turn(
+                self.user_id,
+                turn.id,
+                "已停止生成",
+                cancelled=True,
+                worker_id="worker-a",
+                attempt_id=claimed.turn.attempt_id,
+                fencing_token=claimed.turn.fencing_token,
+            )
+        self.assertEqual(store.get_turn(turn.id).status, "cancelled")
 
     def test_cancel_pending_turn_converges_immediately(self):
         store = self.store()
@@ -222,7 +223,7 @@ class _StoreContractScenarios:
         claimed = store.claim_turn(cancelled.id, "worker-b")
         self.assertEqual(claimed.status, "claimed")
         self.assertEqual(
-            store.request_turn_cancel(self.user_id, cancelled.id).status, "cancelling"
+            store.request_turn_cancel(self.user_id, cancelled.id).status, "cancelled"
         )
         self.expire_lease(cancelled.id)
         summary = store.requeue_stale_turns(stale_after_seconds=30)

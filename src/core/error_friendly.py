@@ -7,7 +7,7 @@ def friendly_error_message(exc: BaseException) -> str:
     lowered = raw.lower()
     if "429" in raw or "rate limit" in lowered or "usage limit" in lowered:
         return "模型服务调用过于频繁或额度受限，请稍后重试。"
-    if any(
+    if any(code in raw for code in ("502", "503", "504")) or any(
         token in lowered
         for token in (
             "streaming response failed",
@@ -17,6 +17,7 @@ def friendly_error_message(exc: BaseException) -> str:
             "bad gateway",
             "gateway timeout",
             "service unavailable",
+            "upstream connect error",
         )
     ):
         return "模型服务暂时不可用，请稍后重新发送本问题。"

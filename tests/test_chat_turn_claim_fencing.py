@@ -250,7 +250,7 @@ class ChatTurnFencingTests(_Base):
         claimed = self.conv.claim_turn(1, turn.id, "worker-a")
         self.assertIsNotNone(claimed)
         cancelled = self.conv.request_turn_cancel(1, turn.id)
-        self.assertEqual(cancelled.status, "cancelling")
+        self.assertEqual(cancelled.status, "cancelled")
         with self.assertRaises(StaleTurnOwner):
             self.conv.complete_turn(
                 1,
@@ -261,16 +261,21 @@ class ChatTurnFencingTests(_Base):
                 fencing_token=claimed.fencing_token,
                 expected_generation=claimed.session_generation,
             )
-        finalised = self.conv.fail_turn(
-            1,
-            turn.id,
-            "已停止生成",
-            cancelled=True,
-            worker_id="worker-a",
-            fencing_token=claimed.fencing_token,
+        with self.assertRaises(StaleTurnOwner):
+            self.conv.fail_turn(
+                1,
+                turn.id,
+                "已停止生成",
+                cancelled=True,
+                worker_id="worker-a",
+                fencing_token=claimed.fencing_token,
+            )
+        self.assertEqual(self.conv.get_turn(1, turn.id).status, "cancelled")
+        self.assertEqual(
+            [event.event_type for event in self.conv.list_turn_events(1, turn.id)],
+            ["error", "turn_end"],
         )
-        self.assertEqual(finalised.status, "cancelled")
-        self.assertTrue(
+        self.assertFalse(
             self.conv.release_turn_ownership(turn.id, "worker-a", fencing_token=claimed.fencing_token)
         )
         row = self._execution_row()
@@ -281,6 +286,20 @@ class ChatTurnFencingTests(_Base):
                 (self.session.id,),
             ).fetchone()[0]
         self.assertEqual(int(generation), 1)
+
+    def test_cancel_unblocks_the_next_turn_immediately(self):
+        first = self._turn("q1")
+        second = self._turn("q2")
+        claimed = self.conv.claim_turn(1, first.id, "worker-a")
+        self.assertIsNotNone(claimed)
+        self.assertIsNone(self.conv.claim_turn(1, second.id, "worker-b"))
+
+        cancelled = self.conv.request_turn_cancel(1, first.id)
+        self.assertEqual(cancelled.status, "cancelled")
+
+        claimed_second = self.conv.claim_turn(1, second.id, "worker-b")
+        self.assertIsNotNone(claimed_second)
+        self.assertEqual(claimed_second.turn_sequence, 2)
 
     def test_stale_write_counter_is_recorded(self):
         turn = self._turn("q1")
@@ -399,7 +418,7 @@ class ChatTurnTerminalEventTests(_Base):
         turn = self._turn("q1")
         self.conv.claim_turn(1, turn.id, "worker-a")
         cancelled = self.conv.request_turn_cancel(1, turn.id)
-        self.assertEqual(cancelled.status, "cancelling")
+        self.assertEqual(cancelled.status, "cancelled")
         self._expire_session_lease(turn.id)
         requeued = self.conv.requeue_stale_turns(stale_after_seconds=30)
         self.assertEqual(requeued, 0)

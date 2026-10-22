@@ -1723,8 +1723,13 @@ class ConversationService:
                     SELECT id, cancel_requested, retry_count
                     FROM chat_turns
                     WHERE status IN ('streaming', 'cancelling')
-                      AND worker_heartbeat_at IS NOT NULL
-                      AND datetime(worker_heartbeat_at) < datetime('now', ?)
+                      AND (
+                        cancel_requested = 1
+                        OR (
+                          worker_heartbeat_at IS NOT NULL
+                          AND datetime(worker_heartbeat_at) < datetime('now', ?)
+                        )
+                      )
                     """,
                     (f"-{stale_after_seconds} seconds",),
                 ).fetchall()
@@ -2720,51 +2725,48 @@ class ConversationService:
             try:
                 target = conn.execute(
                     """
-                    SELECT t.status, t.session_id FROM chat_turns t
+                    SELECT t.status, t.session_id, t.assistant_message_id
+                    FROM chat_turns t
                     JOIN chat_sessions s ON s.id = t.session_id
                     WHERE t.id = ? AND s.user_id = ?
                     """,
                     (turn_id, user_id),
                 ).fetchone()
-                if target is not None and str(target["status"]) in {"streaming", "cancelling"}:
+                if target is None:
+                    conn.execute("COMMIT")
+                    return None
+                status = str(target["status"])
+                if status in {"streaming", "cancelling"}:
                     # Revoke the business commit before signalling the worker:
                     # an in-flight answer must not be accepted after a cancel.
                     self._bump_session_generation(conn, int(target["session_id"]))
-                conn.execute(
-                """
-                UPDATE chat_turns SET cancel_requested = 1,
-                  status = CASE
-                    WHEN status = 'pending' THEN 'cancelled'
-                    WHEN status = 'streaming' THEN 'cancelling'
-                    WHEN status = 'waiting_for_attachments' THEN 'cancelled'
-                    ELSE status
-                  END,
-                  finished_at = CASE WHEN status IN ('pending', 'waiting_for_attachments') THEN ? ELSE finished_at END,
-                  error_message = CASE WHEN status IN ('pending', 'waiting_for_attachments') THEN '已停止生成' ELSE error_message END
-                WHERE id = ? AND session_id IN (
-                    SELECT id FROM chat_sessions
-                    WHERE user_id = ?
-                )
-                  AND status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
-                """,
-                (now, turn_id, user_id),
-                )
-                # A pending turn has no worker to write a terminal message.
-                # Replace its assistant placeholder immediately so history
-                # never contains a permanent blank assistant row.
-                conn.execute(
+                cursor = conn.execute(
                     """
-                    UPDATE chat_messages SET content = '已停止生成'
-                    WHERE id = (
-                        SELECT assistant_message_id FROM chat_turns WHERE id = ? AND status = 'cancelled'
-                    ) AND content = ''
+                    UPDATE chat_turns SET cancel_requested = 1,
+                      status = 'cancelled',
+                      finished_at = ?,
+                      error_message = COALESCE(NULLIF(error_message, ''), '已停止生成'),
+                      worker_id = '', worker_heartbeat_at = NULL
+                    WHERE id = ? AND session_id IN (
+                        SELECT id FROM chat_sessions
+                        WHERE user_id = ?
+                    )
+                      AND status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
                     """,
-                    (turn_id,),
+                    (now, turn_id, user_id),
                 )
-                if target is not None and str(target["status"]) in {"pending", "waiting_for_attachments"}:
-                    # An unstarted turn releases any stale lease so the next turn
-                    # of the session can be claimed.  A running turn keeps its
-                    # lease until the owning worker finalises it.
+                if int(cursor.rowcount or 0) > 0:
+                    # A cancel is terminal immediately.  The browser can submit
+                    # its next turn without waiting for the old worker to unwind;
+                    # late worker writes are fenced by the cleared lease and the
+                    # advanced session generation.
+                    conn.execute(
+                        """
+                        UPDATE chat_messages SET content = '已停止生成'
+                        WHERE id = ? AND content = ''
+                        """,
+                        (target["assistant_message_id"],),
+                    )
                     conn.execute(
                         """
                         UPDATE conversation_execution_state
@@ -2775,6 +2777,13 @@ class ConversationService:
                         """,
                         (now, int(target["session_id"]), turn_id),
                     )
+                    for event_type, payload in (
+                        ("error", {"message": "已停止生成", "cancelled": True}),
+                        ("turn_end", {"status": "cancelled"}),
+                    ):
+                        self._append_turn_event_in_connection(
+                            conn, turn_id, event_type, payload, created_at=now
+                        )
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
