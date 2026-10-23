@@ -4,14 +4,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
 import src.settings as settings
 from src.agents.schemas import Evidence
 from src.agents.tools.runtime import ToolRuntime
 from src.services.retrieval_targets import TargetLocator
 from src.services.turn_evidence_plan import (
-    ADMITTED, BLOCKED, CANDIDATE, MISSING, PENDING, TurnEvidencePlan,
+    ADMITTED, CANDIDATE, MISSING, PENDING, TurnEvidencePlan,
 )
 
 

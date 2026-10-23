@@ -105,8 +105,6 @@ def test_report_store_is_immutable_and_tamper_evident(tmp_path):
 
 
 def test_rerun_with_a_new_created_at_is_idempotent(tmp_path):
-    from dataclasses import replace
-
     left = canonicalize_parts(
         [SimpleNamespace(
             part_id="p1", ordinal=0, part_type="text", text_content="A",

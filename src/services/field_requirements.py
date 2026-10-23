@@ -9,7 +9,6 @@ covered by a model suggestion.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
@@ -75,7 +74,6 @@ class FieldCoveragePlan:
         metadata = dict(getattr(evidence, "metadata", None) or {})
         locator = dict(getattr(evidence, "locator", None) or {})
         content = str(getattr(evidence, "content", "") or "")
-        evidence_ref = str(getattr(evidence, "id", "") or "")
         results = []
         for requirement in self.requirements:
             if int(metadata.get("kb_id") or 0) not in (0, requirement.kb_id):

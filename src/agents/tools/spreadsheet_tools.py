@@ -605,9 +605,17 @@ class SpreadsheetSemanticTool:
             ORDER BY {relevance_order} DESC, r.confidence_score DESC, r.id ASC
             LIMIT ?
         """
+        locator_match = bool(
+            pin_value
+            or (
+                sheet_name
+                and isinstance(row_index, int)
+                and not isinstance(row_index, bool)
+            )
+        )
         return self._query_rows(db_path, sql, params, query, tokens, requested_top_k,
                                 pin_value=pin_value, pin_field=pin_field, sheet_name=sheet_name,
-                                record_id=record_id)
+                                record_id=record_id, locator_match=locator_match)
 
     def _query_rows(
         self,
@@ -622,6 +630,7 @@ class SpreadsheetSemanticTool:
         pin_field: str = "",
         sheet_name: str = "",
         record_id: int = 0,
+        locator_match: bool = False,
     ) -> list[Evidence]:
         try:
             conn = sqlite3.connect(db_path, timeout=30)
@@ -638,7 +647,6 @@ class SpreadsheetSemanticTool:
                 pin_key = _find_pin_column(conn, record_id, sheet_name, pin_field)
         if pin_value:
             rows = [row for row in rows if _row_matches_pin(row, pin_value, pin_field, pin_key)]
-        locator_match = bool(pin_value or (sheet_name and isinstance(row_index, int)))
         rows = _rank_rows(
             rows,
             tokens,
