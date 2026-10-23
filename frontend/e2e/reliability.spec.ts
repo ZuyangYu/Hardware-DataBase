@@ -89,6 +89,44 @@ test('stop button persists cancellation after refresh', async ({ page, request }
   expect((await (await request.get(`/api/v1/turns/${turn.id}`, { headers })).json()).status).toBe('cancelled');
 });
 
+test('stop before the create-turn response still cancels the persisted turn', async ({ page, request }) => {
+  const headers = await login(page);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  await page.route('**/api/v1/conversations/*/turns', async (route) => {
+    if (route.request().method() !== 'POST') return route.continue();
+    await gate;
+    await route.continue();
+  });
+
+  const turnRequest = page.waitForRequest(request =>
+    request.url().endsWith('/turns') && request.method() === 'POST',
+  );
+  const submitted = page.waitForResponse(response =>
+    response.url().endsWith('/turns') && response.request().method() === 'POST',
+  );
+  await page.locator('textarea').fill('请用中文逐条解释从1到100的电气工程术语，每条至少100字。');
+  await page.getByRole('button', { name: '发送', exact: true }).click();
+  await turnRequest;
+  // The composer flips to Stop synchronously; the create-turn POST is still
+  // gated, so this reproduces the in-flight stop race.
+  await page.getByRole('button', { name: '停止生成', exact: true }).click();
+  release();
+
+  const { turn } = await (await submitted).json();
+  const cancelled = await waitTerminal(request, turn.id, headers);
+  expect(cancelled.status).toBe('cancelled');
+
+  // The cancelled turn must not remain a queue blocker for the next question.
+  const next = await request.post(`/api/v1/conversations/${turn.session_id}/turns`, {
+    headers,
+    data: { query: '下一个问题', query_mode: 'fast', client_request_id: randomUUID() },
+  });
+  expect(next.status()).toBe(201);
+  const nextTurn = (await next.json()).turn;
+  expect(nextTurn.queue_reason || '').not.toBe('queued_behind_previous_turn');
+});
+
 test('logout in another tab removes access from the open chat', async ({ page, context }) => {
   await login(page);
   const otherTab = await context.newPage();

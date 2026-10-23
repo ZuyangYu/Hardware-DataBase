@@ -167,7 +167,7 @@ class ConversationFacadeLifecycleTests(unittest.TestCase):
         self.assertEqual(service.list_pending_turn_work(8), [])
 
         cancelled = service.request_turn_cancel(1, first.id)
-        self.assertEqual(cancelled.status, "cancelling")
+        self.assertEqual(cancelled.status, "cancelled")
         with self.assertRaises(StaleTurnOwner):
             service.complete_turn_result(
                 1,
@@ -178,19 +178,19 @@ class ConversationFacadeLifecycleTests(unittest.TestCase):
                 fencing_token=claimed.turn.fencing_token,
                 expected_generation=claimed.turn.session_generation,
             )
-        finalised = service.fail_turn_result(
-            1,
-            first.id,
-            "已停止生成",
-            cancelled=True,
-            worker_id="worker-a",
-            fencing_token=claimed.turn.fencing_token,
-            terminal_events_builder=lambda _turn: [
-                ("error", {"message": "已停止生成", "cancelled": True}),
-                ("turn_end", {"status": "cancelled"}),
-            ],
-        )
-        self.assertEqual(finalised.turn.status, "cancelled")
+        with self.assertRaises(StaleTurnOwner):
+            service.fail_turn_result(
+                1,
+                first.id,
+                "已停止生成",
+                cancelled=True,
+                worker_id="worker-a",
+                fencing_token=claimed.turn.fencing_token,
+                terminal_events_builder=lambda _turn: [
+                    ("error", {"message": "已停止生成", "cancelled": True}),
+                    ("turn_end", {"status": "cancelled"}),
+                ],
+            )
         self.assertEqual(
             [event.event_type for event in service.list_turn_events(1, first.id)],
             ["delta", "error", "turn_end"],

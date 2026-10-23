@@ -482,6 +482,10 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const streamTokenRef = useRef(0);
   const sendingRef = useRef(false);
   const sendingGenerationRef = useRef<number | null>(null);
+  // Generations stopped by the user.  A stop can land while the create-turn
+  // request is still in flight; the response must cancel that persisted turn
+  // instead of starting an orphan that blocks the next question in the queue.
+  const stoppedGenerationsRef = useRef<Set<number>>(new Set());
   // 卡片刷新的在飞标记(ref 而非 state 闭包):两次快速点击只允许发起一次 REST 请求。
   const documentCardRefreshInFlightRef = useRef(false);
   const activeSessionRef = useRef<number | null>(null);
@@ -1213,6 +1217,8 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   }, []);
 
   const abortStream = useCallback(async () => {
+    const generation = sendingGenerationRef.current;
+    if (generation !== null) stoppedGenerationsRef.current.add(generation);
     detachClientStream('user_stop');
   }, [detachClientStream]);
 
@@ -1460,6 +1466,16 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         `/api/v1/conversations/${sessionId}/turns`,
         turnRequest,
       );
+      if (!ownsGeneration()) {
+        // Stop was clicked while the create-turn request was in flight.  The
+        // server has already persisted the turn, so cancel it explicitly;
+        // otherwise it starts as an orphan and the next question queues
+        // behind it even though the user already pressed Stop.
+        if (stoppedGenerationsRef.current.delete(generation)) {
+          await api.post(`/api/v1/turns/${created.turn.id}/cancel`).catch(() => undefined);
+        }
+        return;
+      }
       if (documentContextEnabled && ownsGeneration()) {
         const returnedContext = created.turn.document_context ?? created.user_message.document_context;
         if (returnedContext) setDocumentContextState(returnedContext);
@@ -1621,6 +1637,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         }
       }
     } finally {
+      stoppedGenerationsRef.current.delete(generation);
       if (sendingGenerationRef.current === generation) {
         sendingRef.current = false;
         sendingGenerationRef.current = null;
