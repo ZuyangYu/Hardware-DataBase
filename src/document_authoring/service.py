@@ -25,6 +25,7 @@ import requests
 
 import src.settings
 from src.agents.claim_evidence import RetrievalOutcome, RetrievalSourceOutcome
+from src.services.evidence_sources import ATTACHMENT, normalize_source_type
 from src.document_authoring.artifact_preview import preview_artifact
 from src.document_authoring.conversion import (
     TemplateArtifactConversionService,
@@ -5056,7 +5057,7 @@ class DocumentGenerationService:
                 or getattr(evidence, "source_type", "")
                 or ""
             ).strip()
-            if source_type == "chat_attachment":
+            if normalize_source_type(source_type) == ATTACHMENT:
                 attachment_id = str(metadata.get("attachment_id") or "").strip()
                 if not attachment_id or attachment_id not in frozen_attachment_ids:
                     raise PermissionError(
@@ -5065,7 +5066,7 @@ class DocumentGenerationService:
                 bound_evidence = copy(evidence)
                 bound_evidence.metadata = {
                     **metadata,
-                    "source_type": "chat_attachment",
+                    "source_type": ATTACHMENT,
                     "attachment_id": attachment_id,
                 }
                 accepted.append(bound_evidence)
@@ -5532,7 +5533,7 @@ class DocumentGenerationService:
                     or getattr(evidence, "source_type", "")
                     or ""
                 ).strip()
-                if source_type == "chat_attachment":
+                if normalize_source_type(source_type) == ATTACHMENT:
                     if source_scope not in {"attachment_only", "attachment_and_knowledge_base"}:
                         raise PermissionError(
                             "retrieval outcome contains attachment evidence outside its source scope"

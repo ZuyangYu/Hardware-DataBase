@@ -1,7 +1,7 @@
 /**
  * 聊天会话侧栏(布局在聊天主区右侧:KB 名 + 新建 + 会话列表 + 删除)。
  * 会话侧栏本绑定 agent 业务;我们裁成纯会话 CRUD。
- * 挂载知识库下拉框在输入区左下角(Composer)。
+ * 检索范围下拉框在输入区上方(Composer)。
  */
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';

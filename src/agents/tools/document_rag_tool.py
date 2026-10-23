@@ -8,6 +8,7 @@ from typing import Any
 from src.agents.schemas import Evidence
 from src.pipelines.document_rag.base import RAGBackend
 from src.pipelines.document_store import PipelineDocumentStore
+from src.services.evidence_sources import with_source_metadata
 
 
 class ScopedEvidenceBatch(list):
@@ -201,20 +202,21 @@ def _convert_scoped_evidence(item) -> Evidence:
     }
     if isinstance(structured_locator, dict):
         locator.update(structured_locator)
+    content = str(getattr(item, "content", "") or "")
     return Evidence(
         id=f"document:{identity}",
-        content=str(getattr(item, "content", "") or ""),
+        content=content,
         source_name=str(getattr(item, "source_name", "") or ""),
         content_kind=str(metadata.get("content_kind") or "document_text"),
         processor_kind=str(metadata.get("processor_kind") or getattr(item, "backend", "") or "ragflow"),
         score=float(getattr(item, "score", 0.0) or 0.0),
         locator=locator,
-        metadata={
+        metadata=with_source_metadata({
             **metadata,
             "retriever": getattr(item, "retriever", ""),
             "backend": getattr(item, "backend", ""),
             "tool": "document_search",
-        },
+        }, content=content, locator=locator),
     )
 
 
@@ -296,13 +298,16 @@ def make_document_search(rt, rag_backend: RAGBackend, document_store: PipelineDo
                         "chunk_id": metadata.get("chunk_id") or metadata.get("id") or item.id,
                         "page": metadata.get("page") or metadata.get("page_number"),
                     },
-                    metadata={
+                    metadata=with_source_metadata({
                         **metadata,
                         "retriever": item.retriever,
                         "backend": item.backend,
                         "tool": "document_search",
                         "query": query,
-                    },
+                    }, content=str(item.content or ""), locator={
+                        "document_id": item.id,
+                        "chunk_id": metadata.get("chunk_id") or metadata.get("id") or item.id,
+                    }),
                 )
             )
         return evidences[:top_k]

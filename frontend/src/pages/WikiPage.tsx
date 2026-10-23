@@ -530,7 +530,7 @@ export default function WikiPage({ auth, onLogout, kbs, embedded = false }: Prop
       )}
 
       {!kbName ? (
-        <div className="mt-[24px] border-y border-[#edf0f5] py-[56px] text-center text-[13px] text-[#858b9c]">请先挂载一个知识库,再生成 Wiki。</div>
+        <div className="mt-[24px] border-y border-[#edf0f5] py-[56px] text-center text-[13px] text-[#858b9c]">请先选择一个知识库,再生成 Wiki。</div>
       ) : (
         <div className="mt-[18px]">
           {!loaded ? (

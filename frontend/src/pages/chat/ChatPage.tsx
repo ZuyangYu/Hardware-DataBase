@@ -94,8 +94,8 @@ export function retainExistingAttachmentIds(
 /**
  * Detect the natural-language command that means "use the attached office
  * file as a template and produce a filled document".  The backend remains
- * authoritative; this client hint only removes the extra manual "作为模板"
- * click when exactly one unambiguous office attachment is selected.
+ * authoritative; when exactly one unambiguous office attachment is selected,
+ * this client hint lets the turn auto-convert it without a separate action.
  */
 export function isTemplateGenerationChatIntent(query: string): boolean {
   const text = String(query || '').trim();
@@ -231,7 +231,6 @@ export default function ChatPage({
 }: Props) {
   const navigate = useNavigate();
   const [mountedKbName, setMountedKbName] = useState(kbName);
-  const [knowledgePurpose, setKnowledgePurpose] = useState<KnowledgePurpose | 'auto'>('auto');
   const [selectedKnowledgeBaseIds, setSelectedKnowledgeBaseIds] = useState<number[]>([]);
   const [documentContextLabel, setDocumentContextLabel] = useState<string | null>(null);
   const [documentUploadPending, setDocumentUploadPending] = useState(false);
@@ -308,17 +307,17 @@ export default function ChatPage({
     [anchorKnowledgeBaseId],
   );
 
-  const knowledgeScope = useMemo<KnowledgeSelectionInput | null>(() => {
-    const purpose = knowledgePurpose === 'auto' ? 'answer' : knowledgePurpose;
-    return buildKnowledgeScope(purpose, selectedKnowledgeBaseIds);
-  }, [buildKnowledgeScope, knowledgePurpose, selectedKnowledgeBaseIds]);
+  const knowledgeScope = useMemo<KnowledgeSelectionInput | null>(
+    () => buildKnowledgeScope('answer', selectedKnowledgeBaseIds),
+    [buildKnowledgeScope, selectedKnowledgeBaseIds],
+  );
 
   const resolveKnowledgeScope = useCallback(
     (query: string): KnowledgeSelectionInput | null => {
-      const purpose = inferKnowledgePurpose(query, knowledgePurpose);
+      const purpose = inferKnowledgePurpose(query, 'auto');
       return buildKnowledgeScope(purpose, selectedKnowledgeBaseIds);
     },
-    [buildKnowledgeScope, knowledgePurpose, selectedKnowledgeBaseIds],
+    [buildKnowledgeScope, selectedKnowledgeBaseIds],
   );
 
   useEffect(() => {
@@ -391,7 +390,7 @@ export default function ChatPage({
     documentContextEnabled: documentAuthoringEnabled,
     knowledgeScope,
     resolveKnowledgeScope,
-    knowledgeScopeAuto: knowledgePurpose === 'auto',
+    knowledgeScopeAuto: true,
   });
   const {
     sessions,
@@ -453,16 +452,14 @@ export default function ChatPage({
       .filter((value) => Number.isSafeInteger(value) && value > 0) ?? [];
     if (stored && storedIds.length > 0) {
       setSelectedKnowledgeBaseIds([...new Set(storedIds)]);
-      setKnowledgePurpose(stored.purpose);
     } else {
       setSelectedKnowledgeBaseIds(anchorKnowledgeBaseId != null ? [anchorKnowledgeBaseId] : []);
     }
   }, [activeSession, activeSessionId, anchorKnowledgeBaseId]);
 
-  const handleKnowledgeScopeChange = (purpose: KnowledgePurpose | 'auto', kbIds: number[]) => {
+  const handleKnowledgeScopeChange = (kbIds: number[]) => {
     if (streaming) return;
     const unique = [...new Set(kbIds)];
-    setKnowledgePurpose(purpose);
     if (unique.length === 0) {
       setSelectedKnowledgeBaseIds([]);
       if (mountedKbName) handleKbChange('');
@@ -650,43 +647,6 @@ export default function ChatPage({
     }
   }, [documentAuthoringEnabled, setDocumentContext]);
 
-  async function handleUseAttachmentAsTemplate(attachment: AttachmentView) {
-    if (!canUploadDocumentTemplate || documentUploadPending || activeSessionId == null) return;
-    const extension = attachment.extension.toLowerCase();
-    if (!DOCUMENT_TEMPLATE_EXTENSIONS.includes(extension)) {
-      notify.error('仅支持将 .xlsx、.xlsm 或 .docx 附件转换为模板');
-      return;
-    }
-    if (attachment.parse_status !== 'ready' && attachment.parse_status !== 'degraded') {
-      notify.error('附件尚未完成解析，暂时不能转换为模板');
-      return;
-    }
-
-    setDocumentUploadPending(true);
-    try {
-      const analysis = await analyzeTemplateFromAttachment(
-        mountedKbName,
-        activeSessionId,
-        attachment.attachment_id,
-        attachment.filename,
-      );
-      const context = buildDocumentContext(analysis, mountedKbName, createClientRequestId());
-      if (!context) throw new Error('分析响应缺少可用的模板引用');
-      setDocumentContext(context);
-      setDocumentContextLabel(attachment.filename);
-      // The file is now the document context, not per-turn evidence; keep the
-      // other session attachments mounted.
-      setSelectedAttachmentIds((previous) =>
-        previous.filter((id) => id !== attachment.attachment_id),
-      );
-      notify.success(`附件已转换为模板：${analysis.analysis_id}`);
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '附件转换模板失败');
-    } finally {
-      setDocumentUploadPending(false);
-    }
-  }
-
   function clearDocumentContext() {
     setDocumentContext(null);
     setDocumentContextLabel(null);
@@ -817,8 +777,8 @@ export default function ChatPage({
     // useKbChat.send in the same tick, avoiding a stale React state read.
     // If a context already exists, it is the explicit template choice and
     // unrelated Office attachments remain evidence.  Otherwise inspect all
-    // draft attachments: one eligible candidate can be auto-selected, while
-    // multiple candidates must be chosen with the explicit “作为模板” action.
+    // draft attachments: one eligible candidate can be auto-selected; with
+    // multiple candidates the backend remains authoritative and can clarify.
     let templateRoute = resolveTemplateAttachmentRoute(query, selectedAttachments, documentContext != null);
     if (templateRoute.waitingForTemplate) {
       if (activeSessionId == null) {
@@ -1178,14 +1138,12 @@ export default function ChatPage({
           setInput={setInput}
           streaming={streaming}
           onKbChange={handleKbChange}
-          knowledgePurpose={knowledgePurpose}
           selectedKnowledgeBaseIds={selectedKnowledgeBaseIds}
           onKnowledgeScopeChange={handleKnowledgeScopeChange}
           onSend={handleSendWithAttachments}
           onStop={abortStream}
           quickReplies={documentQuickReplies}
           documentAuthoringEnabled={documentAuthoringEnabled}
-          canUploadDocumentTemplate={canUploadDocumentTemplate}
           documentContext={documentContext}
           documentContextLabel={documentContextLabel ?? undefined}
           documentUploadPending={documentUploadPending}
@@ -1196,7 +1154,6 @@ export default function ChatPage({
           attachmentRetryingId={attachmentRetryingId}
           onUploadAttachment={handleAttachmentUpload}
           onRetryAttachment={handleRetryAttachment}
-          onUseAsTemplate={handleUseAttachmentAsTemplate}
           onRemoveAttachment={handleRemoveAttachment}
         />
       </main>

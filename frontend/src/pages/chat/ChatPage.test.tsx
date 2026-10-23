@@ -228,7 +228,7 @@ describe('ChatPage document authoring bridge', () => {
     expect(markup).not.toContain('chat-document-template-upload');
   });
 
-  it('shows separate primary and reference knowledge-base controls', () => {
+  it('shows primary and additional knowledge-base controls without reference wording', () => {
     const markup = renderChat(true, [
       writableKb,
       { ...writableKb, name: 'reference', kb_id: 2, permission: 'read' },
@@ -236,7 +236,9 @@ describe('ChatPage document authoring bridge', () => {
 
     expect(markup).toContain('检索范围');
     expect(markup).toContain('aria-label="选择主知识库"');
-    expect(markup).toContain('aria-label="添加参考知识库"');
+    expect(markup).toContain('aria-label="添加知识库"');
+    expect(markup).not.toContain('参考知识库');
+    expect(markup).not.toContain('用途');
     expect(markup).not.toContain('aria-label="知识库范围"');
     expect(markup).not.toContain('挂载知识库');
   });
@@ -290,25 +292,25 @@ describe('Composer document context', () => {
     expect(markup).toContain('主知识库');
   });
 
-  it('separates primary and reference knowledge-base selection', () => {
+  it('adds extra knowledge bases without exposing reference or purpose controls', () => {
     const markup = renderComposer({
       availableKbs: [
         writableKb,
         { ...writableKb, name: 'reference', kb_id: 2, permission: 'read' },
       ],
       selectedKnowledgeBaseIds: [1, 2],
-      knowledgePurpose: 'compare',
       onKnowledgeScopeChange: () => undefined,
     });
 
     expect(markup).toContain('aria-label="选择主知识库"');
-    expect(markup).toContain('aria-label="添加参考知识库"');
-    expect(markup).toContain('参考知识库 1');
-    expect(markup).not.toContain('移除参考知识库 reference');
-    expect(markup).not.toContain('已选 2 个知识库');
+    expect(markup).toContain('aria-label="添加知识库"');
+    expect(markup).toContain('已添加 1 个知识库，点击继续添加');
+    expect(markup).not.toContain('参考知识库');
+    expect(markup).not.toContain('用途');
+    expect(markup).not.toContain('检索用途');
   });
 
-  it('disables the reference picker until a primary knowledge base is selected', () => {
+  it('disables the additional knowledge-base picker until a primary knowledge base is selected', () => {
     const markup = renderComposer({
       kbName: '',
       availableKbs: [
@@ -319,7 +321,7 @@ describe('Composer document context', () => {
     });
 
     expect(markup).toContain('选择主知识库');
-    expect(markup).toMatch(/<button[^>]*aria-label="添加参考知识库"[^>]*\bdisabled(?:=""|(?=\s|>))/);
+    expect(markup).toMatch(/<button[^>]*aria-label="添加知识库"[^>]*\bdisabled(?:=""|(?=\s|>))/);
   });
 
   it('shows an explicit primary-knowledge-base prompt when nothing is mounted', () => {
@@ -389,7 +391,7 @@ describe('Composer attachment status', () => {
     expect(markup).toContain('重试解析');
   });
 
-  it('keeps template conversion inside the attach menu instead of an inline chip', () => {
+  it('does not show a template conversion action on uploaded attachments', () => {
     const attachment: AttachmentView = {
       attachment_id: 'att-template',
       asset_id: 'asset-template',
@@ -406,16 +408,15 @@ describe('Composer attachment status', () => {
     const markup = renderComposer({
       attachmentsEnabled: true,
       documentAuthoringEnabled: true,
-      canUploadDocumentTemplate: true,
       draftAttachments: [attachment],
-      onUseAsTemplate: () => undefined,
     });
 
-    // 附件入口收敛为左侧"+"按钮;菜单内容由 Radix portal 在打开时渲染,
-    // 静态标记只断言入口与"不再有内联附件 chip / 检索范围选择"。
     expect(markup).toContain('aria-label="添加附件"');
     expect(markup).toContain('chat-attachment-upload');
     expect(markup).toContain('主知识库');
     expect(markup).toContain('检索范围');
+    expect(markup).toContain('review.xlsx');
+    expect(markup).not.toContain('作为模板');
+    expect(markup).not.toContain('将附件转换为文档模板');
   });
 });

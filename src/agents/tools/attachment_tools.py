@@ -21,11 +21,16 @@ from src.agents.tools.runtime import (
     timed_tool_call,
 )
 from src.attachments.audit import begin_attachment_audit, finish_attachment_audit
-from src.attachments.evidence import evidence_from_chunk, evidence_from_part
+from src.attachments.evidence import (
+    candidate_preview_from_chunk,
+    evidence_from_chunk,
+    evidence_from_part,
+)
 from src.attachments.models import AttachmentError
 from src.attachments.retrieval import AttachmentRetrievalService
 from src.attachments.service import AttachmentService, revision_change_summary
 from src.attachments.store import AttachmentStore
+from src.services.evidence_sources import ATTACHMENT, normalize_source_type
 
 _TOOL_SOURCE = "chat_attachment"
 
@@ -338,16 +343,105 @@ def make_attachment_list(rt: ToolRuntime):
     return attachment_list
 
 
-def make_attachment_search(rt: ToolRuntime, retrieval: AttachmentRetrievalService | None = None):
-    """在当前轮已授权附件内做本地检索，返回带定位的证据。"""
+def _attachment_retriever(rt: ToolRuntime, retrieval: AttachmentRetrievalService | None):
+    retriever = retrieval or getattr(rt, "attachment_retrieval", None)
+    return retriever or AttachmentRetrievalService()
+
+
+def _preview_attachment_candidates(
+    rt: ToolRuntime,
+    *,
+    query: str,
+    top_k: int = 6,
+    retrieval: AttachmentRetrievalService | None = None,
+) -> list[dict[str, Any]]:
+    """Return bounded attachment candidates without formal admission.
+
+    This helper is the only prefetch path used before the model's first turn.
+    It performs the same ACL re-check and retriever call as
+    ``attachment_search`` but never allocates a citation number, never appends
+    to ``ToolRuntime.evidence`` and never consumes the formal evidence budget.
+    """
+
+    retriever = _attachment_retriever(rt, retrieval)
+    refs = _authorized_refs(rt)
+    asset_ids = _asset_ids(refs)
+    if not asset_ids:
+        return []
+    result = retriever.search(
+        str(query or ""),
+        asset_ids=asset_ids,
+        limit=max(1, min(int(top_k or 6), 8)),
+        # Preview must stay smaller than a formal tool result.  The hard cap
+        # is supplied by the caller's settings elsewhere; this keeps prefetch
+        # from depending on attachment retrieval defaults.
+        context_token_budget=1200,
+    )
+    candidates: list[dict[str, Any]] = []
+    for chunk in result.chunks:
+        ref = _ref_for_asset(refs, chunk.asset_id)
+        if ref is None:
+            continue
+        candidates.append(candidate_preview_from_chunk(ref=ref, chunk=chunk))
+    for reason in result.degraded_reasons:
+        rt.emit("degraded", {"stage": "attachment_prefetch", "reason": reason})
+    return candidates
+
+
+def format_attachment_preview(candidates: list[dict[str, Any]], *, limit_bytes: int = 4000) -> str:
+    """Render preview candidates as non-citable untrusted context."""
+
+    if not candidates:
+        return ""
+    blocks: list[str] = []
+    used = 0
+    for candidate in candidates:
+        text = str(candidate.get("content") or "")[:420]
+        locator = candidate.get("locator") or {}
+        locator_text = ", ".join(
+            f"{key}={value}" for key, value in locator.items() if value not in (None, "", [], {})
+        )
+        block = (
+            f'<attachment_candidate id="{candidate.get("candidate_id", "")}" '
+            f'attachment_id="{candidate.get("attachment_id", "")}" '
+            f'filename="{candidate.get("filename", "")}">\n'
+            f"定位：{locator_text or '未提供'}\n{text}\n</attachment_candidate>"
+        )
+        encoded = len(block.encode("utf-8"))
+        if used + encoded > max(400, int(limit_bytes)):
+            break
+        blocks.append(block)
+        used += encoded
+    return "\n\n".join(blocks)
+
+
+def make_attachment_search(
+    rt: ToolRuntime,
+    retrieval: AttachmentRetrievalService | None = None,
+    *,
+    candidate_mode: bool = False,
+):
+    """在当前轮已授权附件内做本地检索，返回带定位的证据。
+
+    ``candidate_mode`` is a deliberate non-admission mode for server-side
+    preflight.  The normal tool (and every explicit model call) keeps the
+    historical formal-evidence path.
+    """
+
+    retriever = _attachment_retriever(rt, retrieval)
+
+    def attachment_search_preview(query: str, top_k: int = 6) -> str:
+        return format_attachment_preview(
+            _preview_attachment_candidates(rt, query=query, top_k=top_k, retrieval=retriever)
+        )
 
     def attachment_search(query: str, top_k: int = 6) -> str:
         """按查询词检索当前轮附件内容，并返回带定位的证据。"""
         from src.attachments.models import PARSER_VERSION  # noqa: F401
 
-        retriever = retrieval or getattr(rt, "attachment_retrieval", None)
-        if retriever is None:
-            retriever = AttachmentRetrievalService()
+        if candidate_mode:
+            preview = attachment_search_preview(query, top_k)
+            return preview or "附件中没有找到可用的候选预览。"
         refs = _authorized_refs(rt)
         asset_ids = _asset_ids(refs)
         if not asset_ids:
@@ -381,6 +475,11 @@ def make_attachment_search(rt: ToolRuntime, retrieval: AttachmentRetrievalServic
             )
         return format_tool_result(rt, adds_nothing, items)
 
+    # The runner uses this server-side capability for the no-admission
+    # preflight.  Keeping it on the callable preserves the legacy tool shape
+    # for prompt construction and tests.
+    attachment_search.preview = attachment_search_preview  # type: ignore[attr-defined]
+    attachment_search.candidate_mode = candidate_mode  # type: ignore[attr-defined]
     return attachment_search
 
 
@@ -521,7 +620,7 @@ def make_attachment_table_query(rt: ToolRuntime):
                                 processor_kind=_TOOL_SOURCE,
                                 score=0.0,
                                 locator={"attachment_id": ref.attachment_id},
-                                metadata={"source_type": "chat_attachment"},
+                                metadata={"source_type": ATTACHMENT},
                             )
                         )
                         continue
@@ -536,7 +635,7 @@ def make_attachment_table_query(rt: ToolRuntime):
                                 processor_kind=_TOOL_SOURCE,
                                 score=0.0,
                                 locator={"attachment_id": ref.attachment_id},
-                                metadata={"source_type": "chat_attachment"},
+                                metadata={"source_type": ATTACHMENT},
                             )
                         )
                         continue
@@ -549,7 +648,7 @@ def make_attachment_table_query(rt: ToolRuntime):
                             processor_kind=_TOOL_SOURCE,
                             score=1.0,
                             locator={"attachment_id": ref.attachment_id, "sql": "executed"},
-                            metadata={"source_type": "chat_attachment"},
+                            metadata={"source_type": ATTACHMENT},
                         )
                     )
                 else:
@@ -570,7 +669,7 @@ def make_attachment_table_query(rt: ToolRuntime):
                                 processor_kind=_TOOL_SOURCE,
                                 score=1.0,
                                 locator={"attachment_id": ref.attachment_id, "table_name": entry["table_name"]},
-                                metadata={"source_type": "chat_attachment"},
+                                metadata={"source_type": ATTACHMENT},
                             )
                         )
             return evidence
@@ -635,7 +734,7 @@ def make_attachment_circuit_search(rt: ToolRuntime):
                 for hit in hits:
                     hit.metadata = {
                         **(hit.metadata or {}),
-                        "source_type": "chat_attachment",
+                        "source_type": ATTACHMENT,
                         "attachment_id": ref.attachment_id,
                         "asset_id": asset_id,
                         "filename": ref.filename,
@@ -1219,7 +1318,7 @@ def _visual_pages(rt: ToolRuntime, *, page: int, pages: str) -> list[int]:
     if values:
         return values
     for item in getattr(rt, "evidence", []) or []:
-        if str(item.metadata.get("source_type") or "") != "chat_attachment":
+        if normalize_source_type(item.metadata.get("source_type")) != ATTACHMENT:
             continue
         try:
             add(item.locator.get("page"))

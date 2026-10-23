@@ -450,6 +450,21 @@ runner 对批准/取消走**确定性路径**（不调模型，`_direct_attachme
 
 ---
 
+## 9.1 预检候选与正式证据分离（2026-10-22）
+
+带附件的 turn 在模型第一轮前仍会执行 `attachment_list` + 小型检索预览，但预览只返回
+`<attachment_candidate>`（附件 id/asset id/locator/片段），**不分配 citation number、
+不写入 `ToolRuntime.evidence`、不占正式附件/知识库预算**。只有模型显式调用
+`attachment_search`/`attachment_read` 才走 `timed_tool_call` 正式准入。
+`make_attachment_search(..., candidate_mode=True)` 与工具上的 `.preview` 属性提供该能力；
+旧的自定义工具替身没有 `.preview` 时保留原路径。
+开关：`ATTACHMENT_PREFETCH_DEFERRED_ADMISSION=true`（默认）。
+
+来源感知预算开启后，附件/知识库各自有硬切片与必要预留；一个来源耗尽只阻塞该来源。
+配置见 `src/settings.py` 的 `EVIDENCE_*`。
+
+---
+
 ## 10. 配置清单
 
 | 变量 | 默认 |

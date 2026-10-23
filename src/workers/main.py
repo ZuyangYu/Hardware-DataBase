@@ -681,18 +681,33 @@ class HardwareWorker:
             ):
                 did_work = True
         if self._role_enabled("chat"):
-            self.conversations.requeue_stale_turns()
-            self.conversations.expire_queued_turns()
-            depth, oldest_age_s = self.conversations.pending_turn_queue_state()
-            set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
-            if self._process_chat_claims():
-                did_work = True
-            if self._process_mcp_write_proposals(
-                limit=max(1, int(getattr(src.settings, "MCP_WRITE_MAX_ATTEMPTS", 3))),
-            ):
-                did_work = True
-            depth, oldest_age_s = self.conversations.pending_turn_queue_state()
-            set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
+            try:
+                self.conversations.requeue_stale_turns()
+                self.conversations.expire_queued_turns()
+            except Exception as exc:  # noqa: BLE001 - maintenance must not kill the worker
+                error(f"Chat turn maintenance failed: {exc}")
+            try:
+                depth, oldest_age_s = self.conversations.pending_turn_queue_state()
+                set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
+            except Exception as exc:  # noqa: BLE001 - metrics are fail-soft
+                error(f"Chat queue state failed: {exc}")
+            try:
+                if self._process_chat_claims():
+                    did_work = True
+            except Exception as exc:  # noqa: BLE001 - keep polling after a DB lock
+                error(f"Chat claim loop failed: {exc}")
+            try:
+                if self._process_mcp_write_proposals(
+                    limit=max(1, int(getattr(src.settings, "MCP_WRITE_MAX_ATTEMPTS", 3))),
+                ):
+                    did_work = True
+            except Exception as exc:  # noqa: BLE001 - fail-soft auxiliary path
+                error(f"MCP write proposal loop failed: {exc}")
+            try:
+                depth, oldest_age_s = self.conversations.pending_turn_queue_state()
+                set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
+            except Exception as exc:  # noqa: BLE001 - metrics are fail-soft
+                error(f"Chat queue state failed: {exc}")
         if self._role_enabled("parse") and self.runtime is not None:
             batch = max(1, src.settings.WORKER_PARSE_BATCH_SIZE)
             for _ in range(batch):

@@ -224,7 +224,28 @@ class AttachmentRetrievalService:
     ) -> list[RetrievedChunk]:
         if self.index.fts_enabled:
             hits = self.index.search(query, asset_ids=asset_ids, limit=limit)
-            return [self._to_chunk(hit) for hit in hits]
+            if hits:
+                return [self._to_chunk(hit) for hit in hits]
+            # unicode61 treats a continuous Chinese run as one token, so a
+            # two-character term such as 术语/管脚 never matches the FTS phrase
+            # even though the parsed text contains it.  Fall back to a bounded
+            # LIKE scan for short CJK terms before declaring a zero hit.
+            chunks: list[RetrievedChunk] = []
+            seen: set[str] = set()
+            for term in re.findall(r"[\u4e00-\u9fff]{2,}", query)[:4]:
+                hits = self.index.exact_scan(term, asset_ids=asset_ids, limit=limit)
+                if not hits and hasattr(self.index, "normalized_text_scan"):
+                    hits = self.index.normalized_text_scan(
+                        term, asset_ids=asset_ids, limit=limit,
+                    )
+                for hit in hits:
+                    if hit.part_id in seen:
+                        continue
+                    seen.add(hit.part_id)
+                    chunks.append(self._to_chunk(hit))
+            if chunks:
+                return chunks[:limit]
+            return []
         # FTS5 unavailable: bounded lexical scan of a few query terms instead
         # of failing the whole tool (design §8.4).
         chunks: list[RetrievedChunk] = []

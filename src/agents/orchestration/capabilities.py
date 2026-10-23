@@ -261,6 +261,9 @@ def authorized_capabilities_for_conversation(
         authorized.update({
             "evidence.search",
             "evidence.read",
+            # Two authorized attachments can be compared without a KB read
+            # grant; the comparison tool still checks every source ACL.
+            "evidence.compare",
             "attachment.search",
         })
         if allow_document_write:

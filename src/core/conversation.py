@@ -228,6 +228,7 @@ class ConversationService:
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
@@ -1760,7 +1761,15 @@ class ConversationService:
         now = utc_now()
         requeued = 0
         with closing(self._connect()) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                # A concurrent writer (quality worker, another chat worker or a
+                # long turn transaction) must not kill the chat worker loop.
+                # The next poll retries; pending turns are not lost.
+                if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                    return 0
+                raise
             try:
                 rows = conn.execute(
                     """

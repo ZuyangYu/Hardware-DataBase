@@ -262,7 +262,7 @@ class AttachmentVisualAnalyzer:
             score=1.0,
             locator={"page": page_number},
             metadata={
-                "source_type": "chat_attachment",
+                "source_type": "attachment",
                 "attachment_id": str(getattr(ref, "attachment_id", "") or ""),
                 "asset_id": str(getattr(ref, "asset_id", "") or ""),
                 "session_id": int(getattr(ref, "session_id", 0) or 0),

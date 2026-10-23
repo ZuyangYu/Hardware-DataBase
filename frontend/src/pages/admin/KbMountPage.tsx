@@ -34,7 +34,7 @@ function kbOptionValue(kb: KbView): string {
   return `name:${kb.department_id ?? 'none'}:${kb.name}`;
 }
 
-/** 知识库挂载: 系统管理员把 KB 归属到部门并指定部门员工为负责人。 */
+/** 知识库分配: 系统管理员把 KB 归属到部门并指定部门员工为负责人。 */
 export default function KbMountPage({ auth, onLogout }: Props) {
   const location = useLocation();
   const [kbs, setKbs] = useState<KbView[]>([]);
@@ -112,12 +112,12 @@ export default function KbMountPage({ auth, onLogout }: Props) {
         `/api/v1/kbs/${encodeURIComponent(selectedKbView.name)}/assign`,
         payload,
       );
-      notify.success('知识库已挂载到新部门');
+      notify.success('知识库已分配到新部门');
       setAssignDeptId('');
       setAssignOwnerId('none');
       loadKbs();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '挂载失败');
+      notify.error(error instanceof Error ? error.message : '分配失败');
     } finally {
       setAssigning(false);
     }
@@ -126,8 +126,8 @@ export default function KbMountPage({ auth, onLogout }: Props) {
   return (
     <AdminPageFrame>
       <AppHeader
-        title="知识库挂载"
-        description="把知识库归属到部门并指定部门员工为所有者；知识库默认私有，由所有者决定是否部门共享，共享后部门其他成员拥有完整 admin 权限。"
+        title="知识库分配"
+        description="把知识库分配给部门并指定部门员工为所有者；知识库默认私有，由所有者决定是否部门共享，共享后部门其他成员拥有完整 admin 权限。"
       />
 
       <div className="mt-[20px] mb-[16px] flex flex-wrap items-center gap-[12px]">
@@ -161,9 +161,9 @@ export default function KbMountPage({ auth, onLogout }: Props) {
       ) : (
         <div className="flex flex-col gap-[20px] rounded-[20px_20px_0_0] bg-white p-[18px_18px_24px] shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]">
           <div className="flex flex-col gap-[12px]">
-            <h3 className="text-[14px] font-semibold text-[#18181a]">挂载到部门</h3>
+            <h3 className="text-[14px] font-semibold text-[#18181a]">分配到部门</h3>
             <p className="text-[12px] text-[#858b9c]">
-              把该知识库重新挂载到另一个部门,并可指定该部门的员工为负责人。
+              把该知识库重新分配给另一个部门,并可指定该部门的员工为负责人。
             </p>
             <div className="grid gap-[12px] md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-end">
               <div className="grid min-w-0 gap-[4px]">
@@ -202,7 +202,7 @@ export default function KbMountPage({ auth, onLogout }: Props) {
                 disabled={assigning}
                 className="h-[36px] shrink-0 self-end whitespace-nowrap gap-[6px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] text-white hover:bg-[#303030]"
               >
-                挂载
+                保存分配
               </Button>
             </div>
           </div>

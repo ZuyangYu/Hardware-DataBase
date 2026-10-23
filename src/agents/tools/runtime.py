@@ -18,6 +18,11 @@ from typing import Any, Callable
 from src.agents.schemas import Evidence
 from src.core.cancellation import QueryCancelled
 from src.pipelines.document_rag.schemas import RequestContext
+from src.services.evidence_sources import (
+    KNOWLEDGE_SOURCE_TYPES,
+    source_type_for_metadata,
+    with_source_metadata,
+)
 from src.services.knowledge_scope_models import KnowledgeScopeSnapshot
 
 MAX_EVIDENCE_CONTENT_CHARS = 1200
@@ -39,6 +44,8 @@ TOOL_LABELS = {
     "attachment_visual_analyze": "附件视觉分析",
     "request_attachment_release": "附件发布申请",
     "attachment_revision_history": "附件修订历史",
+    "document_compare": "整篇文档比较",
+    "comparison_expand": "比较章节展开",
     "wiki_search": "Wiki 检索",
 }
 
@@ -204,6 +211,10 @@ class ToolRuntime:
     # persisted scope or creating an independent budget for each source.
     multi_kb_retrieval: Any | None = None
     retrieval_budget: Any | None = None
+    # Source-aware formal-evidence accounting.  Tools may read the snapshot for
+    # diagnostics but must never keep an independent copy of the budget.
+    evidence_budget_coordinator: Any | None = None
+    evidence_policy: Any | None = None
     chat_session_id: str = ""
     top_k: int = 6
     query_mode: str = "deep"
@@ -338,10 +349,15 @@ class ToolRuntime:
         promoted: list[Evidence] = []
         with self._lock:
             room = max(0, int(self.evidence_budget) - len(self.evidence)) if self.evidence_budget > 0 else 10**9
-            room = min(room, max(0, int(getattr(settings, "MULTI_KB_EVIDENCE_MAX_ITEMS", 24)) - len(self.evidence)))
+            coordinator = getattr(self, "evidence_budget_coordinator", None)
+            source_aware = bool(coordinator is not None and getattr(coordinator, "enabled", False))
+            if not source_aware:
+                room = min(room, max(0, int(getattr(settings, "MULTI_KB_EVIDENCE_MAX_ITEMS", 24)) - len(self.evidence)))
             byte_limit = int(getattr(settings, "MULTI_KB_TURN_EVIDENCE_MAX_BYTES",
                                      getattr(settings, "MULTI_KB_CONTEXT_MAX_TOKENS", 8000)))
             remaining_bytes = max(0, byte_limit - sum(_evidence_context_cost(item) for item in self.evidence))
+            if source_aware:
+                remaining_bytes = 10**9
             ordered = sorted(
                 self.candidate_pool.values(),
                 key=lambda item: (
@@ -353,15 +369,34 @@ class ToolRuntime:
             for item in ordered:
                 if len(promoted) >= room:
                     break
+                item.metadata = with_source_metadata(
+                    item.metadata, content=item.content, locator=item.locator,
+                )
                 matched = plan.evaluate(item)
                 if not matched or not item.id or item.id in self.evidence_index:
                     continue
                 cost = _evidence_context_cost(item)
                 if cost > remaining_bytes:
                     continue
+                if coordinator is not None:
+                    decision = coordinator.try_admit(
+                        source_type_for_metadata(item.metadata), cost, stage="candidate_promotion",
+                    )
+                    if not decision.admitted:
+                        self.last_rejection_reasons[decision.reason] = (
+                            self.last_rejection_reasons.get(decision.reason, 0) + 1
+                        )
+                        plan.mark_blocked(
+                            decision.reason, source_type=decision.source_type,
+                        )
+                        continue
                 item.metadata = {**item.metadata, "citation_number": len(self.evidence) + 1}
                 self.evidence.append(item)
                 self.evidence_index[item.id] = len(self.evidence)
+                if coordinator is not None:
+                    coordinator.note_admitted(
+                        source_type_for_metadata(item.metadata), cost,
+                    )
                 plan.mark_admitted(matched, item.id)
                 self._apply_field_verification(item)
                 promoted.append(item)
@@ -398,6 +433,9 @@ class ToolRuntime:
                 return CitationAdmission([None for _ in items], previously_registered=self.evidence_index)
             fresh: list[int] = []
             for position, item in enumerate(items):
+                item.metadata = with_source_metadata(
+                    item.metadata, content=item.content, locator=item.locator,
+                )
                 if item.id and item.id in self.evidence_index:
                     numbers.append(self.evidence_index[item.id])
                     plan = getattr(self, "turn_evidence_plan", None)
@@ -407,7 +445,10 @@ class ToolRuntime:
                     continue
                 fresh.append(position)
                 numbers.append(None)
-            self.last_rejection_reasons = {"call_quota": 0, "item_limit": 0, "byte_limit": 0, "token_limit": 0}
+            self.last_rejection_reasons = {
+                "call_quota": 0, "item_limit": 0, "byte_limit": 0, "token_limit": 0,
+                "source_budget_exhausted": 0, "global_budget_exhausted": 0,
+            }
             budget_room = (
                 max(0, self.evidence_budget - len(self.evidence))
                 if self.evidence_budget > 0
@@ -417,8 +458,11 @@ class ToolRuntime:
             if self.knowledge_scope is not None:
                 import src.settings as settings
 
-                item_room = max(0, int(settings.MULTI_KB_EVIDENCE_MAX_ITEMS) - len(self.evidence))
-                room = min(room, item_room)
+                coordinator = getattr(self, "evidence_budget_coordinator", None)
+                source_aware = bool(coordinator is not None and getattr(coordinator, "enabled", False))
+                if not source_aware:
+                    item_room = max(0, int(settings.MULTI_KB_EVIDENCE_MAX_ITEMS) - len(self.evidence))
+                    room = min(room, item_room)
 
                 remaining_tokens = max(0, int(settings.MULTI_KB_CONTEXT_MAX_TOKENS)) - sum(
                     _evidence_context_cost(item) for item in self.evidence
@@ -426,7 +470,40 @@ class ToolRuntime:
                 remaining_bytes = max(0, int(getattr(
                     settings, "MULTI_KB_TURN_EVIDENCE_MAX_BYTES", settings.MULTI_KB_CONTEXT_MAX_TOKENS,
                 ))) - sum(_evidence_context_cost(item) for item in self.evidence)
+                if source_aware:
+                    # The coordinator owns the global cap and source reserves;
+                    # the legacy global byte/token counters must not double-block
+                    # a source that still has its own promised capacity.
+                    remaining_tokens = 10**9
+                    remaining_bytes = 10**9
                 plan = getattr(self, "turn_evidence_plan", None)
+
+                def source_budget_blocks(position: int, cost: int) -> bool:
+                    if coordinator is None:
+                        return False
+                    item = items[position]
+                    source_type = source_type_for_metadata(item.metadata)
+                    decision = coordinator.try_admit(source_type, cost)
+                    if decision.admitted:
+                        return False
+                    reason = decision.reason or "source_budget_exhausted"
+                    self.last_rejection_reasons[reason] = (
+                        self.last_rejection_reasons.get(reason, 0) + 1
+                    )
+                    if plan is not None:
+                        plan.mark_blocked(reason, source_type=source_type)
+                    self._remember_candidate_locked(item)
+                    try:
+                        from src.observability.metrics import counter
+
+                        counter(
+                            "hdb.evidence.budget_blocked",
+                            attributes={"source_type": source_type, "reason": reason},
+                            description="Formal evidence rejected by a source-aware budget",
+                        )
+                    except Exception:
+                        pass
+                    return True
 
                 def admission_priority(position: int) -> tuple:
                     item = items[position]
@@ -474,6 +551,8 @@ class ToolRuntime:
                         if not usable:
                             continue
                         cost = _evidence_context_cost(items[position])
+                        if source_budget_blocks(position, cost):
+                            continue
                         if cost > remaining_tokens:
                             self.last_rejection_reasons["token_limit"] += 1
                             self._remember_candidate_locked(items[position])
@@ -483,21 +562,33 @@ class ToolRuntime:
                             self._remember_candidate_locked(items[position])
                             continue
                         kept.add(position)
+                        if coordinator is not None:
+                            coordinator.note_admitted(
+                                source_type_for_metadata(items[position].metadata), cost,
+                            )
                         for requirement_id in usable:
                             per_requirement[requirement_id] = per_requirement.get(requirement_id, 0) + 1
                         remaining_tokens -= cost
                         remaining_bytes -= cost
                 else:
+                    batch_has_kb = any(
+                        source_type_for_metadata(items[position].metadata) in KNOWLEDGE_SOURCE_TYPES
+                        for position in fresh
+                    )
                     for position in fresh:
                         if len(kept) >= room:
                             self.last_rejection_reasons["call_quota" if room == budget_room else "item_limit"] += 1
                             break
                         kb_id = items[position].metadata.get("kb_id")
-                        missing_after = required - covered - {kb_id}
+                        missing_after = (
+                            required - covered - {kb_id} if batch_has_kb else set()
+                        )
                         if room - len(kept) - 1 < len(missing_after):
                             self.last_rejection_reasons["item_limit"] += 1
                             continue
                         cost = _evidence_context_cost(items[position])
+                        if source_budget_blocks(position, cost):
+                            continue
                         if cost > remaining_tokens:
                             self.last_rejection_reasons["token_limit"] += 1
                             continue
@@ -505,6 +596,10 @@ class ToolRuntime:
                             self.last_rejection_reasons["byte_limit"] += 1
                             continue
                         kept.add(position)
+                        if coordinator is not None:
+                            coordinator.note_admitted(
+                                source_type_for_metadata(items[position].metadata), cost,
+                            )
                         covered.add(kb_id)
                         remaining_tokens -= cost
                         remaining_bytes -= cost
@@ -641,6 +736,15 @@ class ToolRuntime:
                 }
             )
 
+    def source_budget_snapshot(self) -> dict[str, Any]:
+        coordinator = getattr(self, "evidence_budget_coordinator", None)
+        if coordinator is None or not hasattr(coordinator, "snapshot"):
+            return {}
+        try:
+            return dict(coordinator.snapshot())
+        except Exception:
+            return {}
+
     def record_multi_kb_result(
         self,
         source_statuses: list[dict[str, Any]],
@@ -681,6 +785,19 @@ def timed_tool_call(
     all of them.
     """
     rt.check_cancel()
+    turn_budget = getattr(rt, "turn_budget", None)
+    if turn_budget is not None and not turn_budget.consume("tool_call"):
+        rt.emit(
+            "degraded",
+            {
+                "stage": f"tool_{tool_name}",
+                "reason": "本轮工具调用预算已耗尽，本次调用未执行。",
+            },
+        )
+        blocked = AdmittedEvidence()
+        blocked.failure = "turn_tool_budget_exhausted"
+        blocked.tool_name = tool_name
+        return blocked, False
     invocation_id = rt.next_invocation_id()
     was_repeat = rt.has_query(tool_name, query)
     with rt._lock:
@@ -833,6 +950,34 @@ def timed_tool_call(
             plan = getattr(rt, "turn_evidence_plan", None)
             if plan is not None:
                 fusion_summary["runtime_admission"]["target_coverage"] = plan.coverage_snapshot()
+    try:
+        from collections import Counter
+
+        from src.observability.metrics import counter
+
+        candidate_counts = Counter(
+            source_type_for_metadata(item.metadata) or "unknown" for item in items
+        )
+        admitted_counts = Counter(
+            source_type_for_metadata(item.metadata) or "unknown"
+            for item in admitted_items
+        )
+        for source_type, count in candidate_counts.items():
+            counter(
+                "hdb.evidence.candidate",
+                attributes={"source_type": source_type},
+                value=int(count),
+                description="Retrieval candidates returned by a tool",
+            )
+        for source_type, count in admitted_counts.items():
+            counter(
+                "hdb.evidence.admitted",
+                attributes={"source_type": source_type},
+                value=int(count),
+                description="Candidates admitted as formal evidence",
+            )
+    except Exception:
+        pass
     if source_statuses:
         rt.record_multi_kb_result(source_statuses, fusion_summary)
     # Distinguish "the source has nothing" from "the run already holds its
@@ -898,14 +1043,68 @@ def format_evidence_for_llm(items: list[Evidence]) -> str:
     return "\n\n".join(blocks)
 
 
+def compress_evidence_for_context(items: list[Evidence], *, max_bytes: int) -> str:
+    """Render a bounded evidence context while keeping stable identities.
+
+    The compressed form never rewrites the underlying evidence: each block
+    keeps its citation number, evidence id, source, locator and hash metadata,
+    and truncates only the displayed body.  Full text remains available to
+    citation readback by evidence id.
+    """
+
+    rendered = format_evidence_for_llm(items)
+    if len(rendered.encode("utf-8")) <= max(0, int(max_bytes or 0)):
+        return rendered
+    blocks: list[str] = []
+    used = 0
+    for item in items:
+        number = int(item.metadata.get("citation_number") or 0)
+        locator = item.locator or {}
+        locator_text = ", ".join(
+            f"{key}={value}" for key, value in locator.items() if value not in (None, "", [], {})
+        )
+        content = str(item.content or "")[:280]
+        block = (
+            f'<evidence id="{number}" source="{item.source_name}" compressed="true">\n'
+            f"[{number}] 来源：{item.source_name} | 位置：{locator_text or '未提供'}\n"
+            f"{content}\n"
+            "（正文已压缩；完整原文可按 evidence id 回读。）\n"
+            "</evidence>"
+        )
+        encoded = len(block.encode("utf-8"))
+        if used + encoded > max(0, int(max_bytes or 0)) and blocks:
+            blocks.append("（其余已登记证据的正文已压缩，可按引用编号回读。）")
+            break
+        blocks.append(block)
+        used += encoded
+    return "\n\n".join(blocks)
+
+
 def evidence_budget_message(rt: ToolRuntime) -> str:
     """Explain a tool call that was dropped because the evidence budget is full."""
 
     budget = int(getattr(rt, "evidence_budget", 0) or 0)
     held = len(getattr(rt, "evidence", []) or [])
-    if rt.knowledge_scope is not None:
+    task_plan = getattr(rt, "task_plan", None)
+    if task_plan is not None and str(getattr(task_plan, "task_kind", "")) == "compare":
         return (
-            f"本轮证据条数或上下文预算已不足（当前 {held} 条），"
+            "本轮普通检索证据预算已不足，但整篇比较的专用预算仍然保留；"
+            "不要继续用 document_search/attachment_search 翻找，也不要据此声称比较预算耗尽。"
+            "请立即调用 document_compare（已有报告时用 comparison_expand）完成整篇比较。"
+        )
+    if rt.knowledge_scope is not None:
+        source_status = rt.source_budget_snapshot()
+        blocked = {
+            source: snapshot.get("status")
+            for source, snapshot in (source_status.get("slices") or {}).items()
+            if snapshot.get("status") == "source_budget_exhausted"
+        }
+        blocked_text = (
+            "；当前来源预算状态：" + "、".join(f"{key}={value}" for key, value in blocked.items())
+            if blocked else ""
+        )
+        return (
+            f"本轮证据条数或上下文预算已不足（当前 {held} 条）{blocked_text}，"
             "本次调用的新内容未纳入证据集；这不代表知识库中没有相关内容。"
             "请基于已登记证据作答，并说明仍缺失的信息。"
         )
@@ -929,6 +1128,8 @@ def tool_failure_message(items: list[Evidence]) -> str:
     failure = str(getattr(items, "failure", "") or "").strip()
     if not failure:
         return ""
+    if failure == "turn_tool_budget_exhausted":
+        return "（本轮工具调用预算已耗尽，本次调用未执行。这是执行预算限制，不代表来源为空。）"
     tool_name = str(getattr(items, "tool_name", "") or "工具").strip()
     return (
         f"（本次调用 {tool_name} 失败：{failure}。"
@@ -956,11 +1157,23 @@ def empty_result_message(
     return default
 
 
-def _evidence_context_cost(item: Evidence) -> int:
+def evidence_context_cost(item: Evidence) -> int:
+    """Return the UTF-8 rendered byte cost used by every budget path.
+
+    The field name is deliberately explicit: this is a conservative byte
+    estimate, never a provider-reported token count.
+    """
+
     # Count the actual tool rendering as well as the fusion estimate.  The
     # small margin covers citation-number growth after atomic admission.
     rendered_cost = len(format_evidence_for_llm([item]).encode("utf-8")) + 16
     return max(rendered_cost, int(item.metadata.get("context_token_estimate") or 0))
+
+
+def _evidence_context_cost(item: Evidence) -> int:
+    """Backwards-compatible private alias for existing callers."""
+
+    return evidence_context_cost(item)
 
 
 def format_navigation_for_llm(items: list[Evidence]) -> str:

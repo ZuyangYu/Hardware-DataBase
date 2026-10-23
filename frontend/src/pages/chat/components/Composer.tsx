@@ -2,13 +2,14 @@
  * 输入区(对齐 Composer 结构,裁掉业务件)。
  * 保留:自适应高度 textarea、Enter 发送 / Shift+Enter 换行、发送按钮、流式中停止按钮、hint。
  * 检索范围下拉框固定在输入框左上角(文本域上方)。
- * 附件入口收敛为输入框左侧的"+"按钮:悬停提示"添加附件",菜单内上传/重试/移除/作为模板;
- * 检索范围统一在输入区设置:先选主知识库,再按需添加参考库和用途;发送后的附件只出现在消息气泡中。
+ * 附件入口收敛为输入框左侧的"+"按钮:悬停提示"添加附件",菜单内上传/重试/移除;
+ * 检索范围统一在输入区设置:先选主知识库,再按需添加更多知识库;用途由系统自动判断。
+ * 发送后的附件只出现在消息气泡中。
  */
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Popover } from 'radix-ui';
 
-import type { AttachmentView, DocumentContext, KnowledgePurpose, KbView } from '@/api/types';
+import type { AttachmentView, DocumentContext, KbView } from '@/api/types';
 import { CHAT_ATTACHMENT_ACCEPT } from '@/api/chatAttachments';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
@@ -56,15 +57,13 @@ type Props = {
   streaming: boolean;
   disabled?: boolean;
   onKbChange?: (kbName: string) => void;
-  knowledgePurpose?: KnowledgePurpose | 'auto';
   selectedKnowledgeBaseIds?: number[];
-  onKnowledgeScopeChange?: (purpose: KnowledgePurpose | 'auto', kbIds: number[]) => void;
+  onKnowledgeScopeChange?: (kbIds: number[]) => void;
   onSend: () => void;
   onStop: () => void;
   quickReplies?: string[];
   /** The bridge is opt-in; false keeps the legacy composer unchanged. */
   documentAuthoringEnabled?: boolean;
-  canUploadDocumentTemplate?: boolean;
   documentContext?: DocumentContext | null;
   documentContextLabel?: string;
   documentUploadPending?: boolean;
@@ -76,11 +75,8 @@ type Props = {
   attachmentRetryingId?: string | null;
   onUploadAttachment?: (file: File) => void | Promise<void>;
   onRetryAttachment?: (attachmentId: string) => void | Promise<void>;
-  onUseAsTemplate?: (attachment: AttachmentView) => void | Promise<void>;
   onRemoveAttachment?: (attachmentId: string) => void;
 };
-
-const TEMPLATE_ATTACHMENT_EXTENSIONS = new Set(['.docx', '.xlsx', '.xlsm']);
 
 /** 与后端 CHAT_ATTACHMENT_MAX_FILES_PER_SESSION 对齐(单会话活动附件上限)。 */
 const ATTACHMENT_MAX_FILES = (() => {
@@ -107,14 +103,12 @@ export default function Composer({
   streaming,
   disabled = false,
   onKbChange = () => undefined,
-  knowledgePurpose = 'auto',
   selectedKnowledgeBaseIds = [],
   onKnowledgeScopeChange,
   onSend,
   onStop,
   quickReplies = [],
   documentAuthoringEnabled = false,
-  canUploadDocumentTemplate = false,
   documentContext = null,
   documentContextLabel,
   documentUploadPending = false,
@@ -127,7 +121,6 @@ export default function Composer({
   attachmentRetryingId = null,
   onUploadAttachment,
   onRetryAttachment,
-  onUseAsTemplate,
   onRemoveAttachment,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -173,7 +166,7 @@ export default function Composer({
     const nextReferenceIds = checked
       ? [...referenceIds, kbId]
       : referenceIds.filter((value) => value !== kbId);
-    onKnowledgeScopeChange?.(knowledgePurpose, [primaryKbId, ...new Set(nextReferenceIds)]);
+    onKnowledgeScopeChange?.([primaryKbId, ...new Set(nextReferenceIds)]);
   };
 
   // 自适应高度
@@ -238,112 +231,85 @@ export default function Composer({
               </Select>
             </div>
             {showReferencePicker && (
-              <div className="flex min-w-0 flex-wrap items-center gap-[6px]">
-                <span className="text-[11px] text-[#858b9c]">参考知识库</span>
-                <Popover.Root>
-                  <Popover.Trigger asChild>
-                    <button
-                      type="button"
-                      aria-label="添加参考知识库"
-                      title={
-                        primaryKbId == null
-                          ? '请先选择主知识库'
-                          : referenceCandidates.length === 0
-                            ? '暂无其他可用知识库'
-                            : referenceKbs.length > 0
-                              ? `已添加 ${referenceKbs.length} 个参考知识库，点击继续添加`
-                              : '添加参考知识库'
-                      }
-                      disabled={referencePickerDisabled}
-                      className={cn(
-                        CHAT_COMPOSER_MODEL_BTN_CLASS,
-                        'min-w-[132px] max-w-[200px] px-[10px] text-[11px]',
-                      )}
-                    >
-                      <span className="text-[14px] leading-none" aria-hidden>+</span>
-                      <span className="min-w-0 truncate">
-                        {referenceKbs.length > 0 ? `参考知识库 ${referenceKbs.length}` : '添加参考知识库'}
-                      </span>
-                    </button>
-                  </Popover.Trigger>
-                  <Popover.Portal>
-                    <Popover.Content
-                      aria-label="选择参考知识库"
-                      align="start"
-                      sideOffset={6}
-                      collisionPadding={12}
-                      className="z-50 w-[320px] max-w-[calc(100vw-24px)] rounded-[10px] border border-[#e5e8f0] bg-white p-[10px] shadow-lg"
-                    >
-                      <div className="mb-[6px] flex items-center justify-between gap-[8px]">
-                        <span className="text-[12px] font-medium text-[#18181a]">添加参考知识库</span>
-                        <span className="text-[10px] text-[#8a92a5]">已选 {referenceKbs.length}</span>
+              <Popover.Root>
+                <Popover.Trigger asChild>
+                  <button
+                    type="button"
+                    aria-label="添加知识库"
+                    title={
+                      primaryKbId == null
+                        ? '请先选择主知识库'
+                        : referenceCandidates.length === 0
+                          ? '暂无其他可用知识库'
+                          : referenceKbs.length > 0
+                            ? `已添加 ${referenceKbs.length} 个知识库，点击继续添加`
+                            : '添加知识库'
+                    }
+                    disabled={referencePickerDisabled}
+                    className={cn(
+                      CHAT_COMPOSER_MODEL_BTN_CLASS,
+                      'min-w-[44px] max-w-[72px] justify-center px-[10px] text-[11px]',
+                    )}
+                  >
+                    <span className="text-[14px] leading-none" aria-hidden>+</span>
+                    {referenceKbs.length > 0 && (
+                      <span className="tabular-nums">{referenceKbs.length}</span>
+                    )}
+                  </button>
+                </Popover.Trigger>
+                <Popover.Portal>
+                  <Popover.Content
+                    aria-label="选择知识库"
+                    align="start"
+                    sideOffset={6}
+                    collisionPadding={12}
+                    className="z-50 w-[320px] max-w-[calc(100vw-24px)] rounded-[10px] border border-[#e5e8f0] bg-white p-[10px] shadow-lg"
+                  >
+                    <div className="mb-[6px] flex items-center justify-between gap-[8px]">
+                      <span className="text-[12px] font-medium text-[#18181a]">添加知识库</span>
+                      <span className="text-[10px] text-[#8a92a5]">已选 {referenceKbs.length}</span>
+                    </div>
+                    <p className="mb-[6px] text-[10px] leading-4 text-[#8a92a5]">
+                      可多选；主知识库不会重复添加。
+                    </p>
+                    {referenceCandidates.length > 0 ? (
+                      <div className="grid max-h-[220px] gap-[2px] overflow-y-auto">
+                        {referenceCandidates.map((kb) => {
+                          const id = Number(kb.kb_id);
+                          const checked = referenceKbs.some((item) => Number(item.kb_id) === id);
+                          const label = kbOptionLabel(kb, showDepartmentInKbOptions);
+                          return (
+                            <label
+                              key={id}
+                              className="flex cursor-pointer items-center gap-[8px] rounded-[6px] px-[8px] py-[6px] text-[11px] text-[#464c5e] hover:bg-[#f6f7fa]"
+                            >
+                              <input
+                                type="checkbox"
+                                aria-label={`选择知识库 ${kb.name}`}
+                                checked={checked}
+                                disabled={scopeDisabled}
+                                onChange={(event) => updateReferences(id, event.target.checked)}
+                                className="size-[13px] accent-[#18181a]"
+                              />
+                              <span className="min-w-0 flex-1 truncate" title={label}>{label}</span>
+                            </label>
+                          );
+                        })}
                       </div>
-                      <p className="mb-[6px] text-[10px] leading-4 text-[#8a92a5]">
-                        可多选；主知识库不会重复添加。
+                    ) : (
+                      <p className="rounded-[6px] border border-dashed border-[#e5e8f0] px-[8px] py-[7px] text-[11px] text-[#a2a8b8]">
+                        暂无其他可用知识库
                       </p>
-                      {referenceCandidates.length > 0 ? (
-                        <div className="grid max-h-[220px] gap-[2px] overflow-y-auto">
-                          {referenceCandidates.map((kb) => {
-                            const id = Number(kb.kb_id);
-                            const checked = referenceKbs.some((item) => Number(item.kb_id) === id);
-                            const label = kbOptionLabel(kb, showDepartmentInKbOptions);
-                            return (
-                              <label
-                                key={id}
-                                className="flex cursor-pointer items-center gap-[8px] rounded-[6px] px-[8px] py-[6px] text-[11px] text-[#464c5e] hover:bg-[#f6f7fa]"
-                              >
-                                <input
-                                  type="checkbox"
-                                  aria-label={`选择参考知识库 ${kb.name}`}
-                                  checked={checked}
-                                  disabled={scopeDisabled}
-                                  onChange={(event) => updateReferences(id, event.target.checked)}
-                                  className="size-[13px] accent-[#18181a]"
-                                />
-                                <span className="min-w-0 flex-1 truncate" title={label}>{label}</span>
-                              </label>
-                            );
-                          })}
-                        </div>
-                      ) : (
-                        <p className="rounded-[6px] border border-dashed border-[#e5e8f0] px-[8px] py-[7px] text-[11px] text-[#a2a8b8]">
-                          暂无其他可用知识库
-                        </p>
-                      )}
-                    </Popover.Content>
-                  </Popover.Portal>
-                </Popover.Root>
-              </div>
+                    )}
+                  </Popover.Content>
+                </Popover.Portal>
+              </Popover.Root>
             )}
-            <label className="flex items-center gap-[6px] text-[11px] text-[#858b9c]">
-              用途
-              <select
-                aria-label="检索用途"
-                value={knowledgePurpose}
-                disabled={scopeDisabled}
-                onChange={(event) => onKnowledgeScopeChange?.(
-                  event.target.value as KnowledgePurpose | 'auto',
-                  effectiveSelectedIds,
-                )}
-                className="rounded border border-[#e5e8f0] px-[5px] py-[3px] text-[11px] text-[#464c5e]"
-              >
-                <option value="auto">自动（推荐）</option>
-                <option value="answer">问答</option>
-                <option value="compare">对比</option>
-                <option value="compose">编写文档</option>
-              </select>
-            </label>
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-[8px]">
             {attachmentsEnabled && attachmentCount > 0 && (
               <div className={CHAT_COMPOSER_ATTACHMENTS_CLASS} aria-label="会话附件">
                 {draftAttachments.map((attachment) => {
-                  const eligibleTemplate =
-                    documentAuthoringEnabled &&
-                    canUploadDocumentTemplate &&
-                    Boolean(onUseAsTemplate) &&
-                    TEMPLATE_ATTACHMENT_EXTENSIONS.has(attachment.extension.toLowerCase()) &&
-                    (attachment.parse_status === 'ready' || attachment.parse_status === 'degraded');
                   return (
                     <div
                       key={attachment.attachment_id}
@@ -367,18 +333,6 @@ export default function Composer({
                           className="shrink-0 border-0 bg-transparent p-0 text-[11px] text-[#1d4ed8] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
                         >
                           {attachmentRetryingId === attachment.attachment_id ? '重试中…' : '重试'}
-                        </button>
-                      )}
-                      {eligibleTemplate && (
-                        <button
-                          type="button"
-                          onClick={() => void onUseAsTemplate?.(attachment)}
-                          disabled={streaming || disabled || documentUploadPending}
-                          aria-label={`将附件 ${attachment.filename} 作为模板`}
-                          title="将附件转换为文档模板"
-                          className="shrink-0 border-0 bg-transparent p-0 text-[11px] text-[#1d4ed8] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
-                        >
-                          作为模板
                         </button>
                       )}
                       {onRemoveAttachment && (

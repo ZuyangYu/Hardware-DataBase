@@ -163,11 +163,11 @@ export default function GovernancePage({ auth, onLogout }: Props) {
               event.stopPropagation();
               navigate(`/admin/kb-mount?kb=${encodeURIComponent(r.name)}`);
             }}
-            title="进入知识库挂载页"
+            title="进入知识库分配页"
             className="inline-flex h-[28px] items-center gap-[4px] whitespace-nowrap rounded-[8px] border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#464c5e] transition-colors hover:border-[#c9d2e4] hover:text-[#18181a]"
           >
             <AppIcon name="lock" size={13} />
-            挂载
+            分配
           </button>
         ),
       },
@@ -181,7 +181,7 @@ export default function GovernancePage({ auth, onLogout }: Props) {
         title="治理总览"
         description={
           sysAdmin
-            ? '全局治理视图:知识库文件统计、解析异常、挂载与归属问题。'
+            ? '全局治理视图:知识库文件统计、解析异常、分配与归属问题。'
             : '本部门治理视图:知识库文件统计与解析异常。'
         }
       />

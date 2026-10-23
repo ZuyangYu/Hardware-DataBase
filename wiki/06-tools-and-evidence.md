@@ -53,6 +53,23 @@ class Evidence:                    # document_rag/schemas.py:59
 | 参数 | `top_k`（deep 8 / fast 5）、`query_mode`、`wiki_assist` |
 | 渲染 | `format_evidence_for_llm(...)`（1200 字符截断、编号、来源行）、`format_tool_result(...)`（**重复调用折叠** + 预算耗尽显式说明）、`empty_result_message(budget_blocked=...)` |
 
+### 2.1 来源类型与来源预算（2026-10-22）
+
+`src/services/evidence_sources.py` 是唯一来源类型判定点：`attachment`、
+`knowledge_base(_document|_structured)`、`conversation`、`wiki`、`memory`。
+历史 `source_type="chat_attachment"` 只做兼容归一化。缺失身份不再作为通配符；
+附件证据不能把知识库义务置为 `admitted`，反之亦然。
+
+`src/services/evidence_budget.py` 提供请求级 `EvidenceBudgetCoordinator`：
+全局上限、附件/知识库切片、必要预留、按渲染 UTF-8 字节计量、来源级/全局
+`source_budget_exhausted`/`global_budget_exhausted` 诊断。正式证据不淘汰；
+候选池可以淘汰。运行时只在 `attachment_and_knowledge_base` + 开关
+`EVIDENCE_SOURCE_AWARE_ENABLED=true` 时启用，工具不得自行复制预算状态。
+
+`src/services/evidence_policy.py` 把 `ConversationPlan.evidence_purpose`
+（`qa/summarize/extract/compare/author/visual`）映射为预检模式与比较双侧义务。
+`qa` 默认候选预览；`compare` 要求两侧来源义务都进入 `admitted` 才报告完整比较。
+
 关键函数：
 
 ```python
@@ -208,6 +225,21 @@ ragas 的 retrieved_contexts / evidence_consistency 指标
 
 **引用编号规则**：`metadata["citation_number"]` 由 ToolRuntime 分配，回答中的 `[n]` 与之对应；
 `_build_claim_coverage` 依赖这个映射生成 citation 级覆盖（词法近似）。
+
+### 5.x `document_compare`（`tools/comparison_tools.py`）
+
+仅在 `DOCUMENT_COMPARISON_ENABLED=true`、用途为 `compare` 且本轮具备
+`evidence.compare` 能力时挂载。参数 `left`/`right` 使用
+`attachment:<attachment_id>` 或 `kb:<record_id>`；服务端重验附件 ACL、
+知识库部门范围与归档哈希。`src/services/document_comparison.py` 在模型上下文外
+完成解析、章节/表格对齐、精确 Diff 和版本冻结；模型只收到变化片段。
+报告写入 `storage/document_comparisons/<report_id>.json`（内容哈希校验，不可变），
+`GET /api/v1/comparisons/{report_id}` 按 owner 读取，`.../sections/{section_key}`
+按章节展开。解析失败、版本变化、权限不足、预算阻塞均为独立错误，不能报告为
+“无差异”。比较 turn 只建立“附件侧 + 知识库侧”两个来源义务，而不是每个候选文件
+一个义务；来源感知预算为 `comparison` 保留专用切片（默认 8KB），普通检索不能
+借用。两侧文件内容哈希相同时，报告直接给出“整篇未发现差异”，嵌入旧格式对象
+未索引只作为 warning，不得改写成“比较未完成”。
 
 ---
 

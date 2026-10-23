@@ -63,6 +63,7 @@ def _resolve_storage_path(raw_path: str | None, default_name: str) -> str:
 
 
 RESULT_EXPORT_STORAGE_DIR = _resolve_storage_path(os.getenv("RESULT_EXPORT_STORAGE_DIR"), "exports")
+DOCUMENT_COMPARISON_STORAGE_DIR = _resolve_storage_path(os.getenv("DOCUMENT_COMPARISON_STORAGE_DIR"), "document_comparisons")
 RESULT_EXPORT_ENABLED = _env_bool("RESULT_EXPORT_ENABLED", True)
 RESULT_EXPORT_MD_ENABLED = _env_bool("RESULT_EXPORT_MD_ENABLED", True)
 RESULT_EXPORT_XLSX_ENABLED = _env_bool("RESULT_EXPORT_XLSX_ENABLED", True)
@@ -555,8 +556,25 @@ MULTI_KB_MAX_CALLS_PER_TURN = int(os.getenv("MULTI_KB_MAX_CALLS_PER_TURN", "24")
 MULTI_KB_RETRIEVAL_DEADLINE_SECONDS = float(os.getenv("MULTI_KB_RETRIEVAL_DEADLINE_SECONDS", "30"))
 MULTI_KB_EVIDENCE_MAX_ITEMS = int(os.getenv("MULTI_KB_EVIDENCE_MAX_ITEMS", "24"))
 MULTI_KB_CONTEXT_MAX_TOKENS = int(os.getenv("MULTI_KB_CONTEXT_MAX_TOKENS", "8000"))
+# Source-aware evidence settings are kept compact to stay inside this file's
+# architecture line budget; parsing remains centralized here.
+_EVIDENCE_DEFAULTS = dict(zip(
+    "EVIDENCE_SOURCE_AWARE_ENABLED ATTACHMENT_PREFETCH_DEFERRED_ADMISSION DOCUMENT_COMPARISON_ENABLED "
+    "EVIDENCE_GLOBAL_CONTEXT_MAX_BYTES EVIDENCE_SYSTEM_PROMPT_RESERVE_BYTES EVIDENCE_ANSWER_RESERVE_BYTES "
+    "EVIDENCE_ATTACHMENT_MAX_BYTES EVIDENCE_KNOWLEDGE_BASE_MAX_BYTES "
+    "EVIDENCE_ATTACHMENT_REQUIRED_RESERVE_BYTES EVIDENCE_KNOWLEDGE_BASE_REQUIRED_RESERVE_BYTES "
+    "DOCUMENT_COMPARISON_MAX_MODEL_BYTES DOCUMENT_COMPARISON_MAX_ITEMS".split(),
+    (False, True, False, 32000, 4000, 6000, 12000, 16000, 4000, 4000, 12000, 40),
+))
+_EVIDENCE_BOOL_KEYS = frozenset("EVIDENCE_SOURCE_AWARE_ENABLED ATTACHMENT_PREFETCH_DEFERRED_ADMISSION DOCUMENT_COMPARISON_ENABLED".split())
+EVIDENCE_INT_SETTING_KEYS = frozenset(set(_EVIDENCE_DEFAULTS) - _EVIDENCE_BOOL_KEYS)
+EVIDENCE_POSITIVE_SETTING_KEYS = EVIDENCE_INT_SETTING_KEYS
 
 
+def _load_evidence_settings() -> dict[str, object]:
+    return {**{k: _env_bool(k, bool(v)) for k, v in _EVIDENCE_DEFAULTS.items() if k in _EVIDENCE_BOOL_KEYS},
+            **{k: int(os.getenv(k, str(v)) or v) for k, v in _EVIDENCE_DEFAULTS.items() if k not in _EVIDENCE_BOOL_KEYS}}
+globals().update(_load_evidence_settings())
 def _multi_kb_byte_limit(name: str) -> int:
     """Resolve a byte limit, inheriting the legacy token-named value when blank."""
     raw = os.getenv(name, "").strip()
@@ -854,6 +872,7 @@ DEFAULT_VALUES = {
     "PIPELINE_ARCHIVE_ROOT": os.path.join(STORAGE_DIR, "pipeline_archives"),
     "RAGFLOW_FILE_ROOT": os.path.join(STORAGE_DIR, "pipeline_archives"),
     "RESULT_EXPORT_STORAGE_DIR": os.path.join(STORAGE_DIR, "exports"),
+    "DOCUMENT_COMPARISON_STORAGE_DIR": os.path.join(STORAGE_DIR, "document_comparisons"),
     "RESULT_EXPORT_ENABLED": "true",
     "RESULT_EXPORT_MD_ENABLED": "true",
     "RESULT_EXPORT_XLSX_ENABLED": "true",
@@ -1198,6 +1217,8 @@ DEFAULT_VALUES = {
 }
 
 
+DEFAULT_VALUES.update({key: (("true" if default else "false") if isinstance(default, bool) else str(default)) for key, default in _EVIDENCE_DEFAULTS.items()})
+
 def reload_settings():
     """Reload hot settings, retaining construction-time settings until restart."""
     with _ENV_WRITE_LOCK:
@@ -1227,7 +1248,7 @@ def _reload_settings():
     global AGENT_CHECKPOINT_DB_PATH, AGENT_CHECKPOINT_BACKEND, AGENT_CHECKPOINT_DATABASE_URL
     global AGENT_CHECKPOINT_POOL_SIZE
     global PIPELINE_ARCHIVE_ROOT, RAGFLOW_FILE_ROOT
-    global RESULT_EXPORT_STORAGE_DIR
+    global RESULT_EXPORT_STORAGE_DIR, DOCUMENT_COMPARISON_STORAGE_DIR
     global RESULT_EXPORT_ENABLED, RESULT_EXPORT_MD_ENABLED, RESULT_EXPORT_XLSX_ENABLED
     global RESULT_EXPORT_DOCX_ENABLED, RESULT_EXPORT_PDF_ENABLED, RESULT_EXPORT_PPTX_ENABLED
     global RESULT_EXPORT_ORGANIZE_ENABLED
@@ -1678,6 +1699,7 @@ def _reload_settings():
     MULTI_KB_CONTEXT_MAX_TOKENS = int(os.getenv("MULTI_KB_CONTEXT_MAX_TOKENS", "8000"))
     MULTI_KB_FUSION_MAX_BYTES = _multi_kb_byte_limit("MULTI_KB_FUSION_MAX_BYTES")
     MULTI_KB_TURN_EVIDENCE_MAX_BYTES = _multi_kb_byte_limit("MULTI_KB_TURN_EVIDENCE_MAX_BYTES")
+    globals().update(_load_evidence_settings())
     RETRIEVAL_EXECUTOR_MAX_WORKERS = int(os.getenv("RETRIEVAL_EXECUTOR_MAX_WORKERS", "8"))
     RETRIEVAL_QUEUE_MAX_DEPTH = int(os.getenv("RETRIEVAL_QUEUE_MAX_DEPTH", "256"))
     RETRIEVAL_PER_REQUEST_FANOUT = int(os.getenv("RETRIEVAL_PER_REQUEST_FANOUT", "4"))
@@ -1722,6 +1744,9 @@ def _reload_settings():
         os.getenv("DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS", "10")
     )
     RESULT_EXPORT_STORAGE_DIR = _resolve_storage_path(os.getenv("RESULT_EXPORT_STORAGE_DIR"), "exports")
+    DOCUMENT_COMPARISON_STORAGE_DIR = _resolve_storage_path(
+        os.getenv("DOCUMENT_COMPARISON_STORAGE_DIR"), "document_comparisons"
+    )
     RESULT_EXPORT_ENABLED = _env_bool("RESULT_EXPORT_ENABLED", True)
     RESULT_EXPORT_MD_ENABLED = _env_bool("RESULT_EXPORT_MD_ENABLED", True)
     RESULT_EXPORT_XLSX_ENABLED = _env_bool("RESULT_EXPORT_XLSX_ENABLED", True)
@@ -2132,7 +2157,7 @@ _INT_SETTING_KEYS = frozenset({
     "MEMORY_STORE_MAX_SCAN",
     "MEMORY_CONTEXT_MAX_TOKENS",
     "MEMORY_ITEM_MAX_TOKENS",
-})
+} | EVIDENCE_INT_SETTING_KEYS)
 _FLOAT_SETTING_KEYS = frozenset({
     "MULTI_KB_RETRIEVAL_DEADLINE_SECONDS",
     "RAGFLOW_SIMILARITY_THRESHOLD",
@@ -2170,7 +2195,7 @@ def validate_settings_values(settings_dict: dict) -> None:
                 parsed_int = int(text)
             except ValueError as exc:
                 raise ValueError(f"{key} 必须是整数，当前值: {text!r}") from exc
-            if key in {
+            if key in ({
                 "SANDBOX_MAX_CONCURRENT",
                 "SANDBOX_MAX_CONCURRENT_PER_USER",
                 "SANDBOX_MAX_CONCURRENT_PER_DEPARTMENT",
@@ -2190,7 +2215,7 @@ def validate_settings_values(settings_dict: dict) -> None:
                 "RAGFLOW_CHUNK_LIST_PAGE_SIZE",
                 "RAGFLOW_CHUNK_LIST_MAX_PAGES",
                 "RAGFLOW_CHUNK_LIST_MAX_BYTES",
-            } and parsed_int <= 0:
+            } | EVIDENCE_POSITIVE_SETTING_KEYS) and parsed_int <= 0:
                 raise ValueError(f"{key} 必须大于 0，当前值: {text!r}")
         elif key in _FLOAT_SETTING_KEYS:
             try:
