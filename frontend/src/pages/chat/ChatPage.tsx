@@ -16,7 +16,7 @@ import {
   retryAttachment,
   uploadAttachment,
 } from '@/api/chatAttachments';
-import type { AttachmentView, ExportArtifactView, ExportBatchResponse, ExportFormat, ExportFormatsResponse, ExportJobView, KbView, KnowledgePurpose, KnowledgeSelectionInput, McpWriteProposal, MessageView } from '@/api/types';
+import type { AttachmentView, ExportArtifactView, ExportBatchResponse, ExportFormat, ExportFormatsResponse, ExportJobView, KbView, McpWriteProposal, MessageView } from '@/api/types';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
@@ -55,19 +55,6 @@ type Props = {
 const DOCUMENT_TEMPLATE_EXTENSIONS = ['.xlsx', '.xlsm', '.docx'];
 const ATTACHMENT_STATUS_POLL_INTERVAL_MS = 2_000;
 const DOCUMENT_COMPARISON_PATTERN = /对比|比较|区别|差异|差别|异同|对照|compare|comparison|difference|diff/i;
-const DOCUMENT_COMPOSE_PATTERN = /(?:生成|创建|撰写|起草|整理成|汇总成|导出|输出)[\s\S]{0,30}(?:文档|报告|说明书|word|docx|pdf|excel|xlsx|pptx)/i;
-
-export function inferKnowledgePurpose(
-  query: string,
-  selected: KnowledgePurpose | 'auto',
-): KnowledgePurpose {
-  if (selected !== 'auto') return selected;
-  const text = String(query || '').trim();
-  if (!text) return 'answer';
-  if (DOCUMENT_COMPARISON_PATTERN.test(text)) return 'compare';
-  if (isTemplateGenerationChatIntent(text) || DOCUMENT_COMPOSE_PATTERN.test(text)) return 'compose';
-  return 'answer';
-}
 
 /**
  * Attachments stay mounted for the whole session: opening a session selects
@@ -231,7 +218,6 @@ export default function ChatPage({
 }: Props) {
   const navigate = useNavigate();
   const [mountedKbName, setMountedKbName] = useState(kbName);
-  const [selectedKnowledgeBaseIds, setSelectedKnowledgeBaseIds] = useState<number[]>([]);
   const [documentContextLabel, setDocumentContextLabel] = useState<string | null>(null);
   const [documentUploadPending, setDocumentUploadPending] = useState(false);
   const [exportJobsByMessageId, setExportJobsByMessageId] = useState<Record<number, ExportJobView[]>>({});
@@ -258,67 +244,6 @@ export default function ChatPage({
       ...rows,
     ];
   }, [availableKbs, mountedKbName]);
-
-  const anchorKnowledgeBaseId = useMemo(
-    () => visibleKbs.find((item) => item.name === mountedKbName)?.kb_id ?? null,
-    [visibleKbs, mountedKbName],
-  );
-  const previousAnchorKnowledgeBaseId = useRef<number | null>(null);
-  useEffect(() => {
-    const anchorChanged = previousAnchorKnowledgeBaseId.current !== anchorKnowledgeBaseId;
-    previousAnchorKnowledgeBaseId.current = anchorKnowledgeBaseId;
-    if (anchorKnowledgeBaseId == null) {
-      setSelectedKnowledgeBaseIds([]);
-      return;
-    }
-    if (anchorChanged) {
-      setSelectedKnowledgeBaseIds([anchorKnowledgeBaseId]);
-      return;
-    }
-    setSelectedKnowledgeBaseIds((previous) => {
-      const allowed = new Set(
-        visibleKbs.map((item) => item.kb_id).filter((value): value is number => value != null),
-      );
-      const retained = previous.filter((value) => allowed.has(value));
-      return retained.includes(anchorKnowledgeBaseId) ? retained : [anchorKnowledgeBaseId, ...retained];
-    });
-  }, [anchorKnowledgeBaseId, visibleKbs]);
-
-  const buildKnowledgeScope = useCallback(
-    (purpose: KnowledgePurpose, kbIds: number[]): KnowledgeSelectionInput | null => {
-      if (anchorKnowledgeBaseId == null || kbIds.length < 2) return null;
-      const ids = [...new Set(kbIds)];
-      if (purpose === 'compare') {
-        return {
-          version: 1,
-          purpose: 'compare',
-          sources: ids.map((kb_id) => ({ kb_id, role: 'peer' as const })),
-        };
-      }
-      return {
-        version: 1,
-        purpose,
-        sources: ids.map((kb_id) => ({
-          kb_id,
-          role: kb_id === anchorKnowledgeBaseId ? 'primary' as const : 'reference' as const,
-        })),
-      };
-    },
-    [anchorKnowledgeBaseId],
-  );
-
-  const knowledgeScope = useMemo<KnowledgeSelectionInput | null>(
-    () => buildKnowledgeScope('answer', selectedKnowledgeBaseIds),
-    [buildKnowledgeScope, selectedKnowledgeBaseIds],
-  );
-
-  const resolveKnowledgeScope = useCallback(
-    (query: string): KnowledgeSelectionInput | null => {
-      const purpose = inferKnowledgePurpose(query, 'auto');
-      return buildKnowledgeScope(purpose, selectedKnowledgeBaseIds);
-    },
-    [buildKnowledgeScope, selectedKnowledgeBaseIds],
-  );
 
   useEffect(() => {
     setMountedKbName(kbName);
@@ -388,9 +313,6 @@ export default function ChatPage({
   const chat = useKbChat(mountedKbName, {
     username: auth.user.username,
     documentContextEnabled: documentAuthoringEnabled,
-    knowledgeScope,
-    resolveKnowledgeScope,
-    knowledgeScopeAuto: true,
   });
   const {
     sessions,
@@ -417,6 +339,10 @@ export default function ChatPage({
     streamingText,
     traceSteps,
     traceByMessageId,
+    livePlan,
+    liveBudget,
+    liveVerification,
+    liveSubagents,
     degradedNotes,
     documentCards,
     turnQueueNotice,
@@ -434,49 +360,6 @@ export default function ChatPage({
     updateMcpWriteCard,
     refreshMcpWriteCards,
   } = chat;
-
-  // Each session keeps its own reference-KB set.  When the user opens a
-  // different session, mirror that session's stored scope into the picker so
-  // the next turn edits the same session instead of silently changing it.
-  const syncedSessionScopeId = useRef<number | null>(null);
-  useEffect(() => {
-    if (activeSessionId == null) {
-      syncedSessionScopeId.current = null;
-      return;
-    }
-    if (syncedSessionScopeId.current === activeSessionId || !activeSession) return;
-    syncedSessionScopeId.current = activeSessionId;
-    const stored = activeSession.knowledge_scope;
-    const storedIds = stored?.sources
-      ?.map((source) => Number(source.kb_id))
-      .filter((value) => Number.isSafeInteger(value) && value > 0) ?? [];
-    if (stored && storedIds.length > 0) {
-      setSelectedKnowledgeBaseIds([...new Set(storedIds)]);
-    } else {
-      setSelectedKnowledgeBaseIds(anchorKnowledgeBaseId != null ? [anchorKnowledgeBaseId] : []);
-    }
-  }, [activeSession, activeSessionId, anchorKnowledgeBaseId]);
-
-  const handleKnowledgeScopeChange = (kbIds: number[]) => {
-    if (streaming) return;
-    const unique = [...new Set(kbIds)];
-    if (unique.length === 0) {
-      setSelectedKnowledgeBaseIds([]);
-      if (mountedKbName) handleKbChange('');
-      return;
-    }
-    const anchorId = anchorKnowledgeBaseId != null && unique.includes(anchorKnowledgeBaseId)
-      ? anchorKnowledgeBaseId
-      : unique[0];
-    const anchor = visibleKbs.find((item) => Number(item.kb_id) === anchorId);
-    setSelectedKnowledgeBaseIds(unique);
-    if (anchor && anchor.name !== mountedKbName) {
-      // Keep the scope popover mounted while the user checks several KBs.
-      setMountedKbName(anchor.name);
-      clearDocumentContext();
-      window.history.replaceState(null, '', `/chat?kb=${encodeURIComponent(anchor.name)}`);
-    }
-  };
 
   useEffect(() => {
     if (!mcpWriteCards.some((card) => card.status === 'confirmed' || card.status === 'running')) {
@@ -1066,6 +949,20 @@ export default function ChatPage({
           streamingText={streamingText}
           traceSteps={traceSteps}
           traceByMessageId={traceByMessageId}
+          livePlan={livePlan}
+          liveBudget={liveBudget}
+          liveVerification={liveVerification}
+          liveSubagents={liveSubagents}
+          onContinue={() => {
+            void send({
+              attachmentIds: [],
+              textOverride:
+                '请基于上一轮已经收集到的证据，继续完成未完成的部分；先说明哪些部分已完成、哪些仍待确认，并保留有效引用。',
+            });
+          }}
+          onNarrowScope={() => {
+            setInput('请缩小范围：只完成上一轮任务中最关键的一个小节，并明确列出其余待确认项。');
+          }}
           degradedNotes={degradedNotes}
           onCreateMemory={(messageIds) => void openUserMemoryDialog(messageIds)}
           onCreateProjectMemory={
@@ -1138,8 +1035,6 @@ export default function ChatPage({
           setInput={setInput}
           streaming={streaming}
           onKbChange={handleKbChange}
-          selectedKnowledgeBaseIds={selectedKnowledgeBaseIds}
-          onKnowledgeScopeChange={handleKnowledgeScopeChange}
           onSend={handleSendWithAttachments}
           onStop={abortStream}
           quickReplies={documentQuickReplies}

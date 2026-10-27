@@ -425,6 +425,94 @@ export interface MessageView {
   cards?: Record<string, unknown>[];
   /** 该 turn 持久化的执行轨迹步骤（刷新后轨迹面板回填）。 */
   trace_steps?: QueryTraceStep[];
+  /** 复杂任务的执行计划（agent todo 投影）。 */
+  plan?: TurnPlanState | null;
+  /** 本轮 agent 循环预算与复杂度。 */
+  budget?: TurnBudget | null;
+  /** 系统校验结果（确定性检查 + 可选独立模型校验）。 */
+  verification?: TurnVerification | null;
+  /** 检索子 agent 摘要（不含原始上下文）。 */
+  subagents?: TurnSubagent[];
+}
+
+export type TurnPlanStatus = 'pending' | 'in_progress' | 'completed';
+
+export interface TurnPlanItem {
+  content: string;
+  status: TurnPlanStatus;
+}
+
+export interface TurnPlanState {
+  items: TurnPlanItem[];
+  revision: number;
+  source?: string;
+}
+
+export interface TurnBudget {
+  status?: 'allocated' | 'ok' | 'partial' | 'exhausted';
+  mode?: string;
+  base_recursion_limit?: number;
+  recursion_limit?: number;
+  complexity?: {
+    score?: number;
+    level?: 'simple' | 'moderate' | 'complex' | string;
+    signals?: string[];
+    query_chars?: number;
+    numbered_items?: number;
+    attachments?: number;
+    kb_count?: number;
+  };
+  exhausted?: boolean;
+  stopped_reason?: string;
+  tool_calls?: number;
+  evidence_count?: number;
+  partial_answer?: boolean;
+  synthesis?: 'model' | 'notice';
+  context_compressed?: {
+    evidence_count?: number;
+    compressed_bytes?: number;
+    max_bytes?: number;
+  };
+  context_window?: {
+    max_prompt_tokens?: number;
+    window_tokens?: number;
+    threshold_tokens?: number;
+    note?: string;
+  };
+}
+
+export interface TurnVerificationCheck {
+  key: string;
+  label: string;
+  status: 'pass' | 'warn' | 'fail' | 'unknown';
+  detail?: string;
+  source?: 'deterministic' | 'model_rubric' | string;
+}
+
+export interface TurnVerification {
+  status: 'pass' | 'warn' | 'fail' | 'partial' | 'unknown';
+  checks?: TurnVerificationCheck[];
+  gaps?: string[];
+  semantic_verification?: {
+    status?: string;
+    checks?: TurnVerificationCheck[];
+    gaps?: string[];
+    error?: string;
+  } | null;
+  budget_exhausted?: boolean;
+  partial_delivery?: boolean;
+  citation_coverage?: number;
+  invalid_citations?: number[];
+  unverified?: boolean;
+}
+
+export interface TurnSubagent {
+  name?: string;
+  description?: string;
+  status?: 'running' | 'completed' | 'failed' | 'abandoned';
+  tool_call_id?: string;
+  result_chars?: number;
+  duration_ms?: number;
 }
 
 export interface SessionMemorySummary {

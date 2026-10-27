@@ -7,6 +7,10 @@ import {
   latestDocumentChatTasks,
   mergeDocumentCardsFromSseEvent,
   mergeMcpWriteProposalFromSseEvent,
+  parseTurnBudget,
+  parseTurnPlan,
+  parseTurnSubagent,
+  parseTurnVerification,
   planConfirmationStaleKey,
 } from './useKbChat';
 
@@ -173,6 +177,39 @@ describe('useKbChat document clarification SSE projection', () => {
   });
 });
 
+
+describe('turn meta SSE projection', () => {
+  it('normalizes plan items and drops empty entries', () => {
+    const plan = parseTurnPlan(JSON.stringify({
+      revision: 2,
+      items: [
+        { content: '读取 BOM', status: 'completed' },
+        { content: '', status: 'pending' },
+        { content: '输出表格', status: 'unexpected' },
+      ],
+    }));
+    expect(plan?.revision).toBe(2);
+    expect(plan?.items).toEqual([
+      { content: '读取 BOM', status: 'completed' },
+      { content: '输出表格', status: 'pending' },
+    ]);
+  });
+
+  it('parses budget, verification and subagent payloads', () => {
+    expect(parseTurnBudget(JSON.stringify({ status: 'exhausted', exhausted: true }))?.exhausted)
+      .toBe(true);
+    expect(parseTurnVerification(JSON.stringify({
+      status: 'partial',
+      checks: [{ key: 'answer_present', label: '回答非空', status: 'pass' }],
+    }))?.status).toBe('partial');
+    expect(parseTurnSubagent(JSON.stringify({
+      name: 'research',
+      status: 'completed',
+    }))?.name).toBe('research');
+    expect(parseTurnVerification('{"status":"weird"}')).toBeNull();
+    expect(parseTurnPlan('not-json')).toBeNull();
+  });
+});
 
 describe('plan confirmation submission guard', () => {
   it('marks only 409 responses as stale', () => {

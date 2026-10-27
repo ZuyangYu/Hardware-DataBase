@@ -82,7 +82,7 @@ export default function ChatSessionSidebar({
   if (collapsed) {
     return <>
       {mobileLauncher}
-      <aside className="flex w-[44px] shrink-0 flex-col items-center border-l border-[#f4f4f4] bg-white py-[12px] max-[700px]:hidden">
+      <aside className="flex w-[44px] shrink-0 flex-col items-center border-l border-[#eceef3] bg-[#fbfbfd] py-[12px] max-[700px]:hidden">
         <button
           type="button"
           onClick={() => {
@@ -103,7 +103,7 @@ export default function ChatSessionSidebar({
       {mobileLauncher}
       {mobileScrim}
       <aside className={cn(
-        'group relative flex shrink-0 flex-col border-l border-[#f4f4f4] bg-white',
+        'group relative flex shrink-0 flex-col border-l border-[#eceef3] bg-[#fbfbfd]',
         mobileOpen ? 'max-[700px]:fixed max-[700px]:right-0 max-[700px]:top-0 max-[700px]:z-50 max-[700px]:h-full max-[700px]:!w-[min(320px,calc(100vw-24px))]' : 'max-[700px]:hidden',
       )} style={{ width }}>
       <div
@@ -114,12 +114,22 @@ export default function ChatSessionSidebar({
         className="absolute left-0 top-0 z-10 h-full w-[3px] cursor-col-resize bg-transparent opacity-0 transition-opacity group-hover:bg-[#d0d5dd] group-hover:opacity-100 active:!opacity-100"
         title="拖动调整宽度"
       />
-      <div className="border-b border-[#f4f4f4] p-[12px]">
-        <div className="flex items-center justify-between gap-[8px]">
-          <span className="min-w-0 truncate text-[14px] font-semibold text-[#18181a]">
-            {kbName || '通用对话'}
-          </span>
-          <div className="flex shrink-0 items-center gap-[4px]">
+      <div className="border-b border-[#eceef3] px-[14px] pb-[12px] pt-[14px]">
+        <div className="flex items-start justify-between gap-[8px]">
+          <div className="min-w-0">
+            <div className="text-[10px] font-medium uppercase tracking-[0.12em] text-[#9aa1b1]">
+              会话
+            </div>
+            <div className="mt-[3px] flex min-w-0 items-center gap-[6px]">
+              <span className="min-w-0 truncate text-[14px] font-semibold text-[#18181a]">
+                {kbName || '通用对话'}
+              </span>
+              <span className="shrink-0 rounded-full bg-[#f0f2f6] px-[6px] py-[1px] text-[10px] tabular-nums text-[#6b7280]">
+                {sessions.length}
+              </span>
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-[2px]">
             <button
               type="button"
               onClick={() => {
@@ -128,7 +138,7 @@ export default function ChatSessionSidebar({
               }}
               aria-label="收起会话侧栏"
               title="收起会话侧栏"
-              className="inline-grid size-[24px] shrink-0 place-items-center rounded-[6px] text-[#757f9c] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a]"
+              className="inline-grid size-[26px] shrink-0 place-items-center rounded-[7px] text-[#8b93a7] transition-colors hover:bg-white hover:text-[#18181a]"
             >
               <AppIcon name="arrow" size={13} />
             </button>
@@ -137,19 +147,21 @@ export default function ChatSessionSidebar({
               onClick={onNew}
               aria-label="新对话"
               title="新建会话"
-              className="inline-grid size-[28px] shrink-0 place-items-center rounded-[8px] text-[#757f9c] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a]"
+              className="inline-grid size-[28px] shrink-0 place-items-center rounded-[8px] border border-[#e6e9f0] bg-white text-[#5b6273] shadow-[0_1px_2px_rgba(24,24,26,0.03)] transition-colors hover:border-[#cfd5e2] hover:text-[#18181a]"
             >
-              <AppIcon name="plus" size={16} />
+              <AppIcon name="plus" size={15} />
             </button>
           </div>
         </div>
       </div>
       <ScrollArea className="min-h-0 flex-1">
-        <div className="grid gap-[2px] p-[8px]">
-          {!sessionsLoaded && [0, 1, 2].map((i) => <Skeleton key={i} className="h-[36px] rounded-[8px]" />)}
+        <div className="grid gap-[6px] p-[10px]">
+          {!sessionsLoaded && [0, 1, 2].map((i) => <Skeleton key={i} className="h-[38px] rounded-[10px]" />)}
           {sessionsLoaded && sessions.length === 0 && (
-            <div className="px-[8px] py-[16px] text-center text-[12px] text-[#858b9c]">
-              暂无会话,点击 + 开始
+            <div className="rounded-[10px] border border-dashed border-[#e6e9f0] px-[10px] py-[18px] text-center text-[11px] leading-[17px] text-[#9aa1b1]">
+              暂无会话
+              <br />
+              点击右上角 + 开始
             </div>
           )}
           {sessions.map((session) => {
@@ -158,26 +170,35 @@ export default function ChatSessionSidebar({
               <div
                 key={session.id}
                 className={cn(
-                  'group flex min-w-0 items-center gap-[6px] overflow-hidden rounded-[8px] px-[10px] py-[8px] text-[13px] transition-colors',
-                  'cursor-pointer',
+                  'group relative flex min-w-0 cursor-pointer items-center gap-[6px] overflow-hidden rounded-[10px] border px-[11px] py-[9px] text-[12px] transition-all',
                   active
-                    ? 'bg-[#f6f6f6] text-[#18181a]'
-                    : 'text-[#858b9c] hover:bg-[#f6f6f6] hover:text-[#18181a]',
+                    ? 'border-[#e6e9f0] bg-white text-[#18181a] shadow-[0_1px_3px_rgba(24,24,26,0.05)]'
+                    : 'border-transparent text-[#6b7280] hover:border-[#eceef3] hover:bg-white/70 hover:text-[#18181a]',
                 )}
                 onClick={() => onSelect(session.id)}
               >
-                <span className="min-w-0 flex-1 truncate">{session.title}</span>
+                <span
+                  className={cn(
+                    'absolute bottom-[10px] left-0 top-[10px] w-[2px] rounded-full bg-[#18181a] transition-opacity',
+                    active ? 'opacity-100' : 'opacity-0',
+                  )}
+                  aria-hidden
+                />
+                <span className="min-w-0 flex-1 truncate pl-[2px]">{session.title}</span>
                 <button
                   type="button"
                   aria-label="删除会话"
                   disabled={streaming}
-                  className="ml-1 mr-[2px] shrink-0 rounded-[6px] bg-[#f0f1f3] p-1 text-[#6b7280] hover:bg-[#fdeaea] hover:text-[#d20b0b] disabled:cursor-not-allowed disabled:opacity-40"
+                  className={cn(
+                    'ml-1 shrink-0 rounded-[6px] p-[5px] text-[#8b93a7] transition-all hover:bg-[#fdeaea] hover:text-[#d20b0b] disabled:cursor-not-allowed disabled:opacity-40',
+                    active ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 max-[700px]:opacity-100',
+                  )}
                   onClick={(e) => {
                     e.stopPropagation();
                     setDeleteTarget(session);
                   }}
                 >
-                  <AppIcon name="trash" size={15} className="text-[#6b7280]" />
+                  <AppIcon name="trash" size={13} />
                 </button>
               </div>
             );

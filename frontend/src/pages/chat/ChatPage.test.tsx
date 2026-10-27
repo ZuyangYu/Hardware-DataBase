@@ -9,7 +9,6 @@ import ChatPage, {
   isChatAttachmentsUiEnabled,
   isDocumentAuthoringChatEnabled,
   isTemplateGenerationChatIntent,
-  inferKnowledgePurpose,
   listTemplateCandidateAttachments,
   pickAutoTemplateAttachment,
   resolveTemplateAttachmentRoute,
@@ -228,16 +227,16 @@ describe('ChatPage document authoring bridge', () => {
     expect(markup).not.toContain('chat-document-template-upload');
   });
 
-  it('shows primary and additional knowledge-base controls without reference wording', () => {
+  it('shows only the single knowledge-base selector', () => {
     const markup = renderChat(true, [
       writableKb,
       { ...writableKb, name: 'reference', kb_id: 2, permission: 'read' },
     ]);
 
     expect(markup).toContain('检索范围');
-    expect(markup).toContain('aria-label="选择主知识库"');
-    expect(markup).toContain('aria-label="添加知识库"');
-    expect(markup).not.toContain('参考知识库');
+    expect(markup).toContain('aria-label="选择会话锚定库"');
+    expect(markup).not.toContain('aria-label="添加知识库"');
+    expect(markup).not.toContain('参考库');
     expect(markup).not.toContain('用途');
     expect(markup).not.toContain('aria-label="知识库范围"');
     expect(markup).not.toContain('挂载知识库');
@@ -281,66 +280,42 @@ describe('Composer document context', () => {
   it('disables the primary knowledge-base selector while a turn is streaming', () => {
     const markup = renderComposer({ streaming: true });
 
-    expect(markup).toMatch(/aria-label="选择主知识库"/);
-    expect(markup).toMatch(/<button[^>]*\bdisabled(?:=""|(?=\s|>))[^>]*aria-label="选择主知识库"/);
+    expect(markup).toMatch(/aria-label="选择会话锚定库"/);
+    expect(markup).toMatch(/<button[^>]*\bdisabled(?:=""|(?=\s|>))[^>]*aria-label="选择会话锚定库"/);
   });
 
   it('labels the selector as the retrieval scope', () => {
     const markup = renderComposer();
 
     expect(markup).toContain('检索范围');
-    expect(markup).toContain('主知识库');
+    expect(markup).toContain('会话锚定库');
   });
 
-  it('adds extra knowledge bases without exposing reference or purpose controls', () => {
+  it('does not render a multi-knowledge-base picker', () => {
     const markup = renderComposer({
       availableKbs: [
         writableKb,
         { ...writableKb, name: 'reference', kb_id: 2, permission: 'read' },
       ],
-      selectedKnowledgeBaseIds: [1, 2],
-      onKnowledgeScopeChange: () => undefined,
     });
 
-    expect(markup).toContain('aria-label="选择主知识库"');
-    expect(markup).toContain('aria-label="添加知识库"');
-    expect(markup).toContain('已添加 1 个知识库，点击继续添加');
-    expect(markup).not.toContain('参考知识库');
+    expect(markup).toContain('aria-label="选择会话锚定库"');
+    expect(markup).not.toContain('aria-label="添加知识库"');
+    expect(markup).not.toContain('参考库');
     expect(markup).not.toContain('用途');
     expect(markup).not.toContain('检索用途');
-  });
-
-  it('disables the additional knowledge-base picker until a primary knowledge base is selected', () => {
-    const markup = renderComposer({
-      kbName: '',
-      availableKbs: [
-        writableKb,
-        { ...writableKb, name: 'reference', kb_id: 2, permission: 'read' },
-      ],
-      onKnowledgeScopeChange: () => undefined,
-    });
-
-    expect(markup).toContain('选择主知识库');
-    expect(markup).toMatch(/<button[^>]*aria-label="添加知识库"[^>]*\bdisabled(?:=""|(?=\s|>))/);
   });
 
   it('shows an explicit primary-knowledge-base prompt when nothing is mounted', () => {
     const markup = renderComposer({ kbName: '' });
 
-    expect(markup).toContain('选择主知识库');
+    expect(markup).toContain('选择会话锚定库');
     expect(markup).toContain('未选择知识库');
   });
 
   it('hides the department suffix when all knowledge bases share one department', () => {
     expect(kbOptionLabel(writableKb, false)).toBe('shared');
     expect(kbOptionLabel(writableKb, true)).toBe('shared · 研发部');
-  });
-
-  it('infers knowledge purpose from the first question in auto mode', () => {
-    expect(inferKnowledgePurpose('对比 AP230060 和 AP230062 的供电范围', 'auto')).toBe('compare');
-    expect(inferKnowledgePurpose('生成一份 Word 报告', 'auto')).toBe('compose');
-    expect(inferKnowledgePurpose('AP230060 的静态电流是多少', 'auto')).toBe('answer');
-    expect(inferKnowledgePurpose('对比这两个项目', 'answer')).toBe('answer');
   });
 
   it('does not render a legacy generation-mode toggle when no document context is attached', () => {
@@ -413,7 +388,7 @@ describe('Composer attachment status', () => {
 
     expect(markup).toContain('aria-label="添加附件"');
     expect(markup).toContain('chat-attachment-upload');
-    expect(markup).toContain('主知识库');
+    expect(markup).toContain('会话锚定库');
     expect(markup).toContain('检索范围');
     expect(markup).toContain('review.xlsx');
     expect(markup).not.toContain('作为模板');

@@ -1,7 +1,7 @@
 import type { DocumentConflict, DocumentConflictDecisionInput } from '@/api/types';
 
 export const CONFLICT_ACTION_LABELS: Record<string, string> = {
-  retain_primary: '保留主库要求',
+  retain_primary: '保留权威来源',
   accept_authoritative_source: '采用有效权威依据',
   choose_claim: '选择证据结论',
   choose_design_candidate: '选择设计候选（待审批）',

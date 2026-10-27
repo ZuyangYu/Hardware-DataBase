@@ -139,9 +139,12 @@ export default function ChatHeader({
     <div className={cn(CHAT_HEADER_CLASS, 'h-auto min-h-[56px] flex-wrap py-[8px]')}>
       <div className={CHAT_HEADER_TITLE_STACK_CLASS}>
         <span className={CHAT_HEADER_TITLE_NAME_CLASS}>{title || '新对话'}</span>
-        <span className={CHAT_HEADER_TITLE_META_CLASS}>{kbName}</span>
+        <span className={CHAT_HEADER_TITLE_META_CLASS}>
+          <AppIcon name="database" size={11} />
+          <span className="max-w-[160px] truncate">{kbName}</span>
+        </span>
       </div>
-      <div className="flex max-w-full flex-wrap items-center gap-[8px] [&>*]:shrink-0">
+      <div className="flex max-w-full flex-wrap items-center gap-[4px] [&>*]:shrink-0">
         {kbName && onWikiAssistChange && (
           <label
             className={cn(

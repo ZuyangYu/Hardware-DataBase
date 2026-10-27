@@ -16,6 +16,10 @@ import type {
   MemoryContextItem,
   MessageView,
   QueryTraceStep,
+  TurnBudget,
+  TurnPlanState,
+  TurnSubagent,
+  TurnVerification,
 } from '@/api/types';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
@@ -40,6 +44,18 @@ type Props = {
   streaming?: boolean;
   streamingText?: string;
   traceSteps?: QueryTraceStep[];
+  /** 复杂任务执行计划（实时气泡传入；历史消息从 msg.plan 读取）。 */
+  plan?: TurnPlanState | null;
+  /** 本轮 agent 循环预算。 */
+  budget?: TurnBudget | null;
+  /** 系统校验结果。 */
+  verification?: TurnVerification | null;
+  /** 检索子 agent 摘要（不含原始上下文）。 */
+  subagents?: TurnSubagent[];
+  /** 预算耗尽后的继续操作。 */
+  onContinue?: () => void;
+  /** 预算耗尽后的缩小范围操作。 */
+  onNarrowScope?: () => void;
   /** 降级提醒(fail-open 发生时)。 */
   degradedNotes?: Array<{ stage: string; reason: string }>;
   /** 通用对话不展示内部执行轨迹和检索概要。 */
@@ -66,12 +82,14 @@ type Props = {
 function CollapsibleSection({
   title,
   badge,
+  icon,
   defaultOpen = false,
   className,
   children,
 }: {
   title: string;
   badge?: string;
+  icon?: ReactNode;
   defaultOpen?: boolean;
   className?: string;
   children: ReactNode;
@@ -82,13 +100,28 @@ function CollapsibleSection({
       <button
         type="button"
         onClick={() => setOpen((prev) => !prev)}
-        className="flex items-center gap-[6px] text-[11px] text-[#9aa1b1] hover:text-[#464c5e]"
+        className="flex w-full items-center gap-[7px] text-left text-[11px] font-medium text-[#6b7280] transition-colors hover:text-[#18181a]"
       >
-        <span className={cn('inline-block transition-transform', open && 'rotate-90')}>▸</span>
+        <span className={cn('inline-block text-[10px] text-[#a1a7b5] transition-transform', open && 'rotate-90')}>▸</span>
+        {icon && <span className="inline-grid size-[18px] place-items-center rounded-[6px] bg-[#f1f3f7] text-[#5b6273]">{icon}</span>}
         <span>{title}</span>
-        {badge != null && <span className="text-[#c3c8d4]">{badge}</span>}
+        {badge != null && <span className="font-normal text-[#a1a7b5]">{badge}</span>}
       </button>
-      {open && <div className="mt-[6px] space-y-[6px]">{children}</div>}
+      {open && <div className="mt-[9px] space-y-[6px]">{children}</div>}
+    </div>
+  );
+}
+
+function AssistantIdentity({ live = false }: { live?: boolean }) {
+  return (
+    <div className="mb-[2px] flex items-center gap-[7px]">
+      <span className="inline-grid size-[20px] place-items-center rounded-[7px] bg-[#18181a] text-white shadow-[0_2px_6px_rgba(24,24,26,0.16)]">
+        <AppIcon name="database" size={11} />
+      </span>
+      <span className="text-[10px] font-medium uppercase tracking-[0.08em] text-[#9aa1b1]">
+        {live ? '正在检索' : '知识库回答'}
+      </span>
+      <span className="h-px flex-1 bg-[linear-gradient(90deg,#eceef3,transparent)]" aria-hidden />
     </div>
   );
 }
@@ -149,6 +182,265 @@ function DegradedBanner({ notes }: { notes: Array<{ stage: string; reason: strin
   );
 }
 
+const PLAN_STATUS_META: Record<string, { icon: string; label: string; className: string }> = {
+  completed: { icon: '✓', label: '已完成', className: 'text-[#15803d]' },
+  in_progress: { icon: '◐', label: '进行中', className: 'text-[#1d4ed8]' },
+  pending: { icon: '○', label: '待开始', className: 'text-[#9aa1b1]' },
+};
+
+function PlanPanel({ plan, defaultOpen = false }: { plan: TurnPlanState; defaultOpen?: boolean }) {
+  if (!plan.items?.length) return null;
+  const completed = plan.items.filter((item) => item.status === 'completed').length;
+  const percent = Math.round((completed / plan.items.length) * 100);
+  return (
+    <CollapsibleSection
+      title="执行计划"
+      badge={`${completed}/${plan.items.length}`}
+      icon={<AppIcon name="check-list" size={11} />}
+      defaultOpen={defaultOpen}
+      className="rounded-[12px] border border-[#e6e9f0] bg-white px-[12px] py-[10px] shadow-[0_1px_2px_rgba(24,24,26,0.03)]"
+    >
+      <div className="mb-[9px] h-[3px] overflow-hidden rounded-full bg-[#eef1f6]">
+        <div
+          className="h-full rounded-full bg-[#18181a] transition-all duration-300"
+          style={{ width: `${Math.max(0, Math.min(100, percent))}%` }}
+        />
+      </div>
+      <div className="grid gap-[7px]">
+        {plan.items.map((item, index) => {
+          const meta = PLAN_STATUS_META[item.status] ?? PLAN_STATUS_META.pending;
+          return (
+            <div key={`${item.content}-${index}`} className="flex items-start gap-[8px] text-[12px] leading-[18px]">
+              <span className={cn('mt-[1px] inline-grid size-[16px] shrink-0 place-items-center rounded-full border border-[#eceef3] bg-[#fafbfc] text-[9px]', meta.className)}>
+                {meta.icon}
+              </span>
+              <span className={cn('min-w-0 flex-1 break-words', item.status === 'completed' ? 'text-[#858b9c]' : 'text-[#464c5e]')}>
+                {item.content}
+              </span>
+              <span className={cn('mt-[1px] shrink-0 text-[10px]', meta.className)}>{meta.label}</span>
+            </div>
+          );
+        })}
+      </div>
+    </CollapsibleSection>
+  );
+}
+
+function BudgetPanel({
+  budget,
+  onContinue,
+  onNarrowScope,
+}: {
+  budget: TurnBudget;
+  onContinue?: () => void;
+  onNarrowScope?: () => void;
+}) {
+  const exhausted = budget.exhausted === true || budget.status === 'exhausted';
+  const partial = budget.partial_answer === true || budget.status === 'partial';
+  const contextWindow = budget.context_window;
+  if (!exhausted && !partial && !contextWindow) return null;
+  const tone = exhausted || partial
+    ? 'border-[#f0d28a] bg-[#fff8e6] text-[#8a6a1f]'
+    : 'border-[#dbe3f0] bg-[#f8faff] text-[#46506b]';
+  const complexity = budget.complexity;
+  const compressed = budget.context_compressed;
+  const limit = Number(budget.recursion_limit ?? 0);
+  const calls = Number(budget.tool_calls ?? 0);
+  const usagePercent = limit > 0 ? Math.min(100, Math.round((calls / limit) * 100)) : 0;
+  return (
+    <div className={cn('rounded-[12px] border px-[12px] py-[10px] text-[12px] leading-[18px] shadow-[0_1px_2px_rgba(24,24,26,0.03)]', tone)}>
+      {exhausted || partial ? (
+        <>
+          <div className="mb-[3px] flex items-center gap-[6px] font-semibold">
+            <AppIcon name="chart" size={12} />
+            {exhausted ? '本轮执行预算已用完' : '本轮为部分交付'}
+          </div>
+          <div>
+            已执行 {budget.tool_calls ?? 0} 次工具调用，登记 {budget.evidence_count ?? 0} 条证据；
+            {budget.partial_answer ? '已基于已有证据生成本轮可交付的部分结果。' : '未能生成可交付结果。'}
+          </div>
+          {limit > 0 && (
+            <div className="mt-[8px]">
+              <div className="h-[3px] overflow-hidden rounded-full bg-white/70">
+                <div
+                  className={cn('h-full rounded-full transition-all', exhausted ? 'bg-[#c98a16]' : 'bg-[#8b93a7]')}
+                  style={{ width: `${Math.max(3, usagePercent)}%` }}
+                />
+              </div>
+              <div className="mt-[3px] text-[10px] opacity-70">工具调用 {calls}/{limit}</div>
+            </div>
+          )}
+        </>
+      ) : (
+        <>
+          <div className="mb-[3px] flex items-center gap-[6px] font-semibold">
+            <AppIcon name="history" size={12} />
+            上下文预算
+          </div>
+          <div>
+            本轮最大输入约 {contextWindow?.max_prompt_tokens ?? 0} tokens
+            {contextWindow?.window_tokens ? `（模型窗口 ${contextWindow.window_tokens}）` : ''}；
+            长对话由框架摘要中间件保留近期消息与关键事实。
+          </div>
+        </>
+      )}
+      {complexity && (
+        <div className="mt-[6px] flex flex-wrap items-center gap-[6px] text-[10px] opacity-80">
+          <span className="rounded-full border border-white/50 bg-white/55 px-[7px] py-[2px]">
+            复杂度 {complexity.level ?? 'unknown'}
+            {typeof complexity.score === 'number' ? ` · ${complexity.score} 分` : ''}
+          </span>
+          {typeof budget.recursion_limit === 'number' && (
+            <span className="rounded-full border border-white/50 bg-white/55 px-[7px] py-[2px]">
+              步数上限 {budget.recursion_limit}
+            </span>
+          )}
+        </div>
+      )}
+      {compressed && (
+        <div className="mt-[5px] text-[10px] opacity-75">
+          收尾时已将 {compressed.evidence_count ?? 0} 条证据压缩为有界上下文
+          {compressed.compressed_bytes ? `（${Math.max(1, Math.round(compressed.compressed_bytes / 1024))} KB）` : ''}。
+        </div>
+      )}
+      {(onContinue || onNarrowScope) && (
+        <div className="mt-[7px] flex flex-wrap gap-[8px]">
+          {onContinue && (
+            <button
+              type="button"
+              onClick={onContinue}
+              className="rounded-[6px] border border-[#d9b95c] bg-white px-[9px] py-[3px] text-[11px] font-medium text-[#7a5a12] hover:bg-[#fffdf5]"
+            >
+              继续完成
+            </button>
+          )}
+          {onNarrowScope && (
+            <button
+              type="button"
+              onClick={onNarrowScope}
+              className="rounded-[6px] border border-[#e4d6b0] bg-transparent px-[9px] py-[3px] text-[11px] text-[#8a6a1f] hover:bg-white/60"
+            >
+              缩小范围
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const VERIFICATION_STATUS_META: Record<string, { label: string; className: string; badge: string }> = {
+  pass: { label: '通过', className: 'border-[#bbf7d0] bg-[#f0fdf4] text-[#166534]', badge: '✓' },
+  warn: { label: '有缺口', className: 'border-[#f0d28a] bg-[#fff8e6] text-[#8a6a1f]', badge: '!' },
+  fail: { label: '未通过', className: 'border-[#fecaca] bg-[#fef2f2] text-[#b42318]', badge: '×' },
+  partial: { label: '部分完成', className: 'border-[#f0d28a] bg-[#fff8e6] text-[#8a6a1f]', badge: '◐' },
+  unknown: { label: '未评估', className: 'border-[#e3e7f1] bg-[#fafbfc] text-[#697187]', badge: '?' },
+};
+
+const CHECK_STATUS_META: Record<string, { icon: string; className: string }> = {
+  pass: { icon: '✓', className: 'text-[#15803d]' },
+  warn: { icon: '!', className: 'text-[#b45309]' },
+  fail: { icon: '×', className: 'text-[#b42318]' },
+  unknown: { icon: '?', className: 'text-[#858b9c]' },
+};
+
+function VerificationPanel({
+  verification,
+  defaultOpen = false,
+}: {
+  verification: TurnVerification;
+  defaultOpen?: boolean;
+}) {
+  if (!verification.status) return null;
+  const meta = VERIFICATION_STATUS_META[verification.status] ?? VERIFICATION_STATUS_META.unknown;
+  const checks = verification.checks ?? [];
+  const gaps = verification.gaps ?? [];
+  return (
+    <div className="rounded-[12px] border border-[#e6e9f0] bg-white px-[12px] py-[10px] shadow-[0_1px_2px_rgba(24,24,26,0.03)]">
+      <CollapsibleSection
+        title="系统校验"
+        badge={`${meta.badge} ${meta.label}${checks.length ? ` · ${checks.length} 项` : ''}`}
+        icon={<AppIcon name="check-list" size={11} />}
+        defaultOpen={defaultOpen}
+      >
+        <div className={cn('mb-[8px] inline-flex w-fit items-center gap-[5px] rounded-full border px-[8px] py-[2px] text-[10px] font-medium', meta.className)}>
+          <span>{meta.badge}</span>
+          <span>{meta.label}</span>
+        </div>
+        <div className="grid gap-[6px]">
+          {checks.map((check, index) => {
+            const checkMeta = CHECK_STATUS_META[check.status] ?? CHECK_STATUS_META.unknown;
+            return (
+              <div key={`${check.key}-${index}`} className="flex items-start gap-[7px] text-[12px] leading-[18px]">
+                <span className={cn('mt-[1px] inline-grid size-[15px] shrink-0 place-items-center rounded-full bg-[#fafbfc] text-[10px] font-semibold', checkMeta.className)}>
+                  {checkMeta.icon}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <span className="text-[#464c5e]">{check.label}</span>
+                  {check.source === 'model_rubric' && (
+                    <span className="ml-[5px] rounded-[4px] bg-[#eef2ff] px-[4px] py-[0px] text-[9px] text-[#4f46e5]">模型</span>
+                  )}
+                  {check.detail && <span className="text-[#9aa1b1]"> · {check.detail}</span>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {gaps.length > 0 && (
+          <div className="mt-[8px] rounded-[8px] border border-[#f0f2f6] bg-[#fafbfc] px-[9px] py-[7px] text-[11px] leading-[17px] text-[#697187]">
+            <div className="mb-[3px] text-[10px] font-semibold text-[#5b6273]">缺口与待确认</div>
+            {gaps.map((gap, index) => <div key={index} className="flex gap-[5px]"><span className="text-[#b3b8c4]">·</span><span>{gap}</span></div>)}
+          </div>
+        )}
+        {verification.semantic_verification?.status === 'unknown' && (
+          <div className="mt-[4px] text-[10px] text-[#9aa1b1]">独立模型校验未完成；以上为结构与引用检查。</div>
+        )}
+      </CollapsibleSection>
+    </div>
+  );
+}
+
+function SubagentPanel({ subagents, defaultOpen = false }: { subagents: TurnSubagent[]; defaultOpen?: boolean }) {
+  if (!subagents.length) return null;
+  return (
+    <CollapsibleSection
+      title="检索子任务"
+      badge={`${subagents.length}`}
+      icon={<AppIcon name="search" size={11} />}
+      defaultOpen={defaultOpen}
+      className="rounded-[12px] border border-[#e6e9f0] bg-white px-[12px] py-[10px] shadow-[0_1px_2px_rgba(24,24,26,0.03)]"
+    >
+      <div className="grid gap-[5px]">
+        {subagents.map((subagent, index) => {
+          const status = subagent.status ?? 'running';
+          const label = status === 'completed' ? '已完成'
+            : status === 'failed' ? '失败'
+              : status === 'abandoned' ? '已中止'
+                : '进行中';
+          const className = status === 'completed' ? 'text-[#15803d]'
+            : status === 'failed' ? 'text-[#b42318]'
+              : status === 'abandoned' ? 'text-[#858b9c]'
+                : 'text-[#1d4ed8]';
+          return (
+            <div key={subagent.tool_call_id ?? `${subagent.name}-${index}`} className="flex items-start gap-[6px] text-[12px] leading-[18px]">
+              <span className={cn('mt-[4px] h-1.5 w-1.5 shrink-0 rounded-full', status === 'running' ? 'animate-pulse bg-[#1d4ed8]' : status === 'completed' ? 'bg-[#16a34a]' : status === 'failed' ? 'bg-[#d20b0b]' : 'bg-[#d1d5db]')} />
+              <div className="min-w-0 flex-1">
+                <span className="text-[#464c5e]">{subagent.name || 'research'}</span>
+                <span className={cn('ml-[6px] text-[10px]', className)}>{label}</span>
+                {subagent.description && (
+                  <div className="truncate text-[11px] text-[#9aa1b1]" title={subagent.description}>
+                    {subagent.description}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </CollapsibleSection>
+  );
+}
+
 /** 参考来源(证据)面板:贴在助手气泡底部,用 citations 样式。 */
 function EvidenceBlock({ evidence }: { evidence: EvidenceItem[] }) {
   const [open, setOpen] = useState(false);
@@ -190,7 +482,7 @@ function EvidenceBlock({ evidence }: { evidence: EvidenceItem[] }) {
         <span>参考来源({evidence.length})</span>
       </button>
       {open && (
-        <div className="grid gap-[8px]">
+        <div className="grid max-h-[420px] gap-[8px] overflow-y-auto pr-[2px]">
           {evidence.map((item, index) => {
             const fileName = citationDisplayTitle(item);
             const preview = citationPreview(item);
@@ -411,6 +703,12 @@ function MessageBubble({
   streaming,
   streamingText,
   traceSteps = [],
+  plan,
+  budget,
+  verification,
+  subagents = [],
+  onContinue,
+  onNarrowScope,
   degradedNotes = [],
   showDiagnostics = true,
   onCreateMemory,
@@ -424,6 +722,10 @@ function MessageBubble({
   exportPreviews = {},
   exportFormats,
 }: Props) {
+  const resolvedPlan = plan ?? msg.plan ?? null;
+  const resolvedBudget = budget ?? msg.budget ?? null;
+  const resolvedVerification = verification ?? msg.verification ?? null;
+  const resolvedSubagents = subagents.length > 0 ? subagents : (msg.subagents ?? []);
   // 流式临时气泡
   if (streaming) {
     const generating = !!streamingText;
@@ -432,9 +734,18 @@ function MessageBubble({
         <div className={chatRowClass('assistant')}>
           <div className={chatBubbleClass('assistant')}>
             <div className="grid gap-[12px]">
+              {showDiagnostics && <AssistantIdentity live />}
               {degradedNotes.length > 0 && <DegradedBanner notes={degradedNotes} />}
               {!generating && (!showDiagnostics || traceSteps.length === 0) && <WaitSpinner />}
+              {showDiagnostics && resolvedPlan && <PlanPanel plan={resolvedPlan} defaultOpen />}
+              {showDiagnostics && resolvedSubagents.length > 0 && <SubagentPanel subagents={resolvedSubagents} defaultOpen />}
               {showDiagnostics && traceSteps.length > 0 && <StepGroup steps={traceSteps} defaultOpen />}
+              {showDiagnostics && resolvedBudget && (
+                <BudgetPanel budget={resolvedBudget} />
+              )}
+              {showDiagnostics && resolvedVerification && (
+                <VerificationPanel verification={resolvedVerification} defaultOpen />
+              )}
               {generating && (
                 <div data-i18n-ignore>
                   <StreamingText content={streamingText} />
@@ -455,8 +766,20 @@ function MessageBubble({
         <div className={chatBubbleClass(msg.role, isError)}>
           {msg.role === 'assistant' ? (
             <div className="grid gap-[12px]" data-i18n-ignore>
+              {showDiagnostics && !isError && <AssistantIdentity />}
+              {showDiagnostics && resolvedPlan && <PlanPanel plan={resolvedPlan} />}
+              {showDiagnostics && resolvedSubagents.length > 0 && <SubagentPanel subagents={resolvedSubagents} />}
               {showDiagnostics && traceSteps.length > 0 && <StepGroup steps={traceSteps} />}
               <MarkdownMessage content={msg.content} />
+              {showDiagnostics && resolvedBudget && (
+                <BudgetPanel budget={resolvedBudget} onContinue={onContinue} onNarrowScope={onNarrowScope} />
+              )}
+              {showDiagnostics && resolvedVerification && (
+                <VerificationPanel
+                  verification={resolvedVerification}
+                  defaultOpen={resolvedVerification.status === 'fail' || resolvedVerification.status === 'partial'}
+                />
+              )}
               <FeedbackActions msg={msg} />
               {msg.memory_context && msg.memory_context.length > 0 && (
                 <MemoryContextBlock memories={msg.memory_context} />
