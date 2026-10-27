@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy as _copy
 import hashlib
+import json
 import logging
 import threading
 from typing import Any, Callable
@@ -39,13 +40,23 @@ def content_hash(evidence: Any) -> str:
 
 
 def dedup_by_content(evidences: list[Any]) -> list[Any]:
-    """Deduplicate by content hash, keeping the highest-scoring copy.
+    """Deduplicate equivalent content within one source identity.
 
-    Ties keep the first-seen entry. Order follows first-seen.
+    Ties keep the first-seen entry.  Identical text from different knowledge
+    bases or source records remains separate so provenance cannot be lost.
     """
-    best: dict[str, Any] = {}
+    best: dict[tuple[str, str], Any] = {}
     for evidence in evidences:
-        key = content_hash(evidence)
+        metadata = getattr(evidence, "metadata", None) or {}
+        source = metadata.get("knowledge_source") if isinstance(metadata, dict) else None
+        source = source if isinstance(source, dict) else {}
+        identity = {
+            key: source.get(key, metadata.get(key))
+            for key in ("tenant_id", "department_id", "kb_id", "local_record_id", "source_content_hash", "index_revision")
+            if source.get(key, metadata.get(key)) not in (None, "")
+        }
+        identity_key = json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)
+        key = (content_hash(evidence), identity_key)
         existing = best.get(key)
         if existing is None or evidence.score > existing.score:
             best[key] = evidence

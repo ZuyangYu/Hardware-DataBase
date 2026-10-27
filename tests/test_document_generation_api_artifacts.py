@@ -119,6 +119,44 @@ class DocGenArtifactApiTests(unittest.TestCase):
             r.headers.get("content-type", ""),
         )
 
+    def test_audit_bundle_download_uses_authorized_service_and_safe_filename(self):
+        self.stub.download_document_artifact_bundle = lambda ctx, artifact_id: b"ZIP-CONTENT"
+        token = self._token("user1")
+        response = self.client.get(
+            "/api/v1/document-generation/artifacts/art-1/audit-bundle?kb=shared",
+            headers=self._auth(token),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.content, b"ZIP-CONTENT")
+        self.assertIn("application/zip", response.headers["content-type"])
+        self.assertIn('document-art-1-with-audit.zip', response.headers['content-disposition'])
+
+        def revoked(*_args):
+            raise PermissionError("source_unavailable")
+
+        self.stub.download_document_artifact_bundle = revoked
+        denied = self.client.get(
+            "/api/v1/document-generation/artifacts/art-1/audit-bundle?kb=shared",
+            headers=self._auth(token),
+        )
+        self.assertEqual(denied.status_code, 403)
+
+    def test_embedded_audit_document_download_uses_authorized_service(self):
+        self.stub.download_document_artifact_with_audit = lambda ctx, artifact_id: b"DOCX-WITH-AUDIT"
+        self.stub.document_generation = SimpleNamespace(store=SimpleNamespace(
+            get_artifact=lambda artifact_id: SimpleNamespace(work_order_id="wo-docx", output_format="docx"),
+            get_work_order=lambda work_order_id: SimpleNamespace(target_format="docx"),
+        ))
+        token = self._token("user1")
+        response = self.client.get(
+            "/api/v1/document-generation/artifacts/art-1/audit-document?kb=shared",
+            headers=self._auth(token),
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.content, b"DOCX-WITH-AUDIT")
+        self.assertIn("application/vnd.openxmlformats-officedocument.wordprocessingml.document", response.headers["content-type"])
+        self.assertIn('document-art-1-with-audit.docx', response.headers['content-disposition'])
+
     def test_conversion_endpoint_queues_pdf_artifact_job(self):
         self.stub.submit_document_artifact_conversion = lambda ctx, artifact_id, *, target_format: SimpleNamespace(
             job_id="conversion-job-1",

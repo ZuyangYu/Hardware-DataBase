@@ -64,6 +64,13 @@ class KnowledgeBaseSummary:
     created_at: str = ""
 
 
+@dataclass(frozen=True)
+class KnowledgeBaseIdentity:
+    kb_id: int
+    kb_name: str
+    department_id: int | None
+
+
 @dataclass
 class AuthSession:
     token: str
@@ -1061,6 +1068,18 @@ class AuthService:
         with closing(self._connect()) as conn:
             row = self._get_kb_row(conn, kb_name, department_id, kb_id)
         return int(row["id"]) if row else None
+
+    def get_knowledge_base_identity(self, kb_id: int) -> KnowledgeBaseIdentity | None:
+        """Read stable resource identity; this does not authorize content access."""
+        with closing(self._connect()) as conn:
+            row = self._get_kb_row(conn, kb_id=kb_id)
+        if row is None:
+            return None
+        return KnowledgeBaseIdentity(
+            kb_id=int(row["id"]),
+            kb_name=str(row["name"]),
+            department_id=int(row["department_id"]) if row["department_id"] is not None else None,
+        )
 
     def get_knowledge_base_owner(
         self,

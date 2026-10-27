@@ -5,6 +5,8 @@
 import { api, uploadFiles, uploadFilesWithProgress } from './client';
 import type {
   ArtifactRevision,
+  DocumentConflict,
+  DocumentConflictDecisionInput,
   DocumentAnalysis,
   DocumentContext,
   DocumentReview,
@@ -233,6 +235,45 @@ export async function fetchDocumentTaskProjection(
   taskId: string,
 ): Promise<DocumentTaskProjection> {
   return api.get<DocumentTaskProjection>(documentTaskProjectionPath(knowledgeBaseName, taskId));
+}
+
+export function documentConflictListPath(knowledgeBaseName: string, workOrderId: string): string {
+  return `/api/v1/document-work-orders/${encodeURIComponent(workOrderId)}/conflicts?kb=${encodeURIComponent(knowledgeBaseName)}`;
+}
+
+export async function fetchDocumentConflicts(
+  knowledgeBaseName: string,
+  workOrderId: string,
+): Promise<DocumentConflict[]> {
+  return api.get<DocumentConflict[]>(documentConflictListPath(knowledgeBaseName, workOrderId));
+}
+
+export function documentConflictPath(
+  knowledgeBaseName: string,
+  workOrderId: string,
+  conflictId: string,
+): string {
+  return `/api/v1/document-work-orders/${encodeURIComponent(workOrderId)}/conflicts/${encodeURIComponent(conflictId)}?kb=${encodeURIComponent(knowledgeBaseName)}`;
+}
+
+export async function fetchDocumentConflict(
+  knowledgeBaseName: string,
+  workOrderId: string,
+  conflictId: string,
+): Promise<DocumentConflict> {
+  return api.get<DocumentConflict>(documentConflictPath(knowledgeBaseName, workOrderId, conflictId));
+}
+
+export async function submitDocumentConflictDecision(
+  knowledgeBaseName: string,
+  workOrderId: string,
+  conflictId: string,
+  body: DocumentConflictDecisionInput,
+): Promise<Record<string, unknown>> {
+  return api.post<Record<string, unknown>>(
+    `${documentConflictPath(knowledgeBaseName, workOrderId, conflictId).replace('?kb=', '/decisions?kb=')}`,
+    body,
+  );
 }
 
 /** Submit an explicit release-review request; this endpoint never approves or publishes. */

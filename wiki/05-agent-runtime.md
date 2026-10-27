@@ -22,8 +22,24 @@
 3. `document_search` 在全库零命中时的一次 **fail-open** `balanced_route` 重试
    （丢掉朴素 source_group 硬过滤，保留冻结的 `source_names` 作用域）。
 
-循环预算：`AGENT_MAX_RETRIEVAL_ROUNDS`（默认 3）→ `recursion_limit`（`deep` 模式 `rounds*12`，
-`fast` 模式 `rounds*6`）。**不是规划器的硬上限**，只是递归预算。
+循环预算：基础 `recursion_limit` 仍由 `AGENT_MAX_RETRIEVAL_ROUNDS` 决定
+（`deep` 模式 `rounds*12`，`fast` 模式 `rounds*6`）；复杂轮次再按
+**问题长度/显式子任务数/附件数/知识库数** 增加预算，并由
+`AGENT_RECURSION_LIMIT_MAX` 封顶。复杂度只影响预算和可选质量机制，不决定工具面或路由。
+步数耗尽后不会只返回错误：先发 `budget_exhausted`，再用已登记证据做一次
+**非工具收尾 synthesis**（`AGENT_PARTIAL_SYNTHESIS_ENABLED`），输出“部分结果 + 缺口”；
+模型失败时回退到确定性证据摘要。`context_compacted` 事件记录证据压缩；压缩会优先保留
+短附件/每个来源的代表块，避免把一份短 BOM 只截成前两行。收尾答案会追加回 checkpoint，
+下一轮追问仍能看到它。复杂轮次还会提供可选的只读 research 子代理
+（`AGENT_RESEARCH_SUBAGENT_ENABLED`）和独立语义 rubric 校验
+（`AGENT_VERIFIER_ENABLED`，同一模型、独立调用，不是发布门禁）。
+模型输出 `[K6]`/`[A2]`/`【知识库:6】` 时，会在持久化前归一化为 `[6]`，引用面板继续按
+evidence metadata 区分附件与知识库。
+
+`deep` 轮次向模型提供 `write_todos`（TodoListMiddleware）；模型自行决定是否使用。
+计划、预算、子任务和校验结果通过 `plan_created/plan_updated`、`budget`、
+`subagent_started/completed`、`verification` 事件下发，并投影到 turn summary，
+刷新后仍可从消息恢复。子代理只返回摘要/状态，不把原始上下文写进聊天区。
 
 ---
 
@@ -299,7 +315,7 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 | `diagnostics` | 每工具调用：`tool_name/status/hit_count/top_k/scoped/duration` |
 | `token usage` | `get_last_token_usage_summary()`（来自 model gateway 账本） |
 | `claim_coverage` | `_build_claim_coverage`：按回答里的 `[n]` 与证据 `citation_number` 对齐去重，状态为 `citation_valid`，仅表示编号有效 |
-| `verification` | 记录无效引用与未引用段落；`semantic_verification_status=not_evaluated`，有证据时 `grounded=null`，`conflicts/unsupported_claims/weak_claims=null`；证据引用覆盖率为 distinct cited evidence / available evidence |
+| `verification` | 简单轮次保留旧的引用诊断；复杂/部分轮次为 v2 结构：`status`（pass/warn/fail/partial）、确定性 `checks`（回答非空、证据、引用有效、来源区分、段落覆盖、预算）、可选 `semantic_verification`（模型 rubric）与 `gaps`。复杂轮次的证据引用覆盖率为 distinct cited evidence / available evidence |
 | `sufficiency_status` | 无证据为 `insufficient`；有证据为 `not_evaluated`，实际语义支持与冲突由固定数据集评测验证 |
 
 降级事件（`degraded`）的 stage：
@@ -307,7 +323,7 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 | stage | 触发 |
 |---|---|
 | `tool_<name>` | 工具异常（返回空证据 + `friendly_error_message`） |
-| `agent_loop` | `GraphRecursionError`（工具步数用尽）→ 追加 `_agent_step_budget_answer(rt)`（证据/来源计数 + 收窄建议），turn 不失败 |
+| `agent_loop` | `GraphRecursionError`（工具步数用尽）→ `budget_exhausted`；优先用 `_synthesize_partial_answer` 生成部分交付，失败才追加 `_agent_step_budget_answer(rt)`（证据/来源计数 + 收窄建议），turn 不失败 |
 | `attachment_search` / `attachment_visual` | 附件检索/视觉失败（视觉失败另记 `record_attachment("visual_failure","degraded")`） |
 
 控制路径的 `stage` 状态：`blocked`/`error` 标失败原因码
@@ -384,9 +400,13 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `AGENT_MAX_RETRIEVAL_ROUNDS` | `3` | → recursion_limit（deep×12 / fast×6） |
+| `AGENT_MAX_RETRIEVAL_ROUNDS` | `3` | 基础 recursion_limit（deep×12 / fast×6） |
+| `AGENT_COMPLEXITY_BUDGET_ENABLED` / `AGENT_RECURSION_LIMIT_MAX` | `true` / `72` | 复杂度感知预算与封顶 |
+| `AGENT_PARTIAL_SYNTHESIS_ENABLED` / `..._MAX_EVIDENCE_BYTES` / `..._MAX_TOKENS` | `true` / `24000` / `8192` | 步数耗尽后的部分答案收尾、证据压缩与输出预算 |
+| `AGENT_VERIFIER_ENABLED` / `AGENT_VERIFIER_MIN_ANSWER_CHARS` | `true` / `600` | 复杂回答的独立 rubric 校验 |
+| `AGENT_RESEARCH_SUBAGENT_ENABLED` | `true` | 复杂 deep 任务提供只读 research 子代理 |
 | `FINAL_TOP_K` | `5` | 后端默认 top_k（agent 实际用 `rt.top_k`：deep 8 / fast 5） |
-| `AGENT_EVIDENCE_BUDGET` / `AGENT_ATTACHMENT_EVIDENCE_BUDGET` | `30` / `80` | 证据堆预算 |
+| `AGENT_EVIDENCE_BUDGET` / `AGENT_ATTACHMENT_EVIDENCE_BUDGET` / `AGENT_HARDWARE_EVIDENCE_BUDGET` | `30` / `80` / `80` | 证据堆预算；硬件问题按位号/表号/阈值识别后提高 |
 | `AGENT_MODEL_MAX_INPUT_TOKENS` | `65536` | 上下文压缩触发（0=关） |
 | `AGENT_TEMPERATURE` / `AGENT_TIMEOUT_SECONDS` | `0.2` / `120` | 模型参数 |
 | `AGENT_RATE_LIMIT_MAX_RETRIES` | `4` | custom 提供商重试（ollama 为 0） |
@@ -401,7 +421,33 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 | `REVIEWER_AGENT_ENABLED` / `RESEARCH_AGENT_ENABLED` | `false` / `false` | 子代理（未接线） |
 | `AGENT_CHECKPOINT_BACKEND` / `_DB_PATH` / `_DATABASE_URL` / `_POOL_SIZE` | `sqlite` / `storage/agent_checkpoints.db` / `""` / `4` | checkpoint |
 | `SHARED_RETRIEVAL_EXECUTOR_ENABLED` + `RETRIEVAL_*` | `false` + 8/256/4/30/10 | 共享检索池 |
+| `MULTI_KB_CHAT_ENABLED` / `MULTI_KB_MAX_SOURCES` | `false` / `4` | 多库独立开关与选库上限；前端原始多选入口已下线，后端保留给后续“项目空间”挂载 |
 | `HDB_WIKI_SEARCH_EXPAND` | 未设置 | 环境变量级覆盖 `wiki_search` 的 `include_linked` |
+
+API 与 Worker 在启动和运行时启用时初始化同一个进程级检索池。多库开关不改变
+旧 `document_search_batch` 的共享池/本地池分支。多库启用但池未初始化成功时，
+就绪探针返回 `multi_kb_retrieval=down`，服务层以 `feature_unavailable` 拒绝使用；
+停止进程按 `RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS` 回收，运行中的 Python 调用不会
+被强制终止。关闭多库开关立即阻止新多库调用，已运行调用仍按取消/截止边界结束。
+
+`services/knowledge_scope_models.py` 定义独立于附件 `source_scope` 的多库选择契约。
+`answer`/`compose` 有且仅有一个 `primary`，其余为 `reference`/`standard`；
+`compare` 至少两个来源且均为 `peer`。`primary` 是会话锚定库：它决定会话归属，
+不参与检索排序、不预留证据席位；检索与融合时所有已选库同级。
+文档创作/冲突策略使用独立的 `authoritative` 字段；它必须由可信元数据显式设置，
+不能由会话锚定角色 `primary` 自动推导。
+`KnowledgeScopeResolver` 按稳定 KB ID 读取真实身份、复核当前用户部门与内容权限，
+任一来源拒绝即整体拒绝；快照及 selection hash 不能代替实时授权。每库上下文只携带
+自己的权限，不复用另一个来源的可变 metadata。会话/轮次已保存选择和授权快照，
+首轮范围绑定采用事务，后续修改范围需新会话；新协议幂等键与请求内容绑定。
+PG 控制面版本为 2，部署前使用 `scripts/production_hardening/migrate_multi_kb_scope.py`
+依次检查、应用、验证加法迁移；脚本默认只检查。
+
+> 2026-10：前端原始“参考库”多选入口已下线，聊天默认单库；后端
+> `knowledge_scope` / 多库检索池保留，作为后续“项目空间”挂载的基础。
+> 在项目空间设计完成前，不要把多选库入口重新暴露给普通用户；如需联调，
+> 仅通过 API/脚本创建带 `knowledge_scope` 的会话，并保持
+> `MULTI_KB_CHAT_ENABLED=false`。
 
 ---
 

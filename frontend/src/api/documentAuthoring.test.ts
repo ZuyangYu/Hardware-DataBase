@@ -15,6 +15,8 @@ import {
   buildClarificationAnswerRequest,
   buildTemplateAnalyzeRequest,
   completeDocumentRevision,
+  fetchDocumentConflict,
+  fetchDocumentConflicts,
   createDocumentRevision,
   fetchGenerationSession,
   fetchDocumentTaskProjection,
@@ -23,6 +25,7 @@ import {
   requestDocumentRelease,
   resumeDocumentTask,
   submitDocumentReviewDecision,
+  submitDocumentConflictDecision,
 } from './documentAuthoring';
 import { api, uploadFiles, uploadFilesWithProgress } from './client';
 import type { DocumentAnalysis } from './types';
@@ -194,6 +197,40 @@ describe('buildClarificationAnswerRequest', () => {
 });
 
 describe('DocumentTask projection and revision requests', () => {
+  it('lists, reads, and decides a work-order conflict through nested endpoints', async () => {
+    const cases = [{ conflict_id: 'conflict-1' }];
+    const detail = { conflict_id: 'conflict-1', status: 'open' };
+    const decision = { decision_id: 'decision-1', status: 'resolved' };
+    vi.mocked(api.get).mockResolvedValueOnce(cases).mockResolvedValueOnce(detail);
+    vi.mocked(api.post).mockResolvedValue(decision);
+
+    await expect(fetchDocumentConflicts('硬件 KB', 'wo/a')).resolves.toBe(cases);
+    await expect(fetchDocumentConflict('硬件 KB', 'wo/a', 'conflict/1')).resolves.toBe(detail);
+    await expect(submitDocumentConflictDecision('硬件 KB', 'wo/a', 'conflict/1', {
+      expected_fingerprint: 'f'.repeat(64),
+      source_snapshot_hash: 's'.repeat(64),
+      evidence_set_hash: 'e'.repeat(64),
+      expected_conflict_version: 2,
+      action: 'choose_claim',
+      selected_claim_id: 'claim-a',
+      reason: 'reviewed',
+      idempotency_key: 'decision-1',
+    })).resolves.toBe(decision);
+
+    expect(api.get).toHaveBeenNthCalledWith(
+      1,
+      '/api/v1/document-work-orders/wo%2Fa/conflicts?kb=%E7%A1%AC%E4%BB%B6%20KB',
+    );
+    expect(api.get).toHaveBeenNthCalledWith(
+      2,
+      '/api/v1/document-work-orders/wo%2Fa/conflicts/conflict%2F1?kb=%E7%A1%AC%E4%BB%B6%20KB',
+    );
+    expect(api.post).toHaveBeenCalledWith(
+      '/api/v1/document-work-orders/wo%2Fa/conflicts/conflict%2F1/decisions?kb=%E7%A1%AC%E4%BB%B6%20KB',
+      expect.objectContaining({ reason: 'reviewed', action: 'choose_claim' }),
+    );
+  });
+
   it('requests release review without using the approval endpoint', async () => {
     const request = { event_id: 'release-request-1' };
     vi.mocked(api.post).mockResolvedValue(request);

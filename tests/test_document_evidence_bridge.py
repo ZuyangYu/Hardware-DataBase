@@ -101,7 +101,7 @@ def test_document_retriever_uses_attachment_provider_without_calling_kb():
         {"query": "CAN_RX", "asset_ids": ["asset-1"], "limit": src.settings.FINAL_TOP_K}
     ]
     assert [item.metadata["source_type"] for item in outcome.evidences] == [
-        "chat_attachment"
+        "attachment"
     ]
 
 
@@ -137,7 +137,7 @@ def test_document_retriever_combines_frozen_kb_and_attachment_evidence():
     pipeline.backend.retrieve.assert_called_once()
     assert [item.metadata["source_type"] for item in outcome.evidences] == [
         "knowledge_base",
-        "chat_attachment",
+        "attachment",
     ]
 
 
@@ -171,7 +171,7 @@ def test_combined_document_retrieval_does_not_widen_an_empty_kb_snapshot():
 
     pipeline.backend.retrieve.assert_not_called()
     assert [item.metadata["source_type"] for item in outcome.evidences] == [
-        "chat_attachment"
+        "attachment"
     ]
 
 
@@ -248,7 +248,7 @@ def test_knowledge_base_outcome_accepts_only_declared_attachment_provenance():
     )
 
     assert outcome.status == "success_with_hits"
-    assert outcome.evidences[0].metadata["source_type"] == "chat_attachment"
+    assert outcome.evidences[0].metadata["source_type"] == "attachment"
 
     with pytest.raises(PermissionError, match="attachment"):
         DocumentGenerationService.build_knowledge_base_retrieval_outcome(

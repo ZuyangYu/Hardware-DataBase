@@ -13,6 +13,7 @@ import tempfile
 import unittest
 import uuid
 from contextlib import closing
+from unittest.mock import patch
 
 import psycopg
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
@@ -100,6 +101,34 @@ class ConversationFacadeLifecycleTests(unittest.TestCase):
             self.assertTrue(report.ok, report.failures)
         self.service = PostgresConversationService(self.dsn, pool_size=2)
         self.addCleanup(self.service.close)
+
+    def test_only_single_kb_completion_enters_project_memory_outbox(self):
+        from tests.test_multi_kb_store_contract import snapshot
+
+        with patch.multiple(src.settings, MEMORY_ENABLED=True, MEMORY_EXTRACTION_ENABLED=True,
+                            RESULT_EXPORT_ENABLED=False):
+            for multi_kb in (False, True):
+                with self.subTest(multi_kb=multi_kb):
+                    scope = snapshot(1) if multi_kb else None
+                    session = self.service.create_session(
+                        1, "KB101", department_id=7, kb_id=101,
+                        knowledge_selection=scope.selection() if scope else None,
+                    )
+                    turn = self.service.create_turn(1, session.id, "compare supplies", knowledge_scope=scope)
+                    claimed = self.service.claim_turn_result(1, turn.id, "memory-isolation-worker")
+                    self.assertEqual(claimed.status, "claimed")
+                    completed = self.service.complete_turn(
+                        1, turn.id, "answer", {"status": "success"},
+                        worker_id="memory-isolation-worker", fencing_token=claimed.turn.fencing_token,
+                        expected_generation=claimed.turn.session_generation,
+                    )
+                    self.assertEqual(completed.answer, "answer")
+                    with psycopg.connect(self.dsn) as conn:
+                        count = conn.execute(
+                            "SELECT COUNT(*) FROM memory_jobs WHERE session_id = %s AND job_kind = 'project_reflection'",
+                            (session.id,),
+                        ).fetchone()[0]
+                    self.assertEqual(count, 0 if multi_kb else 1)
 
     def test_full_turn_lifecycle_on_postgres(self):
         service = self.service

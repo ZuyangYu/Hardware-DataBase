@@ -20,6 +20,7 @@ from src.document_authoring.chat_context import DocumentAuthoringContext, Docume
 from src.document_authoring.icd_scope_decision import ICD_BLOCKING_SCOPE_EXCEPTION_KINDS
 from src.document_authoring.job_store import DocumentAuthoringJobStore
 from src.document_authoring.planning.intake import OutputSpecIntakeService
+from src.document_authoring.conflicts.governance import REVIEW_WORKER_CONTRACT, requires_review_contract
 
 
 def _v2_enabled() -> bool:
@@ -1356,13 +1357,13 @@ class DocumentAuthoringToolset:
                 generation_session_id=session.session_id,
             )
         task_id = str(prepared.get("task_id") or "").strip() or None
+        authoring_store = getattr(
+            getattr(self.pipeline, "document_generation", None), "store", None,
+        )
+        get_work_order = getattr(authoring_store, "get_work_order", None)
+        persisted_order = get_work_order(work_order_id) if callable(get_work_order) else None
         if task_id is None:
-            authoring_store = getattr(
-                getattr(self.pipeline, "document_generation", None), "store", None,
-            )
-            get_work_order = getattr(authoring_store, "get_work_order", None)
-            if callable(get_work_order):
-                persisted_order = get_work_order(work_order_id)
+            if persisted_order is not None:
                 task_id = str(getattr(persisted_order, "task_id", "") or "").strip() or None
         if stage != "ready":
             result = DocumentToolResult(
@@ -1402,6 +1403,7 @@ class DocumentAuthoringToolset:
                     "generation_session_id": session.session_id,
                     "execution_mode": effective_execution_mode,
                     "requested_output_format": requested_output_format,
+                    **({'required_worker_contract': REVIEW_WORKER_CONTRACT} if requires_review_contract(persisted_order) else {}),
                 },
             )
         except ValueError:
@@ -1684,6 +1686,7 @@ class DocumentAuthoringToolset:
                     "knowledge_base_name": self.context.knowledge_base_name,
                     "user_id": self.context.owner_user_id,
                     "execution_mode": execution_mode,
+                    **({'required_worker_contract': REVIEW_WORKER_CONTRACT} if requires_review_contract(order) else {}),
                 },
             )
         except PermissionError:

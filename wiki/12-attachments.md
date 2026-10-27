@@ -439,14 +439,20 @@ runner 对批准/取消走**确定性路径**（不调模型，`_direct_attachme
 - **turn 创建**：`resolve_refs_for_turn` 冻结快照；`parse_status ∈ {queued,running}` →
   turn `waiting_for_attachments`；blocked id → 400 `attachment_unavailable`；
 - **系统提示词**：作用域行（≤5 个附件点名 + 只能用 `attachment_*` 工具读取 + 可写时的完整操作规则）；
-- **预检**：`_prefetch_attachment_context`：`attachment_list()` + 最多 6 个确定性查询
-  （文件名 stem、≥3 或数字 token、join 词、原查询 ≤160 字符），保留 ≤4 个含 `<evidence` 的块；
-  包在 `## 当前轮附件预检` + `<untrusted_attachment>` 内，≤12000 字符，任一步失败 fail-open；
+- **按需读取**：服务端不再在模型第一轮前自动列出/检索附件；模型通过
+  `attachment_list` / `attachment_search` / `attachment_read` 自己决定读取时机；
 - **预算**：有附件时 `max(AGENT_EVIDENCE_BUDGET=30, AGENT_ATTACHMENT_EVIDENCE_BUDGET=80)`；
 - **capability**：`attachment.search`（读族）/ `attachment.revise`（编辑族）；
   `filter_tools_by_capability` 对未映射工具 fail-closed；`attachment_only` 时移除全部 `knowledge_base.*`，
   `knowledge_base_only` 时移除全部 `attachment.*`；
 - **叙述白名单**不含 `attachment_edit` / `request_attachment_release`（只有受治理执行器能写）。
+
+---
+
+## 9.1 服务端预取已移除（2026-10-23）
+
+模型第一轮前不再执行 `attachment_list` 或附件检索预览。附件内容只能由模型显式调用
+`attachment_*` 工具取得；正式证据、引用编号和预算仍由 `timed_tool_call` 统一处理。
 
 ---
 

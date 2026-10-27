@@ -11,6 +11,20 @@ from __future__ import annotations
 
 from src.core.auth import AuthUser, AuthService, build_request_context
 from src.pipelines.document_rag.schemas import RequestContext
+from src.services.knowledge_scope_models import AuthorizedKnowledgeSource
+
+
+def build_context_for_knowledge_source(
+    user: AuthUser,
+    source: AuthorizedKnowledgeSource,
+    auth: AuthService | None = None,
+    *,
+    tenant_key: str = "default",
+) -> RequestContext:
+    """Delegate stable-ID authorization to the service shared with Workers."""
+    from src.services.knowledge_scope import KnowledgeScopeResolver
+
+    return KnowledgeScopeResolver(auth or AuthService(), tenant_key=tenant_key).context_for_source(user.id, source)
 
 
 class _SessionState(dict):

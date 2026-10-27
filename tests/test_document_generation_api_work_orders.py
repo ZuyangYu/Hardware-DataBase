@@ -125,6 +125,86 @@ class DocGenWorkOrderApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["run_id"], "bg-resume")
 
+    def test_nested_conflict_routes_bind_work_order_and_decision_payload(self):
+        captured = {}
+        self.stub.list_document_conflicts = lambda ctx, work_order_id: [
+            {"conflict_id": "conflict-1", "work_order_id": work_order_id}
+        ]
+        self.stub.get_document_conflict = lambda ctx, conflict_id, **kwargs: {
+            "conflict_id": conflict_id,
+            "work_order_id": "wo-1",
+        }
+
+        def submit(ctx, conflict_id, **kwargs):
+            captured.update(kwargs)
+            return {"conflict_id": conflict_id, "status": "resolved"}
+
+        self.stub.submit_document_conflict_decision = submit
+        t = self._token("admin1")
+        headers = self._auth(t)
+        listed = self.client.get(
+            "/api/v1/document-work-orders/wo-1/conflicts?kb=shared",
+            headers=headers,
+        )
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(listed.json()[0]["work_order_id"], "wo-1")
+        detail = self.client.get(
+            "/api/v1/document-work-orders/wo-1/conflicts/conflict-1?kb=shared",
+            headers=headers,
+        )
+        self.assertEqual(detail.status_code, 200, detail.text)
+        submitted = self.client.post(
+            "/api/v1/document-work-orders/wo-1/conflicts/conflict-1/decisions?kb=shared",
+            headers=headers,
+            json={
+                "expected_fingerprint": "f" * 64,
+                "source_snapshot_hash": "s" * 64,
+                "evidence_set_hash": "e" * 64,
+                "expected_conflict_version": 3,
+                "action": "choose_claim",
+                "selected_claim_id": "claim-1",
+                "reason": "reviewed",
+                "idempotency_key": "decision-1",
+            },
+        )
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        self.assertEqual(captured["expected_snapshot_hash"], "s" * 64)
+        self.assertEqual(captured["expected_evidence_set_hash"], "e" * 64)
+        self.assertEqual(captured["expected_conflict_version"], 3)
+        self.assertEqual(captured["decision"]["rationale"], "reviewed")
+
+    def test_conflict_decisions_reject_extra_fields_and_disallowed_actions(self):
+        headers = self._auth(self._token('admin1'))
+        body = dict(expected_fingerprint='f', source_snapshot_hash='s', evidence_set_hash='e', action='defer', idempotency_key='key')
+        path = '/api/v1/document-work-orders/wo-1/conflicts/conflict-1/decisions?kb=shared'
+        called = []
+
+        def submit(*args, **kwargs):
+            called.append(kwargs)
+            raise ValueError('conflict_decision_action_not_allowed')
+
+        self.stub.submit_document_conflict_decision = submit
+        invalid = self.client.post(path, headers=headers, json={**body, 'approved': True})
+        self.assertEqual(invalid.status_code, 422, invalid.text)
+        self.assertEqual(called, [])
+        disallowed = self.client.post(path, headers=headers, json=body)
+        self.assertEqual(disallowed.status_code, 422, disallowed.text)
+
+    def test_artifact_audit_revalidates_access_and_maps_source_changes(self):
+        headers = self._auth(self._token('admin1'))
+        path = '/api/v1/document-generation/artifacts/audit-1/audit?kb=shared'
+        self.stub.document_artifact_audit = lambda ctx, artifact_id: {'artifact_id': artifact_id, 'release_blocked': True}
+        response = self.client.get(path, headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['artifact_id'], 'audit-1')
+        for error, status in [(PermissionError('source_unavailable'), 403), (ValueError('source_changed'), 409)]:
+            with self.subTest(status=status):
+                def fail(*_args):
+                    raise error
+                self.stub.document_artifact_audit = fail
+                denied = self.client.get(path, headers=headers)
+                self.assertEqual(denied.status_code, status, denied.text)
+
     def test_delete_system_admin_forbidden_and_employee_forwards_reason(self):
         self.stub.delete_knowledge_base_document_work_order = lambda ctx, work_order_id, *, reason: {
             "work_order_id": work_order_id,

@@ -81,6 +81,24 @@ def test_human_approval_enqueues_same_run_and_replays_same_job(tmp_path):
     }
 
 
+def test_conflict_resume_replay_is_idempotent_across_http_context_sessions(tmp_path):
+    pipeline = object.__new__(AppPipeline)
+    service = _DecisionService()
+    pipeline.document_generation = service
+    pipeline.document_job_store = DocumentAuthoringJobStore(str(tmp_path / "jobs.db"))
+
+    first = pipeline._queue_document_authoring_resume(
+        _ctx(), service.order, "harness-run-a", client_request_id="conflict-decision:decision-a"
+    )
+    replay_ctx = _ctx()
+    replay_ctx.session_id = "a-different-http-session"
+    replay = pipeline._queue_document_authoring_resume(
+        replay_ctx, service.order, "harness-run-a", client_request_id="conflict-decision:decision-a"
+    )
+
+    assert first.job_id == replay.job_id
+
+
 def test_reject_decision_does_not_create_resume_job(tmp_path):
     pipeline = object.__new__(AppPipeline)
     service = _DecisionService()

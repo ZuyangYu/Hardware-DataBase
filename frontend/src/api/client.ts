@@ -21,11 +21,14 @@ export class ApiError extends Error {
     // "Internal Server Error" text to users (the default API port is 8001).
     const proxyUnavailable =
       status === 500 && !body.trim() && statusText.toLowerCase() === 'internal server error';
+    const gatewayUnavailable = status === 502 || status === 503 || status === 504;
     super(
       parsedMessage ||
         (proxyUnavailable
           ? '无法连接后端服务，请确认 API 已在 8001 端口运行'
-          : statusText || `HTTP ${status}`),
+          : gatewayUnavailable
+            ? '服务暂时不可用，请稍后重试'
+            : statusText || `HTTP ${status}`),
     );
     this.name = 'ApiError';
     this.status = status;

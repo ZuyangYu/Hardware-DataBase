@@ -28,6 +28,8 @@ class ChatSession:
     created_at: str
     updated_at: str
     document_context: dict | None = None
+    knowledge_selection: dict | None = None
+    knowledge_selection_hash: str = ""
 
 
 @dataclass
@@ -90,6 +92,9 @@ class ChatTurn:
     session_generation: int = 0
     # Server-generated identity of the execution attempt that owns this turn.
     attempt_id: str = ""
+    knowledge_scope: dict | None = None
+    knowledge_selection_hash: str = ""
+    knowledge_request_fingerprint: str = ""
 
 
 # A turn waits here while its required chat attachments are still parsing.
@@ -97,6 +102,11 @@ TURN_STATUS_WAITING_FOR_ATTACHMENTS = "waiting_for_attachments"
 
 # Non-terminal statuses that keep later turns of the same session queued.
 TURN_STATUSES_NON_TERMINAL = ("pending", "streaming", "cancelling", "waiting_for_attachments")
+TURN_STATUSES_NON_TERMINAL += tuple(f"multi_kb_{status}" for status in TURN_STATUSES_NON_TERMINAL)
+
+def canonical_turn_status(status: str) -> str:
+    """Expose compatible UI states while old consumers cannot claim new work."""
+    return status.removeprefix("multi_kb_") if status in TURN_STATUSES_NON_TERMINAL else status
 
 
 class StaleTurnOwner(RuntimeError):
@@ -218,6 +228,7 @@ class ConversationService:
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
@@ -359,6 +370,9 @@ class ConversationService:
             self._ensure_column(conn, "chat_sessions", "department_id", "INTEGER")
             self._ensure_column(conn, "chat_sessions", "kb_id", "INTEGER")
             self._ensure_column(conn, "chat_sessions", "document_context_json", "TEXT NOT NULL DEFAULT '{}'" )
+            from src.storage.control_plane.knowledge_scope_migration import apply_sqlite as migrate_scope
+
+            migrate_scope(conn)
             self._ensure_column(conn, "chat_turns", "department_id", "INTEGER")
             self._ensure_column(conn, "chat_turns", "kb_id", "INTEGER")
             self._ensure_column(conn, "chat_turns", "worker_id", "TEXT NOT NULL DEFAULT ''")
@@ -637,7 +651,13 @@ class ConversationService:
         title: str = "新对话",
         department_id: int | None = None,
         kb_id: int | None = None,
+        *,
+        knowledge_selection=None,
+        tenant_key: str = "default",
     ) -> ChatSession:
+        from src.services.knowledge_scope_persistence import selection_for_session
+
+        selection, scope_hash = selection_for_session(knowledge_selection, user_id=user_id, anchor_kb_id=kb_id, tenant_key=tenant_key)
         now = utc_now()
         with closing(self._connect()) as conn:
             if department_id is None:
@@ -645,10 +665,11 @@ class ConversationService:
                 department_id = owner["department_id"] if owner else None
             cursor = conn.execute(
                 """
-                INSERT INTO chat_sessions (user_id, kb_name, department_id, kb_id, title, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO chat_sessions (user_id, kb_name, department_id, kb_id, title, created_at, updated_at,
+                    knowledge_selection_json, knowledge_selection_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, kb_name, department_id, kb_id, title, now, now),
+                (user_id, kb_name, department_id, kb_id, title, now, now, json.dumps(selection, ensure_ascii=False), scope_hash),
             )
             row = conn.execute("SELECT * FROM chat_sessions WHERE id = ?", (cursor.lastrowid,)).fetchone()
         return row_to_session(row)
@@ -914,6 +935,9 @@ class ConversationService:
             src.settings, "MEMORY_EXTRACTION_ENABLED", True
         ):
             return
+        if str(session["knowledge_selection_hash"] or ""):
+            # P0-P2 multi-KB turns must not enter the project-memory namespace.
+            return
         department_id = session["department_id"]
         kb_id = session["kb_id"]
         if department_id in (None, "") or kb_id in (None, ""):
@@ -1022,6 +1046,8 @@ class ConversationService:
         document_context: dict | Any | None = None,
         attachment_ids: list[str] | None = None,
         source_scope: str = "auto",
+        *,
+        knowledge_scope=None,
     ) -> ChatTurn:
         """Persist one user request and its assistant placeholder atomically.
 
@@ -1108,14 +1134,25 @@ class ConversationService:
                 ).fetchone()
                 if session_row is None:
                     raise PermissionError("chat session does not belong to current user")
+                from src.services.knowledge_scope_persistence import (
+                    turn_scope_payload, request_fingerprint, require_replay_fingerprint,
+                    initial_scope_summary,
+                )
+
+                scope = turn_scope_payload(knowledge_scope, user_id=user_id, anchor_kb_id=session_row["kb_id"], stored_hash=session_row["knowledge_selection_hash"])
+                fingerprint = request_fingerprint(scope=scope, query=query, source_scope=effective_scope, attachment_ids=attachment_ids, document_context=document_context or {}, query_mode=query_mode, wiki_assist=wiki_assist)
                 if request_id:
                     existing = conn.execute(
                         "SELECT * FROM chat_turns WHERE session_id = ? AND client_request_id = ?",
                         (session_id, request_id),
                     ).fetchone()
                     if existing is not None:
+                        require_replay_fingerprint(existing["knowledge_request_fingerprint"], fingerprint)
                         conn.execute("COMMIT")
                         return row_to_turn(existing)
+                if scope:
+                    selection = {"version": scope["version"], "purpose": scope["purpose"], "sources": [{"kb_id": s["kb_id"], "role": s["role"]} for s in scope["sources"]]}
+                    conn.execute("UPDATE chat_sessions SET knowledge_selection_json = ?, knowledge_selection_hash = ? WHERE id = ?", (json.dumps(selection, ensure_ascii=False), scope["selection_hash"], session_id))
                 keys = session_row.keys()
                 if "next_turn_sequence" in keys:
                     turn_sequence = int(session_row["next_turn_sequence"] or 0)
@@ -1161,6 +1198,8 @@ class ConversationService:
                 initial_status = (
                     TURN_STATUS_WAITING_FOR_ATTACHMENTS if waiting else "pending"
                 )
+                if scope:
+                    initial_status = f"multi_kb_{initial_status}"
                 required_ids = [ref["attachment_id"] for ref in attachment_refs]
                 conn.execute(
                     """
@@ -1169,8 +1208,9 @@ class ConversationService:
                         department_id, kb_id, status, client_request_id, turn_sequence,
                         trace_context_json, created_at,
                         document_context_json, export_plan_json, source_scope, required_attachment_ids,
-                        wiki_assist
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        wiki_assist, knowledge_scope_json, knowledge_selection_hash, knowledge_request_fingerprint,
+                        summary_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         turn_id,
@@ -1192,6 +1232,10 @@ class ConversationService:
                         effective_scope,
                         json.dumps(required_ids, ensure_ascii=False),
                         1 if wiki_assist else 0,
+                        json.dumps(scope, ensure_ascii=False),
+                        scope.get("selection_hash", ""),
+                        fingerprint,
+                        json.dumps(initial_scope_summary(scope), ensure_ascii=False),
                     ),
                 )
                 if attachment_refs:
@@ -1273,7 +1317,7 @@ class ConversationService:
                     SELECT COUNT(*) AS total FROM chat_turns t
                     JOIN chat_sessions s ON s.id = t.session_id
                     WHERE s.user_id = ? AND t.session_id = ?
-                      AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                      AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                     """,
                     (int(user_id), int(session_id)),
                 ).fetchone()
@@ -1283,7 +1327,7 @@ class ConversationService:
                     SELECT COUNT(*) AS total FROM chat_turns t
                     JOIN chat_sessions s ON s.id = t.session_id
                     WHERE s.user_id = ?
-                      AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                      AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                     """,
                     (int(user_id),),
                 ).fetchone()
@@ -1308,7 +1352,7 @@ class ConversationService:
                 SELECT t.* FROM chat_turns t
                 JOIN chat_sessions s ON s.id = t.session_id
                 WHERE t.session_id = ? AND s.user_id = ?
-                  AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                  AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                 ORDER BY t.created_at
                 """,
                 (session_id, user_id),
@@ -1395,12 +1439,13 @@ class ConversationService:
                 cursor = conn.execute(
                     """
                     UPDATE chat_turns
-                    SET status = ?,
+                    SET status = CASE WHEN knowledge_selection_hash <> '' AND ? = 'pending' THEN 'multi_kb_pending' ELSE ? END,
                         error_message = ?,
                         finished_at = CASE WHEN ? = 'failed' THEN ? ELSE finished_at END
-                    WHERE id = ? AND status = 'waiting_for_attachments'
+                    WHERE id = ? AND status IN ('waiting_for_attachments', 'multi_kb_waiting_for_attachments')
                     """,
                     (
+                        to_status,
                         to_status,
                         error_message[:1000] if to_status == "failed" else "",
                         to_status, now, turn_id,
@@ -1466,7 +1511,7 @@ class ConversationService:
             rows = conn.execute(
                 """
                 SELECT id FROM chat_turns
-                WHERE status = 'waiting_for_attachments'
+                WHERE status IN ('waiting_for_attachments', 'multi_kb_waiting_for_attachments')
                   AND datetime(created_at) < datetime('now', ?)
                 ORDER BY created_at, id
                 LIMIT ?
@@ -1513,7 +1558,7 @@ class ConversationService:
             rows = conn.execute(
                 """
                 SELECT id FROM chat_turns
-                WHERE status = 'pending' AND cancel_requested = 0
+                WHERE status IN ('pending', 'multi_kb_pending') AND cancel_requested = 0
                   AND datetime(created_at) < datetime('now', ?)
                 ORDER BY created_at, id
                 LIMIT ?
@@ -1532,7 +1577,7 @@ class ConversationService:
                         SET status = 'failed',
                             error_message = '排队等待超时，本轮请求未执行；请稍后重试。',
                             finished_at = ?
-                        WHERE id = ? AND status = 'pending'
+                        WHERE id = ? AND status IN ('pending', 'multi_kb_pending')
                         """,
                         (now, turn_id),
                     )
@@ -1592,13 +1637,13 @@ class ConversationService:
                 """
                 SELECT prior.id, prior.status FROM chat_turns prior
                 WHERE prior.session_id = ? AND prior.turn_sequence < ?
-                  AND prior.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                  AND prior.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                 ORDER BY prior.turn_sequence DESC
                 LIMIT 1
                 """,
                 (int(turn["session_id"]), int(turn["turn_sequence"] or 0)),
             ).fetchone()
-        if str(turn["status"]) == TURN_STATUS_WAITING_FOR_ATTACHMENTS:
+        if canonical_turn_status(str(turn["status"])) == TURN_STATUS_WAITING_FOR_ATTACHMENTS:
             context["queue_reason"] = "waiting_for_attachments"
             context["wait_deadline"] = _iso_after(
                 str(turn["created_at"]),
@@ -1608,7 +1653,7 @@ class ConversationService:
             context["blocked_by_turn_id"] = str(blocker["id"])
             context["queue_reason"] = (
                 "waiting_for_attachments"
-                if str(blocker["status"]) == TURN_STATUS_WAITING_FOR_ATTACHMENTS
+                if canonical_turn_status(str(blocker["status"])) == TURN_STATUS_WAITING_FOR_ATTACHMENTS
                 else "queued_behind_previous_turn"
             )
         return context
@@ -1696,7 +1741,7 @@ class ConversationService:
                 """
                 SELECT t.* FROM chat_turns t
                 JOIN turn_attachments ta ON ta.turn_id = t.id
-                WHERE ta.asset_id = ? AND t.status = 'waiting_for_attachments'
+                WHERE ta.asset_id = ? AND t.status IN ('waiting_for_attachments', 'multi_kb_waiting_for_attachments')
                 ORDER BY t.created_at
                 """,
                 (asset_id,),
@@ -1716,13 +1761,21 @@ class ConversationService:
         now = utc_now()
         requeued = 0
         with closing(self._connect()) as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                # A concurrent writer (quality worker, another chat worker or a
+                # long turn transaction) must not kill the chat worker loop.
+                # The next poll retries; pending turns are not lost.
+                if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                    return 0
+                raise
             try:
                 rows = conn.execute(
                     """
                     SELECT id, cancel_requested, retry_count
                     FROM chat_turns
-                    WHERE status IN ('streaming', 'cancelling')
+                    WHERE status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                       AND (
                         cancel_requested = 1
                         OR (
@@ -1741,8 +1794,9 @@ class ConversationService:
                         cursor = conn.execute(
                             """
                             UPDATE chat_turns
-                            SET status = 'pending', worker_id = '', worker_heartbeat_at = NULL
-                            WHERE id = ? AND status IN ('streaming', 'cancelling')
+                            SET status = CASE WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END,
+                                worker_id = '', worker_heartbeat_at = NULL
+                            WHERE id = ? AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                             """,
                             (turn_id,),
                         )
@@ -1755,7 +1809,7 @@ class ConversationService:
                         UPDATE chat_turns
                         SET status = ?, error_message = ?, finished_at = ?,
                             worker_id = '', worker_heartbeat_at = NULL
-                        WHERE id = ? AND status IN ('streaming', 'cancelling')
+                        WHERE id = ? AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                         """,
                         (status, message, now, turn_id),
                     )
@@ -1791,7 +1845,7 @@ class ConversationService:
                     WHERE active_turn_id <> '' AND NOT EXISTS (
                         SELECT 1 FROM chat_turns t
                         WHERE t.id = conversation_execution_state.active_turn_id
-                          AND t.status IN ('streaming', 'cancelling')
+                          AND t.status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                     )
                     """,
                     (now,),
@@ -1810,7 +1864,7 @@ class ConversationService:
                   AND NOT EXISTS (
                       SELECT 1 FROM chat_turns prior
                       WHERE prior.session_id = t.session_id
-                        AND prior.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                        AND prior.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                         AND prior.turn_sequence < t.turn_sequence
                   )
             """
@@ -1824,7 +1878,7 @@ class ConversationService:
                 FROM chat_turns t
                 JOIN chat_sessions s ON s.id = t.session_id
                 JOIN users u ON u.id = s.user_id
-                WHERE t.status = 'pending' AND t.cancel_requested = 0
+                WHERE t.status IN ('pending', 'multi_kb_pending') AND t.cancel_requested = 0
                   AND u.is_active = 1
                   {head_filter}
                 ORDER BY t.created_at, t.id
@@ -1842,7 +1896,7 @@ class ConversationService:
                 """
                 SELECT COUNT(*) AS depth, MIN(created_at) AS oldest_at
                 FROM chat_turns
-                WHERE status = 'pending' AND cancel_requested = 0
+                WHERE status IN ('pending', 'multi_kb_pending') AND cancel_requested = 0
                 """
             ).fetchone()
         depth = int(row["depth"] or 0)
@@ -1959,8 +2013,10 @@ class ConversationService:
                 # touching the row as it emits stages and deltas.
                 conn.execute(
                     """
-                    UPDATE chat_turns SET status = 'pending', worker_id = '', worker_heartbeat_at = NULL
-                    WHERE id = ? AND status IN ('streaming', 'cancelling')
+                    UPDATE chat_turns
+                    SET status = CASE WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END,
+                        worker_id = '', worker_heartbeat_at = NULL
+                    WHERE id = ? AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                       AND worker_heartbeat_at IS NOT NULL
                       AND datetime(worker_heartbeat_at) < datetime('now', ?)
                     """,
@@ -1973,7 +2029,7 @@ class ConversationService:
                     """,
                     (turn_id, user_id),
                 ).fetchone()
-                if row is None or row["status"] != "pending":
+                if row is None or row["status"] not in {"pending", "multi_kb_pending"}:
                     if row is not None and int(row["cancel_requested"] or 0) == 1 and row["status"] == "cancelled":
                         conn.execute("COMMIT")
                         _done("cancelled")
@@ -1991,7 +2047,7 @@ class ConversationService:
                         SET status = 'cancelled',
                             error_message = COALESCE(NULLIF(error_message, ''), '已停止生成'),
                             finished_at = ?, worker_id = '', worker_heartbeat_at = NULL
-                        WHERE id = ? AND status = 'pending'
+                        WHERE id = ? AND status IN ('pending', 'multi_kb_pending')
                         """,
                         (now, turn_id),
                     )
@@ -2027,7 +2083,7 @@ class ConversationService:
                         """
                         SELECT id FROM chat_turns
                         WHERE session_id = ? AND id <> ?
-                          AND status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                          AND status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                           AND turn_sequence < ?
                         ORDER BY turn_sequence
                         LIMIT 1
@@ -2064,9 +2120,10 @@ class ConversationService:
                 conn.execute(
                     """
                     UPDATE chat_turns
-                    SET status = 'streaming', started_at = ?, worker_id = ?, worker_heartbeat_at = ?,
+                    SET status = CASE WHEN knowledge_selection_hash <> '' THEN 'multi_kb_streaming' ELSE 'streaming' END,
+                        started_at = ?, worker_id = ?, worker_heartbeat_at = ?,
                         retry_count = retry_count + 1
-                    WHERE id = ? AND retry_count < 3
+                    WHERE id = ? AND status IN ('pending', 'multi_kb_pending') AND retry_count < 3
                     """,
                     (now, worker_id, now, turn_id),
                 )
@@ -2194,7 +2251,7 @@ class ConversationService:
                 conn.execute(
                     """
                     UPDATE chat_turns SET worker_heartbeat_at = ?
-                    WHERE id = ? AND worker_id = ? AND status IN ('streaming', 'cancelling')
+                    WHERE id = ? AND worker_id = ? AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                     """,
                     (now, turn_id, worker_id),
                 )
@@ -2214,7 +2271,7 @@ class ConversationService:
                 conn.execute(
                     """
                     UPDATE chat_turns SET worker_heartbeat_at = ?
-                    WHERE id = ? AND worker_id = ? AND status IN ('streaming', 'cancelling')
+                    WHERE id = ? AND worker_id = ? AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                     """,
                     (now, turn_id, worker_id),
                 )
@@ -2566,6 +2623,7 @@ class ConversationService:
                     and session_auto_memory == 1
                     and row["department_id"] not in (None, "")
                     and row["kb_id"] not in (None, "")
+                    and not str(row["knowledge_selection_hash"] or "")
                 ):
                     from src.memory.catalog import scope_fingerprint
                     from src.memory.jobs import enqueue_project_reflection_in_connection
@@ -2707,7 +2765,7 @@ class ConversationService:
                 """
                 SELECT 1 FROM chat_turns t JOIN chat_sessions s ON s.id = t.session_id
                 WHERE t.id = ? AND s.user_id = ?
-                  AND t.status IN ('streaming', 'cancelling')
+                  AND t.status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                   AND t.worker_heartbeat_at IS NOT NULL
                   AND datetime(t.worker_heartbeat_at) < datetime('now', ?)
                 """,
@@ -2736,7 +2794,7 @@ class ConversationService:
                     conn.execute("COMMIT")
                     return None
                 status = str(target["status"])
-                if status in {"streaming", "cancelling"}:
+                if status in {"streaming", "cancelling", "multi_kb_streaming", "multi_kb_cancelling"}:
                     # Revoke the business commit before signalling the worker:
                     # an in-flight answer must not be accepted after a cancel.
                     self._bump_session_generation(conn, int(target["session_id"]))
@@ -2751,7 +2809,7 @@ class ConversationService:
                         SELECT id FROM chat_sessions
                         WHERE user_id = ?
                     )
-                      AND status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments')
+                      AND status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                     """,
                     (now, turn_id, user_id),
                 )
@@ -2883,6 +2941,8 @@ def row_to_session(row) -> ChatSession:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         document_context=context,
+        knowledge_selection=json.loads(row["knowledge_selection_json"] or "{}") or None if "knowledge_selection_json" in row.keys() else None,
+        knowledge_selection_hash=row["knowledge_selection_hash"] if "knowledge_selection_hash" in row.keys() else "",
     )
 
 
@@ -2905,6 +2965,18 @@ def row_to_message(row) -> ChatMessage:
                 if not isinstance(item, dict):
                     continue
                 locator = item.get("locator")
+                metadata = item.get("metadata")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                # Refresh must retain the governed readback contract, while
+                # unrelated retrieval diagnostics stay out of history previews.
+                citation_metadata = {
+                    key: metadata[key] for key in (
+                        "kb_id", "kb_name", "local_record_id", "knowledge_source",
+                        "source_content_hash", "source_version_id", "revision", "approval_status",
+                        "index_revision", "processing_artifact_id", "processor_version", "evidence_text_hash",
+                    ) if key in metadata
+                }
+                citation_metadata["citation_number"] = metadata.get("citation_number")
                 citations.append(
                     {
                         "id": item.get("id"),
@@ -2913,13 +2985,7 @@ def row_to_message(row) -> ChatMessage:
                         "locator": locator if isinstance(locator, dict) else {},
                         # 内容只保留预览长度，payload 保持轻量。
                         "content": str(item.get("content") or "")[:240],
-                        "metadata": {
-                            "citation_number": (item.get("metadata") or {}).get(
-                                "citation_number"
-                            )
-                            if isinstance(item.get("metadata"), dict)
-                            else None,
-                        },
+                        "metadata": citation_metadata,
                     }
                 )
     try:
@@ -2996,7 +3062,7 @@ def row_to_turn(row) -> ChatTurn:
         query=row["query"],
         query_mode=row["query_mode"] if "query_mode" in row.keys() else "fast",
         wiki_assist=bool(row["wiki_assist"]) if "wiki_assist" in row.keys() else True,
-        status=row["status"],
+        status=canonical_turn_status(row["status"]),
         client_request_id=row["client_request_id"],
         cancel_requested=bool(row["cancel_requested"]),
         last_event_seq=int(row["last_event_seq"]),
@@ -3016,6 +3082,9 @@ def row_to_turn(row) -> ChatTurn:
         export_plan=export_plan,
         source_scope=row["source_scope"] if "source_scope" in row.keys() else "auto",
         required_attachment_ids=required_ids,
+        knowledge_scope=json.loads(row["knowledge_scope_json"] or "{}") or None if "knowledge_scope_json" in row.keys() else None,
+        knowledge_selection_hash=row["knowledge_selection_hash"] if "knowledge_selection_hash" in row.keys() else "",
+        knowledge_request_fingerprint=row["knowledge_request_fingerprint"] if "knowledge_request_fingerprint" in row.keys() else "",
         turn_sequence=(
             int(row["turn_sequence"])
             if "turn_sequence" in row.keys() and row["turn_sequence"] is not None

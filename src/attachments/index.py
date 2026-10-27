@@ -9,6 +9,7 @@ content for CJK/substring >= 3 char lookups when the build supports it.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
@@ -355,6 +356,68 @@ class AttachmentIndex:
                     backend="scan",
                 )
             )
+        return hits
+
+    def normalized_text_scan(
+        self,
+        needle: str,
+        *,
+        asset_ids: list[str],
+        limit: int = 8,
+        max_parts_scanned: int = 4000,
+    ) -> list[IndexedHit]:
+        """Bounded whitespace-insensitive scan for short CJK terms.
+
+        Chinese headings are often spaced for layout ("目  录", "术 语"), so a
+        plain LIKE scan misses a valid term even though the normalized text
+        contains it.  This stays asset-scoped and bounded.
+        """
+
+        compact_needle = re.sub(r"\s+", "", str(needle or "")).strip()
+        if len(compact_needle) < 2 or not asset_ids:
+            return []
+        placeholders = ",".join("?" for _ in asset_ids)
+        sql = f"""
+            SELECT part_id, asset_id, ordinal, part_type, locator_json, metadata_json, text_content
+            FROM chat_attachment_parts
+            WHERE asset_id IN ({placeholders})
+            ORDER BY ordinal, part_id
+            LIMIT ?
+        """
+        try:
+            with closing(_connect(self.db_path)) as conn:
+                rows = conn.execute(
+                    sql, (*asset_ids, max(1, int(max_parts_scanned)))
+                ).fetchall()
+        except Exception:
+            return []
+        hits: list[IndexedHit] = []
+        for row in rows:
+            if compact_needle not in re.sub(r"\s+", "", row["text_content"] or ""):
+                continue
+            try:
+                locator = json.loads(row["locator_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                locator = {}
+            try:
+                metadata = json.loads(row["metadata_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            hits.append(
+                IndexedHit(
+                    asset_id=row["asset_id"],
+                    part_id=row["part_id"],
+                    ordinal=int(row["ordinal"]),
+                    part_type=row["part_type"],
+                    text_content=row["text_content"] or "",
+                    locator=locator,
+                    metadata=metadata,
+                    score=0.78,
+                    backend="normalized_scan",
+                )
+            )
+            if len(hits) >= max(1, int(limit)):
+                break
         return hits
 
     def normalized_identifier_scan(

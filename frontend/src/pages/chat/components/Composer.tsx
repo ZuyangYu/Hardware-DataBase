@@ -1,17 +1,17 @@
 /**
  * 输入区(对齐 Composer 结构,裁掉业务件)。
  * 保留:自适应高度 textarea、Enter 发送 / Shift+Enter 换行、发送按钮、流式中停止按钮、hint。
- * 挂载知识库下拉框固定在输入框左上角(文本域上方)。
- * 附件入口收敛为输入框左侧的"+"按钮:悬停提示"添加附件",菜单内上传/重试/移除/作为模板;
- * 检索范围固定自动(由后端按用户意图路由),不再在输入区展示;发送后的附件只出现在消息气泡中。
+ * 检索范围下拉框固定在输入框左上角(文本域上方)。
+ * 附件入口收敛为输入框左侧的"+"按钮:悬停提示"添加附件",菜单内上传/重试/移除;
+ * 检索范围统一在输入区设置:只选择当前会话使用的知识库。
+ * 发送后的附件只出现在消息气泡中。
  */
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 
-import type { AttachmentView, DocumentContext } from '@/api/types';
+import type { AttachmentView, DocumentContext, KbView } from '@/api/types';
 import { CHAT_ATTACHMENT_ACCEPT } from '@/api/chatAttachments';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
-import type { KbView } from '@/api/types';
 import {
   Select,
   SelectContent,
@@ -19,8 +19,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import {
-} from '@/components/ui/dropdown-menu';
 import {
   Tooltip,
   TooltipContent,
@@ -61,7 +59,6 @@ type Props = {
   quickReplies?: string[];
   /** The bridge is opt-in; false keeps the legacy composer unchanged. */
   documentAuthoringEnabled?: boolean;
-  canUploadDocumentTemplate?: boolean;
   documentContext?: DocumentContext | null;
   documentContextLabel?: string;
   documentUploadPending?: boolean;
@@ -73,11 +70,8 @@ type Props = {
   attachmentRetryingId?: string | null;
   onUploadAttachment?: (file: File) => void | Promise<void>;
   onRetryAttachment?: (attachmentId: string) => void | Promise<void>;
-  onUseAsTemplate?: (attachment: AttachmentView) => void | Promise<void>;
   onRemoveAttachment?: (attachmentId: string) => void;
 };
-
-const TEMPLATE_ATTACHMENT_EXTENSIONS = new Set(['.docx', '.xlsx', '.xlsm']);
 
 /** 与后端 CHAT_ATTACHMENT_MAX_FILES_PER_SESSION 对齐(单会话活动附件上限)。 */
 const ATTACHMENT_MAX_FILES = (() => {
@@ -85,8 +79,8 @@ const ATTACHMENT_MAX_FILES = (() => {
   return Number.isFinite(configured) && configured > 0 ? configured : 20;
 })();
 
-function kbOptionLabel(kb: KbView): string {
-  return kb.department_name ? `${kb.name} · ${kb.department_name}` : kb.name;
+export function kbOptionLabel(kb: KbView, showDepartment: boolean): string {
+  return showDepartment && kb.department_name ? `${kb.name} · ${kb.department_name}` : kb.name;
 }
 
 function attachmentStateLabel(attachment: AttachmentView): string {
@@ -108,7 +102,6 @@ export default function Composer({
   onStop,
   quickReplies = [],
   documentAuthoringEnabled = false,
-  canUploadDocumentTemplate = false,
   documentContext = null,
   documentContextLabel,
   documentUploadPending = false,
@@ -121,7 +114,6 @@ export default function Composer({
   attachmentRetryingId = null,
   onUploadAttachment,
   onRetryAttachment,
-  onUseAsTemplate,
   onRemoveAttachment,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -143,6 +135,10 @@ export default function Composer({
   const attachmentCount = draftAttachments.length;
   const attachmentLimitReached = attachmentCount >= ATTACHMENT_MAX_FILES;
   const uploadBlocked = streaming || disabled || attachmentUploadPending;
+  const showDepartmentInKbOptions = new Set(
+    availableKbs.map((item) => item.department_name).filter(Boolean),
+  ).size > 1;
+  const scopeDisabled = disabled || streaming;
 
   // 自适应高度
   useEffect(() => {
@@ -161,21 +157,29 @@ export default function Composer({
     <div className={CHAT_INPUT_SHELL_CLASS}>
       <div className={CHAT_COMPOSER_STAGE_CLASS}>
         <form className={CHAT_COMPOSER_FORM_CLASS} onSubmit={handleSubmit}>
-          <div className="flex min-w-0 flex-wrap items-center gap-[8px]">
+          <div className="mb-[8px] flex flex-wrap items-center gap-x-[8px] gap-y-[6px]">
+            <span className="sr-only">检索范围 · 会话锚定库</span>
             <Select
               value={kbName || '__none__'}
               onValueChange={(value) => onKbChange(value === '__none__' ? '' : value)}
-              disabled={disabled}
+              disabled={scopeDisabled}
             >
               <SelectTrigger
-                aria-label="挂载知识库"
-                title={kbName ? `当前挂载：${kbName}` : '未挂载知识库'}
-                className={cn(CHAT_COMPOSER_MODEL_BTN_CLASS)}
+                aria-label="选择会话锚定库"
+                title={kbName ? `当前会话锚定库：${kbName}` : '选择会话锚定库'}
+                className={cn(
+                  CHAT_COMPOSER_MODEL_BTN_CLASS,
+                  'min-w-[190px] max-w-[min(340px,calc(100vw-48px))]',
+                )}
               >
                 <span className="grid size-[14px] shrink-0 place-items-center" aria-hidden>
-                  <AppIcon name="database" size={14} />
+                  <AppIcon name="database" size={12} />
                 </span>
-                <SelectValue className="min-w-0 truncate" />
+                {kbName ? (
+                  <SelectValue className="min-w-0 truncate" />
+                ) : (
+                  <span className="min-w-0 truncate">选择会话锚定库</span>
+                )}
               </SelectTrigger>
               <SelectContent
                 position="popper"
@@ -183,9 +187,9 @@ export default function Composer({
                 sideOffset={6}
                 className="min-w-[240px] max-w-[min(560px,calc(100vw-48px))]"
               >
-                <SelectItem value="__none__">不挂载</SelectItem>
+                <SelectItem value="__none__">不使用知识库（仅附件/普通对话）</SelectItem>
                 {availableKbs.map((kb) => {
-                  const label = kbOptionLabel(kb);
+                  const label = kbOptionLabel(kb, showDepartmentInKbOptions);
                   return (
                     <SelectItem key={kb.kb_id ?? `${kb.department_id ?? 'none'}:${kb.name}`} value={kb.name}>
                       <span className="block max-w-[480px] truncate" title={label}>{label}</span>
@@ -194,15 +198,11 @@ export default function Composer({
                 })}
               </SelectContent>
             </Select>
+          </div>
+          <div className="flex min-w-0 flex-wrap items-center gap-[8px]">
             {attachmentsEnabled && attachmentCount > 0 && (
               <div className={CHAT_COMPOSER_ATTACHMENTS_CLASS} aria-label="会话附件">
                 {draftAttachments.map((attachment) => {
-                  const eligibleTemplate =
-                    documentAuthoringEnabled &&
-                    canUploadDocumentTemplate &&
-                    Boolean(onUseAsTemplate) &&
-                    TEMPLATE_ATTACHMENT_EXTENSIONS.has(attachment.extension.toLowerCase()) &&
-                    (attachment.parse_status === 'ready' || attachment.parse_status === 'degraded');
                   return (
                     <div
                       key={attachment.attachment_id}
@@ -226,18 +226,6 @@ export default function Composer({
                           className="shrink-0 border-0 bg-transparent p-0 text-[11px] text-[#1d4ed8] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
                         >
                           {attachmentRetryingId === attachment.attachment_id ? '重试中…' : '重试'}
-                        </button>
-                      )}
-                      {eligibleTemplate && (
-                        <button
-                          type="button"
-                          onClick={() => void onUseAsTemplate?.(attachment)}
-                          disabled={streaming || disabled || documentUploadPending}
-                          aria-label={`将附件 ${attachment.filename} 作为模板`}
-                          title="将附件转换为文档模板"
-                          className="shrink-0 border-0 bg-transparent p-0 text-[11px] text-[#1d4ed8] hover:underline disabled:cursor-not-allowed disabled:opacity-45"
-                        >
-                          作为模板
                         </button>
                       )}
                       {onRemoveAttachment && (
@@ -270,7 +258,7 @@ export default function Composer({
               <span className="min-w-0 flex-1 truncate" title={contextReference}>
                 {documentContext.template_version_id ? '模板引用' : '文档范围'}：{contextReference}
               </span>
-              <span className={cn('shrink-0 text-[11px]', contextExpired ? 'text-[#b45309]' : 'text-[#858b9c')}>
+              <span className={cn('shrink-0 text-[11px]', contextExpired ? 'text-[#b45309]' : 'text-[#858b9c]')}>
                 {contextExpired ? '已过期，仅可读取历史状态' : '已附加'}
               </span>
               {onClearDocumentContext && (
@@ -323,7 +311,7 @@ export default function Composer({
               ref={textareaRef}
               value={input}
               onChange={(event) => setInput(event.target.value)}
-              placeholder={kbName ? `向「${kbName}」提问,Enter 发送 / Shift+Enter 换行` : '未挂载知识库,直接提问'}
+              placeholder={kbName ? `向「${kbName}」提问,Enter 发送 / Shift+Enter 换行` : '未选择知识库，直接提问'}
               className={cn(CHAT_COMPOSER_TEXTAREA_CLASS, 'flex-1')}
               rows={2}
               disabled={streaming || disabled}

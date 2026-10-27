@@ -26,8 +26,13 @@ import type {
   QueryTraceStep,
   SessionMemorySummary,
   SessionView,
+  TurnBudget,
+  TurnPlanState,
   TurnStartResponse,
+  TurnSubagent,
+  TurnVerification,
   TurnView,
+  KnowledgeSelectionInput,
 } from '@/api/types';
 import { notify } from '@/components/ui/app-toast';
 import {
@@ -232,6 +237,7 @@ export function buildTurnRequest(
   documentContext?: DocumentContext | null,
   documentFlow?: boolean,
   attachments?: { attachmentIds: string[]; sourceScope?: CreateTurnRequest['source_scope'] } | null,
+  knowledgeScope?: KnowledgeSelectionInput | null,
 ): CreateTurnRequest {
   const request: CreateTurnRequest = {
     query,
@@ -282,6 +288,13 @@ export function buildTurnRequest(
     if (attachments.sourceScope && attachments.sourceScope !== 'auto') {
       request.source_scope = attachments.sourceScope;
     }
+  }
+  if (knowledgeScope) {
+    request.knowledge_scope = {
+      version: 1,
+      purpose: knowledgeScope.purpose,
+      sources: knowledgeScope.sources.map((source) => ({ ...source })),
+    };
   }
   return request;
 }
@@ -375,6 +388,57 @@ function traceStepFromToolEvent(etype: string, raw: string): QueryTraceStep | nu
   return null;
 }
 
+function parseJsonRecord(raw: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function parseTurnPlan(raw: string): TurnPlanState | null {
+  const parsed = parseJsonRecord(raw);
+  const rawItems = Array.isArray(parsed?.items) ? parsed.items : [];
+  const items = rawItems
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+    .map((item) => {
+      const status = String(item.status ?? 'pending');
+      return {
+        content: String(item.content ?? '').trim(),
+        status: status === 'completed' || status === 'in_progress' ? status : 'pending',
+      } as const;
+    })
+    .filter((item) => item.content);
+  if (items.length === 0) return null;
+  return {
+    items,
+    revision: Number(parsed?.revision ?? 1),
+    source: typeof parsed?.source === 'string' ? parsed.source : undefined,
+  };
+}
+
+export function parseTurnBudget(raw: string): TurnBudget | null {
+  const parsed = parseJsonRecord(raw);
+  return parsed ? (parsed as TurnBudget) : null;
+}
+
+export function parseTurnVerification(raw: string): TurnVerification | null {
+  const parsed = parseJsonRecord(raw);
+  if (!parsed) return null;
+  const status = String(parsed.status ?? 'unknown');
+  if (!['pass', 'warn', 'fail', 'partial', 'unknown'].includes(status)) return null;
+  return parsed as unknown as TurnVerification;
+}
+
+export function parseTurnSubagent(raw: string): TurnSubagent | null {
+  const parsed = parseJsonRecord(raw);
+  if (!parsed) return null;
+  return parsed as unknown as TurnSubagent;
+}
+
 function mergeTraceDetail(current: string | undefined, next: string | undefined): string | undefined {
   const nextText = next?.trim();
   if (!nextText) return current;
@@ -407,10 +471,22 @@ export type UseKbChatOptions = {
   documentContextEnabled?: boolean;
   /** Called only for a newly completed turn, never for recovered history. */
   onTurnCompleted?: (message: MessageView, query: string) => void | Promise<void>;
+  /**
+   * Reserved for the future project-space mount.  The current ChatPage sends
+   * no scope: the raw multi-select entry was removed and chat runs single-KB.
+   */
+  knowledgeScope?: KnowledgeSelectionInput | null;
+  /** Reserved for project-space routing; not wired by the current ChatPage. */
+  resolveKnowledgeScope?: (query: string) => KnowledgeSelectionInput | null;
+  /** Reserved for project-space routing; not wired by the current ChatPage. */
+  knowledgeScopeAuto?: boolean;
 };
 
 export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const scopeKbName = kbName || GENERAL_CHAT_KB_NAME;
+  const knowledgeScope = options.knowledgeScope ?? null;
+  const resolveKnowledgeScope = options.resolveKnowledgeScope;
+  const knowledgeScopeAuto = options.knowledgeScopeAuto === true;
   const selectedSessionKey = `hdb_chat_session:${encodeURIComponent(options.username ?? 'anonymous')}:${encodeURIComponent(scopeKbName)}`;
   const loadedSessionKey = useRef<string | null>(null);
   const documentContextEnabled = options.documentContextEnabled ?? false;
@@ -498,12 +574,79 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     }
     return step;
   }, []);
+  const applyTurnMetaEvent = useCallback((etype: string, raw: string) => {
+    if (etype === 'plan_created' || etype === 'plan_updated') {
+      const plan = parseTurnPlan(raw);
+      if (plan) setLivePlan(plan);
+      return;
+    }
+    if (etype === 'budget' || etype === 'budget_exhausted') {
+      const budget = parseTurnBudget(raw);
+      if (budget) setLiveBudget(budget);
+      return;
+    }
+    if (etype === 'verification') {
+      const verification = parseTurnVerification(raw);
+      if (verification) setLiveVerification(verification);
+      return;
+    }
+    if (etype === 'partial_result') {
+      const parsed = parseJsonRecord(raw);
+      if (!parsed) return;
+      setLiveBudget((previous) => previous
+        ? { ...previous, partial_answer: parsed.synthesized === true }
+        : previous);
+      return;
+    }
+    if (etype === 'context_compacted') {
+      const parsed = parseJsonRecord(raw);
+      if (!parsed) return;
+      setLiveBudget((previous) => ({
+        ...(previous ?? {}),
+        ...(parsed.stage === 'context_window'
+          ? {
+            context_window: {
+              max_prompt_tokens: Number(parsed.max_prompt_tokens ?? 0),
+              window_tokens: Number(parsed.window_tokens ?? 0),
+              threshold_tokens: Number(parsed.threshold_tokens ?? 0),
+              note: typeof parsed.note === 'string' ? parsed.note : undefined,
+            },
+          }
+          : {
+            context_compressed: {
+              evidence_count: Number(parsed.evidence_count ?? 0),
+              compressed_bytes: Number(parsed.compressed_bytes ?? 0),
+              max_bytes: Number(parsed.max_bytes ?? 0),
+            },
+          }),
+      }));
+    }
+    if (etype === 'subagent_started' || etype === 'subagent_completed') {
+      const subagent = parseTurnSubagent(raw);
+      if (!subagent) return;
+      setLiveSubagents((previous) => {
+        const identity = subagent.tool_call_id || `${subagent.name ?? 'research'}:${subagent.description ?? ''}`;
+        const index = previous.findIndex(
+          (item) => (item.tool_call_id || `${item.name ?? 'research'}:${item.description ?? ''}`) === identity,
+        );
+        if (index < 0) return [...previous, subagent];
+        return previous.map((item, itemIndex) => (itemIndex === index ? { ...item, ...subagent } : item));
+      });
+    }
+  }, []);
+
   const pendingStreamingTextRef = useRef('');
   const streamingFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastStreamingFlushAtRef = useRef(0);
   const traceClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const traceRef = useRef<QueryTraceStep[]>([]);
   const [traceByMessageId, setTraceByMessageId] = useState<Record<number, QueryTraceStep[]>>({});
+  // 复杂任务元数据：计划/预算/校验/子任务。实时值供流式气泡使用；
+  // 完成后随 done.summary 落到 assistant message（刷新从服务端消息投影恢复）。
+  const [livePlan, setLivePlan] = useState<TurnPlanState | null>(null);
+  const [liveBudget, setLiveBudget] = useState<TurnBudget | null>(null);
+  const [liveVerification, setLiveVerification] = useState<TurnVerification | null>(null);
+  const [liveSubagents, setLiveSubagents] = useState<TurnSubagent[]>([]);
 
   const flushStreamingText = useCallback((force = false) => {
     if (streamingFlushTimerRef.current && !force) return;
@@ -580,22 +723,25 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       .get<SessionView[]>(`/api/v1/conversations?kb_name=${encodeURIComponent(scopeKbName)}`)
       .then((rows) => {
         if (cancelled) return;
+        // A session belongs to its primary knowledge base. Reference KB
+        // choices are a per-session detail and must not hide other sessions.
+        const sessionRows = rows;
         loadedSessionKey.current = selectedSessionKey;
         // A session created while this fetch was in flight is not in ``rows``.
         // Keep the new conversation in the list (and selected) instead of
         // dropping it and falling back to an unrelated session.
         setSessions((prev) => {
-          const ids = new Set(rows.map((row) => row.id));
+          const ids = new Set(sessionRows.map((row) => row.id));
           const localSelection = prev.filter(
             (session) => session.id === activeSessionRef.current && !ids.has(session.id),
           );
-          return localSelection.length ? [...localSelection, ...rows] : rows;
+          return localSelection.length ? [...localSelection, ...sessionRows] : sessionRows;
         });
         setActiveSessionId((current) => {
           if (current != null) return current;
           const preferred = savedSessionId;
-          const next = rows.some((session) => session.id === preferred) ? preferred : rows[0]?.id ?? null;
-          const restoredContext = rows.find((session) => session.id === next)?.document_context;
+          const next = sessionRows.some((session) => session.id === preferred) ? preferred : sessionRows[0]?.id ?? null;
+          const restoredContext = sessionRows.find((session) => session.id === next)?.document_context;
           if (restoredContext) {
             // 模板上下文跟随当前会话——切换/新建/删除会话即失效,仅从服务端持久化事实恢复。
             setDocumentContextState(restoredContext);
@@ -1003,6 +1149,10 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       toolActiveKeyRef.current.clear();
       setTraceSteps(createInitialTrace(turn.kb_name === GENERAL_CHAT_KB_NAME));
       setDegradedNotes([]);
+      setLivePlan(null);
+      setLiveBudget(null);
+      setLiveVerification(null);
+      setLiveSubagents([]);
       let accumulated = '';
       try {
         await api.post(`/api/v1/turns/${turn.id}/start`);
@@ -1024,6 +1174,18 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           } else if (evt.event === 'degraded') {
             const parsed = JSON.parse(evt.data) as { stage?: string; reason?: string };
             setDegradedNotes((prev) => [...prev, { stage: parsed.stage ?? '', reason: parsed.reason ?? '' }]);
+          } else if (
+            evt.event === 'plan_created'
+            || evt.event === 'plan_updated'
+            || evt.event === 'budget'
+            || evt.event === 'budget_exhausted'
+            || evt.event === 'verification'
+            || evt.event === 'partial_result'
+            || evt.event === 'context_compacted'
+            || evt.event === 'subagent_started'
+            || evt.event === 'subagent_completed'
+          ) {
+            applyTurnMetaEvent(evt.event, evt.data);
           } else if (evt.event === 'mcp_write_proposal') {
             setMcpWriteCards((prev) => mergeMcpWriteProposalFromSseEvent(prev, evt.event, evt.data));
           } else if (
@@ -1036,6 +1198,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
             if (!ownsStream(turn.id, turn.session_id)) break;
             const payload = JSON.parse(evt.data) as QueryDonePayload;
             const answer = payload.answer ?? accumulated;
+            const summary = payload.summary ?? {};
             setMessages((prev) => [
               ...prev.filter((message) => message.id !== turn.assistant_message_id),
               {
@@ -1045,8 +1208,12 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
                 role: 'assistant',
                 content: answer,
                 footer: (payload.footer ?? '').trim(),
-                memory_context: payload.summary?.memory_context ?? [],
+                memory_context: summary.memory_context ?? [],
                 created_at: turn.created_at,
+                plan: (summary.plan as TurnPlanState | undefined) ?? null,
+                budget: (summary.budget as TurnBudget | undefined) ?? null,
+                verification: (summary.verification as TurnVerification | undefined) ?? null,
+                subagents: (summary.subagents as TurnSubagent[] | undefined) ?? [],
               },
             ]);
             // 刷新恢复时同样回填证据面板,否则引用标号 [n] 没有来源可看
@@ -1089,19 +1256,26 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   }, [activeSessionId, documentContextEnabled, finishTrace, queueStreamingText, resetStreamingText, upsertTraceStep, refreshMemorySummary, scopeKbName, applyTurnQueueNotice]);
 
   const createSession = useCallback(
-    async (title: string, expectedStreamToken?: number): Promise<SessionView> => {
+    async (
+      title: string,
+      expectedStreamToken?: number,
+      scopeOverride?: KnowledgeSelectionInput | null,
+    ): Promise<SessionView> => {
       // Manual calls capture the current stream token too, so a session created
       // by the login “新对话” click cannot steal the selection from a message
       // send that started after it.
       const expected = expectedStreamToken ?? streamTokenRef.current;
+      const scope = scopeOverride === undefined ? knowledgeScope : scopeOverride;
       let pending = pendingCreateRef.current;
-      if (pending !== null && pending.scope !== scopeKbName) pending = null;
+      const createScopeKey = `${scopeKbName}:${scope ? JSON.stringify(scope) : 'none'}`;
+      if (pending !== null && pending.scope !== createScopeKey) pending = null;
       if (pending === null) {
         const entry = {
-          scope: scopeKbName,
+          scope: createScopeKey,
           promise: api.post<SessionView>('/api/v1/conversations', {
             kb_name: scopeKbName,
             title: title || '新对话',
+            ...(scope ? { knowledge_scope: scope } : {}),
           }),
         };
         pending = entry;
@@ -1131,25 +1305,25 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       }
       return session;
     },
-    [scopeKbName],
+    [knowledgeScope, scopeKbName],
   );
 
   const newConversation = useCallback(async () => {
     detachClientStream('route_navigation');
     try {
-      await createSession('新对话');
+      await createSession('新对话', undefined, knowledgeScopeAuto ? null : undefined);
     } catch (error) {
       setForbidden(error instanceof Error ? error.message : '创建会话失败');
     }
-  }, [createSession, detachClientStream]);
+  }, [createSession, detachClientStream, knowledgeScopeAuto]);
 
   /** 无活动会话时先建一个空会话;附件上传与发送共用。 */
   const ensureSession = useCallback(async (): Promise<number> => {
     const current = activeSessionRef.current;
     if (current != null) return current;
-    const session = await createSession('新对话');
+    const session = await createSession('新对话', undefined, knowledgeScopeAuto ? null : undefined);
     return session.id;
-  }, [createSession]);
+  }, [createSession, knowledgeScopeAuto]);
 
   const deleteSession = useCallback(
     async (sessionId: number) => {
@@ -1353,10 +1527,24 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       documentFlowOverride?: boolean;
       /** Wiki 辅助开关(本轮): 默认关闭。 */
       wikiAssist?: boolean;
+      /** 由“继续完成”等操作直接提供文本，避免依赖同一 tick 的 input 状态。 */
+      textOverride?: string;
     } | null,
   ) => {
-    const query = input.trim();
+    const query = (attachments?.textOverride ?? input).trim();
     if (!query || streaming) return;
+    const activeSession = sessions.find((session) => session.id === activeSessionId);
+    const hasActiveSession = activeSessionId != null && activeSession != null;
+    const activeHasScope = Boolean(activeSession?.knowledge_scope || activeSession?.knowledge_selection_hash);
+    const requestedScope = resolveKnowledgeScope?.(query) ?? knowledgeScope;
+    // Reference KBs can change between turns in the same primary-KB session.
+    // Only a session that currently has a scope and is being reduced to a
+    // single KB needs a fresh session, because "no scope" is represented by an
+    // omitted field on the turn request.
+    const mustStartNewSession = !hasActiveSession || (activeHasScope && requestedScope == null);
+    const turnKnowledgeScope = mustStartNewSession
+      ? requestedScope
+      : (requestedScope ?? undefined);
     const generation = streamTokenRef.current + 1;
     streamTokenRef.current = generation;
     sendingGenerationRef.current = generation;
@@ -1370,9 +1558,13 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     toolActiveKeyRef.current.clear();
     setTraceSteps(createInitialTrace(scopeKbName === GENERAL_CHAT_KB_NAME));
     setDegradedNotes([]);
+    setLivePlan(null);
+    setLiveBudget(null);
+    setLiveVerification(null);
+    setLiveSubagents([]);
     setDocumentCardRefreshingId(null);
 
-    let sessionId = activeSessionId;
+    let sessionId = mustStartNewSession ? null : activeSessionId;
     // 乐观更新:点发送立即上屏,不等建会话/建 turn 的两个往返(否则"思考中"
     // 会先于自己的消息出现,体感像页面卡了一下)。turn 建好后用服务端记录对账替换。
     const optimisticId = -Date.now();
@@ -1402,7 +1594,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     try {
       // 1. 确保会话存在(首次提问自动建会话,标题取问题前 20 字)
       if (sessionId == null) {
-        const session = await createSession(query.slice(0, 20), generation);
+        const session = await createSession(query.slice(0, 20), generation, turnKnowledgeScope);
         sessionId = session.id;
       }
       if (!ownsGeneration()) return;
@@ -1419,6 +1611,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           : null,
         undefined,
         attachments ?? null,
+        turnKnowledgeScope,
       );
       turnRequest.wiki_assist = attachments?.wikiAssist ?? false;
       const created = await api.post<TurnStartResponse>(
@@ -1490,7 +1683,19 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           } catch {
             // 忽略坏帧
           }
-          } else if (evt.event === 'mcp_write_proposal') {
+        } else if (
+          evt.event === 'plan_created'
+          || evt.event === 'plan_updated'
+          || evt.event === 'budget'
+          || evt.event === 'budget_exhausted'
+          || evt.event === 'verification'
+          || evt.event === 'partial_result'
+          || evt.event === 'context_compacted'
+          || evt.event === 'subagent_started'
+          || evt.event === 'subagent_completed'
+        ) {
+          applyTurnMetaEvent(evt.event, evt.data);
+        } else if (evt.event === 'mcp_write_proposal') {
             setMcpWriteCards((prev) => mergeMcpWriteProposalFromSseEvent(prev, evt.event, evt.data));
           } else if (
           evt.event === 'document_card'
@@ -1521,6 +1726,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       if (finalPayload) {
         const payload: QueryDonePayload = finalPayload;
         const answer = payload.answer ?? accumulated;
+        const summary = payload.summary ?? {};
         const assistantMessage: MessageView = {
           id: created.turn.assistant_message_id,
           session_id: sessionId,
@@ -1528,8 +1734,12 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           role: 'assistant',
           content: answer,
           footer: (payload.footer ?? '').trim(),
-          memory_context: payload.summary?.memory_context ?? [],
+          memory_context: summary.memory_context ?? [],
           created_at: new Date().toISOString(),
+          plan: (summary.plan as TurnPlanState | undefined) ?? null,
+          budget: (summary.budget as TurnBudget | undefined) ?? null,
+          verification: (summary.verification as TurnVerification | undefined) ?? null,
+          subagents: (summary.subagents as TurnSubagent[] | undefined) ?? [],
         };
         setMessages((prev) => [...prev.filter((message) => message.id !== assistantMessage.id), assistantMessage]);
         const evidence = payload.summary?.evidence ?? [];
@@ -1551,6 +1761,12 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           const updated = {
             ...target,
             title: target.title === '新对话' ? query.slice(0, 20) : target.title,
+            ...(created.turn.knowledge_scope
+              ? {
+                knowledge_scope: created.turn.knowledge_scope,
+                knowledge_selection_hash: created.turn.knowledge_selection_hash ?? target.knowledge_selection_hash,
+              }
+              : {}),
           };
           return [updated, ...prev.filter((s) => s.id !== sessionId)];
         });
@@ -1571,6 +1787,13 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
         if (error instanceof DOMException && error.name === 'AbortError') {
           finishTrace('error', '已停止生成');
+        } else if (error instanceof ApiError && error.status === 409 && error.body.includes('knowledge_scope_changed')) {
+          setInput((current) => current || query);
+          setDocumentContextState(null);
+          activeSessionRef.current = null;
+          setActiveSessionId(null);
+          setDocumentCards([]);
+          notify.error('来源范围已变化，草稿已保留；重新发送将新建会话，请重新选择附件与模板。');
         } else {
           finishTrace('error', error instanceof Error ? error.message : '发送失败');
           const failedSessionId = sessionId;
@@ -1596,7 +1819,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         setTurnQueueNotice(null);
       }
     }
-  }, [input, streaming, activeSessionId, createSession, scopeKbName, documentContextEnabled, documentContext, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary, applyTurnQueueNotice]);
+  }, [input, streaming, sessions, activeSessionId, createSession, scopeKbName, documentContextEnabled, documentContext, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary, applyTurnQueueNotice, knowledgeScope, resolveKnowledgeScope]);
 
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
@@ -1671,6 +1894,10 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     traceSteps,
     traceByMessageId,
     degradedNotes,
+    livePlan,
+    liveBudget,
+    liveVerification,
+    liveSubagents,
     documentCards,
     mcpWriteCards,
     updateMcpWriteCard,

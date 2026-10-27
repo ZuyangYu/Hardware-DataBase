@@ -45,6 +45,7 @@ class SqliteExecutionStore:
         client_request_id: str | None = None,
         query_mode: str = "fast",
         source_scope: str = "auto",
+        knowledge_scope=None,
     ) -> ChatTurn:
         return self._conv.create_turn(
             user_id,
@@ -53,6 +54,7 @@ class SqliteExecutionStore:
             client_request_id=client_request_id,
             query_mode=query_mode,
             source_scope=source_scope,
+            knowledge_scope=knowledge_scope,
         )
 
     def claim_turn(

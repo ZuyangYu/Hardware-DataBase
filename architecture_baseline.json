@@ -6,6 +6,7 @@
     "src.agents.mcp.store",
     "src.agents.orchestration.capabilities",
     "src.agents.orchestration.contracts",
+    "src.agents.tools.retrieval_executor",
     "src.api.routes.quality",
     "src.api.routes.quality_tickets",
     "src.attachments.coordinator",
@@ -67,6 +68,9 @@
     "src.sandbox.client",
     "src.sandbox.dependencies",
     "src.sandbox.policy",
+    "src.services.knowledge_scope",
+    "src.services.knowledge_scope_models",
+    "src.services.knowledge_scope_persistence",
     "src.settings",
     "src.storage.auth_domain",
     "src.storage.auth_mirror",
@@ -74,16 +78,20 @@
     "src.storage.control_plane.conversation_service",
     "src.storage.control_plane.factory",
     "src.storage.control_plane.health",
+    "src.storage.control_plane.knowledge_scope_migration",
+    "src.storage.control_plane.loader",
     "src.storage.control_plane.memory_invalidation",
     "src.storage.control_plane.memory_jobs",
     "src.storage.control_plane.memory_worker",
     "src.storage.control_plane.postgres",
     "src.storage.control_plane.result_exports",
+    "src.storage.control_plane.schema",
+    "src.storage.control_plane.schema_version",
     "src.storage.control_plane.sqlite",
     "src.storage.control_plane.terminal_domain",
     "src.storage.domain_pg"
   ],
-  "scc_edge_count": 228,
+  "scc_edge_count": 248,
   "forbidden_edges": [
     {
       "source": "src.quality.service",
@@ -111,10 +119,10 @@
     }
   ],
   "line_budgets": {
-    "src/core/app_pipeline.py": 6249,
-    "src/document_authoring/service.py": 4857,
-    "src/agents/runner.py": 4014,
-    "src/settings.py": 2300
+    "src/core/app_pipeline.py": 6657,
+    "src/document_authoring/service.py": 5610,
+    "src/agents/runner.py": 4308,
+    "src/settings.py": 2412
   },
-  "runtime_alter_count": 74
+  "runtime_alter_count": 93
 }

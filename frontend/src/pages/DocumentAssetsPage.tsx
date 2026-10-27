@@ -507,7 +507,7 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
           </div>
           <div className="mt-[18px]">
             {!kbName ? (
-              <div className="border-y border-[#edf0f5] py-[56px] text-center text-[13px] text-[#858b9c]">请先挂载一个知识库,再查看图谱。</div>
+              <div className="border-y border-[#edf0f5] py-[56px] text-center text-[13px] text-[#858b9c]">请先选择一个知识库,再查看图谱。</div>
             ) : !graphLoaded ? (
               <div className="grid gap-[8px]">{[0, 1].map((i) => <Skeleton key={i} className="h-[120px] rounded-[8px]" />)}</div>
             ) : graph && visibleGraph ? (
@@ -542,7 +542,7 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
       </div>
 
       {!kbName ? (
-        <div className="mt-[24px] border-y border-[#edf0f5] py-[56px] text-center text-[13px] text-[#858b9c]">请先挂载一个知识库,再开始整理文档资产。</div>
+        <div className="mt-[24px] border-y border-[#edf0f5] py-[56px] text-center text-[13px] text-[#858b9c]">请先选择一个知识库,再开始整理文档资产。</div>
       ) : (
         <div className="mt-[18px]">
           {!loaded ? (

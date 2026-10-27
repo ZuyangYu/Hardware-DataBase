@@ -168,13 +168,12 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # pragma: no cover - governance must not block boot
         print(f"[hardware-database] governor maintenance disabled: {exc}")
     # P0-007: own the shared retrieval executor lifecycle for this process.
-    if bool(getattr(src.settings, "SHARED_RETRIEVAL_EXECUTOR_ENABLED", False)):
-        try:
-            from src.agents.tools.retrieval_executor import get_retrieval_executor
+    try:
+        from src.agents.tools.retrieval_executor import initialize_retrieval_executor
 
-            get_retrieval_executor()
-        except Exception as exc:  # pragma: no cover
-            print(f"[hardware-database] shared retrieval executor disabled: {exc}")
+        initialize_retrieval_executor()
+    except Exception as exc:  # pragma: no cover
+        print(f"[hardware-database] shared retrieval executor unavailable: {type(exc).__name__}")
     _harden_storage_permissions()
     _prune_query_traces_once()
 

@@ -53,6 +53,7 @@ from src.document_authoring.models import (
 from src.document_authoring.harness.idempotency import execution_event_key, receipt_action_key
 from src.document_authoring.harness.plan_graph import PlanDAGExecutor
 from src.document_authoring.harness.plan_graph import PlanDAGExecutionResult
+from src.document_authoring.harness.plan_graph import plan_node_waits_for_human
 from src.document_authoring.validator import DocumentValidator
 from src.document_authoring.work_order_store import DocumentAuthoringStore
 from src.document_authoring.planning.models import DocumentPlan
@@ -148,12 +149,36 @@ class InternalDocumentHarnessRuntime:
         *,
         checkpointer: FencedCheckpointer | None = None,
         checkpointer_factory: Callable[..., FencedCheckpointer] | None = None,
+        conflict_reviewer: Callable[..., Any] | None = None,
+        review_state_provider: Callable[..., Any] | None = None,
+        execution_guard: Callable[..., Any] | None = None,
     ):
         self.store = store
         self.validator = validator or DocumentValidator()
         self.checkpointer = checkpointer
         self.checkpointer_factory = checkpointer_factory
         self.task_graphs = TaskGraphStore(store.db_path)
+        self.conflict_reviewer = conflict_reviewer
+        self.review_state_provider = review_state_provider
+        self.execution_guard = execution_guard
+
+    def _plan_review_hashes(self, graph: CompiledTaskGraph, order: DocumentWorkOrder) -> dict[str, str]:
+        state = self.review_state_provider(order) if self.review_state_provider else {}
+        hashes: dict[str, str] = {}
+        nodes = {node.node_id: node for node in graph.nodes}
+        for node_id in graph.topological_order:
+            node = nodes[node_id]
+            own = state.get(_plan_field_execution_key(node.unit_id), []) if node.unit_id else []
+            parents = {key: hashes[key] for key in node.dependencies if hashes.get(key)}
+            hashes[node_id] = content_hash({"reviews": own, "dependencies": parents}) if own or parents else ""
+        return hashes
+
+    @staticmethod
+    def _plan_node_fingerprint(node: CompiledTaskNode, graph: CompiledTaskGraph, review_hash: str = "") -> str:
+        inputs = {"graph_hash": graph.graph_hash, "node_id": node.node_id, "action_key": node.action_key}
+        if review_hash:
+            inputs["review_hash"] = review_hash
+        return content_hash(inputs)
 
     def _bind_plan_graph(
         self,
@@ -653,21 +678,36 @@ class InternalDocumentHarnessRuntime:
         lease_owner: str,
         persistence_lock: threading.RLock,
     ) -> Any:
+        payload = self._plan_receipt_payload(node, output)
+        if plan_node_waits_for_human(payload):
+            return output
+        order = self.store.get_work_order(running.work_order_id)
+        review_hash = self._plan_review_hashes(graph, order).get(node.node_id, "") if order else ""
+        input_fingerprint = self._plan_node_fingerprint(node, graph, review_hash)
         receipt = NodeExecutionReceipt(
             receipt_id=f"receipt-{uuid.uuid4().hex}",
             harness_run_id=running.harness_run_id,
             node_name="plan_node",
             unit_id=node.node_id,
-            input_fingerprint=content_hash({
-                "graph_hash": graph.graph_hash,
-                "node_id": node.node_id,
-                "action_key": node.action_key,
-            }),
-            action_key=node.action_key,
+            input_fingerprint=input_fingerprint,
+            # A plan node can execute again after a governed review decision
+            # changes its input fingerprint.  The raw plan action key is
+            # stable across that transition, so using it directly would
+            # collide with the run-level unique action-key index.  Derive the
+            # receipt key from the complete execution identity instead; the
+            # same input remains idempotent while a changed review version
+            # gets a new durable receipt.
+            action_key=receipt_action_key(
+                harness_run_id=running.harness_run_id,
+                node_name="plan_node",
+                unit_id=node.node_id,
+                attempt=attempt,
+                input_fingerprint=input_fingerprint,
+                action={"version": "plan-node-v1", "operation": node.action_key},
+            ),
             attempt=attempt,
             fencing_token=running.fencing_token,
         )
-        payload = self._plan_receipt_payload(node, output)
         with persistence_lock:
             started = self.store.begin_node_execution_owned(
                 receipt, lease_owner, running.fencing_token,
@@ -809,12 +849,19 @@ class InternalDocumentHarnessRuntime:
             result.requirements[unit_key] = requirement
             result.unit_statuses[unit_key] = "planned"
 
-        committed = {
-            receipt.unit_id: receipt.output_payload or {}
-            for receipt in self.store.list_node_execution_receipts(
-                run.harness_run_id, node_name="plan_node", status="committed",
-            )
-        }
+        node_by_id = {node.node_id: node for node in graph.nodes}
+        review_hashes = self._plan_review_hashes(graph, work_order)
+        committed = {}
+        for receipt in self.store.list_node_execution_receipts(
+            run.harness_run_id, node_name="plan_node", status="committed",
+        ):
+            node = node_by_id.get(receipt.unit_id)
+            if (node is not None and not plan_node_waits_for_human(receipt.output_payload)
+                    and receipt.input_fingerprint == self._plan_node_fingerprint(node, graph, review_hashes.get(node.node_id, ""))):
+                committed[receipt.unit_id] = receipt.output_payload or {}
+        for node_id in graph.topological_order:
+            if node_id in committed and any(key not in committed for key in node_by_id[node_id].dependencies):
+                committed.pop(node_id)
         # A unit is counted only after its plan-node receipt is durably
         # committed.  Counting in-memory drafts would report progress ahead of
         # what a restarted worker can recover.
@@ -989,6 +1036,7 @@ class InternalDocumentHarnessRuntime:
                 revision_instruction=revision_instructions.get(node.unit_id, ""),
                 revision_edit=revision_edits.get(node.unit_id),
             )
+            request = request.model_copy(update={"dependency_review_fingerprint": self._plan_review_hashes(graph, work_order).get(node.node_id, "")})
             draft = run_context.draft_with_receipt(request)
             step("validate_unit_draft")
             tool_policy.require_tool("validate_unit_draft")
@@ -1014,6 +1062,8 @@ class InternalDocumentHarnessRuntime:
                 status = "requires_human"
             elif validated.validation_status != "supported":
                 status = "requires_human"
+            if validated.metadata.get("conflict_review_pending"):
+                status = "conflicting"
             with result_lock:
                 result.drafts.append(validated)
             # Persist each validated draft before its plan-node receipt is
@@ -1080,7 +1130,9 @@ class InternalDocumentHarnessRuntime:
                 persistence_lock=persistence_lock,
             )
             with result_lock:
-                committed_unit_node_ids.add(node.node_id)
+                payload = output.get("receipt_payload", {})
+                if not plan_node_waits_for_human(payload):
+                    committed_unit_node_ids.add(node.node_id)
                 completed_units = len(committed_unit_node_ids)
                 unit_statuses = dict(result.unit_statuses)
                 draft_ids = [draft.unit_id for draft in result.drafts]
@@ -1105,8 +1157,12 @@ class InternalDocumentHarnessRuntime:
             execute_node=execute_node,
             committed_receipts=committed,
         )
+        for node_id, status in dag.statuses.items():
+            node = node_by_id[node_id]
+            if node.unit_id and status == "blocked_dependency":
+                result.unit_statuses[_plan_field_execution_key(node.unit_id)] = "blocked"
         persisted_drafts = self.store.list_unit_drafts(run.harness_run_id)
-        by_unit = {draft.unit_id: draft for draft in persisted_drafts}
+        by_unit = {draft.unit_id: draft for draft in persisted_drafts if result.unit_statuses.get(draft.unit_id) != "blocked"}
         for draft in result.drafts:
             by_unit[draft.unit_id] = draft
         ordered_unit_ids = [_plan_field_execution_key(unit.unit_id) for unit in plan.semantic_units]
@@ -1284,6 +1340,8 @@ class InternalDocumentHarnessRuntime:
         should_cancel: Callable[[], bool] | None = None,
         plan_node_callback: Callable[[CompiledTaskNode, HarnessExecutionResult, PlanDAGExecutionResult], Any] | None = None,
     ) -> HarnessExecutionResult:
+        if self.execution_guard is not None:
+            self.execution_guard(work_order)
         lease_owner = f"harness-worker-{uuid.uuid4().hex}"
         # Older direct Runtime integrations may provide a minimal manifest
         # stub without the additive route field.  Treat those objects as the
@@ -1410,7 +1468,22 @@ class InternalDocumentHarnessRuntime:
                     **updates,
                 )
 
+        conflict_waiting_units: set[str] = set()
+
         def draft_with_receipt(request) -> DocumentUnitDraft:
+            if self.conflict_reviewer is not None:
+                # Review before the cache lookup as well as before the model:
+                # a historical receipt cannot bypass newly discovered facts.
+                with persistence_lock:
+                    request = self.conflict_reviewer(work_order, snapshot, request)
+                if any(item.get("blocking") for item in request.conflict_context):
+                    conflict_waiting_units.add(request.unit_id)
+                    return DocumentUnitDraft(
+                        unit_id=request.unit_id, run_id=request.run_id,
+                        generated_by="deterministic_rule", content="待人工审阅来源冲突。",
+                        validation_status="requires_human", evidence_ids=[],
+                        metadata={"conflict_review_pending": True, "decision_fingerprint": request.decision_fingerprint},
+                    )
             receipt = NodeExecutionReceipt(
                 receipt_id=f"receipt-{uuid.uuid4().hex}", harness_run_id=running.harness_run_id,
                 node_name="draft_ready_unit", unit_id=request.unit_id,
@@ -1444,6 +1517,11 @@ class InternalDocumentHarnessRuntime:
                         unit_id=request.unit_id,
                     ):
                         draft = writer.generate(request)
+                        if request.conflict_context:
+                            draft = draft.model_copy(update={"metadata": {
+                                **draft.metadata, "decision_fingerprint": request.decision_fingerprint,
+                                "conflict_context": request.conflict_context,
+                            }})
                 except Exception as exc:
                     unit_status = "failed"
                     with persistence_lock:
@@ -1655,7 +1733,7 @@ class InternalDocumentHarnessRuntime:
             if not isinstance(persisted_drafts, (list, tuple)):
                 persisted_drafts = []
             if persisted_drafts and hasattr(result, "drafts"):
-                drafts_by_unit = {draft.unit_id: draft for draft in persisted_drafts}
+                drafts_by_unit = {draft.unit_id: draft for draft in persisted_drafts if result.unit_statuses.get(draft.unit_id) != "blocked"}
                 drafts_by_unit.update({draft.unit_id: draft for draft in (result.drafts or [])})
                 result.drafts = list(drafts_by_unit.values())
                 persisted_statuses = {
@@ -1667,6 +1745,8 @@ class InternalDocumentHarnessRuntime:
                     **persisted_statuses,
                     **dict(getattr(result, "unit_statuses", {}) or {}),
                 }
+            for unit_id in conflict_waiting_units:
+                result.unit_statuses[unit_id] = "conflicting"
             if selection is not None and selection.is_degraded:
                 runtime_event(
                     "fallback_completed",
@@ -1690,7 +1770,7 @@ class InternalDocumentHarnessRuntime:
                 lease_expires_at=None,
             )
             raise
-        final_status = "waiting_human" if any(status in {"requires_human", "blocked", "conflicting", "retrieval_failed"} for status in result.unit_statuses.values()) else "completed"
+        final_status = "waiting_human" if any(plan_node_waits_for_human({"status": status}) for status in result.unit_statuses.values()) else "completed"
         # Refresh the lease before expensive finalization steps so the commit
         # is safe even if the graph took most of the lease window.
         self.store.heartbeat_harness_run(

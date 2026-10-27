@@ -8,6 +8,7 @@
  * URL 与文件名由 documentCardModel 前端拼装。
  */
 import { cn } from '@/lib/utils';
+import { notify } from '@/components/ui/app-toast';
 import {
   documentCardLifecycleLabel,
   documentCardLifecycleTone,
@@ -15,10 +16,14 @@ import {
   documentCardReviewCandidateArtifact,
   documentCardTitle,
   downloadDocumentArtifact,
+  downloadDocumentArtifactAudit,
+  downloadDocumentArtifactBundle,
+  downloadDocumentArtifactWithAudit,
   type DocumentCardData,
   type DocumentStatusTone,
 } from './documentCardModel';
 import OutputSpecConfirmationCard from './OutputSpecConfirmationCard';
+import ConflictReviewPanel from './ConflictReviewPanel';
 
 // 兼容再导出:ChatPage 只用 identity 生成 React key,import 路径保持不变。
 export { documentCardIdentity } from './documentCardModel';
@@ -217,6 +222,14 @@ export default function DocumentStatusCard({
           候选文档已生成，审核通过后才会发布正式文件。
         </p>
       )}
+      {workOrderId && card.kb_name && ['needs_review', 'waiting_human', 'blocked'].includes(card.status) && (
+        <ConflictReviewPanel
+          key={`${card.kb_name}:${workOrderId}`}
+          kbName={card.kb_name}
+          workOrderId={workOrderId}
+          onDecisionSaved={onRefreshStatus ? () => onRefreshStatus(card) : undefined}
+        />
+      )}
       {showConversationContent && card.content && (
         <div className="mt-[6px] rounded-md border border-[#e3e7f1] bg-white px-[8px] py-[6px] text-[12px] text-[#464c5e]">
           <p>{card.content}</p>
@@ -284,8 +297,8 @@ export default function DocumentStatusCard({
             {card.kind === 'attachment_revision' ? '候选附件' : '文档产物'}
           </span>
           {card.artifacts.map((artifact) => (
+            <span key={artifact.artifact_id} className="inline-flex flex-wrap gap-1">
             <button
-              key={artifact.artifact_id}
               type="button"
               aria-label={
                 card.kind === 'attachment_revision'
@@ -297,6 +310,29 @@ export default function DocumentStatusCard({
             >
               下载 {artifact.output_format ? `${artifactStageLabel(artifact.stage)}（${artifact.output_format.toUpperCase()}）` : artifactStageLabel(artifact.stage)}
             </button>
+            {workOrderId && (
+              <>
+              <button
+                type="button"
+                aria-label={`下载来源与决策记录（产物 ${artifact.artifact_id}）`}
+                className="rounded-md border border-[#e3e7f1] bg-white px-2 py-0.5 text-[11px] text-[#464c5e]"
+                onClick={() => void downloadDocumentArtifactAudit(card, artifact).catch((error) => notify.error(error instanceof Error ? error.message : '记录下载失败'))}
+              >来源与决策记录</button>
+              <button
+                type="button"
+                aria-label={`下载含审计附录包（产物 ${artifact.artifact_id}）`}
+                className="rounded-md border border-[#e3e7f1] bg-white px-2 py-0.5 text-[11px] text-[#464c5e]"
+                onClick={() => void downloadDocumentArtifactBundle(card, artifact).catch((error) => notify.error(error instanceof Error ? error.message : '审计包下载失败'))}
+              >含审计附录包</button>
+              <button
+                type="button"
+                aria-label={`下载含内嵌审计章节（产物 ${artifact.artifact_id}）`}
+                className="rounded-md border border-[#e3e7f1] bg-white px-2 py-0.5 text-[11px] text-[#464c5e]"
+                onClick={() => void downloadDocumentArtifactWithAudit(card, artifact).catch((error) => notify.error(error instanceof Error ? error.message : '内嵌审计文档下载失败'))}
+              >含内嵌审计章节</button>
+              </>
+            )}
+            </span>
           ))}
         </div>
       )}

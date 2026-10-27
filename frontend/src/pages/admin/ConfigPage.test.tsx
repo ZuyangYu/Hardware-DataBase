@@ -110,6 +110,15 @@ describe('ConfigPage category navigation', () => {
     expect(markup).toContain('重启生效');
   });
 
+  it('exposes search byte limits with blank inheritance semantics', () => {
+    const keys = new Set(GROUPS.flatMap((group) => group.fields.map(([key]) => key)));
+    expect(keys.has('MULTI_KB_FUSION_MAX_BYTES')).toBe(true);
+    expect(keys.has('MULTI_KB_TURN_EVIDENCE_MAX_BYTES')).toBe(true);
+    const markup = renderPanel('检索', { showAdvanced: true });
+    expect(markup).toContain('MULTI_KB_FUSION_MAX_BYTES');
+    expect(markup).toContain('留空继承');
+  });
+
   it('marks the category that has unsaved edits', () => {
     const markup = renderPanel('检索', {
       draft: { RAGFLOW_GOVERNANCE_DATASET_NAME: 'changed' },

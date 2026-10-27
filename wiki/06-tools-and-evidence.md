@@ -53,6 +53,25 @@ class Evidence:                    # document_rag/schemas.py:59
 | 参数 | `top_k`（deep 8 / fast 5）、`query_mode`、`wiki_assist` |
 | 渲染 | `format_evidence_for_llm(...)`（1200 字符截断、编号、来源行）、`format_tool_result(...)`（**重复调用折叠** + 预算耗尽显式说明）、`empty_result_message(budget_blocked=...)` |
 
+### 2.1 来源类型与来源预算（2026-10-22）
+
+`src/services/evidence_sources.py` 是唯一来源类型判定点：`attachment`、
+`knowledge_base(_document|_structured)`、`conversation`、`wiki`、`memory`。
+历史 `source_type="chat_attachment"` 只做兼容归一化。缺失身份不再作为通配符；
+附件证据不能把知识库义务置为 `admitted`，反之亦然。
+
+`src/services/evidence_budget.py` 提供请求级 `EvidenceBudgetCoordinator`：
+全局上限、附件/知识库切片、必要预留、按渲染 UTF-8 字节计量、来源级/全局
+`source_budget_exhausted`/`global_budget_exhausted` 诊断。正式证据不淘汰；
+候选池可以淘汰。运行时只在 `attachment_and_knowledge_base` + 开关
+`EVIDENCE_SOURCE_AWARE_ENABLED=true` 时启用，工具不得自行复制预算状态。
+
+`src/services/evidence_policy.py` 把 `ConversationPlan.evidence_purpose`
+（`qa/summarize/extract/compare/author/visual`）映射为候选预览模式与比较双侧义务。
+`qa` 默认候选预览；`compare` 要求两侧来源义务都进入 `admitted` 才报告完整比较。
+比较工具按 `evidence.compare` 能力开放，由模型自行选择来源和调用时机；
+服务端不再根据正则/`purpose` 自动预检，也不会替模型预选附件。
+
 关键函数：
 
 ```python
@@ -208,6 +227,13 @@ ragas 的 retrieved_contexts / evidence_consistency 指标
 
 **引用编号规则**：`metadata["citation_number"]` 由 ToolRuntime 分配，回答中的 `[n]` 与之对应；
 `_build_claim_coverage` 依赖这个映射生成 citation 级覆盖（词法近似）。
+
+### 5.x 模型自行比较，无专用比较工具（2026-10-26）
+
+Agent 工具面不再提供 `document_compare` / `comparison_expand`，整篇文档比较
+服务及其只读报告 API 也已删除。比较是模型的行为：模型用普通 `document_search`、
+`attachment_search`、`attachment_read` 等工具读取两侧内容并自行对比，不再由
+路由或预检自动触发。
 
 ---
 

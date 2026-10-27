@@ -41,6 +41,20 @@ const workOrderCard: DocumentCardData = {
 };
 
 describe('DocumentStatusCard', () => {
+  it('shows a conflict review entry point for a waiting work order', () => {
+    const card = parseDocumentCardEvent(cardEvent({
+      kind: 'work_order_status',
+      status: 'needs_review',
+      next_actions: ['review_document'],
+      kb_name: 'shared',
+      work_order_id: 'wo-1',
+    }));
+
+    const markup = renderToStaticMarkup(<DocumentStatusCard card={card!} />);
+
+    expect(markup).toContain('data-conflict-review-panel="wo-1"');
+  });
+
   it('renders work order card from document_card event without a workbench link', () => {
     const card = parseDocumentCardEvent(cardEvent({
       kind: 'work_order_created',
@@ -305,6 +319,10 @@ describe('DocumentStatusCard', () => {
     expect(markup).toContain('下载 final');
     expect(markup).toContain('aria-label="下载 draft（工单 wo-123）"');
     expect(markup).toContain('aria-label="下载 final（工单 wo-123）"');
+    expect(markup).toContain('下载来源与决策记录（产物 a-1）');
+    expect(markup).toContain('下载来源与决策记录（产物 a-2）');
+    expect(markup).toContain('下载含审计附录包（产物 a-1）');
+    expect(markup).toContain('下载含内嵌审计章节（产物 a-1）');
 
     const noArtifacts = renderToStaticMarkup(
       <DocumentStatusCard card={workOrderCard} onRefreshStatus={() => undefined} />,

@@ -23,6 +23,7 @@ from src.api.schemas import (
     ConfirmPlanRequest,
     ConfirmTemplateRequest,
     CompleteDocumentRevisionRequest,
+    ConflictDecisionRequest,
     ConvertDocumentArtifactRequest,
     CreatePlanProposalRequest,
     CreateDocumentRevisionRequest,
@@ -48,6 +49,24 @@ from src.document_authoring.job_store import DocumentAuthoringJobStore
 from src.document_authoring.template_analysis import TemplateMappingCorrection
 
 router = APIRouter(tags=["document-generation"])
+
+
+def _apply_generation_scope(ctx, user, auth, selection):
+    if selection is None:
+        return ctx
+    if not src.settings.MULTI_KB_CHAT_ENABLED or not src.settings.MULTI_KB_HUMAN_REVIEW_ENABLED:
+        raise HTTPException(status_code=409, detail="multi_kb_authoring_feature_unavailable")
+    from src.services.knowledge_scope import KnowledgeScopeResolver
+    try:
+        scope = KnowledgeScopeResolver(auth, tenant_key=ctx.tenant_id or "default").resolve(
+            user, ctx.metadata["document_template_kb_name"], selection,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="knowledge_scope_denied") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    ctx.metadata["knowledge_scope_snapshot"] = scope.model_dump(mode="json")
+    return ctx
 
 
 def _read_upload_limited(file: UploadFile, limit: int) -> bytes:
@@ -419,7 +438,7 @@ def create_generation_session(
     pipeline: AppPipeline = Depends(get_pipeline),
     auth: AuthService = Depends(get_auth_service),
 ):
-    ctx = _write_ctx(user, auth, kb)
+    ctx = _apply_generation_scope(_write_ctx(user, auth, kb), user, auth, payload.knowledge_scope)
     try:
         return pipeline.create_document_generation_session(
             ctx,
@@ -605,7 +624,7 @@ def create_work_order(
     pipeline: AppPipeline = Depends(get_pipeline),
     auth: AuthService = Depends(get_auth_service),
 ):
-    ctx = _write_ctx(user, auth, kb)
+    ctx = _apply_generation_scope(_write_ctx(user, auth, kb), user, auth, payload.knowledge_scope)
     try:
         kwargs = {
             "template_version_id": payload.template_version_id,
@@ -700,6 +719,158 @@ def list_document_task_reviews(
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _conflict_decision_error(exc: ValueError) -> HTTPException:
+    invalid = {
+        'conflict_decision_action_not_allowed', 'conflict_decision_claim_not_found',
+        'conflict_decision_claim_required', 'conflict_decision_case_mismatch',
+        'conflict_decision_idempotency_key_required',
+    }
+    return HTTPException(status_code=422 if str(exc) in invalid else 409, detail=str(exc))
+
+
+@router.get("/document-generation/work-orders/{work_order_id}/conflicts")
+@router.get("/document-work-orders/{work_order_id}/conflicts")
+def list_document_conflicts(
+    work_order_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        return pipeline.list_document_conflicts(ctx, work_order_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/document-generation/conflicts/{conflict_id}")
+def get_document_conflict(
+    conflict_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        result = pipeline.get_document_conflict(ctx, conflict_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="conflict case not found")
+    return result
+
+
+@router.post("/document-generation/conflicts/{conflict_id}/decision")
+def submit_document_conflict_decision(
+    conflict_id: str,
+    kb: str,
+    payload: ConflictDecisionRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _write_ctx(user, auth, kb)
+    try:
+        return pipeline.submit_document_conflict_decision(
+            ctx,
+            conflict_id,
+            expected_fingerprint=payload.expected_fingerprint,
+            expected_conflict_version=payload.expected_conflict_version,
+            expected_snapshot_hash=payload.expected_snapshot_hash,
+            expected_evidence_set_hash=payload.expected_evidence_set_hash,
+            decision={
+                "action": payload.action,
+                    "selected_claim_id": payload.selected_claim_id
+                    or (payload.selected_alternative_ids[0] if payload.selected_alternative_ids else None),
+                "rationale": payload.rationale,
+            },
+            idempotency_key=payload.idempotency_key,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise _conflict_decision_error(exc) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.get("/document-work-orders/{work_order_id}/conflicts/{conflict_id}")
+@router.get("/document-generation/work-orders/{work_order_id}/conflicts/{conflict_id}")
+def get_document_work_order_conflict(
+    work_order_id: str,
+    conflict_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        result = pipeline.get_document_conflict(
+            ctx, conflict_id, expected_work_order_id=work_order_id,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="conflict case not found")
+    return result
+
+
+@router.post("/document-work-orders/{work_order_id}/conflicts/{conflict_id}/decisions")
+@router.post("/document-generation/work-orders/{work_order_id}/conflicts/{conflict_id}/decisions")
+def submit_document_work_order_conflict_decision(
+    work_order_id: str,
+    conflict_id: str,
+    kb: str,
+    payload: ConflictDecisionRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _write_ctx(user, auth, kb)
+    try:
+        return pipeline.submit_document_conflict_decision(
+            ctx,
+            conflict_id,
+            expected_work_order_id=work_order_id,
+            expected_fingerprint=payload.expected_fingerprint,
+            expected_conflict_version=payload.expected_conflict_version,
+            expected_snapshot_hash=payload.expected_snapshot_hash,
+            expected_evidence_set_hash=payload.expected_evidence_set_hash,
+            decision={
+                "action": payload.action,
+                "selected_claim_id": payload.selected_claim_id
+                or (payload.selected_alternative_ids[0] if payload.selected_alternative_ids else None),
+                "rationale": payload.rationale,
+            },
+            idempotency_key=payload.idempotency_key,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise _conflict_decision_error(exc) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.get("/document-generation/reviews/{review_id}")
@@ -1418,6 +1589,7 @@ def generate_work_order(
 
 
 @router.post("/document-generation/work-orders/{work_order_id}/resume")
+@router.post("/document-work-orders/{work_order_id}/resume")
 def resume_work_order(
     work_order_id: str,
     kb: str,
@@ -1579,6 +1751,90 @@ def artifact_convert(
         "source_artifact_id": artifact_id,
         "target_format": payload.target_format,
     }
+
+
+@router.get('/document-generation/artifacts/{artifact_id}/audit')
+def artifact_audit(
+    artifact_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        return pipeline.document_artifact_audit(ctx, artifact_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get('/document-generation/artifacts/{artifact_id}/audit-bundle')
+def artifact_audit_bundle(
+    artifact_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        content = pipeline.download_document_artifact_bundle(ctx, artifact_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    safe_artifact_id = re.sub(r'[^A-Za-z0-9._-]+', '-', artifact_id).strip('.-') or 'artifact'
+    return Response(
+        content=content,
+        media_type='application/zip',
+        headers={'Content-Disposition': f'attachment; filename="document-{safe_artifact_id}-with-audit.zip"'},
+    )
+
+
+@router.get('/document-generation/artifacts/{artifact_id}/audit-document')
+def artifact_audit_document(
+    artifact_id: str,
+    kb: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = _ctx(user, auth, kb)
+    try:
+        content = pipeline.download_document_artifact_with_audit(ctx, artifact_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    target_format = "bin"
+    document_generation = getattr(pipeline, "document_generation", None)
+    store = getattr(document_generation, "store", None)
+    get_artifact = getattr(store, "get_artifact", None)
+    get_work_order = getattr(store, "get_work_order", None)
+    if callable(get_artifact):
+        artifact = get_artifact(artifact_id)
+        if artifact is not None and callable(get_work_order):
+            order = get_work_order(getattr(artifact, "work_order_id", ""))
+            target_format = str(
+                getattr(artifact, "output_format", None)
+                or getattr(order, "target_format", "")
+                or "bin"
+            ).strip().lower()
+    target_format = re.sub(r"[^a-z0-9]+", "", target_format) or "bin"
+    safe_artifact_id = re.sub(r'[^A-Za-z0-9._-]+', '-', artifact_id).strip('.-') or 'artifact'
+    return Response(
+        content=content,
+        media_type=_DOCUMENT_DOWNLOAD_MEDIA_TYPES.get(target_format, "application/octet-stream"),
+        headers={"Content-Disposition": f'attachment; filename="document-{safe_artifact_id}-with-audit.{target_format}"'},
+    )
 
 
 @router.get("/document-generation/artifacts/{artifact_id}/download")

@@ -62,6 +62,23 @@ class DenseAttachmentTests(unittest.TestCase):
         ]
         self.store.replace_parts(self.asset.asset_id, self.parts)
 
+    def test_short_cjk_term_uses_bounded_scan_when_fts_tokenization_misses(self):
+        cjk_part = AttachmentPart(
+            part_id="part-terms",
+            asset_id=self.asset.asset_id,
+            ordinal=2,
+            part_type="text",
+            text_content="1.4 术语及缩写解释 Terms and Abbreviations",
+            locator={"heading_path": ["概述 Introduction"], "paragraph": 15},
+        )
+        self.store.replace_parts(self.asset.asset_id, [*self.parts, cjk_part])
+
+        result = AttachmentRetrievalService().search(
+            "术语", asset_ids=[self.asset.asset_id], limit=4
+        )
+
+        self.assertEqual([chunk.part_id for chunk in result.chunks], ["part-terms"])
+
     def _patch(self, name, value):
         old = getattr(src.settings, name, None)
         setattr(src.settings, name, value)

@@ -1368,11 +1368,23 @@ def _select_field_evidence(
                 discarded.append(evidence_id)
             continue
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        if content_hash in seen_content:
+        metadata = item.get("metadata") or {}
+        source = metadata.get("knowledge_source") if isinstance(metadata, dict) else None
+        source = source if isinstance(source, dict) else {}
+        source_identity = (
+            source.get("tenant_id", metadata.get("tenant_id")),
+            source.get("department_id", metadata.get("department_id")),
+            source.get("kb_id", metadata.get("kb_id")),
+            source.get("local_record_id", metadata.get("local_record_id")),
+            source.get("source_content_hash", metadata.get("source_content_hash")),
+            source.get("index_revision", metadata.get("index_revision")),
+        )
+        content_key = f"{content_hash}:{source_identity!r}"
+        if content_key in seen_content:
             if evidence_id:
                 discarded.append(evidence_id)
             continue
-        seen_content.add(content_hash)
+        seen_content.add(content_key)
         unique.append(item)
     # Frozen ICD pin facts and second-stage pin-function evidence are
     # contract-critical for the connector table unit: keep them ahead of the
@@ -1387,8 +1399,29 @@ def _select_field_evidence(
     ordered = priority_items + [
         item for item in unique if id(item) not in priority_ids
     ]
-    selected = ordered[:max_items]
-    discarded.extend(str(item.get("id") or "") for item in ordered[max_items:] if item.get("id"))
+    # Keep at least one candidate from every knowledge-base source before
+    # spending the bounded field budget on additional hits.  Identical text
+    # across sources is still independent evidence and must remain reviewable.
+    source_first: list[dict[str, Any]] = []
+    seen_sources: set[str] = set()
+    for item in ordered:
+        metadata = item.get("metadata") or {}
+        source = metadata.get("knowledge_source") if isinstance(metadata, dict) else None
+        source = source if isinstance(source, dict) else {}
+        source_id = source.get("kb_id", metadata.get("kb_id"))
+        if source_id in (None, ""):
+            continue
+        source_key = str(source_id)
+        if source_key not in seen_sources:
+            seen_sources.add(source_key)
+            source_first.append(item)
+    selected = (source_first + [item for item in ordered if item not in source_first])[:max_items]
+    selected_ids = {id(item) for item in selected}
+    discarded.extend(
+        str(item.get("id") or "")
+        for item in ordered
+        if id(item) not in selected_ids and item.get("id")
+    )
     return selected, discarded
 
 
@@ -1620,11 +1653,18 @@ def _validated_evidence(
             return []
         result: list[dict[str, Any]] = []
         for evidence in outcome.evidences:
-            if (
-                evidence.metadata.get("knowledge_base_name")
-                != work_order.knowledge_base_name
-                or evidence.source_name not in snapshot.source_names
-            ):
+            if getattr(snapshot, "source_snapshot_kind", "") == "multi_knowledge_v1":
+                source = next((source for source in snapshot.sources
+                               if source.get("kb_id") == evidence.metadata.get("kb_id")
+                               and source.get("local_record_id") == evidence.metadata.get("local_record_id")), None)
+                allowed = source is not None and (
+                    evidence.source_name == source.get("source_name")
+                    and evidence.metadata.get("source_content_hash") == source.get("source_content_hash")
+                    and evidence.metadata.get("knowledge_base_name") == source.get("kb_name_snapshot")
+                )
+            else:
+                allowed = evidence.metadata.get("knowledge_base_name") == work_order.knowledge_base_name and evidence.source_name in snapshot.source_names
+            if not allowed:
                 raise PermissionError(
                     "harness received evidence outside the frozen source set"
                 )

@@ -177,6 +177,27 @@ def test_attempt_checkpoint_thread_preserves_live_attachment_acl(monkeypatch, tm
     assert "owned.md" in str(captured[0])
 
 
+def test_attachment_tool_service_detection_survives_cached_factory(monkeypatch):
+    """A test-time service factory must not poison later ACL service checks."""
+    from src.agents.tools import attachment_tools
+    from src.agents.tools.runtime import ToolRuntime
+    from src.attachments.service import AttachmentService
+    from src.attachments.store import AttachmentStore
+
+    service = AttachmentService(store=AttachmentStore())
+    monkeypatch.setattr(attachment_tools, "AttachmentService", lambda: object())
+    runtime = ToolRuntime(
+        kb_name="kb_hw",
+        ctx=None,
+        attachment_service=service,
+        attachment_session_id=42,
+        attachment_user_id=7,
+        source_scope="attachment_only",
+    )
+
+    assert attachment_tools._service(runtime) is service
+
+
 def test_graph_recursion_error_completes_with_actionable_notice(monkeypatch):
     """步数上限是执行预算，不是系统故障：轮次必须完成并给出可操作提示。"""
     from langgraph.errors import GraphRecursionError
@@ -287,8 +308,8 @@ def test_export_request_mounts_server_owned_export_protocol(monkeypatch):
     assert "不得声称当前环境无法输出 PDF" in prompt
 
 
-def test_attachment_turn_prefetches_evidence_before_agent_answer(monkeypatch):
-    """An attached-file question must not depend on the model choosing the tool."""
+def test_attachment_turn_exposes_tools_without_automatic_prefetch(monkeypatch):
+    """The model gets attachment tools, but the server does not search for it."""
     from src.agents import runner as runner_mod
     from src.agents.tools import attachment_tools as attachment_tools_mod
     from src.attachments.models import AttachmentRef
@@ -352,11 +373,10 @@ def test_attachment_turn_prefetches_evidence_before_agent_answer(monkeypatch):
     ) == ["已读取附件"]
 
     assert captured["runtime_attachment_user_id"] == 7
-    assert search_queries
-    assert any("600605919" in query and "EPS" in query for query in search_queries)
-    assert "600605919_EPS_HSI.docx" in captured["system_prompt"]
-    assert "EPS 系统状态定义如下" in captured["system_prompt"]
-    assert "不得声称附件未挂载" in captured["system_prompt"]
+    assert search_queries == []
+    assert attachment_search in captured["tools"]
+    assert "EPS 系统状态定义如下" not in captured["system_prompt"]
+    assert "当前轮附件预检" not in captured["system_prompt"]
 
 
 def test_general_chat_hides_memory_trace_and_retrieval_footer(monkeypatch):

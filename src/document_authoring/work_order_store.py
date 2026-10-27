@@ -274,6 +274,33 @@ class DocumentAuthoringStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_document_outbox_events_pending
                     ON document_outbox_events(status, created_at, event_id);
+                CREATE TABLE IF NOT EXISTS authoring_conflict_cases (
+                    conflict_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    work_order_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    source_snapshot_hash TEXT NOT NULL DEFAULT '',
+                    evidence_set_hash TEXT NOT NULL DEFAULT '',
+                    row_version INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_authoring_conflicts_work_order
+                    ON authoring_conflict_cases(tenant_id, work_order_id, status);
+                CREATE TABLE IF NOT EXISTS authoring_conflict_decisions (
+                    decision_id TEXT PRIMARY KEY,
+                    conflict_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    request_fingerprint TEXT NOT NULL DEFAULT '',
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(conflict_id, idempotency_key),
+                    FOREIGN KEY(conflict_id) REFERENCES authoring_conflict_cases(conflict_id)
+                );
                 CREATE TABLE IF NOT EXISTS document_work_order_deletion_audits (
                     audit_id TEXT PRIMARY KEY, work_order_id TEXT NOT NULL,
                     tenant_id TEXT NOT NULL, deleted_at TEXT NOT NULL,
@@ -294,6 +321,13 @@ class DocumentAuthoringStore:
                    FROM template_analyses
                    WHERE json_extract(payload_json, '$.analysis_id') IS NOT NULL"""
             )
+        # Older R3 databases already have conflict tables without the new
+        # stamp/version columns. Apply their additive migration before any
+        # indexes reference those columns. The schema probe used by PG
+        # provisioning also executes this path on its temporary SQLite DB.
+        from src.document_authoring.conflicts.store import ConflictDecisionStore
+
+        ConflictDecisionStore(backend_store=self)
 
     @staticmethod
     def _migrate_docx_regions(conn: sqlite3.Connection) -> None:
@@ -1164,7 +1198,9 @@ class DocumentAuthoringStore:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """SELECT payload_json FROM document_work_orders
-                   WHERE tenant_id = ? AND scope_key = ? ORDER BY rowid DESC""",
+                   WHERE tenant_id = ? AND scope_key = ?
+                   ORDER BY COALESCE(json_extract(payload_json, '$.created_at'), '') DESC,
+                            work_order_id DESC""",
                 (tenant_id, f"project:{project_id}"),
             ).fetchall()
         return [DocumentWorkOrder.model_validate(_payload(row)) for row in rows]
@@ -1177,7 +1213,9 @@ class DocumentAuthoringStore:
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """SELECT payload_json FROM document_work_orders
-                   WHERE tenant_id = ? AND scope_key = ? ORDER BY rowid DESC""",
+                   WHERE tenant_id = ? AND scope_key = ?
+                   ORDER BY COALESCE(json_extract(payload_json, '$.created_at'), '') DESC,
+                            work_order_id DESC""",
                 (tenant_id, f"knowledge_base:{knowledge_base_name}"),
             ).fetchall()
         return [DocumentWorkOrder.model_validate(_payload(row)) for row in rows]
@@ -1188,7 +1226,8 @@ class DocumentAuthoringStore:
             try:
                 updated = conn.execute(
                     """UPDATE document_work_orders SET status = ?, payload_json = ?
-                       WHERE work_order_id = ? AND json_extract(payload_json, '$.lock_version') = ?""",
+                       WHERE work_order_id = ?
+                         AND CAST(json_extract(payload_json, '$.lock_version') AS BIGINT) = ?""",
                     (order.status, _json(order), order.work_order_id, order.lock_version - 1),
                 ).rowcount
                 if updated == 1:
@@ -1371,13 +1410,14 @@ class DocumentAuthoringStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 current = self._get_run_for_update(conn, run_id)
-                if current.status not in {"failed", "paused"}:
+                if current.status not in {"failed", "paused", "waiting_human"}:
                     raise ValueError(f"harness run cannot be retried from status {current.status}")
-                if current.retry_count >= max_retries:
+                if current.status != "waiting_human" and current.retry_count >= max_retries:
                     raise ValueError("harness retry budget is exhausted")
                 now = datetime.now(timezone.utc)
                 revised = current.model_copy(update={
-                    "status": "retrying", "retry_count": current.retry_count + 1,
+                    "status": "retrying",
+                    "retry_count": current.retry_count if current.status == "waiting_human" else current.retry_count + 1,
                     "max_retries": max_retries, "lease_owner": None, "lease_expires_at": None,
                     "error": None, "last_error_code": None, "updated_at": now,
                 })
@@ -1840,7 +1880,7 @@ class DocumentAuthoringStore:
         if status is not None:
             query += " AND status = ?"
             params.append(status)
-        query += " ORDER BY rowid, receipt_id"
+        query += " ORDER BY COALESCE(json_extract(payload_json, '$.created_at'), ''), receipt_id"
         with closing(self._connect()) as conn:
             rows = conn.execute(query, params).fetchall()
         return [NodeExecutionReceipt.model_validate(_payload(row)) for row in rows]
@@ -2062,7 +2102,8 @@ class DocumentAuthoringStore:
     def list_artifacts(self, work_order_id: str) -> list[DocumentArtifact]:
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT payload_json FROM document_artifacts WHERE work_order_id = ? ORDER BY rowid", (work_order_id,)
+                """SELECT payload_json FROM document_artifacts WHERE work_order_id = ?
+                   ORDER BY created_at, artifact_id""", (work_order_id,)
             ).fetchall()
         return [DocumentArtifact.model_validate(_payload(row)) for row in rows]
 
@@ -2512,7 +2553,8 @@ class DocumentAuthoringStore:
     def list_human_events(self, artifact_id: str) -> list[DocumentHumanEvent]:
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT payload_json FROM document_human_events WHERE artifact_id = ? ORDER BY rowid", (artifact_id,)
+                """SELECT payload_json FROM document_human_events WHERE artifact_id = ?
+                   ORDER BY COALESCE(json_extract(payload_json, '$.created_at'), ''), event_id""", (artifact_id,)
             ).fetchall()
         return [DocumentHumanEvent.model_validate(_payload(row)) for row in rows]
 

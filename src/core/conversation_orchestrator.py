@@ -56,6 +56,7 @@ class ConversationPlan:
     confidence: float = 0.0
     reason_codes: tuple[str, ...] = ()
     allowed_tools: tuple[str, ...] = ()
+    evidence_purpose: str = "qa"
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -189,7 +190,11 @@ class ConversationOrchestrator:
             )
             routed_by = "deterministic"
 
-        return ConversationPlan(
+        from dataclasses import replace
+
+        from src.services.evidence_policy import resolve_evidence_purpose
+
+        plan = ConversationPlan(
             schema_version=self.schema_version,
             route=route,
             intent=intent.intent,
@@ -208,6 +213,12 @@ class ConversationOrchestrator:
             confidence=float(intent.confidence),
             reason_codes=tuple(dict.fromkeys(reasons)),
             allowed_tools=self._allowed_tools(route, bool(has_attachments)),
+        )
+        return replace(
+            plan,
+            evidence_purpose=resolve_evidence_purpose(
+                query, conversation_plan=plan, intent_plan=intent,
+            ),
         )
 
     @staticmethod

@@ -14,7 +14,7 @@ import ChatPage, {
   resolveTemplateAttachmentRoute,
   retainExistingAttachmentIds,
 } from './ChatPage';
-import Composer from './components/Composer';
+import Composer, { kbOptionLabel } from './components/Composer';
 
 const auth: AuthSession = {
   token: 'test-token',
@@ -226,6 +226,21 @@ describe('ChatPage document authoring bridge', () => {
     expect(markup).not.toContain('上传模板');
     expect(markup).not.toContain('chat-document-template-upload');
   });
+
+  it('shows only the single knowledge-base selector', () => {
+    const markup = renderChat(true, [
+      writableKb,
+      { ...writableKb, name: 'reference', kb_id: 2, permission: 'read' },
+    ]);
+
+    expect(markup).toContain('检索范围');
+    expect(markup).toContain('aria-label="选择会话锚定库"');
+    expect(markup).not.toContain('aria-label="添加知识库"');
+    expect(markup).not.toContain('参考库');
+    expect(markup).not.toContain('用途');
+    expect(markup).not.toContain('aria-label="知识库范围"');
+    expect(markup).not.toContain('挂载知识库');
+  });
 });
 
 const attachedContext: DocumentContext = {
@@ -262,11 +277,45 @@ describe('Composer document context', () => {
     expect(markup).toContain('修改计划');
   });
 
-  it('keeps the knowledge-base selector usable while a turn is streaming', () => {
+  it('disables the primary knowledge-base selector while a turn is streaming', () => {
     const markup = renderComposer({ streaming: true });
 
-    expect(markup).toMatch(/aria-label="挂载知识库"/);
-    expect(markup).not.toMatch(/<button[^>]*\bdisabled(?:=""|(?=\s|>))[^>]*aria-label="挂载知识库"/);
+    expect(markup).toMatch(/aria-label="选择会话锚定库"/);
+    expect(markup).toMatch(/<button[^>]*\bdisabled(?:=""|(?=\s|>))[^>]*aria-label="选择会话锚定库"/);
+  });
+
+  it('labels the selector as the retrieval scope', () => {
+    const markup = renderComposer();
+
+    expect(markup).toContain('检索范围');
+    expect(markup).toContain('会话锚定库');
+  });
+
+  it('does not render a multi-knowledge-base picker', () => {
+    const markup = renderComposer({
+      availableKbs: [
+        writableKb,
+        { ...writableKb, name: 'reference', kb_id: 2, permission: 'read' },
+      ],
+    });
+
+    expect(markup).toContain('aria-label="选择会话锚定库"');
+    expect(markup).not.toContain('aria-label="添加知识库"');
+    expect(markup).not.toContain('参考库');
+    expect(markup).not.toContain('用途');
+    expect(markup).not.toContain('检索用途');
+  });
+
+  it('shows an explicit primary-knowledge-base prompt when nothing is mounted', () => {
+    const markup = renderComposer({ kbName: '' });
+
+    expect(markup).toContain('选择会话锚定库');
+    expect(markup).toContain('未选择知识库');
+  });
+
+  it('hides the department suffix when all knowledge bases share one department', () => {
+    expect(kbOptionLabel(writableKb, false)).toBe('shared');
+    expect(kbOptionLabel(writableKb, true)).toBe('shared · 研发部');
   });
 
   it('does not render a legacy generation-mode toggle when no document context is attached', () => {
@@ -317,7 +366,7 @@ describe('Composer attachment status', () => {
     expect(markup).toContain('重试解析');
   });
 
-  it('keeps template conversion inside the attach menu instead of an inline chip', () => {
+  it('does not show a template conversion action on uploaded attachments', () => {
     const attachment: AttachmentView = {
       attachment_id: 'att-template',
       asset_id: 'asset-template',
@@ -334,17 +383,15 @@ describe('Composer attachment status', () => {
     const markup = renderComposer({
       attachmentsEnabled: true,
       documentAuthoringEnabled: true,
-      canUploadDocumentTemplate: true,
       draftAttachments: [attachment],
-      onUseAsTemplate: () => undefined,
     });
 
-    // 附件入口收敛为左侧"+"按钮;菜单内容由 Radix portal 在打开时渲染,
-    // 静态标记只断言入口与"不再有内联附件 chip / 检索范围选择"。
     expect(markup).toContain('aria-label="添加附件"');
     expect(markup).toContain('chat-attachment-upload');
-    expect(markup).not.toContain('检索范围');
-    expect(markup).not.toContain('已选');
-    expect(markup).not.toContain('未选');
+    expect(markup).toContain('会话锚定库');
+    expect(markup).toContain('检索范围');
+    expect(markup).toContain('review.xlsx');
+    expect(markup).not.toContain('作为模板');
+    expect(markup).not.toContain('将附件转换为文档模板');
   });
 });

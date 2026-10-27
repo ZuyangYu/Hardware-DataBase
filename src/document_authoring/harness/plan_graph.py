@@ -35,6 +35,13 @@ UnitExecutor = Callable[[CompiledTaskNode, int], Any]
 StructuralExecutor = Callable[[CompiledTaskNode, int, PlanDAGExecutionResult], Any]
 
 
+def plan_node_waits_for_human(output: Any) -> bool:
+    payload = output.get("receipt_payload", output) if isinstance(output, dict) else {}
+    return payload.get("status") in {
+        "conflicting", "blocked", "requires_human", "retrieval_failed", "insufficient_evidence",
+    }
+
+
 class PlanDAGExecutor:
     """Run ready graph nodes in stable order and resume from receipts.
 
@@ -68,6 +75,11 @@ class PlanDAGExecutor:
                     statuses=result.statuses,
                     node_id=node_id,
                 )
+        invalidated = {node_id for node_id, payload in committed.items() if plan_node_waits_for_human(payload)}
+        for node_id in graph.topological_order:
+            if node_id in invalidated or any(dependency in invalidated for dependency in node_by_id[node_id].dependencies):
+                invalidated.add(node_id)
+                committed.pop(node_id, None)
         for node_id in graph.topological_order:
             if node_id not in committed:
                 continue
@@ -101,6 +113,11 @@ class PlanDAGExecutor:
                     )
                 ]
                 if not ready:
+                    if any(status in {"waiting_human", "blocked_dependency"} for status in result.statuses.values()):
+                        for node_id in graph.topological_order:
+                            if node_id not in result.statuses:
+                                result.statuses[node_id] = "blocked_dependency"
+                        break
                     raise PlanDAGExecutionError(
                         "compiled graph cannot make progress", statuses=result.statuses,
                     )
@@ -143,7 +160,8 @@ class PlanDAGExecutor:
                         continue
                     result.outputs[node.node_id] = output
                     result.receipts[node.node_id] = output
-                    result.statuses[node.node_id] = "committed"
+                    pending = plan_node_waits_for_human(output)
+                    result.statuses[node.node_id] = "waiting_human" if pending else "committed"
 
                 # Merge the batch in graph order, independent of which worker
                 # completed first. This keeps checkpoints and test projections

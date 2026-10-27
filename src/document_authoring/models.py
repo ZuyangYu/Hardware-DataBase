@@ -258,6 +258,12 @@ class KnowledgeBaseSourceSnapshot(BaseModel):
     created_by: str
     created_at: datetime = Field(default_factory=utc_now)
     content_hash: str = ""
+    # R3 multi-source authoring keeps the legacy fields for readers that only
+    # understand one KB, while these fields preserve the actual source set and
+    # per-source role/record freeze in the payload column.
+    source_snapshot_kind: Literal["legacy_knowledge_base", "multi_knowledge_v1"] = "legacy_knowledge_base"
+    sources: list[dict[str, Any]] = Field(default_factory=list)
+    knowledge_scope_snapshot: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod
     def create(
@@ -267,6 +273,9 @@ class KnowledgeBaseSourceSnapshot(BaseModel):
         knowledge_base_name: str,
         source_names: list[str],
         created_by: str,
+        source_snapshot_kind: Literal["legacy_knowledge_base", "multi_knowledge_v1"] = "legacy_knowledge_base",
+        sources: list[dict[str, Any]] | None = None,
+        knowledge_scope_snapshot: dict[str, Any] | None = None,
     ) -> KnowledgeBaseSourceSnapshot:
         return cls(
             source_set_snapshot_id=f"kb-source-set-{uuid.uuid4().hex}",
@@ -274,12 +283,22 @@ class KnowledgeBaseSourceSnapshot(BaseModel):
             knowledge_base_name=knowledge_base_name,
             source_names=source_names,
             created_by=created_by,
+            source_snapshot_kind=source_snapshot_kind,
+            sources=list(sources or []),
+            knowledge_scope_snapshot=dict(knowledge_scope_snapshot or {}),
         )
 
     @model_validator(mode="after")
     def bind_content_hash(self):
-        expected = content_hash(self.model_dump(mode="json", exclude={"content_hash"}))
+        excluded = {"content_hash"}
+        if not self.knowledge_scope_snapshot:
+            excluded.add("knowledge_scope_snapshot")
+        expected = content_hash(self.model_dump(mode="json", exclude=excluded))
         if self.content_hash and self.content_hash != expected:
+            if self.source_snapshot_kind == 'legacy_knowledge_base' and not self.sources:
+                legacy = content_hash(self.model_dump(mode='json', exclude=excluded | {'source_snapshot_kind', 'sources'}))
+                if self.content_hash == legacy:
+                    return self
             raise ValueError("knowledge-base source snapshot hash does not match contents")
         self.content_hash = expected
         return self
@@ -1269,7 +1288,7 @@ EXECUTION_EVENT_TYPES = (
     "missing_marked", "draft_persisted", "fallback_started", "fallback_completed",
     "human_waiting", "human_resumed", "coverage_evaluated", "unit_reviewed",
     "unit_rework_requested", "pre_render_reviewed", "post_render_reviewed",
-    "release_gated", "run_finalized",
+    "release_gated", "run_finalized", "conflict_decision",
 )
 
 ExecutionEventType = Literal[
@@ -1280,7 +1299,7 @@ ExecutionEventType = Literal[
     "missing_marked", "draft_persisted", "fallback_started", "fallback_completed",
     "human_waiting", "human_resumed", "coverage_evaluated", "unit_reviewed",
     "unit_rework_requested", "pre_render_reviewed", "post_render_reviewed",
-    "release_gated", "run_finalized",
+    "release_gated", "run_finalized", "conflict_decision",
 ]
 
 

@@ -18,6 +18,7 @@ import tempfile
 import threading
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
@@ -92,6 +93,84 @@ class DocumentAuthoringPgParityTests(unittest.TestCase):
             artifact_root=os.path.join(self.tmp.name, "artifacts-pg")
         )
 
+    def test_conflict_decisions_round_trip_and_replay_on_both_backends(self):
+        from src.document_authoring.conflicts.detector import ConflictDetector
+        from src.document_authoring.conflicts.normalizer import normalize_claim
+        from src.document_authoring.conflicts.policy import ConflictPolicy
+        from src.document_authoring.conflicts.store import ConflictDecisionStore
+
+        for backend in (self._sqlite_store(), self._pg_store()):
+            with self.subTest(backend=backend._backend):
+                store = ConflictDecisionStore(backend_store=backend)
+                case = ConflictDetector().detect([
+                    normalize_claim(
+                        claim_id=f'claim-{value}', field_key='input_voltage', subject='power', predicate='requires',
+                        value=value, unit='V', source_kb_id=101,
+                        source_role='primary', evidence_id=f'evidence-{value}',
+                    ) for value in ('5', '12')
+                ])[0]
+                work_order_id = f'pg-conflict-{uuid.uuid4().hex}'
+                store.save_case(case, tenant_id='default', work_order_id=work_order_id)
+                request = dict(
+                    conflict_id=case.conflict_id, tenant_id='default', actor_id='alice',
+                    expected_fingerprint=case.fingerprint, expected_version=1,
+                    expected_snapshot_hash=case.snapshot_hash,
+                    expected_evidence_set_hash=case.evidence_set_hash,
+                    decision=ConflictPolicy().evaluate(case, purpose='compose').model_copy(
+                        update={'selected_claim_id': 'claim-5'},
+                    ), idempotency_key='pg-decision',
+                )
+                first = store.submit_decision(**request)
+                self.assertEqual(first, store.submit_decision(**request))
+                self.assertEqual(store.get_case(case.conflict_id).row_version, 2)
+                self.assertEqual(len(store.list_decisions(case.conflict_id, tenant_id='default')), 1)
+
+    def test_concurrent_conflict_decision_replays_share_one_result_on_both_backends(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        from src.document_authoring.conflicts.detector import ConflictDetector
+        from src.document_authoring.conflicts.normalizer import normalize_claim
+        from src.document_authoring.conflicts.policy import ConflictPolicy
+        from src.document_authoring.conflicts.store import ConflictDecisionStore
+
+        for backend in (self._sqlite_store(), self._pg_store()):
+            with self.subTest(backend=backend._backend):
+                store = ConflictDecisionStore(backend_store=backend)
+                case = ConflictDetector().detect([
+                    normalize_claim(
+                        claim_id=f'claim-{value}', field_key='input_voltage', subject='power', predicate='requires',
+                        value=value, unit='V', source_kb_id=101,
+                        source_role='primary', evidence_id=f'evidence-{value}',
+                    ) for value in ('5', '12')
+                ])[0]
+                store.save_case(case, tenant_id='default', work_order_id=f'pg-conflict-{uuid.uuid4().hex}')
+                barrier = Barrier(4)
+
+                def submit(_index):
+                    barrier.wait(timeout=10)
+                    return store.submit_decision(
+                        case.conflict_id, tenant_id='default', actor_id='alice',
+                        expected_fingerprint=case.fingerprint, expected_version=1,
+                        expected_snapshot_hash=case.snapshot_hash,
+                        expected_evidence_set_hash=case.evidence_set_hash,
+                        decision=ConflictPolicy().evaluate(case, purpose='compose').model_copy(
+                            update={'selected_claim_id': 'claim-5'},
+                        ), idempotency_key='pg-concurrent-decision',
+                    )
+
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    results = list(pool.map(submit, range(4)))
+                self.assertTrue(all(result == results[0] for result in results))
+                self.assertEqual(len(store.list_decisions(case.conflict_id, tenant_id='default')), 1)
+
+    def test_submission_worker_contract_rejects_old_worker_on_both_backends(self):
+        from pytest import MonkeyPatch
+        from tests.test_review_submission_contract import check_submission_review_contract
+
+        for backend in (self._sqlite_store(), self._pg_store()):
+            with self.subTest(backend=backend._backend), MonkeyPatch.context() as patch:
+                check_submission_review_contract(backend, patch)
+
     @staticmethod
     def _seed_template(store: DocumentAuthoringStore, suffix: str):
         store.save_renderer_policy(RendererPolicy(renderer_policy_id=f"renderer-{suffix}"))
@@ -143,6 +222,95 @@ class DocumentAuthoringPgParityTests(unittest.TestCase):
             sqlite_store.read_template_content(f"tv-{sqlite_suffix}"),
             pg_store.read_template_content(f"tv-{pg_suffix}"),
         )
+
+    def test_authoring_history_uses_durable_creation_order_on_both_backends(self):
+        """Restore order survives out-of-order import and has a stable ID tie break."""
+        from src.document_authoring.models import (
+            DocumentArtifact, DocumentHumanEvent, HarnessRun, NodeExecutionReceipt,
+        )
+        from tests.test_knowledge_base_document_work_orders import make_work_order
+
+        for store in (self._sqlite_store(), self._pg_store()):
+            suffix = uuid.uuid4().hex
+            template = self._seed_template(store, suffix)
+            oldest = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            orders = {}
+            # Newer rows arrive before an older imported row; b/c share a time.
+            for key, offset in (("c", 1), ("a", 0), ("b", 1)):
+                order = make_work_order(
+                    work_order_id=f"{suffix}-{key}", tenant_id=suffix,
+                    project_id=suffix, template_version_id=template.template_version_id,
+                    created_at=oldest + timedelta(days=offset),
+                )
+                orders[key] = store.create_work_order(order)
+                store.create_work_order(type(order).model_validate({
+                    **order.model_dump(),
+                    "work_order_id": f"{suffix}-kb-{key}", "scope_type": "knowledge_base",
+                    "project_id": None, "baseline_id": None, "knowledge_base_name": suffix,
+                    "baseline_content_hash": "", "input_fingerprint": "",
+                }))
+            run = store.create_harness_run(HarnessRun(
+                harness_run_id=f"run-{suffix}", work_order_id=orders["a"].work_order_id,
+                run_manifest_id="manifest", status="queued",
+            ))
+            run = store.claim_harness_run(run.harness_run_id, "worker", 300)
+            for key, offset in (("c", 1), ("a", 0), ("b", 1)):
+                created_at = oldest + timedelta(days=offset)
+                receipt = store.begin_node_execution_owned(NodeExecutionReceipt(
+                    receipt_id=f"{suffix}-receipt-{key}", harness_run_id=run.harness_run_id,
+                    node_name="plan_node", unit_id=key, input_fingerprint=key,
+                    fencing_token=run.fencing_token, created_at=created_at,
+                ), "worker", run.fencing_token)
+                store.commit_node_execution_owned(
+                    receipt.receipt_id, run.harness_run_id, "worker", run.fencing_token,
+                    {"unit_id": key},
+                )
+                artifact = store.save_artifact(DocumentArtifact(
+                    artifact_id=f"{suffix}-artifact-{key}", work_order_id=orders["a"].work_order_id,
+                    run_id=run.harness_run_id, stage="review_candidate",
+                    content_hash=hashlib.sha256(key.encode()).hexdigest(),
+                    validation_report_id="report", integrity_manifest_id="integrity",
+                    created_at=created_at,
+                ), key.encode(), "docx")
+                store.save_human_event(DocumentHumanEvent(
+                    event_id=f"{suffix}-event-{key}", work_order_id=orders["a"].work_order_id,
+                    run_id=run.harness_run_id, artifact_id=f"{suffix}-artifact-c",
+                    unit_id=key, event_type="feedback", subject_artifact_content_hash=artifact.content_hash,
+                    actor_id="alice", actor_role="reviewer", created_at=created_at,
+                ))
+            queries = (
+                ("project", lambda: [row.work_order_id for row in store.list_work_orders(suffix, suffix)],
+                 [orders[key].work_order_id for key in ("c", "b", "a")]),
+                ("knowledge_base", lambda: [row.work_order_id for row in store.list_work_orders_for_knowledge_base(suffix, suffix)],
+                 [f"{suffix}-kb-{key}" for key in ("c", "b", "a")]),
+                ("receipts", lambda: [row.receipt_id for row in store.list_node_execution_receipts(run.harness_run_id)],
+                 [f"{suffix}-receipt-{key}" for key in ("a", "b", "c")]),
+                ("artifacts", lambda: [row.artifact_id for row in store.list_artifacts(orders["a"].work_order_id)],
+                 [f"{suffix}-artifact-{key}" for key in ("a", "b", "c")]),
+                ("human_events", lambda: [row.event_id for row in store.list_human_events(f"{suffix}-artifact-c")],
+                 [f"{suffix}-event-{key}" for key in ("a", "b", "c")]),
+            )
+            for name, query, expected in queries:
+                with self.subTest(backend=store._backend, history=name):
+                    self.assertEqual(query(), expected)
+
+    def test_work_order_version_lock_rejects_stale_updates_on_both_backends(self):
+        from tests.test_knowledge_base_document_work_orders import make_work_order
+
+        for store in (self._sqlite_store(), self._pg_store()):
+            with self.subTest(backend=store._backend):
+                suffix = uuid.uuid4().hex
+                template = self._seed_template(store, suffix)
+                original = store.create_work_order(make_work_order(
+                    work_order_id=suffix, template_version_id=template.template_version_id,
+                ))
+                revised = original.model_copy(update={"status": "retrieving", "lock_version": 1})
+                self.assertEqual(store.replace_work_order(revised), revised)
+                with self.assertRaisesRegex(RuntimeError, "changed concurrently"):
+                    store.replace_work_order(original.model_copy(update={"status": "failed", "lock_version": 1}))
+                persisted = store.get_work_order(suffix)
+                self.assertEqual(persisted.status, "retrieving")
+                self.assertEqual(persisted.lock_version, 1)
 
     def test_all_group_stores_run_on_postgres(self) -> None:
         store = self._pg_store()

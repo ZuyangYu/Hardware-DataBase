@@ -15,4 +15,11 @@ describe('ApiError', () => {
 
     expect(error.message).toBe('invalid credentials');
   });
+
+  it('explains a gateway 502 without exposing the raw Bad Gateway text', () => {
+    const error = new ApiError(502, 'Bad Gateway', 'Bad Gateway');
+
+    expect(error.message).toContain('服务暂时不可用');
+    expect(error.message).not.toContain('Bad Gateway');
+  });
 });

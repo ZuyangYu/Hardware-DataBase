@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import sqlite3
 
 import pytest
 
@@ -66,6 +67,65 @@ def test_claim_heartbeat_and_lease_expired_takeover_are_atomic(tmp_path):
     assert adopted.lease_owner == "worker-b"
     assert adopted.attempt == 2
     assert adopted.lease_token == 2
+
+
+def test_r3_jobs_wait_without_attempts_during_review_shutdown_and_reject_old_claims(tmp_path, monkeypatch):
+    import src.settings
+
+    store = _store(tmp_path)
+    job = _create(store, payload={
+        'work_order_id': 'wo-1', 'knowledge_base_name': 'hardware',
+        'required_worker_contract': 'multi_kb_review_v1',
+    })
+    monkeypatch.setattr(src.settings, 'MULTI_KB_HUMAN_REVIEW_ENABLED', False, raising=False)
+    assert store.list_pending() == []
+    assert store.claim(job.job_id, 'worker-current') is None
+    assert store.get(job.job_id).attempt == 0
+    assert store.get(job.job_id).status == 'queued'
+
+    # This is the exact old worker transition: it cannot acknowledge R3.
+    with store._connect() as conn, pytest.raises(sqlite3.IntegrityError, match='unsupported_worker_contract'):
+        conn.execute("UPDATE document_authoring_jobs SET status='running', lease_token=lease_token+1 WHERE job_id=?", (job.job_id,))
+    monkeypatch.setattr(src.settings, 'MULTI_KB_HUMAN_REVIEW_ENABLED', True)
+    claimed = store.claim(job.job_id, 'worker-current')
+    assert claimed is not None and claimed.attempt == 1
+
+    # An acknowledged previous attempt must not authorize a later old worker.
+    with store._connect() as conn, pytest.raises(sqlite3.IntegrityError, match='unsupported_worker_contract'):
+        conn.execute("UPDATE document_authoring_jobs SET lease_token=lease_token+1 WHERE job_id=?", (job.job_id,))
+
+
+def test_r3_job_contract_is_inferred_from_shared_work_order_and_migrated_payload(tmp_path, monkeypatch):
+    import json
+    import src.settings
+
+    store = _store(tmp_path)
+    with store._connect() as conn:
+        conn.execute('CREATE TABLE document_work_orders(work_order_id TEXT PRIMARY KEY, tenant_id TEXT, payload_json TEXT)')
+        conn.execute('INSERT INTO document_work_orders VALUES (?, ?, ?)', ('wo-1', 'tenant-a', json.dumps({
+            'kb_scope_snapshot': {'sources': [{'kb_id': 101}, {'kb_id': 205}]},
+        })))
+    job = _create(store)
+    monkeypatch.setattr(src.settings, 'MULTI_KB_HUMAN_REVIEW_ENABLED', False, raising=False)
+    assert store.claim(job.job_id, 'worker') is None
+    assert store.get(job.job_id).attempt == 0
+
+    # Reopening also backfills jobs created by an older API before migration.
+    with store._connect() as conn:
+        conn.execute("UPDATE document_authoring_jobs SET required_worker_contract='' WHERE job_id=?", (job.job_id,))
+    reopened = DocumentAuthoringJobStore(store.db_path)
+    with reopened._connect() as conn, pytest.raises(sqlite3.IntegrityError, match='unsupported_worker_contract'):
+        conn.execute("UPDATE document_authoring_jobs SET status='running', lease_token=lease_token+1 WHERE job_id=?", (job.job_id,))
+
+
+def test_unknown_worker_contract_is_never_claimed_even_with_review_enabled(tmp_path, monkeypatch):
+    import src.settings
+
+    store = _store(tmp_path)
+    job = _create(store, payload={'work_order_id': 'wo-1', 'required_worker_contract': 'multi_kb_review_v99'})
+    monkeypatch.setattr(src.settings, 'MULTI_KB_HUMAN_REVIEW_ENABLED', True, raising=False)
+    assert store.claim(job.job_id, 'worker') is None
+    assert store.get(job.job_id).attempt == 0
 
 
 def test_resource_lock_serializes_same_knowledge_base_and_releases_after_completion(tmp_path):

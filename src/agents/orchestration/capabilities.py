@@ -261,6 +261,9 @@ def authorized_capabilities_for_conversation(
         authorized.update({
             "evidence.search",
             "evidence.read",
+            # Comparison is performed by the model through ordinary read
+            # tools; the capability only authorizes the compare action kind.
+            "evidence.compare",
             "attachment.search",
         })
         if allow_document_write:

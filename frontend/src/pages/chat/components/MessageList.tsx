@@ -4,7 +4,18 @@
  */
 import { useEffect, useMemo, useRef } from 'react';
 
-import type { EvidenceItem, ExportArtifactView, ExportFormat, ExportJobView, MessageView, QueryTraceStep } from '@/api/types';
+import type {
+  EvidenceItem,
+  ExportArtifactView,
+  ExportFormat,
+  ExportJobView,
+  MessageView,
+  QueryTraceStep,
+  TurnBudget,
+  TurnPlanState,
+  TurnSubagent,
+  TurnVerification,
+} from '@/api/types';
 import { Skeleton } from '@/components/ui/skeleton';
 import { CHAT_MESSAGES_CLASS, CHAT_MESSAGE_STACK_CLASS } from '../chatPageStyles';
 import MessageBubble from './MessageBubble';
@@ -23,6 +34,12 @@ type Props = {
   streamingText: string;
   traceSteps: QueryTraceStep[];
   traceByMessageId: Record<number, QueryTraceStep[]>;
+  livePlan?: TurnPlanState | null;
+  liveBudget?: TurnBudget | null;
+  liveVerification?: TurnVerification | null;
+  liveSubagents?: TurnSubagent[];
+  onContinue?: () => void;
+  onNarrowScope?: () => void;
   degradedNotes: Array<{ stage: string; reason: string }>;
   onCreateMemory?: (messageIds: number[]) => void;
   onCreateProjectMemory?: (messageIds: number[]) => void;
@@ -47,6 +64,12 @@ export default function MessageList({
   streamingText,
   traceSteps,
   traceByMessageId,
+  livePlan,
+  liveBudget,
+  liveVerification,
+  liveSubagents,
+  onContinue,
+  onNarrowScope,
   degradedNotes,
   onCreateMemory,
   onCreateProjectMemory,
@@ -134,6 +157,8 @@ export default function MessageList({
             exportFormats={exportFormats}
             showDiagnostics={showDiagnostics}
             traceSteps={msg.role === 'assistant' && showDiagnostics ? (traceByMessageId[msg.id] ?? []) : []}
+            onContinue={msg.role === 'assistant' ? onContinue : undefined}
+            onNarrowScope={msg.role === 'assistant' ? onNarrowScope : undefined}
           />
         ))}
         {streaming && (
@@ -151,6 +176,12 @@ export default function MessageList({
             streamingText={streamingText}
             showDiagnostics={showDiagnostics}
             traceSteps={showDiagnostics ? traceSteps : []}
+            plan={showDiagnostics ? livePlan : null}
+            budget={showDiagnostics ? liveBudget : null}
+            verification={showDiagnostics ? liveVerification : null}
+            subagents={showDiagnostics ? liveSubagents : []}
+            onContinue={onContinue}
+            onNarrowScope={onNarrowScope}
             degradedNotes={degradedNotes}
           />
         )}

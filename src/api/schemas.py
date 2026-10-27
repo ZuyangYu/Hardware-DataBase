@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from src.document_authoring.chat_context import (
     DocumentAuthoringContext,
@@ -17,6 +17,7 @@ from src.document_authoring.chat_context import (
     DocumentContextInput,
 )
 from src.result_exports.models import normalize_export_format
+from src.services.knowledge_scope_models import KnowledgeSelectionInput, KnowledgeScopeSnapshot
 
 
 DocumentContextRequest = DocumentContextInput | DocumentAuthoringContextInput
@@ -347,6 +348,7 @@ class WikiGraphView(BaseModel):
 class CreateSessionRequest(BaseModel):
     kb_name: str
     title: str = "新对话"
+    knowledge_scope: KnowledgeSelectionInput | None = None
 
 
 class SessionView(BaseModel):
@@ -357,6 +359,9 @@ class SessionView(BaseModel):
     created_at: str
     updated_at: str
     document_context: DocumentContextView | None = None
+    knowledge_scope: KnowledgeScopeSnapshot | None = None
+    knowledge_selection_hash: str = ""
+    source_access_restricted: bool = False
 
 
 class MemoryContextView(BaseModel):
@@ -408,6 +413,12 @@ class MessageView(BaseModel):
     cards: list[dict] = Field(default_factory=list)
     # 该 turn 持久化的执行轨迹（stage/tool 事件折叠；刷新后轨迹面板不消失）。
     trace_steps: list[dict] = Field(default_factory=list)
+    # 复杂任务的计划/预算/校验投影（来自 turn summary；刷新后不清空）。
+    plan: dict | None = None
+    budget: dict | None = None
+    verification: dict | None = None
+    subagents: list[dict] = Field(default_factory=list)
+    source_access_restricted: bool = False
 
 
 class AddMessageRequest(BaseModel):
@@ -435,6 +446,7 @@ class SessionMemorySettingsUpdate(BaseModel):
 
 class CreateTurnRequest(BaseModel):
     query: str = Field(min_length=1, max_length=20_000)
+    knowledge_scope: KnowledgeSelectionInput | None = None
     client_request_id: str | None = Field(default=None, max_length=128)
     # Retained for wire compatibility; the route normalizes KB turns to deep
     # retrieval and general chat bypasses the knowledge-base agent entirely.
@@ -487,6 +499,9 @@ class TurnView(BaseModel):
     blocked_by_turn_id: str | None = None
     queue_reason: str = ""
     wait_deadline: str | None = None
+    knowledge_scope: KnowledgeScopeSnapshot | None = None
+    knowledge_selection_hash: str = ""
+    source_access_restricted: bool = False
 
 
 class TurnStartResponse(BaseModel):
@@ -1242,6 +1257,7 @@ class ConfirmTemplateRequest(BaseModel):
 
 
 class CreateWorkOrderRequest(BaseModel):
+    knowledge_scope: KnowledgeSelectionInput | None = None
     template_version_id: str
     document_schema_id: str
     document_schema_version: str
@@ -1259,6 +1275,7 @@ class ConvertDocumentArtifactRequest(BaseModel):
 
 
 class CreateGenerationSessionRequest(BaseModel):
+    knowledge_scope: KnowledgeSelectionInput | None = None
     template_version_id: str | None = Field(default=None, min_length=1)
     contract_version: Literal["legacy_brief_v1", "output_spec_v1"] = "legacy_brief_v1"
     purpose: str = ""
@@ -1363,6 +1380,44 @@ class DocumentReviewDecisionRequest(BaseModel):
     client_request_id: str = Field(min_length=1, max_length=128)
     status: str | None = Field(default=None, min_length=1, max_length=64)
     decision_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConflictDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    decision_schema_version: int = Field(default=1, ge=1, le=1)
+    expected_fingerprint: str = Field(min_length=1, max_length=128)
+    expected_snapshot_hash: str = Field(
+        min_length=1,
+        max_length=128,
+        validation_alias=AliasChoices("expected_snapshot_hash", "source_snapshot_hash"),
+    )
+    expected_evidence_set_hash: str = Field(
+        min_length=1,
+        max_length=128,
+        validation_alias=AliasChoices("expected_evidence_set_hash", "evidence_set_hash"),
+    )
+    expected_conflict_version: int = Field(default=1, ge=1)
+    action: Literal[
+        "retain_primary",
+        "choose_claim",
+        "report_difference",
+        "integrity_block",
+        "accept_authoritative_source",
+        "choose_design_candidate",
+        "keep_comparison",
+        "request_change_approval",
+        "defer",
+        "mark_not_applicable",
+    ]
+    selected_claim_id: str | None = Field(default=None, max_length=256)
+    rationale: str = Field(
+        default="",
+        max_length=4000,
+        validation_alias=AliasChoices("rationale", "reason"),
+    )
+    selected_alternative_ids: list[str] = Field(default_factory=list, max_length=16)
+    idempotency_key: str = Field(min_length=1, max_length=128)
 
 
 class CreateDocumentRevisionRequest(BaseModel):

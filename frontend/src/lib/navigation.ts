@@ -42,7 +42,7 @@ const NAV_GROUPS: NavGroup[] = [
     id: 'organization', label: '组织与权限', items: [
       { path: '/admin/departments', label: '部门管理', icon: 'folder', description: '部门结构与归属', access: 'system_admin' },
       { path: '/admin/users', label: '员工管理', icon: 'user', description: '员工账号与启停', access: 'system_admin' },
-      { path: '/admin/kb-mount', label: '知识库挂载', icon: 'lock', description: '知识库挂载与访问授权', access: 'system_admin' },
+      { path: '/admin/kb-mount', label: '知识库分配', icon: 'lock', description: '知识库部门归属与访问授权', access: 'system_admin' },
     ],
   },
   {

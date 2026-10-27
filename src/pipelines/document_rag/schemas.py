@@ -1,6 +1,7 @@
 ﻿from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+from typing import Literal
 
 
 def kb_scope_key(kb_name: str, department_id: str | int | None = None) -> str:
@@ -66,6 +67,52 @@ class Evidence:
     metadata: dict[str, Any] = field(default_factory=dict)
     backend: str = "ragflow"
     retriever: str = ""
+
+
+ScopedRetrievalStatus = Literal[
+    "success_with_hits", "success_empty", "access_denied", "source_changed",
+    "source_unavailable", "filter_unsupported", "retrieval_failed", "timeout",
+    "cancelled", "budget_exhausted",
+]
+
+
+class ScopedRetrievalError(RuntimeError):
+    def __init__(self, status: ScopedRetrievalStatus, error_code: str | None = None):
+        self.status = status
+        self.error_code = error_code or status
+        super().__init__(self.error_code)
+
+
+@dataclass(frozen=True)
+class DocumentSourceStamp:
+    kb_id: int
+    local_record_id: int
+    source_content_hash: str
+    remote_document_id: str
+    index_revision: int
+    source_version_id: str | None = None
+    revision: str | None = None
+    processing_artifact_id: str | None = None
+    processor_version: str | None = None
+
+
+@dataclass(frozen=True)
+class DocumentRetrievalContract:
+    mode: Literal["chat", "frozen"] = "chat"
+    allowed_record_ids: tuple[int, ...] | None = None
+    expected_source_stamps: dict[int, DocumentSourceStamp] = field(default_factory=dict)
+    # A frozen authoring scope may contain several processor kinds in one KB.
+    # Structured adapters use this optional discriminator to validate only the
+    # records they can read while retaining the complete source identity set.
+    processor_kind: str | None = None
+
+
+@dataclass
+class ScopedDocumentRetrievalOutcome:
+    status: ScopedRetrievalStatus
+    evidence: list[Evidence] = field(default_factory=list)
+    error_code: str | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

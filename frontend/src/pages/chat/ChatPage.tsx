@@ -4,7 +4,7 @@
  * 数据层在 useKbChat;渲染在各 chat/components 子组件。
  */
 import type { CSSProperties } from 'react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import type { AuthSession } from '../../auth';
@@ -81,8 +81,8 @@ export function retainExistingAttachmentIds(
 /**
  * Detect the natural-language command that means "use the attached office
  * file as a template and produce a filled document".  The backend remains
- * authoritative; this client hint only removes the extra manual "作为模板"
- * click when exactly one unambiguous office attachment is selected.
+ * authoritative; when exactly one unambiguous office attachment is selected,
+ * this client hint lets the turn auto-convert it without a separate action.
  */
 export function isTemplateGenerationChatIntent(query: string): boolean {
   const text = String(query || '').trim();
@@ -310,7 +310,10 @@ export default function ChatPage({
     }
   };
 
-  const chat = useKbChat(mountedKbName, { username: auth.user.username, documentContextEnabled: documentAuthoringEnabled });
+  const chat = useKbChat(mountedKbName, {
+    username: auth.user.username,
+    documentContextEnabled: documentAuthoringEnabled,
+  });
   const {
     sessions,
     sessionsLoaded,
@@ -336,6 +339,10 @@ export default function ChatPage({
     streamingText,
     traceSteps,
     traceByMessageId,
+    livePlan,
+    liveBudget,
+    liveVerification,
+    liveSubagents,
     degradedNotes,
     documentCards,
     turnQueueNotice,
@@ -523,43 +530,6 @@ export default function ChatPage({
     }
   }, [documentAuthoringEnabled, setDocumentContext]);
 
-  async function handleUseAttachmentAsTemplate(attachment: AttachmentView) {
-    if (!canUploadDocumentTemplate || documentUploadPending || activeSessionId == null) return;
-    const extension = attachment.extension.toLowerCase();
-    if (!DOCUMENT_TEMPLATE_EXTENSIONS.includes(extension)) {
-      notify.error('仅支持将 .xlsx、.xlsm 或 .docx 附件转换为模板');
-      return;
-    }
-    if (attachment.parse_status !== 'ready' && attachment.parse_status !== 'degraded') {
-      notify.error('附件尚未完成解析，暂时不能转换为模板');
-      return;
-    }
-
-    setDocumentUploadPending(true);
-    try {
-      const analysis = await analyzeTemplateFromAttachment(
-        mountedKbName,
-        activeSessionId,
-        attachment.attachment_id,
-        attachment.filename,
-      );
-      const context = buildDocumentContext(analysis, mountedKbName, createClientRequestId());
-      if (!context) throw new Error('分析响应缺少可用的模板引用');
-      setDocumentContext(context);
-      setDocumentContextLabel(attachment.filename);
-      // The file is now the document context, not per-turn evidence; keep the
-      // other session attachments mounted.
-      setSelectedAttachmentIds((previous) =>
-        previous.filter((id) => id !== attachment.attachment_id),
-      );
-      notify.success(`附件已转换为模板：${analysis.analysis_id}`);
-    } catch (error) {
-      notify.error(error instanceof Error ? error.message : '附件转换模板失败');
-    } finally {
-      setDocumentUploadPending(false);
-    }
-  }
-
   function clearDocumentContext() {
     setDocumentContext(null);
     setDocumentContextLabel(null);
@@ -690,8 +660,8 @@ export default function ChatPage({
     // useKbChat.send in the same tick, avoiding a stale React state read.
     // If a context already exists, it is the explicit template choice and
     // unrelated Office attachments remain evidence.  Otherwise inspect all
-    // draft attachments: one eligible candidate can be auto-selected, while
-    // multiple candidates must be chosen with the explicit “作为模板” action.
+    // draft attachments: one eligible candidate can be auto-selected; with
+    // multiple candidates the backend remains authoritative and can clarify.
     let templateRoute = resolveTemplateAttachmentRoute(query, selectedAttachments, documentContext != null);
     if (templateRoute.waitingForTemplate) {
       if (activeSessionId == null) {
@@ -927,7 +897,7 @@ export default function ChatPage({
   }
 
   function handleKbChange(nextKbName: string) {
-    if (documentUploadPending) return;
+    if (streaming || documentUploadPending) return;
     setMountedKbName(nextKbName);
     clearDocumentContext();
     navigate(nextKbName ? `/chat?kb=${encodeURIComponent(nextKbName)}` : '/chat', { replace: true });
@@ -954,7 +924,7 @@ export default function ChatPage({
       <main className={cn(CHAT_MAIN_CLASS, 'flex-1')}>
         <ChatHeader
           title={activeSession?.title || '新对话'}
-          kbName={mountedKbName || '未挂载'}
+          kbName={mountedKbName || '未选择知识库'}
           onExtractMemory={mountedKbName ? () => setExtractConfirmOpen(true) : undefined}
           extractDisabled={activeSessionId == null || streaming || extracting}
           memorySummary={memorySummary}
@@ -979,6 +949,20 @@ export default function ChatPage({
           streamingText={streamingText}
           traceSteps={traceSteps}
           traceByMessageId={traceByMessageId}
+          livePlan={livePlan}
+          liveBudget={liveBudget}
+          liveVerification={liveVerification}
+          liveSubagents={liveSubagents}
+          onContinue={() => {
+            void send({
+              attachmentIds: [],
+              textOverride:
+                '请基于上一轮已经收集到的证据，继续完成未完成的部分；先说明哪些部分已完成、哪些仍待确认，并保留有效引用。',
+            });
+          }}
+          onNarrowScope={() => {
+            setInput('请缩小范围：只完成上一轮任务中最关键的一个小节，并明确列出其余待确认项。');
+          }}
           degradedNotes={degradedNotes}
           onCreateMemory={(messageIds) => void openUserMemoryDialog(messageIds)}
           onCreateProjectMemory={
@@ -1055,7 +1039,6 @@ export default function ChatPage({
           onStop={abortStream}
           quickReplies={documentQuickReplies}
           documentAuthoringEnabled={documentAuthoringEnabled}
-          canUploadDocumentTemplate={canUploadDocumentTemplate}
           documentContext={documentContext}
           documentContextLabel={documentContextLabel ?? undefined}
           documentUploadPending={documentUploadPending}
@@ -1066,7 +1049,6 @@ export default function ChatPage({
           attachmentRetryingId={attachmentRetryingId}
           onUploadAttachment={handleAttachmentUpload}
           onRetryAttachment={handleRetryAttachment}
-          onUseAsTemplate={handleUseAttachmentAsTemplate}
           onRemoveAttachment={handleRemoveAttachment}
         />
       </main>

@@ -104,7 +104,7 @@ def test_attachment_provider_retrieves_only_frozen_attachment_refs():
 
     assert retrieval.calls == [{"query": "U1-PA0", "asset_ids": ["asset-1"], "limit": 8}]
     assert len(evidence) == 1
-    assert evidence[0].metadata["source_type"] == "chat_attachment"
+    assert evidence[0].metadata["source_type"] == "attachment"
     assert evidence[0].metadata["attachment_id"] == "att-1"
     assert evidence[0].locator == {"page": 3}
 
@@ -169,7 +169,7 @@ def test_composite_provider_honors_combined_scope_without_calling_disallowed_sou
         ctx=_ctx(),
     )
     assert [item.metadata["source_type"] for item in combined] == [
-        "knowledge_base", "chat_attachment"
+        "knowledge_base", "attachment"
     ]
 
     kb_backend.calls.clear()

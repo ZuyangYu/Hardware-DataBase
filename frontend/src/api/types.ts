@@ -32,6 +32,35 @@ export interface KbView {
   is_owner: boolean;
 }
 
+export type KnowledgePurpose = 'answer' | 'compare' | 'compose';
+export type KnowledgeRole = 'primary' | 'peer' | 'reference' | 'standard';
+
+export interface KnowledgeSourceInput {
+  kb_id: number;
+  role: KnowledgeRole;
+}
+
+export interface KnowledgeSelectionInput {
+  version: 1;
+  purpose: KnowledgePurpose;
+  sources: KnowledgeSourceInput[];
+}
+
+export interface AuthorizedKnowledgeSource extends KnowledgeSourceInput {
+  kb_name: string;
+  department_id: string;
+}
+
+export interface KnowledgeScopeSnapshot extends KnowledgeSelectionInput {
+  snapshot_id: string;
+  tenant_key: string;
+  actor_user_id: number;
+  anchor_kb_id: number;
+  selection_hash: string;
+  sources: AuthorizedKnowledgeSource[];
+  authorized_at: string;
+}
+
 export interface FileView {
   id: string;
   name: string;
@@ -340,6 +369,15 @@ export interface SessionView {
   updated_at: string;
   /** Optional until the conversation API exposes persisted document context. */
   document_context?: DocumentContext | null;
+  knowledge_scope?: KnowledgeScopeSnapshot | null;
+  knowledge_selection_hash?: string;
+  source_access_restricted?: boolean;
+}
+
+export interface CreateSessionRequest {
+  kb_name: string;
+  title?: string;
+  knowledge_scope?: KnowledgeSelectionInput | null;
 }
 
 export interface MemoryContextItem {
@@ -387,6 +425,94 @@ export interface MessageView {
   cards?: Record<string, unknown>[];
   /** 该 turn 持久化的执行轨迹步骤（刷新后轨迹面板回填）。 */
   trace_steps?: QueryTraceStep[];
+  /** 复杂任务的执行计划（agent todo 投影）。 */
+  plan?: TurnPlanState | null;
+  /** 本轮 agent 循环预算与复杂度。 */
+  budget?: TurnBudget | null;
+  /** 系统校验结果（确定性检查 + 可选独立模型校验）。 */
+  verification?: TurnVerification | null;
+  /** 检索子 agent 摘要（不含原始上下文）。 */
+  subagents?: TurnSubagent[];
+}
+
+export type TurnPlanStatus = 'pending' | 'in_progress' | 'completed';
+
+export interface TurnPlanItem {
+  content: string;
+  status: TurnPlanStatus;
+}
+
+export interface TurnPlanState {
+  items: TurnPlanItem[];
+  revision: number;
+  source?: string;
+}
+
+export interface TurnBudget {
+  status?: 'allocated' | 'ok' | 'partial' | 'exhausted';
+  mode?: string;
+  base_recursion_limit?: number;
+  recursion_limit?: number;
+  complexity?: {
+    score?: number;
+    level?: 'simple' | 'moderate' | 'complex' | string;
+    signals?: string[];
+    query_chars?: number;
+    numbered_items?: number;
+    attachments?: number;
+    kb_count?: number;
+  };
+  exhausted?: boolean;
+  stopped_reason?: string;
+  tool_calls?: number;
+  evidence_count?: number;
+  partial_answer?: boolean;
+  synthesis?: 'model' | 'notice';
+  context_compressed?: {
+    evidence_count?: number;
+    compressed_bytes?: number;
+    max_bytes?: number;
+  };
+  context_window?: {
+    max_prompt_tokens?: number;
+    window_tokens?: number;
+    threshold_tokens?: number;
+    note?: string;
+  };
+}
+
+export interface TurnVerificationCheck {
+  key: string;
+  label: string;
+  status: 'pass' | 'warn' | 'fail' | 'unknown';
+  detail?: string;
+  source?: 'deterministic' | 'model_rubric' | string;
+}
+
+export interface TurnVerification {
+  status: 'pass' | 'warn' | 'fail' | 'partial' | 'unknown';
+  checks?: TurnVerificationCheck[];
+  gaps?: string[];
+  semantic_verification?: {
+    status?: string;
+    checks?: TurnVerificationCheck[];
+    gaps?: string[];
+    error?: string;
+  } | null;
+  budget_exhausted?: boolean;
+  partial_delivery?: boolean;
+  citation_coverage?: number;
+  invalid_citations?: number[];
+  unverified?: boolean;
+}
+
+export interface TurnSubagent {
+  name?: string;
+  description?: string;
+  status?: 'running' | 'completed' | 'failed' | 'abandoned';
+  tool_call_id?: string;
+  result_chars?: number;
+  duration_ms?: number;
 }
 
 export interface SessionMemorySummary {
@@ -421,6 +547,9 @@ export interface TurnView {
   blocked_by_turn_id?: string | null;
   queue_reason?: 'waiting_for_attachments' | 'queued_behind_previous_turn' | '';
   wait_deadline?: string | null;
+  knowledge_scope?: KnowledgeScopeSnapshot | null;
+  knowledge_selection_hash?: string;
+  source_access_restricted?: boolean;
 }
 
 /** Chat attachment lifecycle DTO (aligned with src/api/routes/attachments.py). */
@@ -457,6 +586,7 @@ export interface CreateTurnRequest {
   source_scope?: 'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base';
   /** Wiki 辅助开关: true 时注册 wiki_search 检索知识 Wiki 蒸馏页。 */
   wiki_assist?: boolean;
+  knowledge_scope?: KnowledgeSelectionInput | null;
 }
 
 export interface TurnStartResponse {
@@ -1450,6 +1580,37 @@ export type DocumentReview = {
   decision_client_request_id?: string | null;
   client_request_id?: string | null;
   [k: string]: unknown;
+};
+
+export type DocumentConflict = {
+  conflict_id: string;
+  fingerprint?: string;
+  field_key?: string;
+  subject?: string;
+  predicate?: string;
+  claims?: Array<Record<string, unknown>>;
+  severity?: string;
+  status?: string;
+  snapshot_hash?: string;
+  evidence_set_hash?: string;
+  affected_unit_ids?: string[];
+  allowed_actions?: string[];
+  row_version?: number;
+  decisions?: Array<Record<string, unknown>>;
+  [k: string]: unknown;
+};
+
+export type DocumentConflictDecisionInput = {
+  expected_fingerprint: string;
+  source_snapshot_hash: string;
+  evidence_set_hash: string;
+  expected_conflict_version?: number;
+  action: string;
+  selected_claim_id?: string;
+  selected_alternative_ids?: string[];
+  reason?: string;
+  rationale?: string;
+  idempotency_key: string;
 };
 
 export type ArtifactRevision = {

@@ -88,6 +88,34 @@ describe('document authoring chat context', () => {
     expect(legacy).not.toHaveProperty('document_context');
   });
 
+  it('sends the selected multi-KB purpose and stable source roles separately from the query', () => {
+    const request = buildTurnRequest(
+      '对比两个电源方案',
+      'turn-kb-1',
+      'deep',
+      null,
+      undefined,
+      null,
+      {
+        version: 1,
+        purpose: 'compare',
+        sources: [
+          { kb_id: 205, role: 'peer' },
+          { kb_id: 101, role: 'peer' },
+        ],
+      },
+    );
+    expect(request.knowledge_scope).toEqual({
+      version: 1,
+      purpose: 'compare',
+      sources: [
+        { kb_id: 205, role: 'peer' },
+        { kb_id: 101, role: 'peer' },
+      ],
+    });
+    expect(request.query).toBe('对比两个电源方案');
+  });
+
   it('does not send legacy document_flow when a new client has document context', () => {
     const context = buildDocumentContext(
       { analysis_id: 'analysis-1', template_version_id: 'template-v1' },

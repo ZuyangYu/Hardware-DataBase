@@ -78,6 +78,11 @@ RAGFLOW_API_KEY = os.getenv("RAGFLOW_API_KEY", "")
 RAGFLOW_GOVERNANCE_DATASET_NAME = os.getenv("RAGFLOW_GOVERNANCE_DATASET_NAME", "department_governance")
 RAGFLOW_DESIGN_DATASET_NAME = os.getenv("RAGFLOW_DESIGN_DATASET_NAME", "project_design_assets")
 RAGFLOW_TIMEOUT_SECONDS = int(os.getenv("RAGFLOW_TIMEOUT_SECONDS", "120"))
+# Citation readback pages chunk listings explicitly. RAGFlow defaults to 30
+# chunks per page; a single request silently truncates long documents.
+RAGFLOW_CHUNK_LIST_PAGE_SIZE = int(os.getenv("RAGFLOW_CHUNK_LIST_PAGE_SIZE", "30"))
+RAGFLOW_CHUNK_LIST_MAX_PAGES = int(os.getenv("RAGFLOW_CHUNK_LIST_MAX_PAGES", "100"))
+RAGFLOW_CHUNK_LIST_MAX_BYTES = int(os.getenv("RAGFLOW_CHUNK_LIST_MAX_BYTES", str(8 * 1024 * 1024)))
 # 解析状态同步最小间隔: 后台 worker 按该间隔把仍在解析中的文档状态与
 # RAGFlow 远端对齐, 避免本地台账永远停留在 parsing。
 RAGFLOW_STATUS_REFRESH_MIN_SECONDS = int(os.getenv("RAGFLOW_STATUS_REFRESH_MIN_SECONDS", "60"))
@@ -536,6 +541,54 @@ SKILLS_ENABLED = _env_bool("SKILLS_ENABLED", True)
 # batch retrieval; per-request fan-out and the RAG governor are separate.
 # Rollout flag: off until stage acceptance opens it (plan §10.1).
 SHARED_RETRIEVAL_EXECUTOR_ENABLED = _env_bool("SHARED_RETRIEVAL_EXECUTOR_ENABLED", False)
+# R3: independent rollout switch; scope/API acceptance is still required.
+# The raw multi-select UI was removed in 2026-10.  The backend scope/retrieval
+# path is intentionally retained as the base for a future project-space mount;
+# keep this false until that surface is designed and accepted.
+MULTI_KB_CHAT_ENABLED = _env_bool("MULTI_KB_CHAT_ENABLED", False)
+MULTI_KB_EXPLICIT_FIELDS_ENABLED = _env_bool("MULTI_KB_EXPLICIT_FIELDS_ENABLED", False)
+MULTI_KB_HUMAN_REVIEW_ENABLED = _env_bool("MULTI_KB_HUMAN_REVIEW_ENABLED", False)
+MULTI_KB_CONFLICT_AUTO_RESOLVE_ENABLED = _env_bool("MULTI_KB_CONFLICT_AUTO_RESOLVE_ENABLED", False)
+MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL = _env_bool("MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL", True)
+MULTI_KB_MAX_SOURCES = int(os.getenv("MULTI_KB_MAX_SOURCES", "4"))
+MULTI_KB_PER_SOURCE_TOP_K = int(os.getenv("MULTI_KB_PER_SOURCE_TOP_K", "8"))
+MULTI_KB_PER_RECORD_CANDIDATES = int(os.getenv("MULTI_KB_PER_RECORD_CANDIDATES", "8"))
+MULTI_KB_PER_SOURCE_CANDIDATES = int(os.getenv("MULTI_KB_PER_SOURCE_CANDIDATES", "8"))
+MULTI_KB_MAX_CALLS_PER_TURN = int(os.getenv("MULTI_KB_MAX_CALLS_PER_TURN", "24"))
+MULTI_KB_RETRIEVAL_DEADLINE_SECONDS = float(os.getenv("MULTI_KB_RETRIEVAL_DEADLINE_SECONDS", "30"))
+MULTI_KB_EVIDENCE_MAX_ITEMS = int(os.getenv("MULTI_KB_EVIDENCE_MAX_ITEMS", "24"))
+MULTI_KB_CONTEXT_MAX_TOKENS = int(os.getenv("MULTI_KB_CONTEXT_MAX_TOKENS", "8000"))
+# Source-aware evidence settings are kept compact to stay inside this file's
+# architecture line budget; parsing remains centralized here.
+_EVIDENCE_DEFAULTS = dict(zip(
+    "EVIDENCE_SOURCE_AWARE_ENABLED "
+    "EVIDENCE_GLOBAL_CONTEXT_MAX_BYTES EVIDENCE_SYSTEM_PROMPT_RESERVE_BYTES EVIDENCE_ANSWER_RESERVE_BYTES "
+    "EVIDENCE_ATTACHMENT_MAX_BYTES EVIDENCE_KNOWLEDGE_BASE_MAX_BYTES "
+    "EVIDENCE_ATTACHMENT_REQUIRED_RESERVE_BYTES EVIDENCE_KNOWLEDGE_BASE_REQUIRED_RESERVE_BYTES".split(),
+    (False, 32000, 4000, 6000, 12000, 16000, 4000, 4000),
+))
+_EVIDENCE_BOOL_KEYS = frozenset("EVIDENCE_SOURCE_AWARE_ENABLED".split())
+EVIDENCE_INT_SETTING_KEYS = frozenset(set(_EVIDENCE_DEFAULTS) - _EVIDENCE_BOOL_KEYS)
+EVIDENCE_POSITIVE_SETTING_KEYS = EVIDENCE_INT_SETTING_KEYS
+
+
+def _load_evidence_settings() -> dict[str, object]:
+    return {**{k: _env_bool(k, bool(v)) for k, v in _EVIDENCE_DEFAULTS.items() if k in _EVIDENCE_BOOL_KEYS},
+            **{k: int(os.getenv(k, str(v)) or v) for k, v in _EVIDENCE_DEFAULTS.items() if k not in _EVIDENCE_BOOL_KEYS}}
+globals().update(_load_evidence_settings())
+def _multi_kb_byte_limit(name: str) -> int:
+    """Resolve a byte limit, inheriting the legacy token-named value when blank."""
+    raw = os.getenv(name, "").strip()
+    if raw:
+        value = int(raw)
+        if value <= 0:
+            raise ValueError(f"{name} must be positive")
+        return value
+    return int(os.getenv("MULTI_KB_CONTEXT_MAX_TOKENS", "8000"))
+
+
+MULTI_KB_FUSION_MAX_BYTES = _multi_kb_byte_limit("MULTI_KB_FUSION_MAX_BYTES")
+MULTI_KB_TURN_EVIDENCE_MAX_BYTES = _multi_kb_byte_limit("MULTI_KB_TURN_EVIDENCE_MAX_BYTES")
 RETRIEVAL_EXECUTOR_MAX_WORKERS = int(os.getenv("RETRIEVAL_EXECUTOR_MAX_WORKERS", "8"))
 RETRIEVAL_QUEUE_MAX_DEPTH = int(os.getenv("RETRIEVAL_QUEUE_MAX_DEPTH", "256"))
 RETRIEVAL_PER_REQUEST_FANOUT = int(os.getenv("RETRIEVAL_PER_REQUEST_FANOUT", "4"))
@@ -808,6 +861,9 @@ DEFAULT_VALUES = {
     "RAGFLOW_GOVERNANCE_DATASET_NAME": "department_governance",
     "RAGFLOW_DESIGN_DATASET_NAME": "project_design_assets",
     "RAGFLOW_TIMEOUT_SECONDS": "120",
+    "RAGFLOW_CHUNK_LIST_PAGE_SIZE": "30",
+    "RAGFLOW_CHUNK_LIST_MAX_PAGES": "100",
+    "RAGFLOW_CHUNK_LIST_MAX_BYTES": str(8 * 1024 * 1024),
     "RAGFLOW_STATUS_REFRESH_MIN_SECONDS": "60",
     "RAGFLOW_SIMILARITY_THRESHOLD": "0.25",
     "RAGFLOW_VECTOR_WEIGHT": "0.4",
@@ -1025,6 +1081,21 @@ DEFAULT_VALUES = {
     # Deployment-only sandbox identity/endpoints are intentionally excluded
     # from the ordinary config API; these defaults document the closed state.
     "SHARED_RETRIEVAL_EXECUTOR_ENABLED": "false",
+    "MULTI_KB_CHAT_ENABLED": "false",
+    "MULTI_KB_EXPLICIT_FIELDS_ENABLED": "false",
+    "MULTI_KB_HUMAN_REVIEW_ENABLED": "false",
+    "MULTI_KB_CONFLICT_AUTO_RESOLVE_ENABLED": "false",
+    "MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL": "true",
+    "MULTI_KB_MAX_SOURCES": "4",
+    "MULTI_KB_PER_SOURCE_TOP_K": "8",
+    "MULTI_KB_PER_RECORD_CANDIDATES": "8",
+    "MULTI_KB_PER_SOURCE_CANDIDATES": "8",
+    "MULTI_KB_MAX_CALLS_PER_TURN": "24",
+    "MULTI_KB_RETRIEVAL_DEADLINE_SECONDS": "30",
+    "MULTI_KB_EVIDENCE_MAX_ITEMS": "24",
+    "MULTI_KB_CONTEXT_MAX_TOKENS": "8000",
+    "MULTI_KB_FUSION_MAX_BYTES": "",
+    "MULTI_KB_TURN_EVIDENCE_MAX_BYTES": "",
     "RETRIEVAL_EXECUTOR_MAX_WORKERS": "8",
     "RETRIEVAL_QUEUE_MAX_DEPTH": "256",
     "RETRIEVAL_PER_REQUEST_FANOUT": "4",
@@ -1146,6 +1217,8 @@ DEFAULT_VALUES = {
 }
 
 
+DEFAULT_VALUES.update({key: (("true" if default else "false") if isinstance(default, bool) else str(default)) for key, default in _EVIDENCE_DEFAULTS.items()})
+
 def reload_settings():
     """Reload hot settings, retaining construction-time settings until restart."""
     with _ENV_WRITE_LOCK:
@@ -1167,6 +1240,7 @@ def _reload_settings():
     global RAGFLOW_BASE_URL, RAGFLOW_API_KEY
     global RAGFLOW_GOVERNANCE_DATASET_NAME, RAGFLOW_DESIGN_DATASET_NAME
     global RAGFLOW_TIMEOUT_SECONDS, RAGFLOW_SIMILARITY_THRESHOLD, RAGFLOW_VECTOR_WEIGHT
+    global RAGFLOW_CHUNK_LIST_PAGE_SIZE, RAGFLOW_CHUNK_LIST_MAX_PAGES, RAGFLOW_CHUNK_LIST_MAX_BYTES
     global RAGFLOW_STATUS_REFRESH_MIN_SECONDS
     global RAGFLOW_RETRIEVAL_DOC_SCOPE_ENABLED, RAGFLOW_RETRIEVAL_DOC_IDS_MAX
     global RAGFLOW_METADATA_WRITE_BEST_EFFORT
@@ -1265,6 +1339,15 @@ def _reload_settings():
     global SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS
     global SKILLS_ENABLED
     global SHARED_RETRIEVAL_EXECUTOR_ENABLED, RETRIEVAL_EXECUTOR_MAX_WORKERS
+    global MULTI_KB_CHAT_ENABLED
+    global MULTI_KB_EXPLICIT_FIELDS_ENABLED
+    global MULTI_KB_HUMAN_REVIEW_ENABLED
+    global MULTI_KB_CONFLICT_AUTO_RESOLVE_ENABLED, MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL
+    global MULTI_KB_MAX_SOURCES
+    global MULTI_KB_PER_SOURCE_TOP_K, MULTI_KB_MAX_CALLS_PER_TURN
+    global MULTI_KB_PER_RECORD_CANDIDATES, MULTI_KB_PER_SOURCE_CANDIDATES
+    global MULTI_KB_RETRIEVAL_DEADLINE_SECONDS, MULTI_KB_EVIDENCE_MAX_ITEMS, MULTI_KB_CONTEXT_MAX_TOKENS
+    global MULTI_KB_FUSION_MAX_BYTES, MULTI_KB_TURN_EVIDENCE_MAX_BYTES
     global RETRIEVAL_QUEUE_MAX_DEPTH, RETRIEVAL_PER_REQUEST_FANOUT, RETRIEVAL_QUEUE_MAX_WAIT_SECONDS
     global RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS
     global ACTION_DAG_PARALLEL_ENABLED, ACTION_EXECUTOR_MAX_PARALLEL
@@ -1346,6 +1429,9 @@ def _reload_settings():
     RAGFLOW_GOVERNANCE_DATASET_NAME = os.getenv("RAGFLOW_GOVERNANCE_DATASET_NAME", "department_governance")
     RAGFLOW_DESIGN_DATASET_NAME = os.getenv("RAGFLOW_DESIGN_DATASET_NAME", "project_design_assets")
     RAGFLOW_TIMEOUT_SECONDS = int(os.getenv("RAGFLOW_TIMEOUT_SECONDS", "120"))
+    RAGFLOW_CHUNK_LIST_PAGE_SIZE = int(os.getenv("RAGFLOW_CHUNK_LIST_PAGE_SIZE", "30"))
+    RAGFLOW_CHUNK_LIST_MAX_PAGES = int(os.getenv("RAGFLOW_CHUNK_LIST_MAX_PAGES", "100"))
+    RAGFLOW_CHUNK_LIST_MAX_BYTES = int(os.getenv("RAGFLOW_CHUNK_LIST_MAX_BYTES", str(8 * 1024 * 1024)))
     RAGFLOW_STATUS_REFRESH_MIN_SECONDS = int(os.getenv("RAGFLOW_STATUS_REFRESH_MIN_SECONDS", "60"))
     RAGFLOW_SIMILARITY_THRESHOLD = float(os.getenv("RAGFLOW_SIMILARITY_THRESHOLD", "0.25"))
     RAGFLOW_VECTOR_WEIGHT = float(os.getenv("RAGFLOW_VECTOR_WEIGHT", "0.4"))
@@ -1598,6 +1684,22 @@ def _reload_settings():
     )
     SKILLS_ENABLED = _env_bool("SKILLS_ENABLED", True)
     SHARED_RETRIEVAL_EXECUTOR_ENABLED = _env_bool("SHARED_RETRIEVAL_EXECUTOR_ENABLED", False)
+    MULTI_KB_CHAT_ENABLED = _env_bool("MULTI_KB_CHAT_ENABLED", False)
+    MULTI_KB_EXPLICIT_FIELDS_ENABLED = _env_bool("MULTI_KB_EXPLICIT_FIELDS_ENABLED", False)
+    MULTI_KB_HUMAN_REVIEW_ENABLED = _env_bool("MULTI_KB_HUMAN_REVIEW_ENABLED", False)
+    MULTI_KB_CONFLICT_AUTO_RESOLVE_ENABLED = _env_bool("MULTI_KB_CONFLICT_AUTO_RESOLVE_ENABLED", False)
+    MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL = _env_bool("MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL", True)
+    MULTI_KB_MAX_SOURCES = int(os.getenv("MULTI_KB_MAX_SOURCES", "4"))
+    MULTI_KB_PER_SOURCE_TOP_K = int(os.getenv("MULTI_KB_PER_SOURCE_TOP_K", "8"))
+    MULTI_KB_PER_RECORD_CANDIDATES = int(os.getenv("MULTI_KB_PER_RECORD_CANDIDATES", "8"))
+    MULTI_KB_PER_SOURCE_CANDIDATES = int(os.getenv("MULTI_KB_PER_SOURCE_CANDIDATES", "8"))
+    MULTI_KB_MAX_CALLS_PER_TURN = int(os.getenv("MULTI_KB_MAX_CALLS_PER_TURN", "24"))
+    MULTI_KB_RETRIEVAL_DEADLINE_SECONDS = float(os.getenv("MULTI_KB_RETRIEVAL_DEADLINE_SECONDS", "30"))
+    MULTI_KB_EVIDENCE_MAX_ITEMS = int(os.getenv("MULTI_KB_EVIDENCE_MAX_ITEMS", "24"))
+    MULTI_KB_CONTEXT_MAX_TOKENS = int(os.getenv("MULTI_KB_CONTEXT_MAX_TOKENS", "8000"))
+    MULTI_KB_FUSION_MAX_BYTES = _multi_kb_byte_limit("MULTI_KB_FUSION_MAX_BYTES")
+    MULTI_KB_TURN_EVIDENCE_MAX_BYTES = _multi_kb_byte_limit("MULTI_KB_TURN_EVIDENCE_MAX_BYTES")
+    globals().update(_load_evidence_settings())
     RETRIEVAL_EXECUTOR_MAX_WORKERS = int(os.getenv("RETRIEVAL_EXECUTOR_MAX_WORKERS", "8"))
     RETRIEVAL_QUEUE_MAX_DEPTH = int(os.getenv("RETRIEVAL_QUEUE_MAX_DEPTH", "256"))
     RETRIEVAL_PER_REQUEST_FANOUT = int(os.getenv("RETRIEVAL_PER_REQUEST_FANOUT", "4"))
@@ -1915,6 +2017,9 @@ def save_settings_to_env(settings_dict: dict, env_path: str = None):
 # so callers must validate BEFORE persisting anything to .env.
 _INT_SETTING_KEYS = frozenset({
     "RAGFLOW_TIMEOUT_SECONDS",
+    "RAGFLOW_CHUNK_LIST_PAGE_SIZE",
+    "RAGFLOW_CHUNK_LIST_MAX_PAGES",
+    "RAGFLOW_CHUNK_LIST_MAX_BYTES",
     "RAGFLOW_STATUS_REFRESH_MIN_SECONDS",
     "RAGFLOW_RETRIEVAL_DOC_IDS_MAX",
     "AUTH_SESSION_TTL_HOURS",
@@ -1998,6 +2103,15 @@ _INT_SETTING_KEYS = frozenset({
     "SANDBOX_MAX_OUTPUT_BYTES",
     "SANDBOX_MAX_INPUT_BYTES",
     "RETRIEVAL_EXECUTOR_MAX_WORKERS",
+    "MULTI_KB_MAX_SOURCES",
+    "MULTI_KB_PER_SOURCE_TOP_K",
+    "MULTI_KB_PER_RECORD_CANDIDATES",
+    "MULTI_KB_PER_SOURCE_CANDIDATES",
+    "MULTI_KB_MAX_CALLS_PER_TURN",
+    "MULTI_KB_EVIDENCE_MAX_ITEMS",
+    "MULTI_KB_CONTEXT_MAX_TOKENS",
+    "MULTI_KB_FUSION_MAX_BYTES",
+    "MULTI_KB_TURN_EVIDENCE_MAX_BYTES",
     "RETRIEVAL_QUEUE_MAX_DEPTH",
     "RETRIEVAL_PER_REQUEST_FANOUT",
     "ACTION_EXECUTOR_MAX_PARALLEL",
@@ -2040,8 +2154,9 @@ _INT_SETTING_KEYS = frozenset({
     "MEMORY_STORE_MAX_SCAN",
     "MEMORY_CONTEXT_MAX_TOKENS",
     "MEMORY_ITEM_MAX_TOKENS",
-})
+} | EVIDENCE_INT_SETTING_KEYS)
 _FLOAT_SETTING_KEYS = frozenset({
+    "MULTI_KB_RETRIEVAL_DEADLINE_SECONDS",
     "RAGFLOW_SIMILARITY_THRESHOLD",
     "RAGFLOW_VECTOR_WEIGHT",
     "AGENT_TEMPERATURE",
@@ -2071,11 +2186,13 @@ def validate_settings_values(settings_dict: dict) -> None:
     for key, value in settings_dict.items():
         text = "" if value is None else str(value)
         if key in _INT_SETTING_KEYS:
+            if key in {"MULTI_KB_FUSION_MAX_BYTES", "MULTI_KB_TURN_EVIDENCE_MAX_BYTES"} and not text.strip():
+                continue
             try:
                 parsed_int = int(text)
             except ValueError as exc:
                 raise ValueError(f"{key} 必须是整数，当前值: {text!r}") from exc
-            if key in {
+            if key in ({
                 "SANDBOX_MAX_CONCURRENT",
                 "SANDBOX_MAX_CONCURRENT_PER_USER",
                 "SANDBOX_MAX_CONCURRENT_PER_DEPARTMENT",
@@ -2083,13 +2200,30 @@ def validate_settings_values(settings_dict: dict) -> None:
                 "SANDBOX_TASK_LEASE_SECONDS",
                 "SANDBOX_MAX_OUTPUT_BYTES",
                 "SANDBOX_MAX_INPUT_BYTES",
-            } and parsed_int <= 0:
+                "MULTI_KB_MAX_SOURCES",
+                "MULTI_KB_PER_SOURCE_TOP_K",
+                "MULTI_KB_PER_RECORD_CANDIDATES",
+                "MULTI_KB_PER_SOURCE_CANDIDATES",
+                "MULTI_KB_MAX_CALLS_PER_TURN",
+                "MULTI_KB_EVIDENCE_MAX_ITEMS",
+                "MULTI_KB_CONTEXT_MAX_TOKENS",
+                "MULTI_KB_FUSION_MAX_BYTES",
+                "MULTI_KB_TURN_EVIDENCE_MAX_BYTES",
+                "RAGFLOW_CHUNK_LIST_PAGE_SIZE",
+                "RAGFLOW_CHUNK_LIST_MAX_PAGES",
+                "RAGFLOW_CHUNK_LIST_MAX_BYTES",
+            } | EVIDENCE_POSITIVE_SETTING_KEYS) and parsed_int <= 0:
                 raise ValueError(f"{key} 必须大于 0，当前值: {text!r}")
         elif key in _FLOAT_SETTING_KEYS:
             try:
-                float(text)
+                parsed_float = float(text)
             except ValueError as exc:
                 raise ValueError(f"{key} 必须是数字，当前值: {text!r}") from exc
+            if key == "MULTI_KB_RETRIEVAL_DEADLINE_SECONDS":
+                import math
+
+                if not math.isfinite(parsed_float) or parsed_float <= 0:
+                    raise ValueError(f"{key} 必须为大于 0 的有限数字")
         elif key == "MEMORY_MIN_SCORE" and text.strip():
             try:
                 float(text)

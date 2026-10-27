@@ -1,0 +1,50 @@
+"""Deterministic conflict handling; models may propose claims but never decide policy."""
+
+from __future__ import annotations
+
+from .models import ConflictCase, ConflictDecision
+
+
+class ConflictPolicy:
+    def __init__(self, *, version: str = "conflict-policy-v1"):
+        self.version = version
+
+    def evaluate(self, case: ConflictCase, *, purpose: str) -> ConflictDecision:
+        purpose = str(purpose or "answer").strip().casefold()
+        if purpose == "compare":
+            return ConflictDecision(
+                conflict_id=case.conflict_id,
+                action="report_difference",
+                requires_human=False,
+                blocking=False,
+                rationale="peer comparison preserves each source declaration",
+                policy_version=self.version,
+            )
+        approved_authority = [
+            claim
+            for claim in case.claims
+            if claim.authoritative
+            and claim.approval_status in {"approved", "effective", "released"}
+        ]
+        approved_values = {(c.normalized_unit, c.normalized_value) for c in approved_authority}
+        if len(approved_values) == 1:
+            return ConflictDecision(
+                conflict_id=case.conflict_id,
+                action="retain_primary",
+                requires_human=False,
+                blocking=False,
+                selected_claim_id=approved_authority[0].claim_id,
+                rationale="the explicitly authoritative approved source remains the target fact; references are retained as alternatives",
+                policy_version=self.version,
+            )
+        return ConflictDecision(
+            conflict_id=case.conflict_id,
+            action="choose_claim",
+            requires_human=True,
+            blocking=True,
+            rationale="no single explicitly authoritative approved fact determines the target value",
+            policy_version=self.version,
+        )
+
+
+__all__ = ["ConflictPolicy"]

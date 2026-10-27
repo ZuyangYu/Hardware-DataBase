@@ -137,6 +137,9 @@ class HardwareWorker:
             from src.core.model_factory import invalidate_chat_model_cache
 
             invalidate_chat_model_cache()
+            from src.agents.tools.retrieval_executor import initialize_retrieval_executor
+
+            initialize_retrieval_executor()
             self._env_mtime_ns = current_mtime_ns
             # v3 §11.3: record the reloaded content revision so config drift
             # across API/worker processes is traceable in logs.
@@ -678,18 +681,33 @@ class HardwareWorker:
             ):
                 did_work = True
         if self._role_enabled("chat"):
-            self.conversations.requeue_stale_turns()
-            self.conversations.expire_queued_turns()
-            depth, oldest_age_s = self.conversations.pending_turn_queue_state()
-            set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
-            if self._process_chat_claims():
-                did_work = True
-            if self._process_mcp_write_proposals(
-                limit=max(1, int(getattr(src.settings, "MCP_WRITE_MAX_ATTEMPTS", 3))),
-            ):
-                did_work = True
-            depth, oldest_age_s = self.conversations.pending_turn_queue_state()
-            set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
+            try:
+                self.conversations.requeue_stale_turns()
+                self.conversations.expire_queued_turns()
+            except Exception as exc:  # noqa: BLE001 - maintenance must not kill the worker
+                error(f"Chat turn maintenance failed: {exc}")
+            try:
+                depth, oldest_age_s = self.conversations.pending_turn_queue_state()
+                set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
+            except Exception as exc:  # noqa: BLE001 - metrics are fail-soft
+                error(f"Chat queue state failed: {exc}")
+            try:
+                if self._process_chat_claims():
+                    did_work = True
+            except Exception as exc:  # noqa: BLE001 - keep polling after a DB lock
+                error(f"Chat claim loop failed: {exc}")
+            try:
+                if self._process_mcp_write_proposals(
+                    limit=max(1, int(getattr(src.settings, "MCP_WRITE_MAX_ATTEMPTS", 3))),
+                ):
+                    did_work = True
+            except Exception as exc:  # noqa: BLE001 - fail-soft auxiliary path
+                error(f"MCP write proposal loop failed: {exc}")
+            try:
+                depth, oldest_age_s = self.conversations.pending_turn_queue_state()
+                set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
+            except Exception as exc:  # noqa: BLE001 - metrics are fail-soft
+                error(f"Chat queue state failed: {exc}")
         if self._role_enabled("parse") and self.runtime is not None:
             batch = max(1, src.settings.WORKER_PARSE_BATCH_SIZE)
             for _ in range(batch):
@@ -754,10 +772,16 @@ def main() -> None:
     from src.agents.checkpoints.postgres_provider import verify_configured_checkpoint_schemas
 
     verify_configured_checkpoint_schemas()
-    worker = HardwareWorker(role=resolve_worker_role(args.role))
-    signal.signal(signal.SIGTERM, worker.stop)
-    signal.signal(signal.SIGINT, worker.stop)
     try:
+        from src.agents.tools.retrieval_executor import initialize_retrieval_executor
+
+        try:
+            initialize_retrieval_executor()
+        except Exception as exc:
+            error(f"Worker retrieval executor unavailable: {type(exc).__name__}")
+        worker = HardwareWorker(role=resolve_worker_role(args.role))
+        signal.signal(signal.SIGTERM, worker.stop)
+        signal.signal(signal.SIGINT, worker.stop)
         with WorkerHeartbeat(worker.worker_id, worker.role):
             worker.run_forever()
     finally:

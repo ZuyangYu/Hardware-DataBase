@@ -4,6 +4,11 @@ import asyncio
 import json
 import queue
 import inspect
+from src.services.knowledge_scope_access import resolve_session_scope, can_read_turn
+from src.services.knowledge_scope import KnowledgeScopeDenied, KnowledgeScopeInvalid, KnowledgeScopeChanged, KnowledgeScopeResolver
+from src.services.knowledge_scope_models import KnowledgeScopeSnapshot
+from src.services.knowledge_scope_persistence import IdempotencyConflict
+from src.agents.tools.retrieval_executor import MultiKnowledgeRetrievalUnavailable
 import threading
 import time
 import uuid
@@ -26,6 +31,7 @@ from src.core.conversation import (
     ConversationService,
     StaleTurnOwner,
 )
+from src.core.intent import classify_intent
 from src.document_authoring.chat_context import (
     DocumentAuthoringContext,
     DocumentContext,
@@ -49,7 +55,15 @@ from src.api.schemas import (
     TurnStartResponse,
     TurnView,
 )
-from src.core.intent import classify_intent
+
+
+def _can_read_turn(auth, user, turn, conv: ConversationService) -> bool:
+    return can_read_turn(
+        auth,
+        user,
+        turn,
+        dependency_loader=lambda inherited_id: conv.get_turn(user.id, str(inherited_id)),
+    )
 
 router = APIRouter(tags=["query"])
 _TURN_CANCEL_SIGNALS: dict[str, threading.Event] = {}
@@ -326,7 +340,29 @@ def _turn_view(
         blocked_by_turn_id=queue_context.get("blocked_by_turn_id"),
         queue_reason=str(queue_context.get("queue_reason") or ""),
         wait_deadline=queue_context.get("wait_deadline"),
+        knowledge_scope=getattr(turn, "knowledge_scope", None),
+        knowledge_selection_hash=getattr(turn, "knowledge_selection_hash", ""),
     )
+
+
+def _restricted_turn_view(turn: ChatTurn) -> TurnView:
+    from dataclasses import replace
+
+    view = _turn_view(
+        replace(
+            turn,
+            answer="",
+            summary={},
+            footer="",
+            metrics={},
+            knowledge_scope=None,
+            document_context=None,
+            attachments=[],
+        ),
+        attachments=[],
+    )
+    view.source_access_restricted = True
+    return view
 
 
 def _message_view(
@@ -444,6 +480,24 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     runner_thread = visible_thread
     checkpoint_initialization_failed = False
     checkpoint_observer = None
+    knowledge_scope = None
+    knowledge_scope_resolver = None
+    knowledge_scope_error = None
+    if getattr(turn, "knowledge_scope", None):
+        try:
+            knowledge_scope = KnowledgeScopeSnapshot.model_validate(turn.knowledge_scope)
+            knowledge_scope_resolver = KnowledgeScopeResolver(AuthService())
+            knowledge_scope_resolver.revalidate(user.id, knowledge_scope)
+            # Document authoring and its worker adapters receive the same
+            # server-owned snapshot; they must never reconstruct scope from
+            # the client query or the anchor-only RequestContext.
+            metadata = getattr(ctx, "metadata", None)
+            if isinstance(metadata, dict):
+                metadata["knowledge_scope_snapshot"] = knowledge_scope.model_dump(mode="json")
+        except Exception as exc:
+            # A persisted snapshot records what was authorized at creation;
+            # it never grants access after a revoke or department change.
+            knowledge_scope_error = exc
 
     def _register_checkpoint_ref(saved: dict) -> None:
         """Report one durable graph-state write to the authority transaction."""
@@ -787,6 +841,10 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     summary: dict = {}
     footer = ""
     try:
+        if knowledge_scope_error is not None:
+            _fail_owned("知识库来源权限已变化，请重新创建会话")
+            outcome_status = "failed"
+            return
         if checkpoint_initialization_failed:
             _fail_owned("检查点初始化失败，请稍后重试")
             return
@@ -836,6 +894,8 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             attachment_user_id=int(user.id),
             conversation_session_id=int(turn.session_id),
             action_scope=action_scope,
+            knowledge_scope=knowledge_scope,
+            knowledge_scope_resolver=knowledge_scope_resolver,
         )
         try:
             for chunk in gen:
@@ -881,7 +941,15 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             )
             return
 
-        answer = strip_narration_segments("".join(answer_parts), narrated)
+        streamed_answer = strip_narration_segments("".join(answer_parts), narrated)
+        get_agent_answer = getattr(pipeline, "get_last_agent_answer", None)
+        authoritative_answer = (
+            str(get_agent_answer() or "").strip() if callable(get_agent_answer) else ""
+        )
+        # The runner may normalize/scrub or synthesize the final answer after
+        # the deltas were emitted; the authoritative copy must win over the
+        # joined stream so done/persistence match verification.
+        answer = authoritative_answer or streamed_answer
         if not answer:
             raise RuntimeError("未生成回答")
         summary = {
@@ -1111,6 +1179,14 @@ def create_turn(
     session = conv.get_session(user.id, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="session not found")
+    try:
+        knowledge_scope = resolve_session_scope(auth, user, session, body.knowledge_scope)
+    except KnowledgeScopeDenied as exc:
+        raise HTTPException(status_code=403, detail="knowledge_scope_denied") from exc
+    except KnowledgeScopeInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except MultiKnowledgeRetrievalUnavailable as exc:
+        raise HTTPException(status_code=409, detail="feature_unavailable") from exc
     ctx = build_context_for_user(user, session.kb_name, auth=auth)
     reject_system_admin_kb_access(ctx)
     if session.kb_name != GENERAL_CHAT_KB_NAME and not ctx.has_kb_permission(session.kb_name, "read"):
@@ -1118,7 +1194,7 @@ def create_turn(
     # P0-006: an idempotent replay returns the original turn and never counts
     # against admission or creates a second unit of work.
     replay = conv.find_turn_by_client_request(session_id, body.client_request_id or "")
-    if replay is not None:
+    if replay is not None and knowledge_scope is None:
         messages = conv.list_messages(user.id, session_id)
         user_message = next(
             (message for message in messages if message.id == replay.user_message_id), None
@@ -1267,7 +1343,8 @@ def create_turn(
         # trace_context dict is the only string-keyed per-turn carrier
         # available without a schema migration.
         trace_context["document_flow"] = "true" if body.document_flow else "false"
-    turn = conv.create_turn(
+    try:
+        turn = conv.create_turn(
         user.id,
         session_id,
         body.query,
@@ -1277,8 +1354,13 @@ def create_turn(
         wiki_assist=body.wiki_assist,
         document_context=document_context,
         attachment_ids=[ref.attachment_id for ref in attachment_refs],
-        source_scope=effective_scope,
-    )
+            source_scope=effective_scope,
+            **({"knowledge_scope": knowledge_scope} if knowledge_scope is not None else {}),
+        )
+    except (KnowledgeScopeChanged, IdempotencyConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except KnowledgeScopeInvalid as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     messages = conv.list_messages(user.id, session_id)
     user_message = next((message for message in messages if message.id == turn.user_message_id), None)
     if user_message is None:
@@ -1300,6 +1382,8 @@ def start_turn(
     turn = conv.get_turn(user.id, turn_id)
     if turn is None:
         raise HTTPException(status_code=404, detail="turn not found")
+    if not _can_read_turn(auth, user, turn, conv):
+        raise HTTPException(status_code=403, detail="knowledge_scope_denied")
     ctx = build_context_for_user(user, turn.kb_name, auth=auth)
     reject_system_admin_kb_access(ctx)
     if turn.kb_name != GENERAL_CHAT_KB_NAME and not ctx.has_kb_permission(turn.kb_name, "read"):
@@ -1325,11 +1409,14 @@ def start_turn(
 def get_turn(
     turn_id: str,
     user: AuthUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
     conv: ConversationService = Depends(_conv_service),
 ):
     turn = conv.get_turn(user.id, turn_id)
     if turn is None:
         raise HTTPException(status_code=404, detail="turn not found")
+    if not _can_read_turn(auth, user, turn, conv):
+        return _restricted_turn_view(turn)
     return _turn_view(turn)
 
 
@@ -1355,13 +1442,17 @@ def list_active_turns(
         turns = conv.list_recent_turns(user.id, session_id)
     else:
         turns = conv.list_active_turns(user.id, session_id)
-    return [_turn_view(turn) for turn in turns]
+    return [
+        _turn_view(turn) if _can_read_turn(auth, user, turn, conv) else _restricted_turn_view(turn)
+        for turn in turns
+    ]
 
 
 @router.post("/turns/{turn_id}/cancel", response_model=TurnView)
 def cancel_turn(
     turn_id: str,
     user: AuthUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
     conv: ConversationService = Depends(_conv_service),
 ):
     turn = conv.request_turn_cancel(user.id, turn_id)
@@ -1377,7 +1468,7 @@ def cancel_turn(
     local_signal = _existing_turn_cancel_signal(turn_id)
     if local_signal is not None:
         local_signal.set()
-    return _turn_view(turn)
+    return _turn_view(turn) if _can_read_turn(auth, user, turn, conv) else _restricted_turn_view(turn)
 
 
 @router.get("/turns/{turn_id}/events")
@@ -1386,11 +1477,14 @@ async def stream_turn_events(
     request: Request,
     after: int = 0,
     user: AuthUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
     conv: ConversationService = Depends(_conv_service),
 ):
     turn = conv.get_turn(user.id, turn_id)
     if turn is None:
         raise HTTPException(status_code=404, detail="turn not found")
+    if not _can_read_turn(auth, user, turn, conv):
+        raise HTTPException(status_code=403, detail="knowledge_scope_denied")
     try:
         last_seq = max(after, int(request.headers.get("Last-Event-ID") or 0))
     except ValueError:
@@ -1403,11 +1497,25 @@ async def stream_turn_events(
         terminal_idle_polls = 0
         redis_cursor = "0-0"
 
+        def _readable() -> bool:
+            current = conv.get_turn(user.id, turn_id)
+            return current is not None and _can_read_turn(auth, user, current, conv)
+
+        def _restricted_event():
+            return _sse(
+                "source_access_restricted",
+                {"message": "来源权限已变化", "source_access_restricted": True},
+                None,
+            )
+
         def _drain_db_events() -> list:
             return conv.list_turn_events(user.id, turn_id, last_seq)
 
         try:
             while True:
+                if not _readable():
+                    yield _restricted_event()
+                    break
                 # Drain the in-process push channel first (sub-ms delivery).
                 pushed = 0
                 try:
@@ -1418,13 +1526,22 @@ async def stream_turn_events(
                         if seq is None:  # cross-process safety: force DB sync
                             db_synced = False
                             continue
+                        if not _readable():
+                            yield _restricted_event()
+                            return
                         last_seq = seq
                         pushed += 1
                         yield _sse(event_type, payload, seq)
                 except queue.Empty:
                     pass
                 if not db_synced:
+                    if not _readable():
+                        yield _restricted_event()
+                        break
                     for event in _drain_db_events():
+                        if not _readable():
+                            yield _restricted_event()
+                            return
                         last_seq = event.seq
                         yield _sse(event.event_type, event.payload, event.seq)
                     db_synced = True
@@ -1515,6 +1632,8 @@ def _query_generator(
     attachment_user_id=None,
     conversation_session_id=None,
     action_scope=None,
+    knowledge_scope=None,
+    knowledge_scope_resolver=None,
 ):
     params = inspect.signature(pipeline.query).parameters
     if "event_callback" in params:
@@ -1546,6 +1665,10 @@ def _query_generator(
             kwargs["conversation_session_id"] = conversation_session_id
         if action_scope is not None and "action_scope" in params:
             kwargs["action_scope"] = action_scope
+        if "knowledge_scope" in params:
+            kwargs["knowledge_scope"] = knowledge_scope
+        if "knowledge_scope_resolver" in params:
+            kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
         return pipeline.query(
             query,
             kb_name,
@@ -1578,6 +1701,10 @@ def _query_generator(
         kwargs["conversation_session_id"] = conversation_session_id
     if action_scope is not None and "action_scope" in params:
         kwargs["action_scope"] = action_scope
+    if "knowledge_scope" in params:
+        kwargs["knowledge_scope"] = knowledge_scope
+    if "knowledge_scope_resolver" in params:
+        kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
     return pipeline.query(query, kb_name, history, ctx, **kwargs)
 
 

@@ -137,6 +137,17 @@ def _compute_ready() -> dict[str, Any]:
         "storage": _check_storage(),
         "sandbox": _check_sandbox(),
     }
+    if bool(getattr(settings, "MULTI_KB_CHAT_ENABLED", False)):
+        from src.agents.tools.retrieval_executor import (
+            MultiKnowledgeRetrievalUnavailable,
+            get_multi_kb_retrieval_executor,
+        )
+
+        try:
+            get_multi_kb_retrieval_executor()
+            dependencies["multi_kb_retrieval"] = {"status": "up"}
+        except MultiKnowledgeRetrievalUnavailable:
+            dependencies["multi_kb_retrieval"] = {"status": "down", "error": "feature_unavailable"}
     if required_worker_roles():
         dependencies["worker"] = _check_workers()
     if bool(getattr(settings, "REDIS_REQUIRED", True)):

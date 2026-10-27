@@ -219,3 +219,19 @@ def test_validator_fails_custom_renderer_cell_policy_violations():
         "kind": "renderer_integrity",
         "message": "scalar_fanout",
     }]
+
+
+def test_validator_accepts_structured_additional_issues_without_kind():
+    report = DocumentValidator().validate(
+        work_order_id="work-order-1",
+        matrix_rows=[],
+        integrity_manifest={"manifest_hash": "manifest-1"},
+        additional_issues=[
+            {"code": "cross_unit_conflict", "severity": "blocking"},
+        ],
+    )
+
+    assert report.status == "requires_human"
+    assert report.issues == [
+        {"code": "cross_unit_conflict", "severity": "blocking"},
+    ]

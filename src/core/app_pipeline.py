@@ -8,6 +8,8 @@ import tempfile
 import time
 import traceback
 import uuid
+from copy import copy
+from types import SimpleNamespace
 from typing import Any, Callable, Generator, Iterable, List, Mapping, Tuple
 
 import src.settings
@@ -31,6 +33,8 @@ from src.document_authoring.evidence import (
     CompositeDocumentEvidenceProvider,
     KnowledgeBaseEvidenceProvider,
 )
+from src.document_authoring.knowledge_sources import build_frozen_source_entry
+from src.document_authoring.conflicts.governance import requires_review_contract, REVIEW_WORKER_CONTRACT
 from src.document_authoring.job_store import DocumentAuthoringJobStore
 from src.document_authoring.circuit_capabilities import enrich_circuit_capabilities
 from src.document_authoring.icd_scope_decision import (
@@ -78,6 +82,8 @@ from src.attachments.models import (
     scope_allows_kb,
 )
 from src.attachments.retrieval import AttachmentRetrievalService
+from src.services.knowledge_scope import KnowledgeScopeResolver
+from src.services.knowledge_scope_models import KnowledgeScopeSnapshot, KnowledgeSelectionInput, KnowledgeSourceInput
 
 
 _ICD_PIN_TERMS = (
@@ -390,6 +396,9 @@ class AppPipeline:
             self.projects = ProjectService()
             self.project_retrieval = ProjectEvidenceRetrievalService(self.projects)
             self.document_generation = DocumentGenerationService(self.projects)
+            self.document_generation.source_snapshot_validator = (
+                self._validate_authoring_source_snapshot
+            )
             # Chat-created authoring work orders are durable jobs.  Keep one
             # repository instance on the application pipeline so the HTTP
             # tool adapter and the separated worker share the same database
@@ -572,6 +581,8 @@ class AppPipeline:
         attachment_user_id: int | None = None,
         conversation_session_id: int | None = None,
         action_scope: Any | None = None,
+        knowledge_scope: Any | None = None,
+        knowledge_scope_resolver: Any | None = None,
     ) -> Generator[str, None, None]:
         self.clear_last_token_usage_summary()
         if not msg.strip():
@@ -598,6 +609,8 @@ class AppPipeline:
                 attachment_user_id=attachment_user_id,
                 conversation_session_id=conversation_session_id,
                 action_scope=action_scope,
+                knowledge_scope=knowledge_scope,
+                knowledge_scope_resolver=knowledge_scope_resolver,
             )
         except QueryCancelled:
             return
@@ -615,6 +628,9 @@ class AppPipeline:
 
     def get_last_agent_footer(self) -> str:
         return self.agent.get_last_footer()
+
+    def get_last_agent_answer(self) -> str:
+        return self.agent.get_last_agent_answer()
 
     def get_last_retrieval_summary(self) -> dict:
         return self.agent.get_last_retrieval_summary()
@@ -787,6 +803,12 @@ class AppPipeline:
             from src.core.model_factory import invalidate_chat_model_cache
 
             invalidate_chat_model_cache()
+            from src.agents.tools.retrieval_executor import initialize_retrieval_executor
+
+            try:
+                initialize_retrieval_executor()
+            except Exception as exc:
+                error(f"Retrieval executor unavailable after settings reload: {type(exc).__name__}")
 
     def delete_document(self, filename: str, kb_name: str, ctx: RequestContext | None = None) -> str:
         try:
@@ -1121,8 +1143,11 @@ class AppPipeline:
             )
             raise
 
-    def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None):
-        return self.documents.get_parse_result(kb_name, document_id, ctx=ctx)
+    def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None,
+                         *, deadline: float | None = None, should_cancel=None):
+        return self.documents.get_parse_result(
+            kb_name, document_id, ctx=ctx, deadline=deadline, should_cancel=should_cancel,
+        )
 
     # Project/document-authoring domain entry points.  REST, UI and future MCP
     # adapters must use these service methods instead of reaching into SQLite,
@@ -1383,6 +1408,9 @@ class AppPipeline:
         contract_version: str = "legacy_brief_v1",
         output_spec: dict[str, Any] | None = None,
     ):
+        raw_scope = ctx.metadata.get("knowledge_scope_snapshot")
+        if raw_scope:
+            self.document_generation.require_human_review_available({"kb_scope_snapshot": raw_scope})
         compatibility = getattr(self.document_generation, "compatibility", None)
         if compatibility is not None and auto_confirm_recommended:
             compatibility.record_auto_confirmation_attempt(
@@ -1462,6 +1490,7 @@ class AppPipeline:
             brief=brief,
             conversation_id=ctx.metadata.get("conversation_id"),
             initiating_turn_id=ctx.metadata.get("initiating_turn_id"),
+            knowledge_scope_snapshot=ctx.metadata.get("knowledge_scope_snapshot"),
         )
         sessions = self.document_generation.store.generation_sessions
         task = self.document_generation.ensure_document_task(
@@ -1551,11 +1580,13 @@ class AppPipeline:
         scope = draft.get("source_scope") or {}
         if scope.get("attachments") or scope.get("projects") or scope.get("structured_inputs"):
             raise ValueError("当前初步资料预览尚不支持附件、项目或结构化输入范围；不会擅自替换为知识库检索")
-        if set(scope.get("knowledge_bases") or []) - {knowledge_base_name}:
+        selected_names = {source.get("kb_name") for source in (ctx.metadata.get("knowledge_scope_snapshot") or {}).get("sources", [])} or {knowledge_base_name}
+        if set(scope.get("knowledge_bases") or []) - selected_names:
             raise ValueError("当前初步资料预览不能跨知识库检索，不会擅自改变来源范围")
         snapshot, _ = self._planning_source_snapshot(ctx, knowledge_base_name=knowledge_base_name)
         source_names = list(snapshot.source_names)
-        provider = KnowledgeBaseEvidenceProvider(self.backend, top_k=5, source_names=source_names)
+        provider_kwargs = self._frozen_kb_provider_kwargs(ctx, knowledge_base_name, snapshot)
+        provider = KnowledgeBaseEvidenceProvider(self.backend, top_k=5, source_names=source_names, **provider_kwargs)
         outline = draft.get("outline") or []
         query = " ".join([
             str(draft.get("purpose") or ""),
@@ -1588,6 +1619,10 @@ class AppPipeline:
             seen.add(key)
             excerpts.append({
                 "evidence_id": item.id, "source_name": item.source_name,
+                "kb_id": item.metadata.get("kb_id"),
+                "knowledge_base_name": item.metadata.get("knowledge_base_name"),
+                "local_record_id": item.metadata.get("local_record_id"),
+                "locator": dict(item.locator),
                 "excerpt": item.content[:800],
             })
             if len(excerpts) == 5:
@@ -1789,6 +1824,7 @@ class AppPipeline:
             output_spec_draft=draft,
             conversation_id=ctx.metadata.get("conversation_id"),
             initiating_turn_id=ctx.metadata.get("initiating_turn_id"),
+            knowledge_scope_snapshot=ctx.metadata.get("knowledge_scope_snapshot"),
         )
         task = self.document_generation.ensure_document_task(
             ctx,
@@ -1844,6 +1880,16 @@ class AppPipeline:
         requested_kb = ctx.metadata.get("document_template_kb_name")
         if requested_kb is not None and session.knowledge_base_name != requested_kb:
             raise PermissionError("generation session belongs to another knowledge base")
+        stored_scope = getattr(session, "knowledge_scope_snapshot", {})
+        if stored_scope:
+            scope = KnowledgeScopeSnapshot.model_validate(stored_scope)
+            resolver = KnowledgeScopeResolver(AuthService())
+            actor_id = self._resolve_actor_user_id(ctx, resolver.auth)
+            resolver.revalidate(actor_id, scope)
+            requested = ctx.metadata.get("knowledge_scope_snapshot")
+            if requested and requested.get("selection_hash") != scope.selection_hash:
+                raise ValueError("knowledge_scope_changed")
+            ctx.metadata["knowledge_scope_snapshot"] = scope.model_dump(mode="json")
         return session
 
     def _inherited_output_spec_scope(
@@ -2016,18 +2062,51 @@ class AppPipeline:
         ctx: RequestContext,
         *,
         knowledge_base_name: str,
+        persist: bool = True,
     ) -> tuple[Any, dict[str, Any]]:
         """Freeze currently readable source identities for a proposal."""
 
         kb = str(knowledge_base_name or "").strip()
-        if not kb or not ctx.has_kb_permission(kb, "read"):
+        raw_scope = (getattr(ctx, "metadata", {}) or {}).get("knowledge_scope_snapshot")
+        multi_scope = None
+        if raw_scope:
+            try:
+                multi_scope = raw_scope if isinstance(raw_scope, KnowledgeScopeSnapshot) else KnowledgeScopeSnapshot.model_validate(raw_scope)
+                KnowledgeScopeResolver(AuthService()).revalidate(
+                    multi_scope.actor_user_id, multi_scope
+                )
+            except Exception as exc:
+                raise PermissionError("knowledge scope is no longer authorized") from exc
+        if multi_scope is None and (not kb or not ctx.has_kb_permission(kb, "read")):
             raise PermissionError("knowledge base read permission is required")
         source_names: list[str] = []
-        for document in self.list_file_infos(kb, ctx):
-            name = document.get("name", "") if isinstance(document, dict) else getattr(document, "name", "")
-            normalized = str(name or "").strip()
-            if normalized and normalized not in source_names:
-                source_names.append(normalized)
+        frozen_sources: list[dict[str, Any]] = []
+        if multi_scope is None:
+            documents = self.list_file_infos(kb, ctx)
+            for document in documents:
+                name = document.get("name", "") if isinstance(document, dict) else getattr(document, "name", "")
+                normalized = str(name or "").strip()
+                if normalized and normalized not in source_names:
+                    source_names.append(normalized)
+        else:
+            # Freeze each selected source independently. The role is metadata
+            # for authoring policy; it never changes the read authorization.
+            auth = AuthService()
+            resolver = KnowledgeScopeResolver(auth)
+            for source in multi_scope.sources:
+                source_ctx = resolver.context_for_source(multi_scope.actor_user_id, source)
+                for document in self.list_file_infos(source.kb_name, source_ctx):
+                    entry = build_frozen_source_entry(
+                        tenant_key=multi_scope.tenant_key,
+                        source=source,
+                        document=document,
+                        strict=True,
+                    )
+                    normalized = str(entry["source_name"] or "").strip()
+                    if normalized and normalized not in source_names:
+                        source_names.append(normalized)
+                    if normalized:
+                        frozen_sources.append(entry)
         attachment_ids = [
             str(item).strip()
             for item in (ctx.metadata.get("document_authoring_attachment_ids", []) or [])
@@ -2037,6 +2116,9 @@ class AppPipeline:
             ctx,
             kb,
             source_names,
+            source_snapshot_kind="multi_knowledge_v1" if multi_scope is not None else "legacy_knowledge_base",
+            sources=frozen_sources,
+            persist=persist,
         )
         source_hash = content_hash({
             # KnowledgeBaseSourceSnapshot includes created_at and therefore
@@ -2044,16 +2126,117 @@ class AppPipeline:
             # retries need a semantic scope hash independent of that nonce.
             "knowledge_base_name": kb,
             "source_names": sorted(set(source_names)),
+            "sources": frozen_sources,
+            "selection_hash": multi_scope.selection_hash if multi_scope is not None else "",
             "attachment_ids": sorted(set(attachment_ids)),
         })
         return snapshot, {
-            "knowledge_base_count": 1,
+            "knowledge_base_count": len(multi_scope.sources) if multi_scope is not None else 1,
             "attachment_count": len(set(attachment_ids)),
             "source_count": len(source_names),
             "snapshot_bound": True,
             "snapshot_hash": source_hash,
             "snapshot_content_hash": str(snapshot.content_hash),
         }
+
+    def _resolve_frozen_authoring_scope(self, ctx: RequestContext, kb_name: str, snapshot: Any):
+        """Reauthorize the frozen selection for the actor executing this boundary."""
+        if str(getattr(snapshot, 'tenant_id', ctx.tenant_id)) != str(ctx.tenant_id or 'default'):
+            raise PermissionError('source_unavailable')
+        auth = AuthService()
+        actor_id = self._resolve_actor_user_id(ctx, auth)
+        actor = auth.get_user_by_id(actor_id) if actor_id is not None else None
+        if actor is None:
+            raise PermissionError('source_unavailable')
+        resolver = KnowledgeScopeResolver(auth, tenant_key=str(ctx.tenant_id or 'default'))
+        stored = getattr(snapshot, 'knowledge_scope_snapshot', {}) or {}
+        if stored:
+            selection = KnowledgeScopeSnapshot.model_validate(stored).selection()
+        else:
+            refs = {int(entry['kb_id']): entry for entry in snapshot.sources}
+            selection = KnowledgeSelectionInput(
+                purpose='compare' if all(entry['role'] == 'peer' for entry in refs.values()) else 'compose',
+                sources=tuple(KnowledgeSourceInput(kb_id=kb_id, role=entry['role']) for kb_id, entry in refs.items()),
+            )
+        scope = resolver.resolve(actor, kb_name, selection)
+        identities = {source.kb_id: source for source in scope.sources}
+        for frozen in snapshot.sources:
+            source = identities.get(int(frozen['kb_id']))
+            if (source is None or source.kb_name != str(frozen.get('kb_name_snapshot') or frozen.get('kb_name'))
+                    or source.department_id != str(frozen.get('department_id'))):
+                raise ValueError('source_changed')
+        return resolver, scope
+
+    def _validate_authoring_source_snapshot(
+        self,
+        ctx: RequestContext,
+        order: Any,
+        snapshot: Any,
+    ) -> None:
+        """Re-read every frozen multi-KB record before worker or release use."""
+        if str(getattr(snapshot, "source_snapshot_kind", "") or "") != "multi_knowledge_v1":
+            return
+        sources = list(getattr(snapshot, "sources", []) or [])
+        if not sources:
+            raise ValueError("source_unavailable")
+        self._resolve_frozen_authoring_scope(ctx, snapshot.knowledge_base_name, snapshot)
+        for frozen in sources:
+            if not isinstance(frozen, Mapping):
+                raise ValueError("source_unavailable")
+            kb_name = str(
+                frozen.get("kb_name_snapshot") or frozen.get("kb_name") or ""
+            ).strip()
+            department_id = str(frozen.get("department_id") or "").strip()
+            if not kb_name or not department_id:
+                raise ValueError("source_unavailable")
+            source_ctx = copy(ctx)
+            source_ctx.metadata = dict(getattr(ctx, "metadata", {}) or {})
+            source_ctx.metadata["resource_department_id"] = department_id
+            source_ctx.metadata["department_id"] = department_id
+            if not source_ctx.has_kb_permission(kb_name, "read"):
+                raise PermissionError("source_unavailable")
+            try:
+                documents = self.list_file_infos(kb_name, source_ctx)
+            except PermissionError:
+                raise
+            except Exception as exc:
+                raise ValueError("source_unavailable") from exc
+            current_entries = []
+            source_ref = SimpleNamespace(
+                kb_id=int(frozen.get("kb_id") or 0),
+                kb_name=kb_name,
+                department_id=department_id,
+                role=str(frozen.get("role") or "reference"),
+            )
+            for document in documents:
+                try:
+                    current_entries.append(
+                        build_frozen_source_entry(
+                            tenant_key=str(frozen.get("tenant_key") or getattr(ctx, "tenant_id", "default")),
+                            source=source_ref,
+                            document=document,
+                            strict=False,
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+            frozen_record_id = str(frozen.get("local_record_id") or "")
+            current = next(
+                (
+                    entry for entry in current_entries
+                    if str(entry.get("local_record_id") or "") == frozen_record_id
+                ),
+                None,
+            )
+            if current is None:
+                raise ValueError("source_unavailable")
+            for key in (
+                "source_content_hash", "dataset_id", "remote_document_id",
+                "index_revision", "processing_artifact_id", "processor_version",
+                "source_version_id", "revision", "approval_status", "source_name", "processor_kind",
+            ):
+                if str(current.get(key) or "") != str(frozen.get(key) or ""):
+                    raise ValueError("source_changed")
 
     @staticmethod
     def _synthetic_document_schema(spec: OutputSpec) -> DocumentSchema:
@@ -2104,10 +2287,17 @@ class AppPipeline:
             raise ValueError("output spec draft is missing")
         intake = getattr(self, "output_spec_intake", None) or OutputSpecIntakeService()
         spec = intake.to_output_spec(draft).model_copy(update={"status": "proposed"})
-        snapshot, source_summary = self._planning_source_snapshot(
-            ctx,
-            knowledge_base_name=session.knowledge_base_name,
-        )
+        preview_id = (draft.get("content_preview") or {}).get("source_snapshot_id")
+        preview_snapshot = self.document_generation.store.get_knowledge_base_source_snapshot(preview_id) if preview_id else None
+        if preview_snapshot is not None and getattr(preview_snapshot, "source_snapshot_kind", "") == "multi_knowledge_v1":
+            self._validate_authoring_source_snapshot(ctx, None, preview_snapshot)
+            snapshot = preview_snapshot
+            source_summary = {"snapshot_content_hash": snapshot.content_hash, "snapshot_hash": snapshot.content_hash,
+                              "snapshot_bound": True, "source_count": len(snapshot.sources),
+                              "knowledge_base_count": len((snapshot.knowledge_scope_snapshot or {}).get("sources", [])),
+                              "attachment_count": 0}
+        else:
+            snapshot, source_summary = self._planning_source_snapshot(ctx, knowledge_base_name=session.knowledge_base_name)
         template = None
         analysis = None
         bindings: list[Any] = []
@@ -2819,7 +3009,18 @@ class AppPipeline:
             is_general_chat=False,
         )
         source_names = []
-        if effective_scope != "attachment_only":
+        source_snapshot = None
+        if (
+            effective_scope != "attachment_only"
+            and (ctx.metadata.get("knowledge_scope_snapshot") or None) is not None
+        ):
+            source_snapshot, _ = self._planning_source_snapshot(
+                ctx,
+                knowledge_base_name=knowledge_base_name,
+                persist=False,
+            )
+            source_names = list(source_snapshot.source_names)
+        elif effective_scope != "attachment_only":
             for document in self.list_file_infos(knowledge_base_name, ctx):
                 name = (
                     document.get("name", "")
@@ -2835,6 +3036,8 @@ class AppPipeline:
                 "upload and parse a source before generating a document"
             )
         kwargs.pop("source_names", None)
+        if source_snapshot is not None:
+            kwargs["source_snapshot"] = source_snapshot
         return self.document_generation.create_knowledge_base_work_order(
             ctx,
             knowledge_base_name=knowledge_base_name,
@@ -3686,6 +3889,7 @@ class AppPipeline:
                 payload={
                     "work_order_id": work_order_id,
                     "knowledge_base_name": order.knowledge_base_name,
+                    **({"required_worker_contract": REVIEW_WORKER_CONTRACT} if requires_review_contract(order) else {}),
                 },
             )
             mark_task_queued = getattr(self.document_generation, "mark_document_task_queued", None)
@@ -3745,6 +3949,7 @@ class AppPipeline:
                 "knowledge_base_name": order.knowledge_base_name,
                 "source_artifact_id": artifact.artifact_id,
                 "target_format": normalized_target,
+                **({"required_worker_contract": REVIEW_WORKER_CONTRACT} if requires_review_contract(order) else {}),
             },
         )
         return job
@@ -3810,10 +4015,10 @@ class AppPipeline:
             raise ValueError("work order is not a knowledge-base document generation")
         paused_runs = [
             run for run in self.document_generation.store.list_harness_runs(work_order_id)
-            if run.status == "paused"
+            if run.status in {"paused", "waiting_human"}
         ]
         if not paused_runs:
-            raise ValueError("work order has no paused Harness run")
+            raise ValueError("work order has no resumable Harness run")
         paused_run = paused_runs[-1]
         job_store = getattr(self, "document_job_store", None)
         if callable(getattr(job_store, "create_job", None)):
@@ -3867,7 +4072,10 @@ class AppPipeline:
         job = job_store.create_job(
             tenant_id=ctx.tenant_id or "default",
             user_id=ctx.user_id,
-            session_id=ctx.session_id or f"document-generation:{order.work_order_id}",
+            # HTTP contexts receive a fresh session id for each request.  A
+            # resume request is bound to the frozen work order instead, so a
+            # replayed conflict decision cannot enqueue a second resume job.
+            session_id=f"document-generation:{order.work_order_id}",
             client_request_id=str(client_request_id),
             operation="resume_work_order",
             work_order_id=order.work_order_id,
@@ -3876,6 +4084,7 @@ class AppPipeline:
                 "work_order_id": order.work_order_id,
                 "knowledge_base_name": order.knowledge_base_name,
                 "harness_run_id": str(harness_run_id),
+                **({"required_worker_contract": REVIEW_WORKER_CONTRACT} if requires_review_contract(order) else {}),
             },
         )
         mark_task_queued = getattr(self.document_generation, "mark_document_task_queued", None)
@@ -3912,6 +4121,17 @@ class AppPipeline:
             ctx, retrieve_factory=retrieve_factory, **kwargs,
         )
 
+    def _frozen_kb_provider_kwargs(self, ctx: RequestContext, kb_name: str, snapshot: Any) -> dict[str, Any]:
+        if getattr(snapshot, "source_snapshot_kind", "") != "multi_knowledge_v1":
+            return {}
+        from src.document_authoring.knowledge_sources import frozen_document_contracts
+        from src.services.multi_kb_retrieval import MultiKnowledgeRetrievalService, RetrievalBudget
+        self._validate_authoring_source_snapshot(ctx, None, snapshot)
+        resolver, scope = self._resolve_frozen_authoring_scope(ctx, kb_name, snapshot)
+        return {"knowledge_scope": scope, "multi_kb_service": MultiKnowledgeRetrievalService(resolver, self.backend),
+                "retrieval_budget": RetrievalBudget(max_calls=24, timeout_seconds=30, should_cancel=ctx.metadata.get("document_job_cancelled")),
+                "document_contracts": frozen_document_contracts(snapshot.sources)}
+
     def _knowledge_base_retriever(
         self,
         ctx: RequestContext,
@@ -3942,10 +4162,74 @@ class AppPipeline:
             for ref in frozen_attachment_refs
         ]
         attachment_ids = list(dict.fromkeys(item for item in attachment_ids if item))
+        frozen_snapshot = None
+        structured_retrieval_services: dict[str, tuple[Any, dict[int, Any]]] = {}
+        get_snapshot = getattr(getattr(self.document_generation, 'store', None), 'get_knowledge_base_source_snapshot', None)
+        if source_set_snapshot_id and callable(get_snapshot):
+            candidate = get_snapshot(source_set_snapshot_id)
+            if getattr(candidate, 'source_snapshot_kind', '') == 'multi_knowledge_v1':
+                frozen_snapshot = candidate
+        provider_kwargs: dict[str, Any] = {}
+        if frozen_snapshot is not None:
+            from src.document_authoring.knowledge_sources import frozen_document_contracts
+            from src.services.multi_kb_retrieval import MultiKnowledgeRetrievalService, RetrievalBudget
+
+            if frozen_snapshot.knowledge_base_name != kb_name:
+                raise PermissionError('source_unavailable')
+            self._validate_authoring_source_snapshot(ctx, None, frozen_snapshot)
+            resolver, scope = self._resolve_frozen_authoring_scope(ctx, kb_name, frozen_snapshot)
+            ctx = copy(ctx)
+            ctx.metadata = {**ctx.metadata, 'knowledge_scope_snapshot': scope.model_dump(mode='json')}
+            provider_kwargs = {
+                'knowledge_scope': scope,
+                'multi_kb_service': MultiKnowledgeRetrievalService(resolver, self.backend),
+                'retrieval_budget': RetrievalBudget(max_calls=24, timeout_seconds=30,
+                    should_cancel=ctx.metadata.get('document_job_cancelled')),
+                'document_contracts': frozen_document_contracts(frozen_snapshot.sources),
+            }
+            # A frozen multi-KB authoring scope can contain text, spreadsheet,
+            # circuit and conversation records in the same KB. Build strict
+            # structured adapters once and bind each retriever kind to the
+            # complete source set; the processor discriminator lets an
+            # adapter ignore other record kinds without widening its filter.
+            structured_store = getattr(self.backend, "store", None)
+            if callable(getattr(structured_store, "list_documents", None)):
+                from src.services.structured_retrieval import build_structured_retrieval_adapters
+
+                adapters = build_structured_retrieval_adapters(
+                    document_store=structured_store,
+                    spreadsheet_service=getattr(self, "spreadsheet_service", None),
+                    circuit_service=getattr(self, "circuit_service", None),
+                    conversation_service=getattr(self.backend, "conversation_indexes", None),
+                )
+                processor_by_retriever = {
+                    "spreadsheet_semantic": "spreadsheet_table",
+                    "spreadsheet_cell": "spreadsheet_table",
+                    "circuit": "circuit_design",
+                    "circuit_structure_overview": "circuit_design",
+                    "circuit_module_list": "circuit_design",
+                    "circuit_resolve_identity": "circuit_design",
+                    "circuit_resolved_connections": "circuit_design",
+                    "conversation": "external_conversation",
+                }
+                for retriever_kind, processor_kind in processor_by_retriever.items():
+                    if retriever_kind not in adapters:
+                        continue
+                    structured_retrieval_services[retriever_kind] = (
+                        MultiKnowledgeRetrievalService(resolver, self.backend, adapters=adapters),
+                        frozen_document_contracts(
+                            frozen_snapshot.sources,
+                            processor_kind=processor_kind,
+                        ),
+                    )
+        multi_kb_authoring = (getattr(ctx, "metadata", {}) or {}).get(
+            "knowledge_scope_snapshot"
+        ) is not None
         kb_provider = KnowledgeBaseEvidenceProvider(
             self.backend,
             top_k=src.settings.FINAL_TOP_K,
             source_names=frozen_source_names,
+            **provider_kwargs,
         )
         attachment_provider = None
         if frozen_attachment_refs and effective_source_scope in {
@@ -3960,10 +4244,14 @@ class AppPipeline:
         if attachment_provider is not None:
             evidence_providers.append(attachment_provider)
         composite_provider = CompositeDocumentEvidenceProvider(evidence_providers)
-        frozen_pin_evidence = self._frozen_icd_pin_evidence(
-            kb_name,
-            frozen_source_names,
-            icd_scope_review,
+        frozen_pin_evidence = (
+            []
+            if multi_kb_authoring
+            else self._frozen_icd_pin_evidence(
+                kb_name,
+                frozen_source_names,
+                icd_scope_review,
+            )
         )
 
         # Spreadsheet structured index (xlsx TableIndexStore). Instantiated
@@ -3974,7 +4262,7 @@ class AppPipeline:
         # re-checks as a second guard.
         spreadsheet_tool = (
             SpreadsheetSemanticTool(self.spreadsheet_service)
-            if self.spreadsheet_service is not None
+            if self.spreadsheet_service is not None and not multi_kb_authoring
             else None
         )
 
@@ -3988,7 +4276,7 @@ class AppPipeline:
         circuit_service = getattr(self, "circuit_service", None)
         circuit_tool = (
             CircuitQueryTool(circuit_service)
-            if circuit_service is not None
+            if circuit_service is not None and not multi_kb_authoring
             else None
         )
 
@@ -4003,6 +4291,7 @@ class AppPipeline:
                     top_k=src.settings.FINAL_TOP_K,
                     source_names=frozen_source_names,
                     extra_filters={"balanced_route": True},
+                    **provider_kwargs,
                 )
                 provider = CompositeDocumentEvidenceProvider(
                     [balanced_kb_provider]
@@ -4066,6 +4355,40 @@ class AppPipeline:
                 )
                 return [*circuit_evidences, *frozen_pin_evidence]
             specialized["relationship_lookup"] = _relationship_retriever
+
+        if multi_kb_authoring and structured_retrieval_services:
+            capability_retrievers = {
+                "tabular_lookup": "spreadsheet_semantic",
+                "entity_lookup": "circuit",
+                "relationship_lookup": "circuit_resolved_connections",
+                "conversation_lookup": "conversation",
+            }
+
+            def _multi_kb_structured_retriever(
+                query: str,
+                requirement: Any,
+                *,
+                retriever_kind: str,
+            ) -> list[Any]:
+                service_and_contracts = structured_retrieval_services.get(retriever_kind)
+                if service_and_contracts is None:
+                    return []
+                service, contracts = service_and_contracts
+                outcome = service.search(
+                    snapshot=scope,
+                    queries=[query],
+                    retriever_kind=retriever_kind,
+                    per_source_top_k=src.settings.FINAL_TOP_K,
+                    budget=provider_kwargs["retrieval_budget"],
+                    document_contracts=contracts,
+                )
+                return list(outcome.evidence)
+
+            for capability, retriever_kind in capability_retrievers.items():
+                if retriever_kind in structured_retrieval_services:
+                    specialized[capability] = lambda query, requirement, kind=retriever_kind: (
+                        _multi_kb_structured_retriever(query, requirement, retriever_kind=kind)
+                    )
 
         # The registry generalises the Stage 0 tabular_lookup dispatch: the
         # default (RAGFlow) retriever is always invoked, specialised retrievers
@@ -4250,6 +4573,7 @@ class AppPipeline:
                 requirement_id=requirement.requirement_id,
                 source_set_snapshot_id=source_set_snapshot_id,
                 attachment_ids=attachment_ids,
+                **({'frozen_sources': frozen_snapshot.sources} if frozen_snapshot is not None else {}),
             )
 
         return retrieve
@@ -5344,6 +5668,84 @@ class AppPipeline:
                 raise ValueError("document task/work-order association mismatch")
         return self._document_reviews_for_task(ctx, task, order)
 
+    def list_document_conflicts(
+        self,
+        ctx: RequestContext,
+        work_order_id: str,
+    ) -> list[dict[str, Any]]:
+        return self.document_generation.list_conflict_cases(ctx, work_order_id)
+
+    def get_document_conflict(
+        self,
+        ctx: RequestContext,
+        conflict_id: str,
+        *,
+        expected_work_order_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        return self.document_generation.get_conflict_case(
+            ctx,
+            conflict_id,
+            expected_work_order_id=expected_work_order_id,
+        )
+
+    def submit_document_conflict_decision(
+        self,
+        ctx: RequestContext,
+        conflict_id: str,
+        *,
+        expected_work_order_id: str | None = None,
+        expected_fingerprint: str,
+        expected_conflict_version: int = 1,
+        expected_snapshot_hash: str,
+        expected_evidence_set_hash: str,
+        decision: dict[str, Any],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        from src.document_authoring.conflicts.models import ConflictDecision
+
+        result = self.document_generation.submit_conflict_decision(
+            ctx,
+            conflict_id,
+            expected_work_order_id=expected_work_order_id,
+            expected_fingerprint=expected_fingerprint,
+            expected_conflict_version=expected_conflict_version,
+            expected_snapshot_hash=expected_snapshot_hash,
+            expected_evidence_set_hash=expected_evidence_set_hash,
+            decision=ConflictDecision.model_validate({
+                "conflict_id": conflict_id,
+                "expected_version": expected_conflict_version,
+                "policy_version": decision.get("policy_version") or "conflict-policy-v1",
+                "action": decision.get("action"),
+                "selected_claim_id": decision.get("selected_claim_id"),
+                "rationale": decision.get("rationale") or "",
+                "requires_human": True,
+                "blocking": True,
+            }),
+            idempotency_key=idempotency_key,
+        )
+        if result.get("status") == "resolved":
+            context = self.document_generation.conflict_store.get_case_context(conflict_id)
+            if context is not None:
+                _case, _tenant_id, work_order_id = context
+                order = self.document_generation.store.get_work_order(work_order_id)
+                unresolved = self.document_generation.conflict_store.list_cases(
+                    tenant_id=str(_tenant_id), work_order_id=work_order_id,
+                )
+                waiting_runs = [
+                    run for run in self.document_generation.store.list_harness_runs(work_order_id)
+                    if run.status == "waiting_human"
+                ]
+                if order is not None and not unresolved and waiting_runs:
+                    job = self._queue_document_authoring_resume(
+                        ctx,
+                        order,
+                        waiting_runs[-1].harness_run_id,
+                        client_request_id=f"conflict-decision:{result['decision_id']}",
+                    )
+                    result["job_id"] = job.job_id
+                    result["next_action"] = "resume_work_order"
+        return result
+
     def get_document_review(
         self,
         ctx: RequestContext,
@@ -6244,6 +6646,15 @@ class AppPipeline:
 
     def download_document_artifact(self, ctx: RequestContext, artifact_id: str) -> bytes:
         return self.document_generation.download_document_artifact(ctx, artifact_id)
+
+    def document_artifact_audit(self, ctx: RequestContext, artifact_id: str) -> dict[str, Any]:
+        return self.document_generation.document_artifact_audit(ctx, artifact_id)
+
+    def download_document_artifact_bundle(self, ctx: RequestContext, artifact_id: str) -> bytes:
+        return self.document_generation.download_document_artifact_bundle(ctx, artifact_id)
+
+    def download_document_artifact_with_audit(self, ctx: RequestContext, artifact_id: str) -> bytes:
+        return self.document_generation.download_document_artifact_with_audit(ctx, artifact_id)
 
     def preview_document_artifact(self, ctx: RequestContext, artifact_id: str) -> dict[str, Any]:
         return self.document_generation.preview_document_artifact(ctx, artifact_id)

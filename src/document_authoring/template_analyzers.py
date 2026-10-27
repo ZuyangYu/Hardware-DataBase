@@ -526,6 +526,7 @@ def _analyze_docx(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUnit],
     for child in body:
         if child.tag == f"{{{WORD_NS}}}p":
             units.append(_docx_unit(
+                element=child,
                 unit_id=f"paragraph:{paragraph_index}",
                 locator={"paragraph_index": paragraph_index},
                 label=f"Paragraph {paragraph_index + 1}",
@@ -534,8 +535,9 @@ def _analyze_docx(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUnit],
             paragraph_index += 1
         elif child.tag == f"{{{WORD_NS}}}tbl":
             for row_index, row in enumerate(child.findall("w:tr", NS)):
-                for cell_index, _cell in enumerate(row.findall("w:tc", NS)):
+                for cell_index, cell in enumerate(row.findall("w:tc", NS)):
                     units.append(_docx_unit(
+                        element=cell,
                         unit_id=f"table:{table_index}:{row_index}:{cell_index}",
                         locator={"table_index": table_index, "row_index": row_index, "cell_index": cell_index},
                         label=f"Table {table_index + 1} cell {row_index + 1},{cell_index + 1}",
@@ -545,13 +547,31 @@ def _analyze_docx(package: zipfile.ZipFile) -> tuple[list[TemplateAnalysisUnit],
     return units, bool(hazards)
 
 
-def _docx_unit(*, unit_id: str, locator: dict[str, int], label: str, blocked_reason: str | None) -> TemplateAnalysisUnit:
+def _docx_unit(*, element: ET.Element, unit_id: str, locator: dict[str, int], label: str, blocked_reason: str | None) -> TemplateAnalysisUnit:
+    # Runs may split one placeholder across differently styled text nodes.
+    # Only Word text enters the bounded semantic inventory, never XML/fields.
+    full_value = "".join(text.text or "" for text in element.findall(".//w:t", NS)).strip() or None
+    value_kind = "text" if full_value else "blank"
+    role = _structural_role(value_kind, full_value)
+    properties = element.find("w:pPr", NS) if element.tag == f"{{{WORD_NS}}}p" else element.find("w:tcPr", NS)
+    if role == "fixed_label" and properties is not None:
+        style = properties.find("w:pStyle", NS)
+        style_name = str(style.get(f"{{{WORD_NS}}}val", "") if style is not None else "").casefold()
+        if style_name.startswith(("heading", "title", "subtitle")) or properties.find("w:outlineLvl", NS) is not None:
+            role = "section_header"
+    preview = _bounded_preview(full_value or "")
     return TemplateAnalysisUnit(
         unit_id=unit_id,
         locator=locator,
-        label=label,
+        label=preview or label,
         writable=blocked_reason is None,
         blocked_reason=blocked_reason,
+        value_kind=value_kind,
+        value_preview=preview,
+        value_hash=workbook_value_hash(full_value),
+        style_fingerprint=hashlib.sha256(ET.tostring(properties)).hexdigest() if properties is not None else "",
+        structural_role_hint=role,
+        candidate_for_auto_fill=blocked_reason is None and role == "placeholder",
     )
 
 
