@@ -413,6 +413,11 @@ class MessageView(BaseModel):
     cards: list[dict] = Field(default_factory=list)
     # 该 turn 持久化的执行轨迹（stage/tool 事件折叠；刷新后轨迹面板不消失）。
     trace_steps: list[dict] = Field(default_factory=list)
+    # 复杂任务的计划/预算/校验投影（来自 turn summary；刷新后不清空）。
+    plan: dict | None = None
+    budget: dict | None = None
+    verification: dict | None = None
+    subagents: list[dict] = Field(default_factory=list)
     source_access_restricted: bool = False
 
 

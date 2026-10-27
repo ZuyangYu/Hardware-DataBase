@@ -2431,9 +2431,19 @@ class DocumentGenerationService:
                         except ValueError:
                             continue
                     if isinstance(item, NormalizedClaim):
+                        trusted_role = (
+                            knowledge_source.get('role')
+                            or metadata.get('source_role')
+                            or item.source_role
+                        )
                         trusted = {
                             'source_kb_id': knowledge_source.get('kb_id') or metadata.get('kb_id') or item.source_kb_id,
-                            'source_role': knowledge_source.get('role') or metadata.get('source_role') or item.source_role,
+                            'source_role': trusted_role,
+                            'authoritative': bool(
+                                knowledge_source.get('authoritative')
+                                or metadata.get('authoritative')
+                                or item.authoritative
+                            ),
                             'approval_status': metadata.get('approval_status', item.approval_status),
                             'source_content_hash': metadata.get('source_content_hash', item.source_content_hash),
                             'source_version_id': metadata.get('source_version_id', item.source_version_id),
@@ -2461,6 +2471,11 @@ class DocumentGenerationService:
                     ).strip().casefold()
                     if role not in {"primary", "peer", "reference", "standard"}:
                         continue
+                    authoritative = bool(
+                        knowledge_source.get("authoritative")
+                        or metadata.get("authoritative")
+                        or data.get("authoritative")
+                    )
                     evidence_id = str(getattr(evidence, "id", "") or "").strip()
                     try:
                         claims.append(
@@ -2475,6 +2490,7 @@ class DocumentGenerationService:
                                 scope_key=data.get("scope_key", ""),
                                 source_kb_id=source_kb_id,
                                 source_role=role,
+                                authoritative=authoritative,
                                 approval_status=metadata.get('approval_status', data.get('approval_status', '')),
                                 evidence_id=evidence_id,
                                 evidence_ids=(),
@@ -2625,7 +2641,7 @@ class DocumentGenerationService:
         self._detect_and_persist_conflicts(order, snapshot, result)
         tenant = str(getattr(order, "tenant_id", None) or "default")
         scope = dict(getattr(order, "kb_scope_snapshot", {}) or {})
-        if scope.get("purpose") in {"compose", "adapt"} and any(s.get("role") == "primary" for s in scope.get("sources", [])):
+        if scope.get("purpose") in {"compose", "adapt"}:
             # A reference can supply a candidate, never a missing target fact.
             # Check only fields explicitly requested by this unit.
             import re
@@ -2647,7 +2663,7 @@ class DocumentGenerationService:
                 if claim.field_key in focus_fields:
                     groups.setdefault((claim.field_key, claim.subject, claim.condition), []).append(claim)
             for key, grouped in groups.items():
-                if any(c.source_role == "primary" for c in grouped):
+                if any(c.authoritative for c in grouped):
                     continue
                 fingerprint = content_hash({"kind": "critical_source_gap", "field": key,
                                             "claims": sorted(c.claim_id for c in grouped)})
@@ -3218,7 +3234,7 @@ class DocumentGenerationService:
             if decision.get('action') not in {'choose_claim', 'accept_authoritative_source', 'retain_primary'}:
                 continue
             selected = next((claim for claim in case.claims if claim.claim_id == decision.get('selected_claim_id')), None)
-            if selected is None or selected.source_role != 'primary' or selected.approval_status.casefold() not in {'approved', 'effective', 'released'}:
+            if selected is None or not selected.authoritative or selected.approval_status.casefold() not in {'approved', 'effective', 'released'}:
                 pending.append({**case.model_dump(mode='json'), 'decisions': records,
                                 'approval_reason': 'critical_specification_approval_required'})
         return pending

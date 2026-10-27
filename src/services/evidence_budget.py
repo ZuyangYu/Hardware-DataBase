@@ -19,7 +19,6 @@ from typing import Any, Iterable, Mapping
 
 from src.services.evidence_sources import (
     ATTACHMENT,
-    COMPARISON,
     KNOWLEDGE_BASE,
     KNOWLEDGE_BASE_DOCUMENT,
     KNOWLEDGE_BASE_STRUCTURED,
@@ -123,11 +122,6 @@ class EvidenceBudgetCoordinator:
     system_reserve_bytes: int = 0
     answer_reserve_bytes: int = 0
     item_limit_per_source: int = 0
-    # Reserved exclusively for the derived comparison report.  Ordinary
-    # retrieval sees it as another source's outstanding reserve and cannot
-    # consume it.
-    comparison_reserve_bytes: int = 0
-    comparison_limit_bytes: int = 0
     enabled: bool = True
     _slices: dict[str, SourceBudgetSlice] = field(default_factory=dict, init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False)
@@ -138,17 +132,6 @@ class EvidenceBudgetCoordinator:
         self.system_reserve_bytes = max(0, int(self.system_reserve_bytes or 0))
         self.answer_reserve_bytes = max(0, int(self.answer_reserve_bytes or 0))
         self.item_limit_per_source = max(0, int(self.item_limit_per_source or 0))
-        self.comparison_reserve_bytes = max(0, int(self.comparison_reserve_bytes or 0))
-        self.comparison_limit_bytes = max(
-            self.comparison_reserve_bytes, int(self.comparison_limit_bytes or 0),
-        )
-        if self.comparison_reserve_bytes:
-            self._slices[COMPARISON] = SourceBudgetSlice(
-                source_type=COMPARISON,
-                hard_bytes=self.comparison_limit_bytes or self.comparison_reserve_bytes,
-                required_reserve=self.comparison_reserve_bytes,
-                item_limit=self.item_limit_per_source,
-            )
         for source_type, hard_bytes in dict(self.source_limits or {}).items():
             canonical = normalize_source_type(source_type) or str(source_type)
             reserve = int((self.source_reserves or {}).get(source_type)
@@ -226,16 +209,10 @@ class EvidenceBudgetCoordinator:
             target = self._canonical_slice(source_type)
             self._refresh_all()
             source_remaining = target.remaining_bytes
-            if target.source_type == COMPARISON:
-                # The comparison reserve was withheld from ordinary
-                # admission.  It may be spent even when other sources still
-                # have outstanding reserves, but never above the global cap.
-                global_available = max(0, self.evidence_bytes - self._global_used())
-            else:
-                global_available = max(
-                    0,
-                    self.evidence_bytes - self._global_used() - self._other_reserved(target.source_type),
-                )
+            global_available = max(
+                0,
+                self.evidence_bytes - self._global_used() - self._other_reserved(target.source_type),
+            )
             if target.source_type not in self._slices:
                 decision = BudgetDecision(
                     False, target.source_type, SOURCE_BUDGET_EXHAUSTED, stage, cost,
@@ -273,7 +250,7 @@ class EvidenceBudgetCoordinator:
 
         The runtime normally holds its own admission lock and calls
         ``try_admit``/``note_admitted`` separately; this convenience method is
-        the safe direct API for comparison jobs and tests.
+        the safe direct API for callers that cannot hold the runtime lock.
         """
 
         with self._lock:
@@ -336,7 +313,6 @@ class EvidenceBudgetCoordinator:
         *,
         item_limit: int | None = None,
         required_sources: Iterable[str] = (),
-        include_comparison_reserve: bool = False,
     ) -> "EvidenceBudgetCoordinator":
         import src.settings as settings
 
@@ -362,10 +338,6 @@ class EvidenceBudgetCoordinator:
             source_reserves[ATTACHMENT] = attachment_reserve
             source_reserves[KNOWLEDGE_BASE_DOCUMENT] = kb_reserve
             source_reserves[KNOWLEDGE_BASE_STRUCTURED] = kb_reserve
-        comparison_limit = int(
-            getattr(settings, "DOCUMENT_COMPARISON_MAX_MODEL_BYTES", 12000) or 12000
-        )
-        comparison_reserve = comparison_limit if include_comparison_reserve else 0
         return cls(
             global_bytes=global_bytes,
             source_limits={
@@ -377,8 +349,6 @@ class EvidenceBudgetCoordinator:
             system_reserve_bytes=system_reserve,
             answer_reserve_bytes=answer_reserve,
             item_limit_per_source=max(0, int(item_limit or 0)),
-            comparison_reserve_bytes=comparison_reserve,
-            comparison_limit_bytes=comparison_limit if include_comparison_reserve else 0,
             enabled=bool(getattr(settings, "EVIDENCE_SOURCE_AWARE_ENABLED", False)),
         )
 

@@ -53,6 +53,20 @@ def resolve(question, **kwargs):
     return resolve_turn_targets(question, sources=SOURCES, document_store=STORE, **kwargs)
 
 
+def test_generic_question_does_not_scan_every_document():
+    class _NoListStore:
+        def list_documents(self, kb_name, department_id):
+            raise AssertionError("generic questions must not enumerate the catalog")
+
+    result = resolve_turn_targets(
+        "这些库里的供电范围是什么意思？",
+        sources=SOURCES,
+        document_store=_NoListStore(),
+    )
+    assert result.resolution == "unrestricted_within_kb"
+    assert result.targets == ()
+
+
 def test_three_project_supply_sentence_pairs_each_file_with_its_project():
     question = "AP230060、AP230062、AA250004 三个项目的供电范围分别是什么？请参考 HWREQM、HWSolution、ADAS HSI。"
     result = resolve(question)

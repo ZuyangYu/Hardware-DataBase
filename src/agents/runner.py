@@ -36,9 +36,36 @@ from deepagents import (
     create_deep_agent,
     register_harness_profile,
 )
-from langchain_core.messages import AIMessage
+from langchain.agents.middleware import TodoListMiddleware
+from langchain_core.messages import AIMessage, ToolMessage
 
 from src.agents.schemas import Evidence
+from src.agents.turn_meta import (
+    PARTIAL_SYNTHESIS_ENABLED,
+    RESEARCH_SUBAGENT_ENABLED,
+    TokenUsageSummary,
+    _accumulate_usage,
+    _agent_active,
+    _agent_evidence_budget,
+    _agent_recursion_limit,
+    _agent_step_budget_answer,
+    _build_citation_verification,
+    _build_claim_coverage,
+    _build_evidence_quality,
+    _build_messages,
+    _build_turn_verification,
+    _complex_task_prompt,
+    _empty_answer_delivery,
+    _evidence_digest,
+    _extract_text_delta,
+    _is_incomplete_answer,
+    _normalize_citation_labels,
+    _normalize_plan_items,
+    _research_subagent_spec,
+    _scope_dependency_fields,
+    _scrub_invalid_citations,
+    _synthesize_partial_answer,
+)
 from src.agents.orchestration.capabilities import (
     CapabilityResolver,
     authorized_capabilities_for_conversation,
@@ -114,24 +141,6 @@ for _provider_key in ("openai", "ollama"):
         break
 
 
-_AGENT_ACTIVE = 0
-_AGENT_ACTIVE_LOCK = threading.Lock()
-
-
-def _agent_active(delta: int) -> None:
-    """Publish the concurrent agent-run gauge (P2-002)."""
-    global _AGENT_ACTIVE
-    with _AGENT_ACTIVE_LOCK:
-        _AGENT_ACTIVE = max(0, _AGENT_ACTIVE + int(delta))
-        current = _AGENT_ACTIVE
-    try:
-        from src.observability.metrics import set_active_state
-
-        set_active_state("hdb.agent.inflight_requests", "Concurrent agent runs", current)
-    except Exception:
-        pass
-
-
 # LangGraph checkpointer：agent 会话状态（thread 级完整消息历史）持久化。
 # PostgreSQL 后端为每次构图返回独立 saver（共享连接池），避免实例锁串行化
 # 并发会话；SQLite 后端保持进程级单例（v3 §10）。
@@ -201,49 +210,6 @@ _DOCUMENT_TASK_FOLLOW_UP_PATTERN = re.compile(
     r"cancel|pause|resume|retry|release|status|candidate",
     re.IGNORECASE,
 )
-
-
-def _agent_evidence_budget(attachment_refs: list[Any]) -> int:
-    """Return the per-run evidence budget for the assembled tool runtime.
-
-    Long attachments are parsed into many parts and completing a chapter can
-    legitimately need more registered evidence than an ordinary Q&A turn, so
-    attachment sessions use the larger of the two configured budgets.
-    """
-
-    base = int(getattr(settings, "AGENT_EVIDENCE_BUDGET", 30) or 30)
-    if not attachment_refs:
-        return base
-    attachment_budget = int(
-        getattr(settings, "AGENT_ATTACHMENT_EVIDENCE_BUDGET", 80) or 80
-    )
-    return max(base, attachment_budget)
-
-
-def _agent_step_budget_answer(rt: Any) -> str:
-    """Explain a clean stop after the agent loop exhausted its step budget."""
-
-    evidence = list(getattr(rt, "evidence", []) or [])
-    sources = [
-        name
-        for name in dict.fromkeys(
-            str(getattr(item, "source_name", "") or "").strip() for item in evidence
-        )
-        if name
-    ]
-    lines = ["本轮工具调用已达到单轮步数上限，为避免无限循环已停止继续检索。"]
-    if evidence and sources:
-        listed = "、".join(sources[:5]) + (" 等" if len(sources) > 5 else "")
-        lines.append(f"已登记 {len(evidence)} 条证据（来源：{listed}），但尚未完成全部任务。")
-    elif evidence:
-        lines.append(f"已登记 {len(evidence)} 条证据，但尚未完成全部任务。")
-    else:
-        lines.append("本轮尚未登记可用证据。")
-    lines.append(
-        "请缩小任务范围后重试：例如直接指明目标章节标题/编号、要读取的附件序号范围，"
-        "或先让系统只完成其中一个小节。"
-    )
-    return "\n".join(lines)
 
 
 def _direct_attachment_proposal_answer(
@@ -400,70 +366,6 @@ def _direct_attachment_proposal_answer(
     return message
 
 
-def _build_evidence_quality(evidence: list[Evidence]) -> list[dict]:
-    quality: list[dict] = []
-    for item in evidence:
-        try:
-            score = float(item.score) if item.score is not None else 0.0
-        except (TypeError, ValueError):
-            score = 0.0
-        quality.append({"evidence_id": item.id, "score": score})
-    return quality
-
-
-def _build_claim_coverage(answer_text: str, evidence: list[Evidence]) -> list[dict]:
-    """Map ``[n]`` citation markers in the answer to the evidence actually cited.
-
-    Returns one entry per distinct cited index with status ``"citation_valid"`` and
-    the matching evidence id. This is a lexical proxy for claim grounding (no
-    LLM claim extraction) and feeds RAGAS' claim-aware context selection.
-    """
-    by_citation: dict[int, str] = {}
-    for item in evidence:
-        raw = (item.metadata or {}).get("citation_number")
-        try:
-            num = int(raw) if raw is not None else None
-        except (TypeError, ValueError):
-            num = None
-        if num is not None and num not in by_citation:
-            by_citation[num] = item.id
-    coverage: list[dict] = []
-    for match in dict.fromkeys(_CITATION_RE.findall(answer_text or "")):
-        num = int(match)
-        evidence_id = by_citation.get(num)
-        if evidence_id is None:
-            continue
-        coverage.append(
-            {
-                "claim_id": f"cite-{num}",
-                "status": "citation_valid",
-                "evidence_ids": [evidence_id],
-            }
-        )
-    return coverage
-
-
-def _build_citation_verification(answer_text: str, evidence: list[Evidence]) -> dict:
-    """Lexical diagnostics; semantic support and sufficiency remain unevaluated."""
-    coverage = _build_claim_coverage(answer_text, evidence)
-    cited_ids = {item["evidence_ids"][0] for item in coverage}
-    valid_numbers = {int(item["claim_id"].split("-", 1)[1]) for item in coverage}
-    all_numbers = {int(item) for item in _CITATION_RE.findall(answer_text or "")}
-    paragraphs = [text.strip() for text in re.split(r"\n\s*\n", answer_text or "") if text.strip()]
-    return {
-        "grounded": False if not evidence else None,
-        "grounding_method": "citation_presence",
-        "semantic_verification_status": "not_evaluated",
-        "unsupported_claims": None,
-        "weak_claims": None,
-        "conflicts": None,
-        "invalid_citations": sorted(all_numbers - valid_numbers),
-        "uncited_paragraphs": [index for index, text in enumerate(paragraphs, 1) if not _CITATION_RE.search(text)],
-        "citation_coverage": len(cited_ids) / len(evidence) if evidence else 0.0,
-        "citation_coverage_basis": "distinct_cited_evidence/available_evidence",
-    }
-
-
 @dataclass
 class _RunRecord:
     """Per-execution-context holder for the most recent stream's observability.
@@ -512,22 +414,6 @@ class _TurnPlan:
     action_execution: Any
     direct_control_answer: str | None
     direct_answer_grounding: str
-
-
-@dataclass
-class TokenUsageSummary:
-    """Aggregated token usage across all model calls of one stream."""
-
-    provider: str = ""
-    model: str = ""
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-    call_count: int = 0
-
-    @property
-    def has_usage(self) -> bool:
-        return self.call_count > 0
 
 
 def _current_run() -> _RunRecord:
@@ -1305,46 +1191,6 @@ def _direct_action_plan_feedback(
     return "\n".join(lines)
 
 
-def _build_messages(query: str, history: list[tuple[str, str]]) -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = []
-    for user_text, assistant_text in (history or [])[-6:]:
-        if user_text:
-            messages.append({"role": "user", "content": str(user_text)})
-        if assistant_text:
-            messages.append({"role": "assistant", "content": str(assistant_text)})
-    messages.append({"role": "user", "content": query})
-    return messages
-
-
-def _scope_dependency_fields(scope: KnowledgeScopeSnapshot | None) -> dict[str, Any]:
-    if scope is None:
-        return {}
-    return {
-        "source_dependencies": {
-            "version": 1,
-            "kb_ids": sorted({int(source.kb_id) for source in scope.sources}),
-            "inherited_turn_ids": [],
-            "complete": True,
-        }
-    }
-
-
-def _extract_text_delta(chunk: Any) -> str:
-    content = getattr(chunk, "content", None)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict):
-                if block.get("type") in ("text", "text_delta"):
-                    parts.append(str(block.get("text") or block.get("delta") or ""))
-            elif isinstance(block, str):
-                parts.append(block)
-        return "".join(parts)
-    return ""
-
-
 class _AnswerSplitter:
     """Incremental narration/answer classifier over the deepagents model stream.
 
@@ -1451,16 +1297,6 @@ def strip_narration_segments(answer: str, narrations: list[str]) -> str:
         result = result[:idx] + result[idx + len(text) :]
         search_from = idx
     return result
-
-
-def _accumulate_usage(usage: TokenUsageSummary, chunk: Any) -> None:
-    meta = getattr(chunk, "usage_metadata", None)
-    if not meta:
-        return
-    usage.call_count += 1
-    usage.prompt_tokens += int(meta.get("input_tokens") or 0)
-    usage.completion_tokens += int(meta.get("output_tokens") or 0)
-    usage.total_tokens += int(meta.get("total_tokens") or 0)
 
 
 class MultiSourceAgentRunner:
@@ -1819,43 +1655,6 @@ class MultiSourceAgentRunner:
                 if callable(close):
                     close()
 
-    @staticmethod
-    def _attachment_prefetch_queries(query: str, refs: list[Any]) -> list[str]:
-        """Build a small, deterministic set of attachment retrieval queries.
-
-        Models are not reliable at selecting a newly mounted tool on the
-        first turn.  Filename-derived terms give the preflight a stable
-        fallback even when the user only says “附件中的文档”.
-        """
-        candidates: list[str] = []
-
-        def add(value: Any) -> None:
-            normalized = re.sub(r"\s+", " ", str(value or "")).strip()
-            if not normalized:
-                return
-            if normalized.casefold() not in {item.casefold() for item in candidates}:
-                candidates.append(normalized)
-
-        for ref in refs:
-            filename = str(getattr(ref, "filename", "") or "")
-            stem = re.sub(r"\.[^.]+$", "", filename)
-            tokens = [token for token in re.findall(r"[A-Za-z0-9]+", stem) if len(token) >= 2]
-            if tokens:
-                add(" ".join(tokens))
-                # Individual model/part tokens are useful when a combined
-                # FTS query is too restrictive for a particular parser.
-                for token in tokens:
-                    if len(token) >= 3 or token.isdigit():
-                        add(token)
-
-        query_tokens = [token for token in re.findall(r"[A-Za-z0-9]+", str(query or "")) if len(token) >= 2]
-        if query_tokens:
-            add(" ".join(query_tokens[:8]))
-        raw_query = str(query or "").strip()
-        if raw_query and len(raw_query) <= 160:
-            add(raw_query)
-        return candidates[:6]
-
     def _recover_pending_document_context(
         self,
         *,
@@ -2003,22 +1802,6 @@ class MultiSourceAgentRunner:
                 kb_name=kb_name,
             )
         return current
-
-    def _prefetch_attachment_context(
-        self,
-        *,
-        query: str,
-        rt: ToolRuntime,
-        tools: list[Any],
-    ) -> str:
-        from src.agents.attachment_prefetch import build_attachment_prefetch_context
-
-        return build_attachment_prefetch_context(
-            query=query,
-            rt=rt,
-            tools=tools,
-            query_builder=self._attachment_prefetch_queries,
-        )
 
     @staticmethod
     def _load_skill_prompt_context(
@@ -2452,7 +2235,7 @@ class MultiSourceAgentRunner:
             top_k=8 if query_mode == "deep" else 5,
             query_mode=query_mode,
             question=query,
-            evidence_budget=_agent_evidence_budget(attachment_refs),
+            evidence_budget=_agent_evidence_budget(attachment_refs, question=query),
             should_cancel=should_cancel,
             on_event=emit_event,
             attachment_refs=attachment_refs,
@@ -2607,14 +2390,10 @@ class MultiSourceAgentRunner:
 
         from src.agents.turn_evidence_runtime import configure_turn_evidence
 
-        evidence_policy = configure_turn_evidence(
+        configure_turn_evidence(
             rt=rt,
             conversation_plan=conversation_plan,
             intent_plan=intent_plan,
-            thread_id=str(thread_id or ""),
-            knowledge_scope=knowledge_scope,
-            ctx=ctx,
-            attachment_refs=attachment_refs,
             effective_scope=effective_scope,
             has_attachments=has_attachments,
             has_kb=not is_general,
@@ -2755,203 +2534,98 @@ class MultiSourceAgentRunner:
         # executor or become a second authority for the same user turn.
         legacy_direct_shortcuts = not action_plan_enabled
 
-        # An explicitly routed document-flow turn owns its tool surface.  Its
-        # branch must win over unified chat; otherwise ``memory_search`` and
-        # other general tools leak into a deterministic authoring turn.
-        if document_flow_routed and not action_plan_enabled:
-            tools: list[Any] = list(document_tools)
-            # Document Flow multi-source bridge (design §13.7): the authoring
-            # agent gathers attachment evidence through the same scoped tools
-            # instead of the renderer reading attachment bytes directly.
-            if attachment_refs:
-                from src.agents.tools.attachment_tools import (
-                    make_attachment_circuit_search,
-                    make_attachment_list,
-                    make_attachment_read,
-                    make_attachment_release,
-                    make_attachment_revision_history,
-                    make_attachment_search,
-                    make_attachment_table_query,
-                    make_attachment_visual_analyze,
-                    make_attachment_edit,
-                )
+        # The document flow is a prompt/state hint, not a tool-surface owner.
+        # All authorized tools stay visible; capability filtering is the only
+        # visibility boundary and every tool re-checks its own ACL.  An explicit
+        # document_flow=False is a client constraint, not a route, and only
+        # withholds document-write tools.
+        document_tools_allowed = document_flow is not False
+        tools: list[Any] = []
+        from src.attachments.models import scope_allows_kb
 
-                attachment_tools = [
-                    make_attachment_list(rt),
-                    make_attachment_search(rt),
-                    make_attachment_read(rt),
-                    make_attachment_table_query(rt),
-                    make_attachment_circuit_search(rt),
-                    make_attachment_visual_analyze(rt),
-                ]
-                if bool(getattr(rt, "attachment_edit_enabled", True)):
-                    attachment_tools.append(make_attachment_edit(rt))
-                attachment_tools.append(make_attachment_release(rt))
-                attachment_tools.append(make_attachment_revision_history(rt))
-                tools.extend(attachment_tools)
-            system_prompt = _DOCUMENT_FLOW_PROMPT.format(
-                kb_name=scope_kb or kb_name,
-                analysis_id=getattr(document_context, "analysis_id", None) or "未挂载",
-                template_version_id=getattr(document_context, "template_version_id", None) or "未挂载",
-            )
-        elif unified_tools_enabled:
-            # New conversation path: retrieval, attachment, document and task
-            # controls coexist.  Capability filtering below is the sole model
-            # visibility boundary; no old route flag selects a separate agent.
-            tools = []
-            from src.attachments.models import scope_allows_kb
-
-            if not is_general and scope_allows_kb(effective_scope):
-                kb_tools = [
-                    make_document_search(rt, self.rag_backend, self.document_store),
-                    make_document_search_batch(rt, self.rag_backend, self.document_store),
-                ]
-                if rt.knowledge_scope is None:
-                    kb_tools = [
-                        make_catalog_tool(
-                            rt,
-                            document_store=self.document_store,
-                            spreadsheet_service=self.spreadsheet_service,
-                            circuit_service=self.circuit_service,
-                            rag_backend=self.rag_backend,
-                        ),
-                        *kb_tools,
-                        make_circuit_search(rt, self.circuit_service),
-                        *make_spreadsheet_tools(rt, self.spreadsheet_service),
-                        *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
-                        make_conversation_search(rt, self.conversation_service),
-                    ]
-                elif rt.multi_kb_retrieval is not None:
-                    from src.agents.tools.structured_scope_tools import make_scoped_structured_tools
-
-                    scoped_tools = make_scoped_structured_tools(rt, wiki_assist=wiki_assist)
-                    kb_tools.extend(tool for tool in scoped_tools if getattr(tool, "multi_kb_exposed", True))
-                tools.extend(kb_tools)
-                if wiki_assist and rt.knowledge_scope is None:
-                    tools.append(make_wiki_search(rt, self.wiki_service))
-            if attachment_refs:
-                from src.agents.tools.attachment_tools import build_attachment_tools
-
-                tools.extend(build_attachment_tools(rt))
+        if not is_general and scope_allows_kb(effective_scope):
+            kb_tools = [
+                make_document_search(rt, self.rag_backend, self.document_store),
+                make_document_search_batch(rt, self.rag_backend, self.document_store),
+            ]
             if rt.knowledge_scope is None:
-                tools.append(make_memory_search(rt, memory_service_factory=self.memory_service_factory))
+                kb_tools = [
+                    make_catalog_tool(
+                        rt,
+                        document_store=self.document_store,
+                        spreadsheet_service=self.spreadsheet_service,
+                        circuit_service=self.circuit_service,
+                        rag_backend=self.rag_backend,
+                    ),
+                    *kb_tools,
+                    make_circuit_search(rt, self.circuit_service),
+                    *make_spreadsheet_tools(rt, self.spreadsheet_service),
+                    *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
+                    make_conversation_search(rt, self.conversation_service),
+                ]
+            elif rt.multi_kb_retrieval is not None:
+                from src.agents.tools.knowledge_scope_catalog import (
+                    make_knowledge_scope_catalog_tool,
+                )
+                from src.agents.tools.structured_scope_tools import make_scoped_structured_tools
+
+                kb_tools.append(make_knowledge_scope_catalog_tool(rt))
+                scoped_tools = make_scoped_structured_tools(rt, wiki_assist=wiki_assist)
+                kb_tools.extend(
+                    tool for tool in scoped_tools
+                    if getattr(tool, "multi_kb_exposed", True)
+                )
+            tools.extend(kb_tools)
+            if wiki_assist and rt.knowledge_scope is None:
+                tools.append(make_wiki_search(rt, self.wiki_service))
+        if attachment_refs:
+            from src.agents.tools.attachment_tools import build_attachment_tools
+
+            tools.extend(build_attachment_tools(rt))
+        if rt.knowledge_scope is None:
+            tools.append(make_memory_search(rt, memory_service_factory=self.memory_service_factory))
+        if document_tools_allowed:
             tools.extend(document_tools)
+        # Authenticated turns use the capability boundary.  Internal callers
+        # without a RequestContext keep their legacy (already-scoped) tools.
+        if ctx is not None:
             tools = filter_tools_by_capability(
                 tools,
                 available_capabilities=effective_capabilities,
             )
-            base_prompt = settings.SYSTEM_PROMPT.strip() or _SYSTEM_PROMPT
-            if not wiki_assist:
-                base_prompt = f"{base_prompt}\n\n本次未启用 Wiki 检索, 请不要调用 wiki_search。"
-            system_prompt = (
-                f"{kb_scope_line}\n\n"
-                f"{base_prompt.format_map(_PromptDict(kb_name=scope_kb, workflow=workflow))}\n\n"
-                "本轮按受控动作计划执行：只能调用当前可见的业务工具；"
-                "附件、知识库和文档产物均须通过这些工具访问，绝不可访问任意文件系统。"
-                "当工具结果明确提示“本轮所有目标/查询义务均已取得已编号证据”时，必须立即停止检索并基于现有证据作答。"
-            )
-            memory_context = "" if rt.knowledge_scope is not None else self._prefetch_memory_context(
-                query=query,
-                kb_name=scope_kb,
-                ctx=ctx,
-                rt=rt,
-            )
-            if memory_context:
-                system_prompt = f"{system_prompt}\n\n{memory_context}"
-        else:
-            tools = []
-            # Scope-based assembly (design §11.3): KB tools mount only when
-            # the effective scope allows the knowledge base AND the session is
-            # a KB chat; attachment tools mount whenever the scope allows them.
-            from src.attachments.models import scope_allows_kb
-
-            if not is_general and scope_allows_kb(effective_scope):
-                tools = [
-                    make_document_search(rt, self.rag_backend, self.document_store),
-                    make_document_search_batch(rt, self.rag_backend, self.document_store),
-                ]
-                if rt.knowledge_scope is None:
-                    tools = [
-                        make_catalog_tool(
-                            rt,
-                            document_store=self.document_store,
-                            spreadsheet_service=self.spreadsheet_service,
-                            circuit_service=self.circuit_service,
-                            rag_backend=self.rag_backend,
-                        ),
-                        *tools,
-                        make_circuit_search(rt, self.circuit_service),
-                        *make_spreadsheet_tools(rt, self.spreadsheet_service),
-                        *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
-                        make_conversation_search(rt, self.conversation_service),
-                    ]
-                elif rt.multi_kb_retrieval is not None:
-                    from src.agents.tools.structured_scope_tools import make_scoped_structured_tools
-
-                    scoped_tools = make_scoped_structured_tools(rt, wiki_assist=wiki_assist)
-                    tools.extend(tool for tool in scoped_tools if getattr(tool, "multi_kb_exposed", True))
-                if wiki_assist and rt.knowledge_scope is None:
-                    tools.append(make_wiki_search(rt, self.wiki_service))
-            if attachment_refs:
-                from src.agents.tools.attachment_tools import build_attachment_tools
-
-                tools.extend(build_attachment_tools(rt))
-            if rt.knowledge_scope is None:
-                tools.append(make_memory_search(rt, memory_service_factory=self.memory_service_factory))
-            base_prompt = settings.SYSTEM_PROMPT.strip() or _SYSTEM_PROMPT
-            if not wiki_assist:
-                base_prompt = f"{base_prompt}\n\n本次未启用 Wiki 检索, 请不要调用 wiki_search。"
-            system_prompt = f"{kb_scope_line}\n\n{base_prompt.format_map(_PromptDict(kb_name=scope_kb, workflow=workflow))}"
-            # Legacy behaviour (document_flow is None) keeps the document
-            # tools mounted on the general toolset.  An explicit false strips
-            # them so the agent cannot bypass the deterministic flow, and an
-            # explicit true that failed routing must not fall back to them.
-            if document_flow is None:
-                tools.extend(document_tools)
-            memory_context = "" if rt.knowledge_scope is not None else self._prefetch_memory_context(
-                query=query,
-                kb_name=scope_kb,
-                ctx=ctx,
-                rt=rt,
-            )
-            if memory_context:
-                # The formatter owns the boundary markers and fixed warning.  It
-                # is appended after the fixed agent rules so memory text cannot
-                # replace the formal evidence hierarchy or tool policy.
-                system_prompt = f"{system_prompt}\n\n{memory_context}"
-
-        comparison_tool_mounted = False
-        if (
-            bool(getattr(settings, "DOCUMENT_COMPARISON_ENABLED", False))
-            and evidence_policy.purpose == "compare"
-            and attachment_refs
-            and "evidence.compare" in effective_capabilities
-            and (knowledge_scope is not None or len(attachment_refs) >= 2)
-        ):
-            from src.agents.tools.comparison_tools import (
-                make_comparison_expand_tool,
-                make_document_comparison_tool,
-            )
-
-            tools.append(make_document_comparison_tool(rt))
-            tools.append(make_comparison_expand_tool(rt))
-            comparison_tool_mounted = True
-
-        attachment_context = self._prefetch_attachment_context(
-            query=query,
-            rt=rt,
-            tools=tools,
+        base_prompt = settings.SYSTEM_PROMPT.strip() or _SYSTEM_PROMPT
+        if not wiki_assist:
+            base_prompt = f"{base_prompt}\n\n本次未启用 Wiki 检索, 请不要调用 wiki_search。"
+        system_prompt = (
+            f"{kb_scope_line}\n\n"
+            f"{base_prompt.format_map(_PromptDict(kb_name=scope_kb, workflow=workflow))}\n\n"
+            "本轮按受控动作计划执行：只能调用当前可见的业务工具；"
+            "附件、知识库和文档产物均须通过这些工具访问，绝不可访问任意文件系统。"
+            "当工具结果明确提示“本轮所有目标/查询义务均已取得已编号证据”时，必须立即停止检索并基于现有证据作答。"
         )
-        if attachment_context:
-            system_prompt = f"{system_prompt}\n\n{attachment_context}"
-        if comparison_tool_mounted:
-            from src.agents.tools.comparison_tools import comparison_prompt
-            from src.services.task_runtime import run_comparison_preflight
 
-            system_prompt += comparison_prompt()
-            preflight = run_comparison_preflight(tools, rt)
-            if preflight:
-                system_prompt += "\n\n## 整篇比较预检（服务端已执行）\n本轮已由服务端执行 document_compare；不要重复整篇比较，直接基于以下冻结报告回答；需要章节明细时用 comparison_expand。\n" + preflight[:12000]
+        # The routed document flow only adds its trusted operating prompt.
+        # It no longer replaces the tool set; all authorized tools remain
+        # visible and every domain tool enforces its own ACL.
+        if document_flow_routed and not action_plan_enabled:
+            system_prompt = (
+                f"{system_prompt}\n\n"
+                + _DOCUMENT_FLOW_PROMPT.format(
+                    kb_name=scope_kb or kb_name,
+                    analysis_id=getattr(document_context, "analysis_id", None) or "未挂载",
+                    template_version_id=getattr(document_context, "template_version_id", None) or "未挂载",
+                )
+            )
+        if rt.knowledge_scope is None:
+            memory_context = self._prefetch_memory_context(
+                query=query,
+                kb_name=scope_kb,
+                ctx=ctx,
+                rt=rt,
+            )
+            if memory_context:
+                system_prompt = f"{system_prompt}\n\n{memory_context}"
+
         skill_context = self._load_skill_prompt_context(
             ctx,
             on_error=lambda exc: emit_event(
@@ -3927,16 +3601,62 @@ class MultiSourceAgentRunner:
             if (persist_thread and str(thread_id or "").strip())
             else None
         )
-        agent = create_deep_agent(
-            model=model, tools=tools, system_prompt=system_prompt, checkpointer=checkpointer
+        recursion_limit, budget_state = _agent_recursion_limit(
+            query=query,
+            query_mode=query_mode,
+            attachment_refs=list(getattr(rt, "attachment_refs", []) or []),
+            knowledge_scope=knowledge_scope,
+            document_flow=document_flow_routed,
         )
-        rounds = max(1, int(settings.AGENT_MAX_RETRIEVAL_ROUNDS))
-        if document_flow_routed:
-            recursion_limit = max(24, rounds * 8)
-        elif query_mode == "deep":
-            recursion_limit = max(12, rounds * 12)
-        else:
-            recursion_limit = max(8, rounds * 6)
+        budget_state.update(
+            {
+                "status": "allocated",
+                "exhausted": False,
+                "tool_calls": 0,
+                "evidence_count": 0,
+                "partial_answer": False,
+            }
+        )
+        show_turn_meta = (
+            str(budget_state["complexity"].get("level") or "simple") != "simple"
+        )
+        if show_turn_meta:
+            emit_event({"type": "budget", "payload": dict(budget_state)})
+
+        agent_middleware: list[Any] = []
+        if query_mode == "deep":
+            # The model decides whether a plan is useful; the middleware only
+            # makes the todo tool available for genuinely multi-step turns.
+            agent_middleware.append(TodoListMiddleware())
+        agent_subagents: list[dict[str, Any]] | None = None
+        if (
+            RESEARCH_SUBAGENT_ENABLED
+            and query_mode == "deep"
+            and str(budget_state["complexity"].get("level") or "simple") == "complex"
+        ):
+            research = _research_subagent_spec(tools=tools, model=model)
+            if research is not None:
+                agent_subagents = [research]
+        if show_turn_meta and query_mode == "deep":
+            system_prompt = _complex_task_prompt(
+                system_prompt, has_subagents=bool(agent_subagents)
+            )
+        if not is_general:
+            system_prompt += (
+                "\n引用编号只对当前轮有效；不要复用上一轮回答或对话历史中的 [n]，"
+                "必须使用本轮工具返回的证据编号。"
+            )
+        agent_kwargs: dict[str, Any] = {
+            "model": model,
+            "tools": tools,
+            "system_prompt": system_prompt,
+            "checkpointer": checkpointer,
+        }
+        if agent_middleware:
+            agent_kwargs["middleware"] = agent_middleware
+        if agent_subagents:
+            agent_kwargs["subagents"] = agent_subagents
+        agent = create_deep_agent(**agent_kwargs)
         config: dict[str, Any] = {"recursion_limit": recursion_limit}
         if checkpointer is not None:
             config["configurable"] = {"thread_id": str(thread_id)}
@@ -3953,15 +3673,28 @@ class MultiSourceAgentRunner:
             provider=str(type(model).__module__),
             model=str(getattr(model, "model_name", None) or getattr(model, "model", "") or ""),
         )
+        initial_todos_snapshot: str | None = None
+        if checkpointer is not None and hasattr(agent, "get_state"):
+            try:
+                initial_state = agent.get_state(config)
+                initial_values = getattr(initial_state, "values", None) or {}
+                if isinstance(initial_values, dict):
+                    initial_todos_snapshot = json.dumps(
+                        initial_values.get("todos"), ensure_ascii=False, sort_keys=True, default=str
+                    )
+            except Exception:
+                initial_todos_snapshot = None
 
         timeline: list[dict[str, Any]] = []
-        from src.services.task_runtime import audit_fields, handle_final_answer, should_buffer_answer
-
-        buffer_answer = should_buffer_answer(rt)
         splitter = _AnswerSplitter(
             on_narration=lambda text: emit_event({"type": "narration", "payload": {"text": text}})
         )
         recursion_stopped = False
+        plan_state: dict[str, Any] | None = None
+        plan_revision = 0
+        seen_tool_calls: set[str] = set()
+        subagents: list[dict[str, Any]] = []
+        subagent_by_call: dict[str, dict[str, Any]] = {}
         try:
             with bind_cancel_check(should_cancel):
                 for chunk, metadata in agent.stream(
@@ -3972,14 +3705,92 @@ class MultiSourceAgentRunner:
                     rt.check_cancel()
                     node = str((metadata or {}).get("langgraph_node") or "")
                     _accumulate_usage(usage, chunk)
+                    if isinstance(chunk, ToolMessage):
+                        call_id = str(getattr(chunk, "tool_call_id", "") or "")
+                        subagent = subagent_by_call.get(call_id)
+                        if subagent is not None:
+                            result_text = _extract_text_delta(chunk)
+                            failed = str(getattr(chunk, "status", "") or "").lower() == "error"
+                            subagent["status"] = "failed" if failed else "completed"
+                            subagent["result_chars"] = len(result_text)
+                            subagent["duration_ms"] = max(
+                                0,
+                                int((time.monotonic() - float(subagent.pop("_started", time.monotonic()))) * 1000),
+                            )
+                            emit_event(
+                                {
+                                    "type": "subagent_completed",
+                                    "payload": {
+                                        key: value
+                                        for key, value in subagent.items()
+                                        if not key.startswith("_")
+                                    },
+                                }
+                            )
+                        continue
                     # Real providers stream AIMessageChunk pieces; fake/fallback
                     # paths deliver a whole AIMessage per model call. Empty-text
                     # chunks still matter: they may carry tool-call metadata that
                     # reclassifies the segment as narration.
                     if node != "model" or not isinstance(chunk, AIMessage):
                         continue
+                    for call in getattr(chunk, "tool_calls", None) or []:
+                        if not isinstance(call, dict):
+                            continue
+                        call_name = str(call.get("name") or "").strip()
+                        call_id = str(call.get("id") or "").strip()
+                        args = call.get("args") if isinstance(call.get("args"), dict) else {}
+                        fingerprint = call_id or f"{call_name}:{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"
+                        if not call_name or fingerprint in seen_tool_calls:
+                            continue
+                        if call_name == "write_todos":
+                            items = _normalize_plan_items(args.get("todos"))
+                            if items:
+                                seen_tool_calls.add(fingerprint)
+                                plan_revision += 1
+                                plan_state = {
+                                    "items": items,
+                                    "revision": plan_revision,
+                                    "source": "agent_todos",
+                                }
+                                emit_event(
+                                    {
+                                        "type": "plan_created" if plan_revision == 1 else "plan_updated",
+                                        "payload": dict(plan_state),
+                                    }
+                                )
+                        elif call_name == "task":
+                            description = str(
+                                args.get("description")
+                                or args.get("prompt")
+                                or args.get("goal")
+                                or ""
+                            ).strip()[:300]
+                            if not description:
+                                continue
+                            seen_tool_calls.add(fingerprint)
+                            subagent = {
+                                "name": str(args.get("subagent_type") or "research"),
+                                "description": description,
+                                "status": "running",
+                                "tool_call_id": call_id,
+                                "_started": time.monotonic(),
+                            }
+                            subagents.append(subagent)
+                            if call_id:
+                                subagent_by_call[call_id] = subagent
+                            emit_event(
+                                {
+                                    "type": "subagent_started",
+                                    "payload": {
+                                        key: value
+                                        for key, value in subagent.items()
+                                        if not key.startswith("_")
+                                    },
+                                }
+                            )
                     delta = splitter.feed(chunk, _extract_text_delta(chunk))
-                    if delta and not buffer_answer:
+                    if delta:
                         yield delta
         except QueryCancelled:
             return
@@ -3989,7 +3800,7 @@ class MultiSourceAgentRunner:
             if isinstance(exc, GraphRecursionError):
                 # A runaway tool-call loop must not surface as an opaque
                 # system error: stop cleanly, keep the evidence already
-                # gathered and tell the user what to narrow down.
+                # gathered and synthesize what can be delivered.
                 recursion_stopped = True
                 emit_event(
                     {
@@ -4014,36 +3825,104 @@ class MultiSourceAgentRunner:
                 )
                 raise
 
-        # The final message's text was already streamed live above; finish()
-        # only returns it for the observability record, nothing is re-yielded.
-        answer_text = splitter.finish()
-        answer_text, completion_status_note, completion_decision = handle_final_answer(
-            rt, answer_text=answer_text, evidence=list(rt.evidence),
-        )
+        # Recover planner state when a provider only exposes tool calls on the
+        # assembled message.
+        if plan_state is None and checkpointer is not None and hasattr(agent, "get_state"):
+            try:
+                state = agent.get_state(config)
+                values = getattr(state, "values", None) or {}
+                current_todos = values.get("todos") if isinstance(values, dict) else None
+                current_snapshot = json.dumps(
+                    current_todos, ensure_ascii=False, sort_keys=True, default=str
+                )
+                items = _normalize_plan_items(current_todos)
+                if items and current_snapshot != initial_todos_snapshot:
+                    plan_revision += 1
+                    plan_state = {
+                        "items": items,
+                        "revision": plan_revision,
+                        "source": "agent_todos",
+                    }
+                    emit_event({"type": "plan_created", "payload": dict(plan_state)})
+            except Exception:
+                pass
+
+        # finish() only returns the final text for the record; it is not re-yielded.
+        rt.finalize_evidence()
+        answer_text = _normalize_citation_labels(splitter.finish())
+        partial_delivery = False
         if recursion_stopped:
-            # Append the step-budget notice to any partial answer so the turn
-            # completes with an actionable message instead of a failure.
-            notice = _agent_step_budget_answer(rt)
-            combined = f"{answer_text.rstrip()}\n\n{notice}" if answer_text else notice
-            record.answer = combined
-            _current_run().answer = combined
-            answer_text = combined
-            if buffer_answer and answer_text:
-                yield answer_text
+            budget_state.update(
+                {
+                    "status": "exhausted",
+                    "exhausted": True,
+                    "stopped_reason": "recursion_limit",
+                    "tool_calls": len(rt.diagnostics),
+                    "evidence_count": len(rt.evidence),
+                }
+            )
+            emit_event({"type": "budget_exhausted", "payload": dict(budget_state)})
+            synthesized: str | None = None
+            if PARTIAL_SYNTHESIS_ENABLED:
+                synthesized = _synthesize_partial_answer(
+                    model=model,
+                    query=query,
+                    evidence=rt.evidence,
+                    partial_answer=answer_text,
+                    emit_event=emit_event,
+                    budget_state=budget_state,
+                )
+            if synthesized:
+                answer_text = synthesized
+                partial_delivery = True
+                budget_state["partial_answer"] = True
+                budget_state["synthesis"] = "model"
+                emit_event(
+                    {
+                        "type": "partial_result",
+                        "payload": {
+                            "reason": "budget_exhausted",
+                            "synthesized": True,
+                            "evidence_count": len(rt.evidence),
+                            "answer_chars": len(synthesized),
+                        },
+                    }
+                )
+                yield synthesized
             else:
-                if completion_status_note:
-                    yield completion_status_note
-                yield notice
+                # Fail-soft path when the model cannot synthesize (or
+                # synthesis is disabled): keep the already-registered evidence
+                # visible as a bounded digest, then append the actionable
+                # budget notice.
+                digest = _evidence_digest(rt.evidence)
+                notice = _agent_step_budget_answer(rt)
+                combined = "\n\n".join(
+                    part for part in (answer_text.strip(), digest, notice) if part
+                )
+                answer_text = combined
+                partial_delivery = True
+                budget_state["partial_answer"] = bool(combined)
+                budget_state["synthesis"] = "digest" if digest else "notice"
+                emit_event(
+                    {
+                        "type": "partial_result",
+                        "payload": {
+                            "reason": "budget_exhausted",
+                            "synthesized": False,
+                            "fallback": "evidence_digest" if digest else "notice",
+                            "evidence_count": len(rt.evidence),
+                            "answer_chars": len(combined),
+                        },
+                    }
+                )
+                yield combined
+            record.answer = answer_text
+            _current_run().answer = answer_text
         elif answer_text:
             record.answer = answer_text
             _current_run().answer = answer_text
-            if buffer_answer:
-                yield answer_text
-            elif completion_status_note:
-                yield completion_status_note
 
-        # Post-stream bookkeeping: diagnostics events were emitted live by the
-        # tool wrappers; here we translate them into the summary/footer shapes.
+        # Translate live diagnostics into the summary/footer projections.
         for diag in rt.diagnostics:
             timeline.append(
                 {
@@ -4061,13 +3940,140 @@ class MultiSourceAgentRunner:
         record.token_usage_summary = usage
         rt.finalize_evidence()
         answer_text = _current_run().answer
-        verification = _build_citation_verification(answer_text, rt.evidence)
+        if not partial_delivery and _is_incomplete_answer(
+            answer_text, show_turn_meta=show_turn_meta, has_plan=plan_state is not None
+        ):
+            answer_text = ""
+        if not answer_text and rt.evidence and PARTIAL_SYNTHESIS_ENABLED:
+            answer_text, partial_delivery = _empty_answer_delivery(
+                model=model,
+                query=query,
+                evidence=rt.evidence,
+                emit_event=emit_event,
+                budget_state=budget_state,
+            )
+            if answer_text:
+                yield answer_text
+        if not answer_text:
+            # No answer text streamed and synthesis was unavailable/disabled.
+            if rt.evidence:
+                source_names = [
+                    name
+                    for name in dict.fromkeys(
+                        str(item.source_name or "") for item in rt.evidence
+                    )
+                    if name
+                ]
+                listed = ", ".join(source_names[:8]) + (" 等" if len(source_names) > 8 else "")
+                fallback = (
+                    f"本轮未能生成带引用标注的回答，仅检索到候选证据来源：{listed}。"
+                    "建议换个问法或补充更具体的关键词后重试。"
+                )
+            else:
+                fallback = settings.NO_CONTEXT_PROMPT or "未生成回答。"
+            answer_text = str(fallback)
+            record.answer = answer_text
+            _current_run().answer = answer_text
+            yield answer_text
+        answer_text, removed_citations = _scrub_invalid_citations(answer_text, rt.evidence)
+        record.answer = _current_run().answer = answer_text
+        if (
+            answer_text
+            and (partial_delivery or recursion_stopped)
+            and checkpointer is not None
+            and hasattr(agent, "update_state")
+        ):
+            # Otherwise the next turn loses the authoritative synthesized answer.
+            try:
+                agent.update_state(
+                    config,
+                    {"messages": [AIMessage(content=answer_text)]},
+                )
+            except Exception:
+                pass
+
+        context_window: dict[str, Any] | None = None
+        max_input_tokens = int(getattr(settings, "AGENT_MODEL_MAX_INPUT_TOKENS", 0) or 0)
+        if max_input_tokens > 0 and usage.max_prompt_tokens >= int(max_input_tokens * 0.85):
+            context_window = {
+                "max_prompt_tokens": usage.max_prompt_tokens,
+                "window_tokens": max_input_tokens,
+                "threshold_tokens": int(max_input_tokens * 0.85),
+                "note": "上下文接近模型窗口；框架摘要中间件负责保留近期消息与关键事实。",
+            }
+            budget_state["context_window"] = context_window
+            emit_event(
+                {
+                    "type": "context_compacted",
+                    "payload": {
+                        "stage": "context_window",
+                        **context_window,
+                    },
+                }
+            )
+        evidence_gaps: list[str] = []
+        turn_evidence_plan = getattr(rt, "turn_evidence_plan", None)
+        if turn_evidence_plan is not None:
+            try:
+                coverage = turn_evidence_plan.coverage_snapshot()
+                evidence_gaps = [
+                    f"{item.get('source_type') or '目标'} {item.get('target_id') or ''}："
+                    f"{item.get('state')} {item.get('reason') or ''}".strip()
+                    for item in coverage.get("requirements", [])
+                    if item.get("state") not in {"admitted"}
+                ]
+            except Exception:
+                evidence_gaps = []
+        if show_turn_meta or recursion_stopped or partial_delivery:
+            verification = _build_turn_verification(
+                answer_text=answer_text,
+                evidence=rt.evidence,
+                query=query,
+                model=model,
+                complexity=budget_state.get("complexity") or {},
+                budget_exhausted=recursion_stopped,
+                partial_delivery=partial_delivery,
+                require_evidence=not is_general,
+                evidence_gaps=evidence_gaps,
+            )
+        else:
+            # Simple turns keep only the historical lexical diagnostics.
+            verification = _build_citation_verification(answer_text, rt.evidence)
+        verification["removed_citations"] = removed_citations
+        budget_state.update(
+            {
+                "status": (
+                    "exhausted"
+                    if recursion_stopped
+                    else "partial"
+                    if partial_delivery
+                    else "ok"
+                ),
+                "tool_calls": len(rt.diagnostics),
+                "evidence_count": len(rt.evidence),
+                "partial_answer": partial_delivery,
+            }
+        )
         record.retrieval_summary = self._build_retrieval_summary(rt, timeline, verification)
-        record.retrieval_summary.update(audit_fields(rt))
-        if completion_decision is not None:
-            record.retrieval_summary["completion"] = completion_decision.model_dump(mode="json")
-            record.retrieval_summary.update({"completion_status": completion_decision.status, "sufficiency_status": completion_decision.status})
-            emit_event({"type": "task_completion", "payload": completion_decision.model_dump(mode="json")})
+        meta_visible = show_turn_meta or recursion_stopped or partial_delivery or bool(context_window)
+        if meta_visible:
+            record.retrieval_summary["budget"] = dict(budget_state)
+        if plan_state is not None:
+            record.retrieval_summary["plan"] = dict(plan_state)
+        if subagents:
+            persisted_subagents = []
+            for subagent in subagents:
+                row = {
+                    key: value for key, value in subagent.items() if not key.startswith("_")
+                }
+                if row.get("status") == "running":
+                    row["status"] = "abandoned"
+                persisted_subagents.append(row)
+            record.retrieval_summary["subagents"] = persisted_subagents
+        if meta_visible:
+            emit_event({"type": "budget", "payload": dict(budget_state)})
+        if show_turn_meta or recursion_stopped or partial_delivery:
+            emit_event({"type": "verification", "payload": verification})
         if getattr(rt, "turn_retrieval_targets", None) is not None:
             record.retrieval_summary["retrieval_targets"] = {
                 "resolution": rt.turn_retrieval_targets.resolution,
@@ -4101,32 +4107,16 @@ class MultiSourceAgentRunner:
         ))
         record.footer = "" if is_general else self._format_footer(rt, verification, timeline)
 
-        if not answer_text:
-            # No answer text streamed (e.g. loop ended right after tool calls).
-            if rt.evidence:
-                source_names = [
-                    name
-                    for name in dict.fromkeys(
-                        str(item.source_name or "") for item in rt.evidence
-                    )
-                    if name
-                ]
-                listed = ", ".join(source_names[:8]) + (" 等" if len(source_names) > 8 else "")
-                fallback = (
-                    f"本轮未能生成带引用标注的回答，仅检索到候选证据来源：{listed}。"
-                    "建议换个问法或补充更具体的关键词后重试。"
-                )
-            else:
-                fallback = settings.NO_CONTEXT_PROMPT or "未生成回答。"
-            record.answer = str(fallback)
-            yield fallback
-
     # ------------------------------------------------------------------
     # Public observability contract (unchanged shape)
 
     def get_last_footer(self) -> str:
         record = _RUN_RECORD.get()
         return record.footer if record is not None else ""
+
+    def get_last_agent_answer(self) -> str:
+        record = _RUN_RECORD.get()
+        return record.answer if record is not None else ""
 
     def get_last_retrieval_summary(self) -> dict:
         record = _RUN_RECORD.get()
@@ -4322,11 +4312,22 @@ class MultiSourceAgentRunner:
                     f"- {item.get('field_type')} / 目标 {item.get('target_id')}："
                     f"{item.get('status')} {item.get('reason') or ''}".rstrip()
                 )
-        sections.append("\n**Grounding**")
-        sections.append(
-            "- 语义支持=未评估 · 证据引用覆盖率={cov:.0%} · 无效引用={invalid} · 校验方式=仅核对 [n] 编号（未做逐句归因或冲突校验）".format(
-                invalid=verification.get("invalid_citations", []),
-                cov=float(verification.get("citation_coverage") or 0.0),
+        sections.append("\n**交付校验**")
+        if verification.get("status"):
+            sections.append(
+                f"- 状态：{verification.get('status')}；检查项 {len(verification.get('checks') or [])}；"
+                f"缺口 {len(verification.get('gaps') or [])}"
             )
-        )
+            for check in (verification.get("checks") or [])[:8]:
+                sections.append(
+                    f"- {check.get('label') or check.get('key')}：{check.get('status')}"
+                    + (f" · {check.get('detail')}" if check.get("detail") else "")
+                )
+        else:
+            sections.append(
+                "- 语义支持=未评估 · 证据引用覆盖率={cov:.0%} · 无效引用={invalid} · 校验方式=仅核对 [n] 编号（未做逐句归因或冲突校验）".format(
+                    invalid=verification.get("invalid_citations", []),
+                    cov=float(verification.get("citation_coverage") or 0.0),
+                )
+            )
         return "\n".join(sections)

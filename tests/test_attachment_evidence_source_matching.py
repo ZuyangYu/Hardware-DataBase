@@ -5,10 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from src.agents.schemas import Evidence
-from src.services.turn_evidence_plan import (
-    ADMITTED,
-    TurnEvidencePlan,
-)
+from src.services.turn_evidence_plan import TurnEvidencePlan
 
 
 def _kb_evidence(**metadata):
@@ -77,83 +74,6 @@ def test_missing_identity_is_not_a_wildcard_for_a_restricted_obligation():
         content_kind="document_text", processor_kind="ragflow", metadata={},
     )
     assert plan.evaluate(item) == ()
-
-
-def test_knowledge_evidence_does_not_satisfy_attachment_source_obligation():
-    plan = TurnEvidencePlan.from_comparison_sources(
-        turn_id="turn-1", attachment_ids=["att-1"], kb_ids=[5], selected_kb_ids=[5],
-    )
-    matched = plan.evaluate(_kb_evidence(target_ids=["source:knowledge_base:5"]))
-    assert matched == ("source:knowledge_base:5",)
-    snapshot = plan.coverage_snapshot()
-    assert snapshot["comparison_complete"] is False
-
-
-def test_comparison_report_with_both_sides_can_satisfy_both_source_obligations():
-    plan = TurnEvidencePlan.from_comparison_sources(
-        turn_id="turn-1", attachment_ids=["att-1"], kb_ids=[5], selected_kb_ids=[5],
-    )
-    report_evidence = Evidence(
-        id="comparison:cmp-1:item-1",
-        content="changed pin voltage",
-        source_name="HSI ↔ KB HSI",
-        content_kind="comparison_modified",
-        processor_kind="document_comparison",
-        metadata={
-            "source_type": "knowledge_base",
-            "evidence_role": "comparison",
-            "comparison_sources": ["attachment", "knowledge_base"],
-            "comparison_report_id": "cmp-1",
-        },
-        locator={"comparison_report_id": "cmp-1"},
-    )
-    matched = plan.evaluate(report_evidence)
-    assert set(matched) == {"source:attachment:att-1", "source:knowledge_base:5"}
-    plan.mark_admitted(matched, report_evidence.id)
-    snapshot = plan.coverage_snapshot()
-    assert snapshot["states"][ADMITTED] == 2
-    assert snapshot["comparison_complete"] is True
-
-
-def test_attachment_source_obligation_requires_a_real_attachment_identity():
-    plan = TurnEvidencePlan.from_comparison_sources(
-        turn_id="turn-1", attachment_ids=["att-1"], kb_ids=[5], selected_kb_ids=[5],
-    )
-    wrong = _attachment_evidence(attachment_id="att-other", asset_id="asset-other")
-    assert plan.evaluate(wrong) == ()
-    assert plan.evaluate(_attachment_evidence()) == ("source:attachment:att-1",)
-
-
-def test_comparison_sides_are_one_obligation_each_not_every_candidate():
-    plan = TurnEvidencePlan.from_comparison_sides(
-        turn_id="turn-1",
-        attachment_ids=["att-1", "att-2"],
-        kb_ids=[5, 6],
-        selected_kb_ids=[5, 6],
-    )
-    snapshot = plan.coverage_snapshot()
-    assert snapshot["required"] == 2
-    assert snapshot["by_source"]["attachment"]["pending"] == 1
-    assert snapshot["by_source"]["knowledge_base"]["pending"] == 1
-    report_evidence = Evidence(
-        id="comparison:cmp-1:item-1",
-        content="frozen diff",
-        source_name="a ↔ b",
-        content_kind="comparison_modified",
-        processor_kind="document_comparison",
-        metadata={
-            "source_type": "comparison",
-            "evidence_role": "comparison",
-            "comparison_sources": ["attachment", "knowledge_base"],
-            "comparison_report_id": "cmp-1",
-        },
-    )
-    matched = plan.evaluate(report_evidence)
-    assert set(matched) == {
-        "source:attachment:any", "source:knowledge_base:any",
-    }
-    plan.mark_admitted(matched, report_evidence.id)
-    assert plan.coverage_snapshot()["comparison_complete"] is True
 
 
 def test_coverage_snapshot_exposes_source_budget_provider():

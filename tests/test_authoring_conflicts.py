@@ -20,6 +20,7 @@ def _claim(
     *,
     unit: str,
     role: str,
+    authoritative: bool | None = None,
     approval_status: str = "",
     scope_key: str = "target-A",
 ):
@@ -33,6 +34,7 @@ def _claim(
         scope_key=scope_key,
         source_kb_id=101 if role == "primary" else 205,
         source_role=role,
+        authoritative=(role == "primary") if authoritative is None else authoritative,
         approval_status=approval_status,
         evidence_id=f"evidence:{claim_id}",
     )
@@ -86,6 +88,17 @@ def test_approved_primary_fact_is_retained_when_reference_differs():
     assert decision.action == "retain_primary"
     assert decision.requires_human is False
     assert decision.blocking is False
+
+
+def test_session_anchor_primary_without_explicit_authority_requires_human():
+    claims = [
+        _claim("a", "5", unit="V", role="primary", authoritative=False, approval_status="approved"),
+        _claim("b", "12", unit="V", role="reference"),
+    ]
+    case = ConflictDetector().detect(claims)[0]
+    decision = ConflictPolicy().evaluate(case, purpose="compose")
+    assert decision.action == "choose_claim"
+    assert decision.requires_human is True
 
 
 @pytest.mark.parametrize('as_model', [False, True])

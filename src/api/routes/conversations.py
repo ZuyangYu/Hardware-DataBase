@@ -77,6 +77,10 @@ def _message_view(
     m,
     cards: list[dict] | None = None,
     trace_steps: list[dict] | None = None,
+    plan: dict | None = None,
+    budget: dict | None = None,
+    verification: dict | None = None,
+    subagents: list[dict] | None = None,
 ) -> MessageView:
     attachments = []
     if m.turn_id and m.role == "user":
@@ -101,6 +105,10 @@ def _message_view(
         citations=getattr(m, "citations", []) or [],
         cards=list(cards or []),
         trace_steps=list(trace_steps or []),
+        plan=plan,
+        budget=budget,
+        verification=verification,
+        subagents=list(subagents or []),
     )
 
 
@@ -300,6 +308,7 @@ def list_messages(
             trace_by_turn[turn_id] = []
     views: list[MessageView] = []
     for m in messages:
+        owning_turn = None
         if m.turn_id:
             owning_turn = conv.get_turn(user.id, str(m.turn_id))
             if owning_turn is not None and not _can_read_turn(auth, user, owning_turn, conv):
@@ -312,7 +321,27 @@ def list_messages(
         if turn_id and (m.role == "assistant" or turn_id not in assistant_turns):
             cards = cards_by_turn.get(turn_id, [])
         trace_steps = trace_by_turn.get(turn_id, []) if m.role == "assistant" else []
-        views.append(_message_view(m, cards=cards, trace_steps=trace_steps))
+        summary = getattr(owning_turn, "summary", None) if m.role == "assistant" else None
+        summary = summary if isinstance(summary, dict) else {}
+        views.append(
+            _message_view(
+                m,
+                cards=cards,
+                trace_steps=trace_steps,
+                plan=summary.get("plan") if isinstance(summary.get("plan"), dict) else None,
+                budget=summary.get("budget") if isinstance(summary.get("budget"), dict) else None,
+                verification=(
+                    summary.get("verification")
+                    if isinstance(summary.get("verification"), dict)
+                    else None
+                ),
+                subagents=(
+                    summary.get("subagents")
+                    if isinstance(summary.get("subagents"), list)
+                    else []
+                ),
+            )
+        )
     return views
 
 

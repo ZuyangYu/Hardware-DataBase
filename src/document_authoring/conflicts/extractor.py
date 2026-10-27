@@ -111,6 +111,10 @@ class GroundedClaimExtractor:
                         claim_id=claim_id, field_key=field, subject=subject, predicate=field,
                         value=value, condition=";".join(conditions), scope_key=scope,
                         source_kb_id=kb_id, source_role=role,
+                        authoritative=bool(
+                            source.get("authoritative")
+                            or metadata.get("authoritative")
+                        ),
                         approval_status=str(metadata.get("approval_status") or ""),
                         evidence_id=identity,
                         source_content_hash=str(metadata.get("source_content_hash") or ""),

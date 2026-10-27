@@ -24,11 +24,6 @@ KNOWLEDGE_BASE_STRUCTURED = "knowledge_base_structured"
 CONVERSATION = "conversation"
 WIKI = "wiki"
 MEMORY = "memory"
-# Derived evidence produced by the whole-document comparison service.  It is
-# not a raw source; it carries both side references and gets a dedicated
-# reserve so ordinary retrieval cannot crowd out a completed comparison.
-COMPARISON = "comparison"
-
 CANONICAL_SOURCE_TYPES = (
     ATTACHMENT,
     KNOWLEDGE_BASE,
@@ -37,7 +32,6 @@ CANONICAL_SOURCE_TYPES = (
     CONVERSATION,
     WIKI,
     MEMORY,
-    COMPARISON,
 )
 KNOWLEDGE_SOURCE_TYPES = frozenset({
     KNOWLEDGE_BASE,
@@ -138,7 +132,7 @@ def source_matches(required: str, actual: str) -> bool:
 
 
 def source_id_for_metadata(metadata: Mapping[str, Any] | None) -> str:
-    """Stable source identity used by candidate pools and comparison reports."""
+    """Stable source identity used by candidate pools and evidence fusion."""
 
     data = dict(metadata or {})
     source_type = source_type_for_metadata(data)

@@ -941,7 +941,15 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             )
             return
 
-        answer = strip_narration_segments("".join(answer_parts), narrated)
+        streamed_answer = strip_narration_segments("".join(answer_parts), narrated)
+        get_agent_answer = getattr(pipeline, "get_last_agent_answer", None)
+        authoritative_answer = (
+            str(get_agent_answer() or "").strip() if callable(get_agent_answer) else ""
+        )
+        # The runner may normalize/scrub or synthesize the final answer after
+        # the deltas were emitted; the authoritative copy must win over the
+        # joined stream so done/persistence match verification.
+        answer = authoritative_answer or streamed_answer
         if not answer:
             raise RuntimeError("未生成回答")
         summary = {

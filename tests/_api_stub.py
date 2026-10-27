@@ -124,6 +124,9 @@ class StubPipeline:
     def get_last_agent_footer(self):
         return "footer"
 
+    def get_last_agent_answer(self):
+        return "".join(self.query_chunks)
+
     def get_last_token_usage_summary(self):
         return {"total_tokens": 10}
 

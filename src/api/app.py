@@ -19,7 +19,6 @@ from src.api.routes import (
     assets,
     attachments,
     auth,
-    comparisons,
     config,
     costs,
     conversations,
@@ -324,7 +323,6 @@ def create_app() -> FastAPI:
     app.include_router(doc_assets.router, prefix=api_v1)
     app.include_router(wiki.router, prefix=api_v1)
     app.include_router(attachments.router, prefix=api_v1)
-    app.include_router(comparisons.router, prefix=api_v1)
     app.include_router(conversations.router, prefix=api_v1)
     app.include_router(kbs.router, prefix=api_v1)
     app.include_router(files.router, prefix=api_v1)

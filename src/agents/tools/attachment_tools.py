@@ -330,13 +330,29 @@ def make_attachment_list(rt: ToolRuntime):
                     f"；修订候选，发布状态: {label}"
                     f"（revision_id: {revision.revision_id}）"
                 )
+            part_note = ""
+            try:
+                asset_id = str(getattr(ref, "asset_id", "") or "")
+                readable = [
+                    part
+                    for part in store.list_parts(asset_id)
+                    if str(part.text_content or "").strip()
+                ] if asset_id else []
+                if readable:
+                    part_note = (
+                        f"；可读片段: {len(readable)}，序号 0-{int(readable[-1].ordinal)}"
+                    )
+            except Exception:  # noqa: BLE001 - listing must stay fail-soft
+                part_note = ""
             lines.append(
                 f"{index}. {getattr(ref, 'filename', '')} — 解析状态: {state}"
-                f"{suffix}{revision_note}（attachment_id: {attachment_id}）"
+                f"{suffix}{revision_note}（attachment_id: {attachment_id}{part_note}）"
             )
         lines.append(
             "使用 attachment_search 检索附件内容，attachment_read 读取指定段落，"
             "attachment_visual_analyze 分析指定 PDF 页面。"
+            "可读片段不多（≤12）时，先一次 attachment_read(ordinal_from=0, limit=片段数) 读完，"
+            "不要只读前几段就下结论。"
         )
         return "\n".join(lines)
 
@@ -556,7 +572,13 @@ def make_attachment_read(rt: ToolRuntime):
                 f"可读文本 {state['readable_count']} 个，最大有效序号 {readable_max}）。"
                 "可尝试更小的起始序号，或使用 attachment_search 按关键词定位。"
             )
-        return format_tool_result(rt, adds_nothing, items)
+        rendered = format_tool_result(rt, adds_nothing, items)
+        if int(state["readable_count"]) > len(items):
+            rendered += (
+                f"\n\n（当前附件可读片段 {state['readable_count']} 个，"
+                f"本次读取 {len(items)} 个；短附件请一次读完，或继续读取剩余序号。）"
+            )
+        return rendered
 
     return attachment_read
 

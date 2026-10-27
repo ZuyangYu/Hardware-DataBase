@@ -629,6 +629,9 @@ class AppPipeline:
     def get_last_agent_footer(self) -> str:
         return self.agent.get_last_footer()
 
+    def get_last_agent_answer(self) -> str:
+        return self.agent.get_last_agent_answer()
+
     def get_last_retrieval_summary(self) -> dict:
         return self.agent.get_last_retrieval_summary()
 

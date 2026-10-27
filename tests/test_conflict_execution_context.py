@@ -111,7 +111,8 @@ def test_duplicate_approved_primary_occurrences_do_not_cause_human_prompt():
     from src.document_authoring.conflicts.normalizer import normalize_claim
     from src.document_authoring.conflicts.policy import ConflictPolicy
     claims = [normalize_claim(claim_id=identity, field_key="voltage", subject="input", predicate="nominal",
-                              value=value, source_kb_id=kb, source_role=role, approval_status=approval)
+                              value=value, source_kb_id=kb, source_role=role,
+                              authoritative=role == "primary", approval_status=approval)
               for identity, value, kb, role, approval in [
                   ("a1", "5V", 1, "primary", "approved"), ("a2", "5000mV", 1, "primary", "approved"),
                   ("b", "12V", 2, "reference", "draft"),

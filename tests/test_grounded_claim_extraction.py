@@ -25,7 +25,10 @@ def test_engineering_range_and_limit_equivalence(left, right):
 def evidence(text, *, kb=1, role="primary", identity="e1"):
     return {"id": identity, "content": text, "source_name": "HWREQM.docx",
             "locator": {"page": 4}, "metadata": {
-                "knowledge_source": {"kb_id": kb, "role": role},
+                "knowledge_source": {
+                    "kb_id": kb, "role": role,
+                    "authoritative": role == "primary",
+                },
                 "source_content_hash": "sha256:original", "source_version_id": "rev1",
                 "approval_status": "draft",
             }}

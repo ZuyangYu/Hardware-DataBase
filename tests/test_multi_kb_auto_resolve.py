@@ -19,7 +19,7 @@ def _request(*, reference_value="12V", reference_scope="target"):
         items.append({
             "id": identity, "content": f"Input voltage {value}", "source_name": f"{identity}.pdf",
             "metadata": {
-                "knowledge_source": {"kb_id": kb, "role": role},
+                "knowledge_source": {"kb_id": kb, "role": role, "authoritative": role == "primary"},
                 "approval_status": approval,
                 "normalized_claim": {
                     "claim_id": identity, "field_key": "operating_voltage",

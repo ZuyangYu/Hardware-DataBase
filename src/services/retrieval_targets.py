@@ -263,6 +263,33 @@ def _target_fingerprint(targets: Sequence[RetrievalTarget]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+_EXPLICIT_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
+_FILE_MENTION_RE = re.compile(
+    r"\.(?:docx?|xlsx?|xlsm|pdf|pptx?|txt|md)\b", re.IGNORECASE,
+)
+
+
+def _likely_explicit_target(question: str) -> bool:
+    """Cheap prefilter before listing every document in every selected KB.
+
+    Only questions that look like they name a project/file trigger the full
+    catalog scan.  Generic questions fall back to ordinary retrieval, which
+    can still discover files by content.
+    """
+
+    text = str(question or "")
+    if _PROJECT_RE.search(text) or _FILE_MENTION_RE.search(text):
+        return True
+    for token in _EXPLICIT_TOKEN_RE.findall(text):
+        if len(token) >= 4 and (
+            any(ch.isdigit() for ch in token)
+            or "_" in token
+            or token.isupper()
+        ):
+            return True
+    return False
+
+
 def resolve_turn_targets(
     question: str,
     *,
@@ -273,6 +300,13 @@ def resolve_turn_targets(
     history_hint: Sequence[dict] | None = None,
 ) -> TurnRetrievalTargets:
     """Resolve explicit project/file mentions to authorized current records."""
+    if not history_hint and not _likely_explicit_target(question):
+        return TurnRetrievalTargets(
+            turn_id=turn_id,
+            scope_fingerprint=scope_fingerprint,
+            resolution="unrestricted_within_kb",
+            target_fingerprint=_target_fingerprint(()),
+        )
     records_by_kb: dict[int, list] = {}
     for source in sources:
         try:

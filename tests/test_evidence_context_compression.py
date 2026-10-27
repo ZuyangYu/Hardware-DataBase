@@ -33,6 +33,29 @@ def test_compression_keeps_citation_id_source_locator_and_hash():
     assert "完整原文可按 evidence id 回读" in compressed
 
 
+def test_short_attachment_source_is_kept_intact_under_pressure():
+    from src.agents.schemas import Evidence
+
+    short = Evidence(
+        id="att-bom",
+        content="# 上一代 BOM\n" + "| 电源 | LM61460-Q1 |\n| 以太网 | DP83TG720S-Q1 |\n| MCU | TC377 |\n" + "尾行标记 END-OF-BOM",
+        source_name="previous_bom.md",
+        content_kind="text",
+        processor_kind="local_attachment",
+        locator={"line_start": 1, "line_end": 8},
+        metadata={
+            "citation_number": 1,
+            "source_type": "attachment",
+            "attachment_id": "att-1",
+        },
+    )
+    long_items = [_item(index) for index in range(2, 12)]
+    compressed = compress_evidence_for_context([short, *long_items], max_bytes=6000)
+    assert "DP83TG720S-Q1" in compressed
+    assert "尾行标记 END-OF-BOM" in compressed
+    assert 'compressed="true"' in compressed
+
+
 def test_small_context_is_rendered_unchanged():
     items = [_item(1)]
     full = format_evidence_for_llm(items)

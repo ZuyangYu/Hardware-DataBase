@@ -78,7 +78,6 @@ class RankedCandidate:
     score: float
     cost: int
     kb_id: int
-    primary: bool
     ranks: list[dict] = field(default_factory=list)
 
 
@@ -137,7 +136,7 @@ def rank_evidence_candidates(
                 }, ensure_ascii=False, sort_keys=True)
                 cost = max(1, int(count(render_payload if token_counter else render_payload + " " * 128)))
                 candidates[key] = {"item": replace(item, id=key, metadata=metadata), "score": 0.0, "cost": cost,
-                                   "kb_id": outcome.kb_id, "primary": source.get("role") == "primary", "ranks": []}
+                                   "kb_id": outcome.kb_id, "ranks": []}
             query_rank_key = (outcome.kb_id, outcome.query, outcome.retriever_kind, key)
             if query_rank_key in seen_ranks:
                 continue
@@ -146,12 +145,15 @@ def rank_evidence_candidates(
             candidates[key]["ranks"].append({"query": outcome.query, "rank": rank, "raw_score": item.score,
                                              "retriever_kind": outcome.retriever_kind})
             query_candidates[query_key].append(key)
-    ranked = sorted(candidates, key=lambda key: (-candidates[key]["score"], not candidates[key]["primary"],
+    # The session anchor (``role=primary``) is a navigation/ownership concept,
+    # never a retrieval-quality signal.  Ties are broken deterministically by
+    # the stable KB id so an anchor cannot outrank a better-matching source.
+    ranked = sorted(candidates, key=lambda key: (-candidates[key]["score"],
                                                  candidates[key]["kb_id"], key))
     return ScopedCandidateBatch(
         candidates=[RankedCandidate(identity=key, item=candidates[key]["item"], score=candidates[key]["score"],
                                     cost=candidates[key]["cost"], kb_id=candidates[key]["kb_id"],
-                                    primary=candidates[key]["primary"], ranks=list(candidates[key]["ranks"]))
+                                    ranks=list(candidates[key]["ranks"]))
                     for key in ranked],
         discarded=discarded, query_candidates=query_candidates,
     )
@@ -206,7 +208,7 @@ def fuse_evidence(
                 }, ensure_ascii=False, sort_keys=True)
                 cost = max(1, int(count(render_payload if token_counter else render_payload + " " * 128)))
                 candidates[key] = {"item": replace(item, id=key, metadata=metadata), "score": 0.0, "cost": cost,
-                                   "kb_id": outcome.kb_id, "primary": source.get("role") == "primary", "ranks": []}
+                                   "kb_id": outcome.kb_id, "ranks": []}
             query_rank_key = (outcome.kb_id, outcome.query, outcome.retriever_kind, key)
             if query_rank_key in seen_ranks:
                 continue
@@ -214,8 +216,11 @@ def fuse_evidence(
             candidates[key]["score"] += 1 / (60 + rank)
             candidates[key]["ranks"].append({"query": outcome.query, "rank": rank, "raw_score": item.score, "retriever_kind": outcome.retriever_kind})
             query_candidates[query_key].append(key)
-    ranked = sorted(candidates, key=lambda key: (-candidates[key]["score"], not candidates[key]["primary"], candidates[key]["kb_id"], key))
-    source_ids = sorted({item["kb_id"] for item in candidates.values()}, key=lambda kb: (not any(c["kb_id"] == kb and c["primary"] for c in candidates.values()), kb))
+    ranked = sorted(candidates, key=lambda key: (-candidates[key]["score"],
+                                                 candidates[key]["kb_id"], key))
+    # All selected KBs are peers for retrieval.  The session anchor gets no
+    # reserved slot and no ordering preference.
+    source_ids = sorted({item["kb_id"] for item in candidates.values()})
     per_source = {kb: [key for key in ranked if candidates[key]["kb_id"] == kb] for kb in source_ids}
     representatives = []
     preferred = {kb: [] for kb in source_ids}

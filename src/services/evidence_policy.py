@@ -1,9 +1,9 @@
 """Deterministic evidence strategy for one conversation turn.
 
-``ConversationPlan`` owns the route.  This module translates the route into a
-small evidence policy (purpose, prefetch mode, comparison obligations).  It
-never widens the server-resolved source scope; it can only make retrieval more
-selective.
+This module no longer decides that a turn *is* a comparison.  Comparison is a
+model-selected tool call; the policy here only bounds prefetch/admission for a
+purpose explicitly supplied by the caller.  It never widens the server-resolved
+source scope.
 """
 
 from __future__ import annotations
@@ -11,8 +11,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any
-
-from src.core.intent import is_document_comparison_query
 
 QA = "qa"
 SUMMARIZE = "summarize"
@@ -47,22 +45,17 @@ def resolve_evidence_purpose(
     conversation_plan: Any | None = None,
     intent_plan: Any | None = None,
 ) -> str:
-    """Return one of ``qa/summarize/extract/compare/author/visual``.
+    """Return a bounded evidence purpose for an explicitly routed turn.
 
-    Comparison and authoring routes from the server plan win.  The remaining
-    purposes are derived from explicit verbs only; an uncertain request stays
-    on the low-cost ``qa`` path.
+    Comparison is intentionally absent: the model decides whether to call the
+    comparison tool, so a keyword must not pre-classify the turn.  The
+    remaining purposes are derived from explicit verbs only; an uncertain
+    request stays on the low-cost ``qa`` path.
     """
 
     text = str(query or "")
-    if bool(getattr(conversation_plan, "comparison_requested", False)):
-        return COMPARE
-    if is_document_comparison_query(text):
-        return COMPARE
     intent = str(getattr(conversation_plan, "intent", "") or getattr(intent_plan, "intent", ""))
     action = str(getattr(conversation_plan, "action", "") or getattr(intent_plan, "action", ""))
-    if intent == "compare" or action == "compare":
-        return COMPARE
     if intent in {"document_authoring", "template_generation"} or action in {
         "create_document", "revise", "revise_document", "revise_attachment",
     }:

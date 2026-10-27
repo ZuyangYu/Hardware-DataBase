@@ -194,7 +194,13 @@ def observe_case(case: dict, service: DocumentGenerationService, *, index: int) 
     evidence = [{
         "id": item["id"], "content": item["content"], "source_name": f"fixture-{item['id']}",
         "metadata": {
-            "knowledge_source": sources[item["kb_id"]],
+            "knowledge_source": {
+                **sources[item["kb_id"]],
+                # This fixed fixture predates the explicit authority field;
+                # mark its primary source authoritative to keep the regression
+                # comparable.  Production evidence must set this explicitly.
+                "authoritative": sources[item["kb_id"]].get("role") == "primary",
+            },
             "approval_status": item["approval_status"], "effective_scope": item["effective_scope"],
             "revision": item["revision"], "source_version_id": item["source_version_id"],
             "source_content_hash": hashlib.sha256(item["content"].encode()).hexdigest(),

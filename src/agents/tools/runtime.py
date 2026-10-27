@@ -26,6 +26,10 @@ from src.services.evidence_sources import (
 from src.services.knowledge_scope_models import KnowledgeScopeSnapshot
 
 MAX_EVIDENCE_CONTENT_CHARS = 1200
+# Comparison rows intentionally carry both sides plus a short inline diff.
+# Truncating them to the generic single-chunk cap would silently drop the
+# right side and the diff before the model ever sees them.
+MAX_COMPARISON_CONTENT_CHARS = 4800
 
 TOOL_LABELS = {
     "document_search": "文档检索",
@@ -44,8 +48,7 @@ TOOL_LABELS = {
     "attachment_visual_analyze": "附件视觉分析",
     "request_attachment_release": "附件发布申请",
     "attachment_revision_history": "附件修订历史",
-    "document_compare": "整篇文档比较",
-    "comparison_expand": "比较章节展开",
+    "list_knowledge_sources": "多库目录",
     "wiki_search": "Wiki 检索",
 }
 
@@ -785,19 +788,6 @@ def timed_tool_call(
     all of them.
     """
     rt.check_cancel()
-    turn_budget = getattr(rt, "turn_budget", None)
-    if turn_budget is not None and not turn_budget.consume("tool_call"):
-        rt.emit(
-            "degraded",
-            {
-                "stage": f"tool_{tool_name}",
-                "reason": "本轮工具调用预算已耗尽，本次调用未执行。",
-            },
-        )
-        blocked = AdmittedEvidence()
-        blocked.failure = "turn_tool_budget_exhausted"
-        blocked.tool_name = tool_name
-        return blocked, False
     invocation_id = rt.next_invocation_id()
     was_repeat = rt.has_query(tool_name, query)
     with rt._lock:
@@ -1024,7 +1014,12 @@ def format_evidence_for_llm(items: list[Evidence]) -> str:
     blocks = []
     for item in items:
         number = int(item.metadata.get("citation_number") or 0)
-        content = str(item.content or "")[:MAX_EVIDENCE_CONTENT_CHARS]
+        content_limit = (
+            MAX_COMPARISON_CONTENT_CHARS
+            if str(item.metadata.get("evidence_role") or "") == "comparison"
+            else MAX_EVIDENCE_CONTENT_CHARS
+        )
+        content = str(item.content or "")[:content_limit]
         content = _LEADING_CITATION_RE.sub(r"`\1`", content)
         locator = item.locator or {}
         locator_text = ", ".join(f"{k}={v}" for k, v in locator.items() if v not in (None, ""))
@@ -1053,26 +1048,69 @@ def compress_evidence_for_context(items: list[Evidence], *, max_bytes: int) -> s
     """
 
     rendered = format_evidence_for_llm(items)
-    if len(rendered.encode("utf-8")) <= max(0, int(max_bytes or 0)):
+    budget = max(0, int(max_bytes or 0))
+    if len(rendered.encode("utf-8")) <= budget:
         return rendered
-    blocks: list[str] = []
-    used = 0
-    for item in items:
+
+    def _block(item: Evidence, content_limit: int, *, compressed: bool) -> str:
         number = int(item.metadata.get("citation_number") or 0)
         locator = item.locator or {}
         locator_text = ", ".join(
             f"{key}={value}" for key, value in locator.items() if value not in (None, "", [], {})
         )
-        content = str(item.content or "")[:280]
-        block = (
-            f'<evidence id="{number}" source="{item.source_name}" compressed="true">\n'
+        content = str(item.content or "")[: max(0, int(content_limit))]
+        note = "\n（正文已压缩；完整原文可按 evidence id 回读。）" if compressed else ""
+        return (
+            f'<evidence id="{number}" source="{item.source_name}"'
+            + (' compressed="true"' if compressed else "")
+            + ">\n"
             f"[{number}] 来源：{item.source_name} | 位置：{locator_text or '未提供'}\n"
-            f"{content}\n"
-            "（正文已压缩；完整原文可按 evidence id 回读。）\n"
+            f"{content}{note}\n"
             "</evidence>"
         )
+
+    # Keep one source-aware representative as intact as possible.  A short
+    # attachment (e.g. a one-part BOM table) must not be cut to its first rows
+    # just because the other sources are long; per-source quota is more useful
+    # than a global first-N truncation.
+    groups: dict[str, list[Evidence]] = {}
+    for item in items:
+        groups.setdefault(str(item.source_name or ""), []).append(item)
+    quota = max(240, budget // max(1, len(groups))) if budget else 0
+    blocks: list[str] = []
+    used = 0
+    emitted: set[int] = set()
+    for group in groups.values():
+        first = group[0]
+        full_block = _block(first, MAX_EVIDENCE_CONTENT_CHARS, compressed=False)
+        full_size = len(full_block.encode("utf-8"))
+        metadata = first.metadata or {}
+        is_attachment = bool(
+            metadata.get("attachment_id")
+            or str(metadata.get("source_type") or "").lower() == "attachment"
+            or (first.locator or {}).get("attachment_id")
+        )
+        # Short sources (especially a one-part BOM/requirements attachment) are
+        # cheap to keep intact and carry high task value; do not cut them just
+        # because a long PDF shares the budget.
+        if (full_size <= 800 or (is_attachment and full_size <= 1200)) or (
+            budget and full_size <= quota
+        ):
+            block = full_block
+        else:
+            block = _block(first, 280, compressed=True)
         encoded = len(block.encode("utf-8"))
-        if used + encoded > max(0, int(max_bytes or 0)) and blocks:
+        if budget and used + encoded > budget and blocks:
+            break
+        blocks.append(block)
+        emitted.add(id(first))
+        used += encoded
+    for item in items:
+        if id(item) in emitted:
+            continue
+        block = _block(item, 280, compressed=True)
+        encoded = len(block.encode("utf-8"))
+        if budget and used + encoded > budget and blocks:
             blocks.append("（其余已登记证据的正文已压缩，可按引用编号回读。）")
             break
         blocks.append(block)
@@ -1085,13 +1123,6 @@ def evidence_budget_message(rt: ToolRuntime) -> str:
 
     budget = int(getattr(rt, "evidence_budget", 0) or 0)
     held = len(getattr(rt, "evidence", []) or [])
-    task_plan = getattr(rt, "task_plan", None)
-    if task_plan is not None and str(getattr(task_plan, "task_kind", "")) == "compare":
-        return (
-            "本轮普通检索证据预算已不足，但整篇比较的专用预算仍然保留；"
-            "不要继续用 document_search/attachment_search 翻找，也不要据此声称比较预算耗尽。"
-            "请立即调用 document_compare（已有报告时用 comparison_expand）完成整篇比较。"
-        )
     if rt.knowledge_scope is not None:
         source_status = rt.source_budget_snapshot()
         blocked = {

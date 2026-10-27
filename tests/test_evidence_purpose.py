@@ -16,7 +16,8 @@ from src.services.evidence_policy import (
 
 
 def test_purpose_resolution_covers_explicit_verbs():
-    assert resolve_evidence_purpose("对比附件和知识库中的 HSI 文档") == COMPARE
+    # Comparison is a model-selected tool call, not a keyword-derived purpose.
+    assert resolve_evidence_purpose("对比附件和知识库中的 HSI 文档") == QA
     assert resolve_evidence_purpose("总结这份附件的第 2 章") == SUMMARIZE
     assert resolve_evidence_purpose("提取表格中的所有管脚字段") == EXTRACT
     assert resolve_evidence_purpose("看一下第 3 页的图片") == VISUAL
@@ -30,9 +31,9 @@ def test_conversation_plan_records_comparison_purpose():
         has_kb=True,
         source_scope="attachment_and_knowledge_base",
     )
-    assert plan.evidence_purpose == COMPARE
+    assert plan.evidence_purpose == QA
     assert plan.comparison_requested is True
-    assert plan.to_dict()["evidence_purpose"] == COMPARE
+    assert plan.to_dict()["evidence_purpose"] == QA
 
 
 def test_compare_policy_requires_both_sources_and_never_formally_prefetches():

@@ -105,26 +105,6 @@ def test_concurrent_admission_never_exceeds_the_global_cap():
     assert len(accepted) == 50
 
 
-def test_comparison_reserve_cannot_be_consumed_by_ordinary_retrieval():
-    budget = EvidenceBudgetCoordinator(
-        global_bytes=10000,
-        source_limits={"attachment": 8000, "knowledge_base_document": 8000},
-        source_reserves={"attachment": 0, "knowledge_base_document": 0},
-        comparison_reserve_bytes=3000,
-        comparison_limit_bytes=3000,
-    )
-    assert budget.try_admit("knowledge_base_document", 7000).admitted
-    budget.note_admitted("knowledge_base_document", 7000)
-    # Ordinary evidence must leave the comparison reserve untouched.
-    assert budget.try_admit("attachment", 2000).reason == GLOBAL_BUDGET_EXHAUSTED
-    decision = budget.try_admit("comparison", 2500)
-    assert decision.admitted
-    budget.note_admitted("comparison", 2500)
-    snapshot = budget.snapshot()
-    assert snapshot["slices"]["comparison"]["used_bytes"] == 2500
-    assert snapshot["global_used_bytes"] == 9500
-
-
 def _attachment_evidence(content="attachment text", **metadata):
     return Evidence(
         id=f"att-{hash(content)}",
@@ -173,61 +153,6 @@ def test_runtime_rejects_attachment_overrun_but_still_admits_kb(monkeypatch):
     assert rt.last_rejection_reasons[SOURCE_BUDGET_EXHAUSTED] == 1
     assert rt.add_evidence([kb]) == [2]
     assert rt.source_budget_snapshot()["slices"]["knowledge_base_document"]["used_bytes"] > 0
-
-
-def test_comparison_report_is_admitted_after_ordinary_retrieval(monkeypatch):
-    monkeypatch.setattr(settings, "MULTI_KB_EVIDENCE_MAX_ITEMS", 24)
-    monkeypatch.setattr(settings, "MULTI_KB_CONTEXT_MAX_TOKENS", 8000)
-    monkeypatch.setattr(settings, "MULTI_KB_TURN_EVIDENCE_MAX_BYTES", 8000)
-    from src.services.turn_evidence_plan import TurnEvidencePlan
-
-    plan = TurnEvidencePlan.from_comparison_sides(
-        turn_id="t", attachment_ids=["att-1"], kb_ids=[5], selected_kb_ids=[5],
-    )
-    bt = EvidenceBudgetCoordinator(
-        global_bytes=22000,
-        source_limits={"attachment": 12000, "knowledge_base_document": 16000},
-        source_reserves={"attachment": 4000, "knowledge_base_document": 4000},
-        comparison_reserve_bytes=8000,
-        comparison_limit_bytes=12000,
-    )
-    rt = ToolRuntime(
-        kb_name="KB5", ctx=None,
-        knowledge_scope=SimpleNamespace(sources=[SimpleNamespace(kb_id=5)]),
-        source_scope="attachment_and_knowledge_base",
-        question="compare", evidence_budget=80, turn_evidence_plan=plan,
-    )
-    rt.evidence_budget_coordinator = bt
-    plan.source_budget_provider = bt.snapshot
-
-    ordinary = []
-    for index in range(14):
-        item = _kb_evidence("K" * 900)
-        item.id = f"kb-{index}"
-        ordinary.append(item)
-    admitted = [number for number in rt.add_evidence(ordinary) if number is not None]
-    # The comparison plan keeps at most two rows per side obligation, which
-    # leaves the dedicated comparison reserve untouched.
-    assert len(admitted) >= 2
-    assert bt.snapshot()["global_used_bytes"] <= 14000
-
-    comparison = Evidence(
-        id="comparison:cmp-1:item-1",
-        content="比较项：两侧文件内容哈希相同，整篇未发现差异。",
-        source_name="附件 ↔ 知识库",
-        content_kind="comparison_unchanged",
-        processor_kind="document_comparison",
-        metadata={
-            "source_type": "comparison",
-            "evidence_role": "comparison",
-            "comparison_sources": ["attachment", "knowledge_base"],
-            "comparison_report_id": "cmp-1",
-        },
-    )
-    numbers = rt.add_evidence([comparison])
-    assert numbers != [None]
-    assert bt.snapshot()["slices"]["comparison"]["used_bytes"] > 0
-    assert plan.coverage_snapshot()["comparison_complete"] is True
 
 
 def test_source_aware_budget_supersedes_legacy_shared_byte_counter(monkeypatch):

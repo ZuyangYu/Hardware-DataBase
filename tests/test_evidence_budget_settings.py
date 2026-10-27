@@ -19,8 +19,6 @@ def restore_settings():
 def reload_with(monkeypatch, **values):
     for key in (
         "EVIDENCE_SOURCE_AWARE_ENABLED",
-        "ATTACHMENT_PREFETCH_DEFERRED_ADMISSION",
-        "DOCUMENT_COMPARISON_ENABLED",
         "EVIDENCE_GLOBAL_CONTEXT_MAX_BYTES",
         "EVIDENCE_SYSTEM_PROMPT_RESERVE_BYTES",
         "EVIDENCE_ANSWER_RESERVE_BYTES",
@@ -39,8 +37,6 @@ def reload_with(monkeypatch, **values):
 def test_source_aware_defaults_are_safe(monkeypatch):
     reload_with(monkeypatch)
     assert settings.EVIDENCE_SOURCE_AWARE_ENABLED is False
-    assert settings.ATTACHMENT_PREFETCH_DEFERRED_ADMISSION is True
-    assert settings.DOCUMENT_COMPARISON_ENABLED is False
     assert settings.EVIDENCE_GLOBAL_CONTEXT_MAX_BYTES == 32000
     assert settings.EVIDENCE_ATTACHMENT_MAX_BYTES == 12000
     assert settings.EVIDENCE_KNOWLEDGE_BASE_MAX_BYTES == 16000
@@ -50,11 +46,9 @@ def test_source_budget_env_can_enable_the_new_path(monkeypatch):
     reload_with(
         monkeypatch,
         EVIDENCE_SOURCE_AWARE_ENABLED="true",
-        ATTACHMENT_PREFETCH_DEFERRED_ADMISSION="false",
         EVIDENCE_GLOBAL_CONTEXT_MAX_BYTES="30000",
     )
     assert settings.EVIDENCE_SOURCE_AWARE_ENABLED is True
-    assert settings.ATTACHMENT_PREFETCH_DEFERRED_ADMISSION is False
     assert settings.EVIDENCE_GLOBAL_CONTEXT_MAX_BYTES == 30000
 
 
@@ -76,5 +70,4 @@ def test_config_surface_exposes_new_keys():
 
     config = _current_config()
     assert config["EVIDENCE_SOURCE_AWARE_ENABLED"] is False
-    assert config["ATTACHMENT_PREFETCH_DEFERRED_ADMISSION"] is True
     assert "EVIDENCE_GLOBAL_CONTEXT_MAX_BYTES" in config

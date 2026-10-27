@@ -223,7 +223,7 @@ def test_none_falls_back_to_regex():
     assert routed is True and by == "regex"
 
 
-def test_routed_turn_assembles_document_only_agent(monkeypatch):
+def test_routed_turn_keeps_document_tools_and_retrieval_tools(monkeypatch):
     captured = _install_fake_agent(monkeypatch)
     runner = MultiSourceAgentRunner(
         rag_backend=_FakeRAGBackend(),
@@ -245,8 +245,8 @@ def test_routed_turn_assembles_document_only_agent(monkeypatch):
 
     assert deltas == ["好的"]
     names = {_tool_name(tool) for tool in captured["tools"]}
-    assert names and names <= DOCUMENT_TOOL_NAMES
-    assert names & RETRIEVAL_TOOL_NAMES == set()
+    assert names & DOCUMENT_TOOL_NAMES
+    assert names & RETRIEVAL_TOOL_NAMES
     prompt = captured["system_prompt"]
     assert "文档生成流程助手" in prompt
     assert "analysis-1" in prompt and "template-1" in prompt
@@ -710,7 +710,8 @@ def test_explicit_true_with_valid_context_routes_to_document_flow(monkeypatch):
     )
 
     names = {_tool_name(tool) for tool in captured["tools"]}
-    assert names and names <= DOCUMENT_TOOL_NAMES
+    assert names & DOCUMENT_TOOL_NAMES
+    assert names & RETRIEVAL_TOOL_NAMES
     assert "文档生成流程助手" in captured["system_prompt"]
     routed = [
         event

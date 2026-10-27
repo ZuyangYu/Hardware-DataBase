@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 from src.agents.tools import attachment_tools
 from src.agents.tools.attachment_tools import make_attachment_search
 from src.agents.tools.runtime import ToolRuntime
@@ -85,37 +83,3 @@ def test_explicit_search_keeps_the_formal_evidence_path(monkeypatch):
     assert runtime.evidence[0].metadata["attachment_id"] == "att-1"
     assert runtime.evidence[0].metadata["content_hash"]
     assert runtime.evidence[0].metadata["document_version"] == "a" * 16
-
-
-def test_runner_prefetch_uses_preview_and_does_not_mutate_evidence():
-    from src.agents.runner import MultiSourceAgentRunner
-
-    runtime = _runtime()
-    calls: list[str] = []
-
-    def attachment_list():
-        return "本轮可用附件：1. user-hsi.docx — 解析状态: ready"
-
-    def attachment_search(query, top_k=6):
-        raise AssertionError("formal search must not run in deferred prefetch mode")
-
-    def preview(query, top_k=6):
-        calls.append(query)
-        return (
-            '<attachment_candidate id="c1" attachment_id="att-1" filename="user-hsi.docx">\n'
-            "定位：heading_path=HSI\nHSI 管脚 2 的电压为 3.3V。\n</attachment_candidate>"
-        )
-
-    attachment_search.preview = preview
-    runner = MultiSourceAgentRunner(rag_backend=SimpleNamespace(retrieve=lambda *a, **k: []))
-    context = runner._prefetch_attachment_context(
-        query="对比附件 HSI 和知识库 HSI",
-        rt=runtime,
-        tools=[attachment_list, attachment_search],
-    )
-
-    assert calls
-    assert "attachment_candidate" in context
-    assert "不是正式证据" in context
-    assert "不得声称附件未挂载" in context
-    assert runtime.evidence == []

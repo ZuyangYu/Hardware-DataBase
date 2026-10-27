@@ -261,8 +261,8 @@ def authorized_capabilities_for_conversation(
         authorized.update({
             "evidence.search",
             "evidence.read",
-            # Two authorized attachments can be compared without a KB read
-            # grant; the comparison tool still checks every source ACL.
+            # Comparison is performed by the model through ordinary read
+            # tools; the capability only authorizes the compare action kind.
             "evidence.compare",
             "attachment.search",
         })

@@ -22,6 +22,9 @@ class NormalizedClaim(BaseModel):
     scope_key: str = ""
     source_kb_id: int = Field(gt=0)
     source_role: Literal["primary", "peer", "reference", "standard"]
+    # Explicit authoring authority.  A session anchor (``primary``) is not
+    # authoritative merely because it anchors the conversation.
+    authoritative: bool = False
     approval_status: str = ""
     evidence_ids: tuple[str, ...] = ()
     source_content_hash: str = ""

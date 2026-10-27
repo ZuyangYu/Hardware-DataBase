@@ -115,12 +115,24 @@ def test_low_quality_candidates_never_manufacture_coverage():
     assert result.discarded["quality"] == 1
 
 
-def test_reference_score_does_not_displace_primary_when_only_one_item_fits():
+def test_session_anchor_role_is_not_a_ranking_signal():
     from src.services.evidence_fusion import fuse_evidence
 
-    result = fuse_evidence([outcome(205, [evidence(205, score=0.99, role="reference")]), outcome(101, [evidence(score=0.6)])],
-                           purpose="compose", max_items=1, token_budget=10, token_counter=lambda _: 10)
-    assert result.evidence[0].metadata["kb_id"] == 101
+    # The same two sources are compared twice with their anchor roles swapped.
+    # Retrieval order must be identical: "primary" only anchors the session.
+    first = fuse_evidence(
+        [outcome(205, [evidence(205, score=0.99, role="primary")]),
+         outcome(101, [evidence(score=0.6, role="reference")])],
+        purpose="compose", max_items=1, token_budget=10, token_counter=lambda _: 10,
+    )
+    second = fuse_evidence(
+        [outcome(205, [evidence(205, score=0.99, role="reference")]),
+         outcome(101, [evidence(score=0.6, role="primary")])],
+        purpose="compose", max_items=1, token_budget=10, token_counter=lambda _: 10,
+    )
+    assert [item.metadata["kb_id"] for item in first.evidence] == [
+        item.metadata["kb_id"] for item in second.evidence
+    ]
 
 
 def test_fusion_checks_raw_text_hash_and_never_merges_failed_source_evidence():
