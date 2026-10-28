@@ -95,6 +95,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=5 \
 
 ENTRYPOINT ["/app/deploy/docker/entrypoint.sh"]
 # 默认角色：API。worker 角色示例：
-#   hardware-database-worker --role chat|authoring|parse
+#   hardware-database-worker --role chat|parse
 #   hardware-database-memory-worker / hardware-database-export-worker
 CMD ["hardware-database-server"]

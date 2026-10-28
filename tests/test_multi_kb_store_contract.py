@@ -147,7 +147,7 @@ def test_new_protocol_replay_ignores_snapshot_nonce_and_authorization_time(store
     assert len(service.list_messages(user, session.id)) == 2
 
 
-@pytest.mark.parametrize("change", ["query", "scope", "document_context", "wiki_assist"])
+@pytest.mark.parametrize("change", ["query", "scope", "wiki_assist"])
 def test_same_key_with_different_new_request_is_conflict(store, change):
     service, user = store
     scope = snapshot(user)
@@ -156,7 +156,6 @@ def test_same_key_with_different_new_request_is_conflict(store, change):
     kwargs = {"query": "question", "client_request_id": "same", "knowledge_scope": scope}
     kwargs.update({
         "query": {"query": "different"}, "scope": {"knowledge_scope": snapshot(user, reference=306)},
-        "document_context": {"document_context": {"template_id": "new"}},
         "wiki_assist": {"wiki_assist": True},
     }[change])
     with pytest.raises(ValueError, match="idempotency_conflict"):
@@ -224,7 +223,7 @@ def test_fingerprint_binds_attachment_ids_and_scope_without_volatile_snapshot_fi
     from src.services.knowledge_scope_persistence import request_fingerprint
 
     inputs = {"scope": snapshot(1).model_dump(mode="json"), "query": "question", "source_scope": "attachment_only",
-              "attachment_ids": ["attachment-a", "attachment-b"], "document_context": {}, "query_mode": "deep", "wiki_assist": False}
+              "attachment_ids": ["attachment-a", "attachment-b"], "query_mode": "deep", "wiki_assist": False}
     original = request_fingerprint(**inputs)
     assert original != request_fingerprint(**{**inputs, "source_scope": "attachment_and_knowledge_base"})
     assert original != request_fingerprint(**{**inputs, "attachment_ids": ["attachment-c"]})

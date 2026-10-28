@@ -81,58 +81,6 @@ class CheckpointerProviderTests(unittest.TestCase):
         src.settings.validate_settings_values({"AGENT_CHECKPOINT_BACKEND": "postgres"})
 
 
-class AuthoringCheckpointerProviderTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self._original_backend = src.settings.DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND
-        self._original_url = src.settings.DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL
-        self.addCleanup(
-            setattr, src.settings, "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", self._original_backend
-        )
-        self.addCleanup(
-            setattr, src.settings, "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL", self._original_url
-        )
-
-    def test_postgres_requires_database_url(self):
-        from src.document_authoring.harness.checkpointer import build_checkpointer
-
-        src.settings.DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL = ""
-        with self.assertRaises(ValueError):
-            build_checkpointer("postgres")
-
-    def test_sqlite_path_unchanged(self):
-        from src.document_authoring.harness.checkpointer import FencedCheckpointer, build_checkpointer
-
-        checkpointer = build_checkpointer(
-            "sqlite", sqlite_path=os.path.join(self.tmp.name, "authoring.db")
-        )
-        self.assertIsInstance(checkpointer, FencedCheckpointer)
-        close = getattr(checkpointer, "close", None)
-        if callable(close):
-            close()
-
-    @unittest.skipUnless(
-        os.environ.get("HDB_TEST_POSTGRES_DSN", ""), "HDB_TEST_POSTGRES_DSN is not configured"
-    )
-    def test_postgres_postgres_backend_smoke(self):
-        from src.agents.checkpoints.postgres_provider import ensure_checkpoint_schema
-        from src.document_authoring.harness.checkpointer import build_checkpointer
-
-        # Runtime only verifies: prepare the schema just as migrate does.
-        ensure_checkpoint_schema(os.environ["HDB_TEST_POSTGRES_DSN"])
-        checkpointer = build_checkpointer(
-            "postgres",
-            database_url=os.environ["HDB_TEST_POSTGRES_DSN"],
-            fencing_token_provider=lambda _thread_id: 1,
-        )
-        try:
-            checkpointer.delete_thread("hdb-authoring-provider-smoke")
-        finally:
-            close = getattr(checkpointer, "close", None)
-            if callable(close):
-                close()
-
 
 class PostgresCheckpointerIntegrationTests(unittest.TestCase):
     """Opt-in: set HDB_TEST_POSTGRES_DSN to run against a real database."""

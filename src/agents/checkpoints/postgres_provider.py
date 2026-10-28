@@ -95,11 +95,6 @@ def verify_configured_checkpoint_schemas(settings_module: Any | None = None) -> 
             getattr(settings_module, "AGENT_CHECKPOINT_BACKEND", "sqlite"),
             getattr(settings_module, "AGENT_CHECKPOINT_DATABASE_URL", ""),
         ),
-        (
-            "authoring-checkpoint",
-            getattr(settings_module, "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "sqlite"),
-            getattr(settings_module, "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL", ""),
-        ),
     )
     for name, backend, dsn in targets:
         if str(backend or "").strip().lower() != "postgres":

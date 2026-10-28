@@ -70,9 +70,8 @@ class PipelineDocumentRecord:
     worker_started_at: str = ""
     worker_heartbeat_at: str = ""
     retry_count: int = 0
-    # Additive P1 scope metadata. The normalized ProjectStore remains the
-    # business source of truth; this keeps the existing pipeline catalog able
-    # to pre-filter by the same identity during the migration.
+    # Additive P1 scope metadata. This keeps the existing pipeline catalog
+    # able to pre-filter by the same identity during the migration.
     asset_id: str = ""
     logical_document_id: str = ""
     source_version_id: str = ""

@@ -108,7 +108,7 @@ spool 各进程配额之和及 Collector 的真实出口速率、故障缓冲磁
 deadline_seconds、first_token_seconds、availability_target 和 minimum_events。
 该策略为 task 固定，不覆盖旧任务；业务事实按 turn ID 去重，迟到成功/取消不能删除违约。
 窗口按 accepted_at 归组，有等待 deadline 成熟的滞后；无流量显示 insufficient_traffic。
-authoring/attachment/export 的成功标准及 deadline 需单独确认和接入。
+attachment/export 的成功标准及 deadline 需单独确认和接入。
 
 已在当前配置模型上验证两次真实调用，reported usage 均持久保存；请求别名与同步响应模型不同，
 流式模型版本缺失，因此无正式价目时仍为 unknown_price。`real-provider-usage.json` 只保留用量/身份元数据。

@@ -98,7 +98,6 @@ def _turn_from_row(row: dict) -> ChatTurn:
         created_at=_timestamp(row["created_at"]),
         started_at=_timestamp(row.get("started_at")),
         finished_at=_timestamp(row.get("finished_at")),
-        document_context=_json_value(row.get("document_context_json"), None) or None,
         export_plan=_json_value(row.get("export_plan_json"), {}),
         source_scope=str(row.get("source_scope") or "auto"),
         required_attachment_ids=[
@@ -310,7 +309,6 @@ class PostgresExecutionStore:
         query_mode: str = "fast",
         trace_context: dict[str, str] | None = None,
         wiki_assist: bool = False,
-        document_context: dict | Any | None = None,
         attachment_ids: list[str] | None = None,
         source_scope: str = "auto",
         *,
@@ -321,11 +319,6 @@ class PostgresExecutionStore:
             raise ValueError("query must not be empty")
         request_id = (client_request_id or "").strip()[:128] or None
         query_mode = query_mode if query_mode in {"fast", "deep"} else "fast"
-        if hasattr(document_context, "model_dump"):
-            document_context = document_context.model_dump(mode="json")
-        if document_context is not None and not isinstance(document_context, dict):
-            raise ValueError("document_context must be an object")
-        document = document_context or {}
         attachment_ids = [
             str(item or "").strip()
             for item in (attachment_ids or [])
@@ -395,7 +388,7 @@ class PostgresExecutionStore:
             )
 
             scope = turn_scope_payload(knowledge_scope, user_id=user_id, anchor_kb_id=session_row["kb_id"], stored_hash=session_row["knowledge_selection_hash"])
-            fingerprint = request_fingerprint(scope=scope, query=query, source_scope=effective_scope, attachment_ids=attachment_ids, document_context=document, query_mode=query_mode, wiki_assist=wiki_assist)
+            fingerprint = request_fingerprint(scope=scope, query=query, source_scope=effective_scope, attachment_ids=attachment_ids, query_mode=query_mode, wiki_assist=wiki_assist)
             if request_id:
                 existing = conn.execute(
                     "SELECT * FROM chat_turns WHERE session_id = %s AND client_request_id = %s",
@@ -424,14 +417,10 @@ class PostgresExecutionStore:
                 """
                 UPDATE chat_sessions
                 SET updated_at = clock_timestamp(),
-                    title = CASE WHEN title = '新对话' THEN %s ELSE title END,
-                    document_context_json = CASE
-                        WHEN %s = '{}'::jsonb THEN document_context_json
-                        ELSE %s
-                    END
+                    title = CASE WHEN title = '新对话' THEN %s ELSE title END
                 WHERE id = %s
                 """,
-                (title, Jsonb(document), Jsonb(document), int(session_id)),
+                (title, int(session_id)),
             )
             turn_id = str(uuid.uuid4())
             row = conn.execute(
@@ -439,13 +428,13 @@ class PostgresExecutionStore:
                 INSERT INTO chat_turns (
                     id, session_id, user_message_id, assistant_message_id, kb_name,
                     department_id, kb_id, query, query_mode, status, client_request_id,
-                    turn_sequence, trace_context_json, document_context_json,
+                    turn_sequence, trace_context_json,
                     export_plan_json, source_scope, required_attachment_ids, wiki_assist,
                     created_at, knowledge_scope_json, knowledge_selection_hash, knowledge_request_fingerprint,
                     summary_json
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, clock_timestamp(), %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, clock_timestamp(), %s, %s, %s, %s
                 ) RETURNING *
                 """,
                 (
@@ -462,7 +451,6 @@ class PostgresExecutionStore:
                     request_id,
                     int(turn_sequence),
                     Jsonb(trace_context or {}),
-                    Jsonb(document),
                     Jsonb(export_plan_payload),
                     effective_scope,
                     Jsonb(required_ids),
@@ -572,8 +560,7 @@ class PostgresExecutionStore:
             rows = conn.execute(
                 """
                 SELECT m.*, COALESCE(t.footer, '') AS footer, t.id AS turn_id,
-                       COALESCE(t.summary_json, '{}'::jsonb) AS turn_summary,
-                       COALESCE(t.document_context_json, '{}'::jsonb) AS turn_document_context
+                       COALESCE(t.summary_json, '{}'::jsonb) AS turn_summary
                 FROM chat_messages m
                 LEFT JOIN chat_turns t
                   ON t.assistant_message_id = m.id OR t.user_message_id = m.id

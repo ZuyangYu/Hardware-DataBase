@@ -378,25 +378,6 @@ class AuthDomainPostgresTests(unittest.TestCase):
         self.assertIsNotNone(created)
         self.assertEqual(notifications.unread_count(user_id=1), 1)
 
-    def test_compatibility_store_round_trip_on_postgres(self) -> None:
-        from src.document_authoring.compatibility import (
-            DocumentAuthoringCompatibilityStore,
-        )
-
-        app_settings.COMPATIBILITY_STORE_BACKEND = "postgres"
-        app_settings.COMPATIBILITY_STORE_DATABASE_URL = self.dsn
-        self.addCleanup(
-            setattr,
-            app_settings,
-            "COMPATIBILITY_STORE_BACKEND",
-            app_settings.COMPATIBILITY_STORE_BACKEND,
-        )
-        app_settings.DOCUMENT_AUTHORING_COMPATIBILITY_DB_PATH = os.path.join(
-            self.tmp.name, "compat.sqlite"
-        )
-        store = DocumentAuthoringCompatibilityStore()
-        self.assertEqual(store._backend, "postgres")
-        self.assertIsNone(store.db_path)
 
 
 if __name__ == "__main__":

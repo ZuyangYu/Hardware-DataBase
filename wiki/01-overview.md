@@ -10,7 +10,6 @@ Hardware DataBase 是一个**基于 Agent 的硬件设计知识问答与受控�
 
 1. **知识问答**（Chat）：自然语言提问，Agent 自主多跳检索文档/表格/电路/外部对话，给出带引用的回答，可一键导出 Markdown/Excel/Word/PDF/PPT。
 2. **资产治理**（Assets / Wiki / Memory）：把解析结果沉淀为文档资产、知识 Wiki 页、长期记忆，并受部门与知识库权限约束。
-3. **文档生成**（Document Authoring）：从模板或系统配方出发，结合冻结的证据快照，生产 ICD/FPT/需求规格等受控文档，人工审核后放行。
 
 三条主线的共同底座：**多源摄取管道 + 统一证据模型 + 可观测的 Agent 运行时 + 部门级权限治理**。
 
@@ -26,7 +25,6 @@ Hardware DataBase 是一个**基于 Agent 的硬件设计知识问答与受控�
 | 电路结构化          | `src/circuit/`                                                          | `CircuitIndexService` / `CircuitQueryEngine`                   | ~8.6k          | 常开（语义向量默认停用）                    |
 | 长期记忆            | `src/memory/`                                                           | `MemoryService` / `MemoryWorker`                               | ~6.7k          | `MEMORY_ENABLED=true`；个人记忆需 opt-in  |
 | 对话附件            | `src/attachments/`                                                      | `AttachmentService` / `AttachmentWorker`                       | ~9.0k          | `CHAT_ATTACHMENTS_ENABLED=true`           |
-| 文档生成            | `src/document_authoring/`                                               | `DocumentGenerationService` / `InternalDocumentHarnessRuntime` | ~49.4k         | 灰度：多个`DOCUMENT_*` 开关默认 `false` |
 | 结果导出            | `src/result_exports/`                                                   | `ResultExportWorker` / `render_result`                         | ~4.5k          | `RESULT_EXPORT_ENABLED=true`              |
 | 外部对话            | `src/external_conversations/`                                           | `ExternalConversationQueryEngine`                                | ~1.2k          | 随上传路由启用                              |
 | Wiki / 资产 / 项目  | `src/core/wiki.py`、`doc_assets.py`、`assets.py`、`src/projects/` | `WikiService` 等                                                 | ~4.4k          | 常开                                        |
@@ -44,7 +42,7 @@ Hardware DataBase 是一个**基于 Agent 的硬件设计知识问答与受控�
 | ----------------------------------------------------------- | -------------------------- | ----------------------------------------------------------------- |
 | `deepagents`                                              | ≥0.7.8                    | `create_deep_agent`：Agent 循环骨架（底层是编译后的 LangGraph） |
 | `langgraph`                                               | `==1.2.11`               | 图执行、checkpointer（SQLite/Postgres）                           |
-| `langgraph-checkpoint-sqlite` / `-postgres`             | `3.1.1` / `3.1.2`      | 会话与文档生成的持久化 checkpoint                                 |
+| `langgraph-checkpoint-sqlite` / `-postgres`             | `3.1.1` / `3.1.2`      | 会话的持久化 checkpoint                                 |
 | `langmem`                                                 | `==0.0.30`               | 长期记忆抽取适配层（隔离在`src/memory/manager.py` 后）          |
 | `langchain` / `langchain-openai` / `langchain-ollama` | 1.3.x                      | 模型适配                                                          |
 | `llama-index-core`                                        | ≥0.12.52                  | 向量索引（电路/外部对话语义补充，默认停用）                       |
@@ -115,23 +113,6 @@ markdown 渲染库、图表库、i18n 库——全部手写实现（见 [19-fron
             └─ complete_turn_result（同事务写回答 + turn 终态事件 + 导出任务 + 记忆 outbox）
 ```
 
-### 4.3 文档生成链路
-
-```
-模板上传 → 消毒（宏/外链/嵌入物剥离）→ 确定性盘点 → LLM 建议 → 安全策略判定
-  → （人工确认）激活为 DocumentSchema + 区域/绑定
-  → 创建 GenerationSession（legacy brief 或 v2 OutputSpec intake）
-  → 编译 DocumentPlan（语义单元 / 依赖边 / 覆盖契约 / 单元任务）
-  → 人工哈希绑定确认 → DocumentPlanSubmission（outbox）→ worker 派发
-  → 物化 DocumentWorkOrder（v3 指纹：绑定 output_spec/plan 的 id+version+hash）
-  → InternalDocumentHarnessRuntime.create_run 冻结 manifest
-  → AuthoringGraph / PlanDAGExecutor：逐单元检索 → 写作 → 校验 → 落盘（receipt 幂等）
-  → 覆盖评估 → 单元评审 → 聚合 DocumentModel → 渲染 → 包校验 → 放行门
-  → DocumentArtifact(review_candidate) → 人工 approve → approved_release
-```
-
----
-
 ## 5. 关键设计原则（贯穿全系统的「铁律」）
 
 1. **后端权威（backend authority）**
@@ -154,7 +135,7 @@ markdown 渲染库、图表库、i18n 库——全部手写实现（见 [19-fron
 6. **幂等 + 租约 + 栅栏（fencing）**
    所有长任务都有 `(lease_owner, lease_token/fencing_token, attempt)`；claim 用 CAS；
    终态写入要求 `expected_generation`。典型实现：`chat_turns`、`harness_runs`、
-   `result_export_jobs`、`chat_attachment_jobs`、`memory_jobs`、`document_authoring_jobs`。
+   `result_export_jobs`、`chat_attachment_jobs`、`memory_jobs`。
 7. **证据接地（grounded）**
    回答必须可回溯到 `Evidence`（id/content/source_name/score/metadata/backend/retriever）；
    Wiki/记忆/附件都是「线索」而非正式证据，提示词中显式声明优先级：正式规范/BOM/原理图 > 记忆。
@@ -183,8 +164,6 @@ markdown 渲染库、图表库、i18n 库——全部手写实现（见 [19-fron
 | **ConversationPlan**          | 服务端对一次提问的路由判定结果（route/权限/工具白名单）                                                                             | `src/core/conversation_orchestrator.py`                       |
 | **action plan**               | 模型提出的结构化动作计划（`off/shadow/enabled` 三态灰度）                                                                         | `src/agents/orchestration/contracts.py`                       |
 | **receipt / 收据**            | 有副作用节点的幂等记录（重复执行返回已提交结果）                                                                                    | `node_execution_receipts`                                     |
-| **WorkOrder**                 | 文档生成的冻结执行定义（输入指纹 v1/v2/v3）                                                                                         | `document_work_orders`                                        |
-| **HarnessRun**                | WorkOrder 的一次执行尝试（租约/栅栏/降级原因）                                                                                      | `harness_runs`                                                |
 | **OutputSpec / DocumentPlan** | v2 规划产物：「生成什么」与「怎么执行」，均不可变且哈希绑定                                                                         | `document_output_specs` / `document_plans`                  |
 | **Artifact**                  | 不可变的生成产物（`draft_preview/review_candidate/approved_release`）                                                             | `document_artifacts`                                          |
 | **Revision**                  | 受治理的产物修订请求（永不自动放行）                                                                                                | `artifact_revisions`                                          |
@@ -195,7 +174,7 @@ markdown 渲染库、图表库、i18n 库——全部手写实现（见 [19-fron
 | **collection QC**             | 评估在线采集后的质检门（fail/pass_with_warnings/pass）                                                                              | `collection_qc.json`                                          |
 | **cohort_fingerprint**        | 评估样本集合指纹，用于基线可比性校验                                                                                                | `src/evaluation/history.py`                                   |
 | **ICP / ICD**                 | 互联文档（Interconnect Document）：连接器/引脚定义表格是核心产物                                                                    | `icd_*.py`                                                    |
-| **shadow planning**           | 只编译并记录计划、不执行的灰度模式                                                                                                  | `DOCUMENT_PLANNING_SHADOW_ENABLED`                            |
+| **shadow planning**           | 只编译并记录计划、不执行的灰度模式（代码内常量，默认关闭）                                                                          | `DOCUMENT_PLANNING_SHADOW_ENABLED`                            |
 
 ---
 
@@ -240,11 +219,11 @@ Hardware-DataBase/
 │   │   ├── document_rag/           # RAGFlow 后端与 schema
 │   │   └── spreadsheet/            # xlsx_parser / table_store / sql_materializer
 │   ├── circuit/                    # 电路子系统（8.6k，含 vendor/spydrnet）
-│   ├── memory/ / attachments/ / document_authoring/ / result_exports/
+│   ├── memory/ / attachments/ / result_exports/
 │   ├── external_conversations/ / projects/ / evaluation/ / ingestion/ / services/
 │   ├── storage/control_plane/      # 控制面 PG schema/loader/adapter
 │   ├── observability/              # OTel 引导、指标、健康、worker 注册
-│   ├── workers/main.py             # 统一后台 worker（role: all|chat|authoring|parse）
+│   ├── workers/main.py             # 统一后台 worker（role: all|chat|parse）
 │   ├── maintenance/cli.py          # 维护命令
 │   └── test_data/                  # 结构化测试数据（骨架）
 ├── frontend/                       # React SPA
@@ -272,7 +251,7 @@ Hardware-DataBase/
 | 上传/删除/查看文件、检索                    | ❌**（铁律）**         | ✅（自己的库 + 部门共享库） |
 | 切换 KB 共享                                | ❌                           | ✅ 仅所有者                 |
 | 删除 KB                                     | ❌                           | ✅ 仅所有者                 |
-| 文档生成 / Wiki / 资产 / 记忆               | ❌ 内容路径被拒              | ✅                          |
+| Wiki / 资产 / 记忆                         | ❌ 内容路径被拒              | ✅                          |
 
 实现要点：
 

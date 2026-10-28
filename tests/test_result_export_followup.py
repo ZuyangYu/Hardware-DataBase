@@ -53,12 +53,14 @@ def test_server_export_intent_requires_explicit_output_language_and_normalizes_f
     assert infer_export_intent("不要导出成 Excel") is None
 
 
-def test_template_generation_does_not_create_a_chat_export_plan():
-    # The final artifact must be rendered from the approved template work
-    # order; a generic export here would only serialize the assistant answer.
+def test_explicit_export_formats_produce_a_chat_export_plan():
     assert infer_export_intent("参考模板，根据知识库生成新的 ICD 文档") is None
-    assert infer_export_intent("按照模板格式回填并导出 Excel") is None
-    assert infer_export_intent("将模板按照知识库内容回填并导出 Excel") is None
+    for query in (
+        "按照模板格式回填并导出 Excel",
+        "将模板按照知识库内容回填并导出 Excel",
+    ):
+        plan = infer_export_intent(query)
+        assert plan is not None and plan.formats == ("xlsx",)
 
 
 def test_comparison_with_explicit_pdf_keeps_compare_route_and_requests_pdf_only():

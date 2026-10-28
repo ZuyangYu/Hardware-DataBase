@@ -26,15 +26,15 @@
 │   └─ 域服务：AuthService / WikiService / DocumentAssetService / AppLog…    │
 └───────┬──────────────┬───────────────┬──────────────┬────────────────────┘
         │              │               │              │
-┌───────▼──────┐ ┌─────▼──────┐ ┌──────▼──────┐ ┌─────▼───────────────┐
-│ Agent 运行时 │ │ 摄取管道   │ │ 结构化索引  │ │ 受控文档生成        │
-│ src/agents/  │ │ src/pipeline│ │ spreadsheet│ │ document_authoring/ │
-│ runner/tools │ │ ingestion  │ │ circuit    │ │ harness/planning/   │
-│ orchestration│ │ registry   │ │ external_  │ │ writers/renderers   │
-│ checkpoints  │ │ runtime    │ │ conversations│ │ migrations         │
-└───────┬──────┘ └─────┬──────┘ └──────┬──────┘ └─────┬───────────────┘
-        │              │               │              │
-┌───────▼──────────────▼───────────────▼──────────────▼───────────────────┐
+┌───────▼──────┐ ┌─────▼──────┐ ┌──────▼──────┐
+│ Agent 运行时 │ │ 摄取管道   │ │ 结构化索引  │
+│ src/agents/  │ │ src/pipeline│ │ spreadsheet│
+│ runner/tools │ │ ingestion  │ │ circuit    │
+│ orchestration│ │ registry   │ │ external_  │
+│ checkpoints  │ │ runtime    │ │ conversations│
+└───────┬──────┘ └─────┬──────┘ └──────┬──────┘
+        │              │               │
+┌───────▼──────────────▼───────────────▼────────────────────────────────┐
 │ 基础层                                                                   │
 │  model_factory / chat_model_runtime / llm_governor / model_gateway       │
 │  auth / conversation(控制面) / app_logs / notifications / wiki / assets  │
@@ -44,7 +44,7 @@
         │                    │                        │
 ┌───────▼──────┐   ┌────────▼────────┐   ┌───────────▼──────────────────┐
 │ 本地状态      │   │ 外部服务        │   │ 后台进程                     │
-│ storage/*.db │   │ RAGFlow         │   │ worker(all|chat|authoring|   │
+│ storage/*.db │   │ RAGFlow         │   │ worker(all|chat|parse|       │
 │ 文件归档/索引 │   │ LLM(Ollama/API) │   │ parse) / export / memory     │
 │              │   │ PG / Redis      │   │                              │
 └──────────────┘   └─────────────────┘   └──────────────────────────────┘
@@ -111,7 +111,7 @@
 | 进程           | 入口                                                         | 职责                                          | 备注                                                |
 | -------------- | ------------------------------------------------------------ | --------------------------------------------- | --------------------------------------------------- |
 | API            | `hardware-database-server` → `src/api/app.py:main`      | HTTP + SSE + 子进程管理                       | 默认`127.0.0.1:8001`；单机可自动拉起 worker       |
-| Worker（统一） | `hardware-database-worker --role all\|chat\|authoring\|parse` | turn 执行 / 文档生成 job / 解析 claim         | `WORKER_ROLE` 默认 `all`（仅开发）              |
+| Worker（统一） | `hardware-database-worker --role all\|chat\|parse` | turn 执行 / 解析 claim         | `WORKER_ROLE` 默认 `all`（仅开发）              |
 | Export worker  | `hardware-database-export-worker`                          | 导出渲染（不可变快照 → 文件）                | 有独立运行配额与保留期清理                          |
 | Memory worker  | `hardware-database-memory-worker`                          | 记忆抽取/投影/删除 outbox/retention/reconcile | `MEMORY_SINGLE_WRITER=true` 时用 flock 保证单写者 |
 | Eval CLI       | `hardware-database-eval`                                   | RAGAS validate/collect/score/run              | 也可由 API 页面驱动                                 |
@@ -139,7 +139,6 @@
 | ------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
 | 控制面              | `CONTROL_PLANE_BACKEND=sqlite`（或 `bash scripts/postgres.sh up` + `write-env` 单机也走 PG） | `postgres` + `CONTROL_PLANE_DATABASE_URL`（池 `CONTROL_PLANE_POOL_SIZE=8`）                |
 | 会话 checkpoint     | `AGENT_CHECKPOINT_BACKEND=sqlite`                                                                | `postgres`                                                                                     |
-| 文档生成 checkpoint | `DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND=sqlite`                                                 | `postgres`；会话 attempt/pointer 同步使用 PG，共享 advisory lock |
 | 记忆投影            | `MEMORY_STORE_BACKEND=sqlite`                                                                    | `postgres`（pgvector）                                                                         |
 | 资源配额            | `RESOURCE_GOVERNOR_SCOPE=process`                                                                | `deployment` + `RESOURCE_GOVERNOR_BACKEND=postgres`                                          |
 | 实时平面            | 默认必需 Redis（`REDIS_REQUIRED=true`，缺失拒绝启动）                                           | `REDIS_URL`：取消快路径 / 跨进程 SSE / 分布式准入                                              |
@@ -162,8 +161,6 @@
 | 解析台账         | `storage/pipeline_documents.db`                                      | `pipeline_documents` `pipeline_datasets` `pipeline_document_profiles` `pipeline_profile_outbox`                                                                                                                                                                                             | 权威                               |
 | 表格索引         | `storage/table_indexes/departments/<dept>/kbs/<kb>/table_indexes.db` | `table_documents/sheets/rows/cells/text_blocks/semantic_rows` + `sql_table_registry` + 物化表 `t_<rec>_<seq>`                                                                                                                                                                                 | 权威（可重解析）                   |
 | 附件库           | `storage/chat_attachments.db`                                        | `chat_attachments/assets/parts/revisions/edit_proposals/embeddings/visual_cache/jobs` + FTS5 虚表 + `session_cleanup_outbox` + `coordinator_leases`                                                                                                                                           | 权威                               |
-| 文档生成库       | `storage/document_authoring.db`                                      | 30+ 表（模板/分析/区域/绑定/计划/任务/run/receipt/事件/artifact…）                                                                                                                                                                                                                                 | 权威                               |
-| 生成 checkpoint  | `storage/document_authoring_checkpoints.sqlite`                      | LangGraph checkpoint                                                                                                                                                                                                                                                                                | 可重建                             |
 | 项目库           | `storage/projects.db`                                                | `projects` `project_knowledge_bindings` `source_assets` `source_versions` `project_baselines` `source_set_snapshots` …                                                                                                                                                                 | 权威                               |
 | Agent checkpoint | `storage/agent_checkpoints.db`                                       | LangGraph`checkpoints`/`writes` + `hdb_checkpoint_attempts`/`pointers`                                                                                                                                                                                                                      | 可重建（attempt 指针表除外）       |
 | 资源配额         | `storage/resource_quotas.db`                                         | 许可租约/队列/额度                                                                                                                                                                                                                                                                                  | 可重建但影响限流                   |
@@ -180,7 +177,6 @@ storage/
 ├── external_conversations/departments/<dept>/kbs/<kb>/{index.db, <conversation_id>/...}
 ├── chat_attachments/{sources,circuits,table_indexes}/<session_id>/...
 ├── exports/artifact-<hex>.<ext>            # 0700 目录 / 0600 文件
-├── document_authoring/                      # artifact/template 字节
 ├── evaluations/[{uploads/,<run_id>/,e2e/}]
 ├── logs/rag_YYYY-MM-DD.log                  # JSON 日志
 └── run/                                     # hdb.sh 的 pid 文件
@@ -198,14 +194,13 @@ storage/
   事件必须停机窗口（目标表非空即拒绝）；
 - 域写入（导出快照/任务/outbox、记忆 reflection outbox）通过 `domain_writer` 与 turn 完成同事务提交。
 
-**刻意留在 SQLite 的域**：认证/审计/文档生成/附件字节。迁移文档明确：
+**刻意留在 SQLite 的域**：认证/审计/附件字节。迁移文档明确：
 PostgreSQL 只拥有「会话执行 + 记忆账本 + 导出账本」，其它域不参与控制面事务。
 
-**本地台账域收敛（存储收敛项目，进行中）**：`projects.db`、`pipeline_documents.db`、
-`document_authoring.db`（46 表，7 个 store 成组建表）以及**认证域**（`auth.db` 的
-users/departments/auth_sessions/login_attempts/knowledge_bases/audit_events/
-query_traces/retrieved_evidence/wiki/文档资产/硬件资产/通知）以及文档生成兼容库
-（`document_authoring_compatibility.sqlite`）已经切到同一个 PG（`PROJECT_STORE_BACKEND` / `PIPELINE_DOCUMENT_STORE_BACKEND`，
+**本地台账域收敛（存储收敛项目，进行中）**：`projects.db`、`pipeline_documents.db`
+以及**认证域**（`auth.db` 的 users/departments/auth_sessions/login_attempts/
+knowledge_bases/audit_events/query_traces/retrieved_evidence/wiki/文档资产/
+硬件资产/通知）已经切到同一个 PG（`PROJECT_STORE_BACKEND` / `PIPELINE_DOCUMENT_STORE_BACKEND`，
 空值跟随控制面；PG 表结构由 `src/storage/domain_pg.py` 从 store 自己的 SQLite
 bootstrap 用机械映射生成，时间戳保持 TEXT）。切换前先跑
 `migrate_sqlite_to_postgres.py --group projects|pipeline`；未迁移时 store 启动
@@ -243,7 +238,6 @@ fail-closed 并提示命令。认证域切换前需要 `rebuild_auth_domain.py` 
 | Redis Stream | key`hdb:turn:events:{turn_id}`，TTL 7200，maxlen 5000       | 跨进程/跨实例 SSE                                |
 | DB 轮询      | `chat_turn_events` 每 0.4s                                  | 无 Redis 兜底                                    |
 | Redis 取消键 | `hdb:turn:cancel:{turn_id}`，TTL 7200                       | 取消快路径（权威仍是 DB 列`cancel_requested`） |
-| 文档任务流   | `GET /document-generation/chat-tasks/events`（SSE，可重放） | 文档生成卡片更新                                 |
 | 通知         | `notifications` 表 + 30s 轮询 + 可选 webhook                | 附件放行审批等                                   |
 
 ### 5.3 幂等与去重
@@ -268,8 +262,6 @@ fail-closed 并提示命令。认证域切换前需要 `rebuild_auth_domain.py` 
 | LLM 准入              | 队列超时                 | `LLMQueueTimeoutError`                             | turn 失败（排队超时）                     |
 | 附件解析              | 解析器异常               | 资产`failed`，可 retry；waiting turn 收敛为 failed | 卡片提示 +`attachment_failed`           |
 | 附件/记忆/导出 worker | 任务失败                 | 退避重试 → dead_letter + 指标/告警日志              | 任务中心可见失败状态，可手动重试          |
-| 文档生成              | 单元检索/校验失败        | 单元`requires_human`，run `waiting_human`        | 需要人工决策卡                            |
-| 文档生成              | 迁移/DDL 冲突            | 中止且不产生部分写                                   | 明确错误码                                |
 | 权限/作用域           | 任何越权                 | fail-closed 拒绝                                     | 403/404/409                               |
 | OTel/指标/审计        | 导出或写入失败           | 完全 fail-soft                                       | 无感                                      |
 
@@ -300,7 +292,7 @@ cd frontend && npm ci && npm run dev       # 5176，代理 /api → 8001
 
 生产化进程管理（推荐）：`scripts/hdb.sh` 白名单读取 `.env` 中 `HDB_API_HOST/PORT`、`HDB_FRONT_PORT`、`HDB_WORKER_ROLES`，
 强制 `HDB_API_SPAWN_WORKER=0`/`HDB_API_SPAWN_EXPORT_WORKER=0`/`HDB_API_SPAWN_MEMORY_WORKER=0`，
-分别启动 `worker-chat`、`worker-authoring`、`worker-parse`、`memory-worker`、`export-worker`，
+分别启动 `worker-chat`、`worker-parse`、`memory-worker`、`export-worker`，
 pid 写 `storage/run/`、日志写 `storage/logs/`。
 
 ### 6.2 可观测性栈
@@ -349,7 +341,6 @@ load_probe.py / governor_recovery.py / regression_runner.py
 | 表格/电路走独立结构化索引                     | 全部塞进 RAGFlow                         | 精确数字/引脚/位号查询需要确定性检索，语义检索不可靠                         |
 | 会话执行持久化（turns + SSE）                 | 请求内同步流式                           | 刷新/切换不丢任务；worker 可水平扩展；带租约天然抗双写                       |
 | «治理角色不能看内容»                        | 超管全权                                 | 防止平台管理员静默窥视部门私有数据（合规要求）                               |
-| 文档生成哈希绑定 + 收据 + 人工放行            | 直接让模型写模板                         | 工程文档是受控交付物，必须可复现、可审计、可回滚                             |
 | 记忆 Catalog 权威 + 投影可重建                | 直接写向量库                             | consent/revoke/来源失效必须强一致，向量库只是可重建的检索副本                |
 | 配置单文件 + 热重载                           | 各模块自读 env                           | 避免配置漂移；系统配置页可在线改；重启项显式暴露                             |
 

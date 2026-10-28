@@ -19,8 +19,6 @@ def _conversation_kwargs(**overrides):
         "has_kb_read": True,
         "has_kb_write": False,
         "has_attachments": False,
-        "has_document_context": False,
-        "has_task": False,
     }
     kwargs.update(overrides)
     return kwargs
@@ -49,11 +47,10 @@ class McpCapabilityTests(unittest.TestCase):
         )
         self.assertIn("external_tool.invoke", with_access)
 
-    def test_effective_is_intersection_and_constraints_do_not_touch_it(self):
+    def test_effective_is_intersection(self):
         effective = compute_effective_capabilities(
             deployed={"external_tool.invoke", "evidence.search"},
             authorized={"external_tool.invoke", "evidence.search"},
-            accepted_constraints=[{"kind": "forbid_action", "value": "export"}],
         )
         self.assertIn("external_tool.invoke", effective)
 

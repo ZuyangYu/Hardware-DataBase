@@ -9,7 +9,7 @@
 ## 1. 分层职责
 
 ```
-业务代码（agent / 文档生成 / 记忆 / 评估 / 外部对话）
+业务代码（agent / 记忆 / 评估 / 外部对话）
    │  create_chat_model(profile=..., priority=...)    ← 唯一构造入口
    ▼
 model_factory          配置解析 + 缓存 + profile 化 + 上下文窗口声明
@@ -37,7 +37,7 @@ ChatModelConfig(
     require_structured_tools=False, max_input_tokens=0,
     priority=PRIORITY_INTERACTIVE,
 )
-_PROFILE_NAMES = {"default", "authoring_auxiliary", "template_suggestion",
+_PROFILE_NAMES = {"default",
                   "external_conversation", "memory"}     # 未知 profile 抛 ValueError
 ```
 
@@ -64,7 +64,6 @@ profile 覆盖：
 
 | profile | 覆盖 |
 |---|---|
-| `authoring_auxiliary` | timeout 20s、retries 0 |
 | `template_suggestion` | timeout 60s |
 | `external_conversation` | timeout = `EXTERNAL_CONVERSATION_LLM_TIMEOUT_SECONDS − 5`（≥1）、retries 0 |
 | `memory` | provider/model/key 优先 `MEMORY_MODEL_*`；timeout `MEMORY_REFLECTION_TIMEOUT_SECONDS`(120)；`require_structured_tools=MEMORY_MODEL_REQUIRE_STRUCTURED_TOOLS`(true) |
@@ -249,7 +248,7 @@ default_multimodal_gateway() -> gateway | None
 | `RESOURCE_RAG_MAX_CONCURRENT` / `_RESERVED_INTERACTIVE` | `8` / `4` | RAGFlow 许可 |
 | `RESOURCE_TOOL_MAX_CONCURRENT` / `_RESERVED_INTERACTIVE` | `16` / `0` | 工具许可 |
 | `RESOURCE_CHAT_MAX_CONCURRENT` / `_RESERVED_INTERACTIVE` | `4` / `0` | 会话许可 |
-| `RESOURCE_HEAVY_JOB_MAX_CONCURRENT` / `_RESERVED_INTERACTIVE` | `4` / `1` | 重任务（文档生成等） |
+| `RESOURCE_HEAVY_JOB_MAX_CONCURRENT` / `_RESERVED_INTERACTIVE` | `4` / `1` | 重任务（OCR、评估等） |
 | `RESOURCE_OCR_MAX_CONCURRENT` / `_RESERVED_INTERACTIVE` | `1` / `0` | OCR |
 | `RESOURCE_EXPORT_MAX_CONCURRENT` / `_RESERVED_INTERACTIVE` | `4` / `0` | 导出 |
 | `RESOURCE_MEMORY_MAX_CONCURRENT` / `_RESERVED_INTERACTIVE` | `1` / `0` | 记忆反思 |

@@ -162,10 +162,9 @@ test('chat problem submission explicitly shares only the submitted answer and cr
     return route.fulfill({ json: [] });
   });
   await page.goto('/chat');
-  const composer = page.getByPlaceholder('未挂载知识库,直接提问', { exact: true });
-  const composerFrame = page.locator('form').filter({ has: composer });
-  await expectVisibleFormFocus(composer, 'mouse', composerFrame);
-  await expectVisibleFormFocus(composer, 'keyboard', composerFrame);
+  const composer = page.getByPlaceholder('未选择知识库，直接提问', { exact: true });
+  await expectVisibleFormFocus(composer, 'mouse');
+  await expectVisibleFormFocus(composer, 'keyboard');
   await page.getByRole('button', { name: '回答有问题', exact: true }).click();
   const dialog = page.getByRole('dialog');
   await expect(dialog.getByText('提交后，处理管理员可查看本次提问、回答和补充说明，用于联系你解决问题。', { exact: true })).toBeVisible();

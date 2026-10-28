@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '@/api/client';
-import { createClientRequestId } from '@/api/documentAuthoring';
+import { createClientRequestId } from '@/api/clientRequestId';
 import type { MessageView, QualityFeedbackState, QualityRating, QualityReason } from '@/api/types';
 import { QUALITY_REASONS } from '@/lib/qualityLabels';
 import { TICKET_STATUS } from '@/lib/ticketLabels';

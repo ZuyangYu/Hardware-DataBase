@@ -48,16 +48,15 @@ class ConnectionBudgetTests(unittest.TestCase):
         self.assertFalse(fits)
         self.assertIn("headroom", message)
 
-    def test_settings_budget_counts_authoring_and_memory_postgres(self):
+    def test_settings_budget_counts_memory_postgres(self):
         settings = SimpleNamespace(
             AGENT_CHECKPOINT_POOL_SIZE=4,
             CONTROL_PLANE_POOL_SIZE=8,
-            DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND="postgres",
             MEMORY_STORE_BACKEND="postgres",
         )
         budget = settings_connection_budget(settings, api_replicas=1, worker_replicas=1)
-        # worker: 8 control + (4 agent + 4 authoring) checkpoint + 4 unpooled
-        self.assertEqual(budget.entries["worker"], 20)
+        # worker: 8 control + 4 agent checkpoint + 4 unpooled
+        self.assertEqual(budget.entries["worker"], 16)
         self.assertEqual(budget.entries["memory"], 1)
         self.assertEqual(budget.entries["migration/ops"], 2)
 

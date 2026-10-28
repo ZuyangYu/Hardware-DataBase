@@ -483,7 +483,7 @@ runner 对批准/取消走**确定性路径**（不调模型，`_direct_attachme
 ## 11. 测试与不变量
 
 `tests/`：`test_attachment_*`（上传/配额/解析/索引/检索/修订/放行/保留/回填）、
-`test_embedded_ingestion.py`、`test_conversation_led_document_authoring_*`、
+`test_embedded_ingestion.py`、
 `test_waiting_turn_timeout.py`、`test_document_shadow_planner.py`。
 
 关键不变量：

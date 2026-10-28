@@ -117,7 +117,6 @@ class ReadParityPostgresTests(unittest.TestCase):
             user_id=1,
             session_id=session.id,
             query="已完成的问题",
-            document_context={"knowledge_base_name": "kb", "analysis_id": "a-1"},
         )
         claimed = service.claim_turn(1, completed.id, "worker-a")
         service.complete_turn_result(
@@ -186,7 +185,6 @@ class ReadParityPostgresTests(unittest.TestCase):
             self.assertEqual(actual.content, expected.content)
             self.assertEqual(actual.footer, expected.footer)
             self.assertEqual(actual.memory_context, expected.memory_context)
-            self.assertEqual(actual.document_context, expected.document_context)
             self.assertEqual(actual.citations, expected.citations)
         self.assertEqual(store.list_messages(2, session_id), [])
 
@@ -219,7 +217,6 @@ class ReadParityPostgresTests(unittest.TestCase):
             query_mode="deep",
             trace_context={"traceparent": "00-abc-def-01"},
             wiki_assist=True,
-            document_context={"knowledge_base_name": "kb", "analysis_id": "ctx-1"},
         )
         pg_turn = store.create_turn(
             1,
@@ -228,18 +225,12 @@ class ReadParityPostgresTests(unittest.TestCase):
             query_mode="deep",
             trace_context={"traceparent": "00-abc-def-01"},
             wiki_assist=True,
-            document_context={"knowledge_base_name": "kb", "analysis_id": "ctx-1"},
         )
         self.assertEqual(pg_turn.status, sqlite_turn.status)
         self.assertEqual(pg_turn.query_mode, sqlite_turn.query_mode)
         self.assertEqual(pg_turn.trace_context, sqlite_turn.trace_context)
         self.assertEqual(pg_turn.wiki_assist, sqlite_turn.wiki_assist)
-        self.assertEqual(pg_turn.document_context, sqlite_turn.document_context)
         self.assertEqual(pg_turn.source_scope, sqlite_turn.source_scope)
-        self.assertEqual(
-            store.get_turn(pg_turn.id).document_context,
-            service.get_turn_unscoped(sqlite_turn.id).document_context,
-        )
         self.assertEqual(
             store.get_session(1, session_id).title,
             service.get_session(1, session_id).title,

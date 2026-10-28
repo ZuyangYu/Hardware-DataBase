@@ -67,10 +67,7 @@ class StorageBootstrapTests(unittest.TestCase):
             ("AUTH_DB_PATH", app_settings.AUTH_DB_PATH),
             ("AUTH_STORE_BACKEND", app_settings.AUTH_STORE_BACKEND),
             ("AUTH_STORE_DATABASE_URL", app_settings.AUTH_STORE_DATABASE_URL),
-            ("PROJECT_STORE_BACKEND", app_settings.PROJECT_STORE_BACKEND),
             ("PIPELINE_DOCUMENT_STORE_BACKEND", app_settings.PIPELINE_DOCUMENT_STORE_BACKEND),
-            ("AUTHORING_STORE_BACKEND", app_settings.AUTHORING_STORE_BACKEND),
-            ("COMPATIBILITY_STORE_BACKEND", app_settings.COMPATIBILITY_STORE_BACKEND),
             ("EVALUATION_STORE_BACKEND", app_settings.EVALUATION_STORE_BACKEND),
             ("EVALUATION_STORE_DATABASE_URL", app_settings.EVALUATION_STORE_DATABASE_URL),
         ):
@@ -82,10 +79,7 @@ class StorageBootstrapTests(unittest.TestCase):
         # 域后端留空 = 跟随控制面（全新部署的默认形态）
         app_settings.AUTH_STORE_BACKEND = ""
         app_settings.AUTH_STORE_DATABASE_URL = ""
-        app_settings.PROJECT_STORE_BACKEND = ""
         app_settings.PIPELINE_DOCUMENT_STORE_BACKEND = ""
-        app_settings.AUTHORING_STORE_BACKEND = ""
-        app_settings.COMPATIBILITY_STORE_BACKEND = ""
         app_settings.EVALUATION_STORE_BACKEND = ""
         app_settings.EVALUATION_STORE_DATABASE_URL = ""
 
@@ -122,10 +116,7 @@ class StorageBootstrapTests(unittest.TestCase):
         # 各域的代表表（机械映射建出来的）
         self.assertIn("users", tables)
         self.assertIn("wiki_pages", tables)
-        self.assertIn("projects", tables)
         self.assertIn("pipeline_documents", tables)
-        self.assertIn("template_versions", tables)
-        self.assertIn("document_authoring_compatibility_events", tables)
         self.assertIn("evaluation_execution_schema", tables)
         self.assertIn("evaluation_execution_owners", tables)
         self.assertTrue({"quality_schema", "quality_snapshots", "quality_cases", "quality_feedback_events", "quality_reviews", "quality_outbox"} <= tables)
@@ -183,14 +174,10 @@ class StorageBootstrapTests(unittest.TestCase):
         for name in (
             "AGENT_CHECKPOINT_BACKEND",
             "AGENT_CHECKPOINT_DATABASE_URL",
-            "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND",
-            "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL",
         ):
             self.addCleanup(setattr, app_settings, name, getattr(app_settings, name))
         app_settings.AGENT_CHECKPOINT_BACKEND = "postgres"
         app_settings.AGENT_CHECKPOINT_DATABASE_URL = self.dsn
-        app_settings.DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND = "postgres"
-        app_settings.DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL = self.dsn
 
         self.assertEqual(bootstrap.main(), 0, "检查点表必须由 migrate 建好")
         tables = self._table_names()
@@ -370,11 +357,8 @@ class StorageBootstrapTests(unittest.TestCase):
 
     def test_sqlite_backend_is_a_noop(self) -> None:
         app_settings.CONTROL_PLANE_BACKEND = "sqlite"
-        app_settings.PROJECT_STORE_BACKEND = "sqlite"
         app_settings.PIPELINE_DOCUMENT_STORE_BACKEND = "sqlite"
-        app_settings.AUTHORING_STORE_BACKEND = "sqlite"
         app_settings.AUTH_STORE_BACKEND = "sqlite"
-        app_settings.COMPATIBILITY_STORE_BACKEND = "sqlite"
         app_settings.EVALUATION_STORE_BACKEND = "sqlite"
         self.assertEqual(bootstrap.main(), 0, "纯 SQLite 部署下应直接通过")
         self.assertEqual(self._table_names(), set(), "不该往 PG 建任何表")
@@ -382,9 +366,8 @@ class StorageBootstrapTests(unittest.TestCase):
 
 def test_bootstrap_collects_separate_evaluation_database_for_storage_lock(monkeypatch):
     for prefix in (
-        "CONTROL_PLANE", "PROJECT_STORE", "PIPELINE_DOCUMENT",
-        "AUTHORING_STORE", "AUTH_STORE", "COMPATIBILITY_STORE",
-        "AGENT_CHECKPOINT", "DOCUMENT_AUTHORING_CHECKPOINTER",
+        "CONTROL_PLANE", "PIPELINE_DOCUMENT",
+        "AUTH_STORE", "AGENT_CHECKPOINT",
     ):
         monkeypatch.setattr(app_settings, f"{prefix}_BACKEND", "sqlite", raising=False)
     monkeypatch.setattr(app_settings, "EVALUATION_STORE_BACKEND", "postgres")

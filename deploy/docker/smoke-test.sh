@@ -65,7 +65,7 @@ for svc in $SERVICES; do
     [ -z "$health" ] || [ "$health" = "healthy" ] || bad "$svc 健康检查=$health"
   fi
 done
-for role in chat authoring parse export memory; do
+for role in chat parse export memory; do
   st="$(${COMPOSE[@]} ps --format '{{.State}}' "worker-$role" 2>/dev/null | head -n 1)"
   expect "worker-$role 运行中" running "${st:-none}"
 done
@@ -172,7 +172,7 @@ if [ -n "$probe2" ]; then ok "导出表时间戳查询探针通过"; else bad "�
 
 log "6) 日志扫描"
 LOG_PATTERNS='Traceback|session deletion not committed|does not exist|UniqueViolation|cannot join current thread|DatatypeMismatch'
-for svc in api web worker-chat worker-authoring worker-parse worker-export worker-memory; do
+for svc in api web worker-chat worker-parse worker-export worker-memory; do
   hits="$(${COMPOSE[@]} logs --no-color "$svc" 2>/dev/null | grep -cE "$LOG_PATTERNS" || true)"
   expect "$svc 异常日志行数" 0 "${hits:-0}"
 done

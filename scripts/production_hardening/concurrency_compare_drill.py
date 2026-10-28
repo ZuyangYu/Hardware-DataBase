@@ -4,8 +4,7 @@ Runs the *same* workload twice against isolated temporary storage:
 
 - **off**: default flags (legacy concurrent sessions, no deployment governor);
 - **on**: ``CONVERSATION_SERIALIZE_SAME_THREAD=true``,
-  ``RESOURCE_GOVERNOR_ENABLED=true`` (deployment scope, shared SQLite quotas),
-  ``SHARED_RETRIEVAL_EXECUTOR_ENABLED=true``.
+  ``RESOURCE_GOVERNOR_ENABLED=true`` (deployment scope, shared SQLite quotas).
 
 Scenarios per mode:
 
@@ -287,7 +286,6 @@ def _run_mode(mode: str, args: argparse.Namespace, workdir: Path) -> dict:
                 "CONVERSATION_SERIALIZE_SAME_THREAD": "true",
                 "RESOURCE_GOVERNOR_ENABLED": "true",
                 "RESOURCE_GOVERNOR_SCOPE": "deployment",
-                "SHARED_RETRIEVAL_EXECUTOR_ENABLED": "true",
                 "ADMISSION_CHAT_RPM_PER_USER": str(args.user_rpm),
                 "ADMISSION_CHAT_RPM_PER_TENANT": str(args.tenant_rpm),
             }

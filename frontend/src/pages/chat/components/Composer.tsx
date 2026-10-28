@@ -8,7 +8,7 @@
  */
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 
-import type { AttachmentView, DocumentContext, KbView } from '@/api/types';
+import type { AttachmentView, KbView } from '@/api/types';
 import { CHAT_ATTACHMENT_ACCEPT } from '@/api/chatAttachments';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
@@ -25,7 +25,6 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
-import { isDocumentContextExpired } from '../useKbChat';
 import {
   CHAT_COMPOSER_ATTACHMENT_CHIP_CLASS,
   CHAT_COMPOSER_ATTACHMENT_COPY_CLASS,
@@ -56,13 +55,6 @@ type Props = {
   onKbChange?: (kbName: string) => void;
   onSend: () => void;
   onStop: () => void;
-  quickReplies?: string[];
-  /** The bridge is opt-in; false keeps the legacy composer unchanged. */
-  documentAuthoringEnabled?: boolean;
-  documentContext?: DocumentContext | null;
-  documentContextLabel?: string;
-  documentUploadPending?: boolean;
-  onClearDocumentContext?: () => void;
   /** 会话附件(默认开):后端 CHAT_ATTACHMENTS_ENABLED 打开时由 ChatPage 传入。 */
   attachmentsEnabled?: boolean;
   draftAttachments?: AttachmentView[];
@@ -100,12 +92,6 @@ export default function Composer({
   onKbChange = () => undefined,
   onSend,
   onStop,
-  quickReplies = [],
-  documentAuthoringEnabled = false,
-  documentContext = null,
-  documentContextLabel,
-  documentUploadPending = false,
-  onClearDocumentContext,
   // Attachment support is on by default; ChatPage passes the explicit
   // environment-controlled value when an installation opts out.
   attachmentsEnabled = true,
@@ -118,19 +104,6 @@ export default function Composer({
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const attachmentInputRef = useRef<HTMLInputElement>(null);
-  const contextExpired = isDocumentContextExpired(documentContext);
-  const contextReference = documentContext
-    ? documentContextLabel
-      || documentContext.template_version_id
-      || documentContext.generation_session_id
-      || (documentContext.version === 'v2' && documentContext.task_id
-        ? documentContext.task_id
-        : undefined)
-      || (documentContext.version === 'v2' && documentContext.attachment_ids?.length
-        ? '会话附件'
-        : '文档会话')
-    : '';
-  const showDocumentControls = documentAuthoringEnabled && documentContext;
   const failedAttachments = draftAttachments.filter((item) => item.parse_status === 'failed');
   const attachmentCount = draftAttachments.length;
   const attachmentLimitReached = attachmentCount >= ATTACHMENT_MAX_FILES;
@@ -249,49 +222,6 @@ export default function Composer({
               </div>
             )}
           </div>
-          {showDocumentControls && (
-            <div
-              className="flex min-w-0 items-center gap-[8px] rounded-[10px] border border-[#e3e7f1] bg-[#fafbfc] px-[9px] py-[6px] text-[12px] text-[#464c5e]"
-              aria-label="当前文档模板引用"
-            >
-              <AppIcon name="file" size={16} className="shrink-0 text-[#68728a]" />
-              <span className="min-w-0 flex-1 truncate" title={contextReference}>
-                {documentContext.template_version_id ? '模板引用' : '文档范围'}：{contextReference}
-              </span>
-              <span className={cn('shrink-0 text-[11px]', contextExpired ? 'text-[#b45309]' : 'text-[#858b9c]')}>
-                {contextExpired ? '已过期，仅可读取历史状态' : '已附加'}
-              </span>
-              {onClearDocumentContext && (
-                <button
-                  type="button"
-                  onClick={onClearDocumentContext}
-                  aria-label="清除文档模板引用"
-                  title="清除文档模板引用"
-                  className="inline-grid size-[20px] shrink-0 place-items-center rounded-full border-0 bg-transparent p-0 text-[15px] leading-none text-[#a2a8b8] hover:text-[#18181a]"
-                >
-                  ×
-                </button>
-              )}
-            </div>
-          )}
-          {quickReplies.length > 0 && !streaming && (
-            <div className="flex flex-wrap gap-[6px]" aria-label="文档快捷回复">
-              {quickReplies.slice(0, 6).map((reply) => (
-                <button
-                  key={reply}
-                  type="button"
-                  onClick={() => {
-                    setInput(reply);
-                    textareaRef.current?.focus();
-                  }}
-                  disabled={disabled}
-                  className="rounded-full border border-[#c8d8f5] bg-[#f4f7ff] px-[9px] py-[3px] text-[11px] text-[#315da8] hover:bg-[#eaf1ff] disabled:opacity-45"
-                >
-                  {reply}
-                </button>
-              ))}
-            </div>
-          )}
           <div className="flex min-w-0 items-end gap-[8px]">
 
             <input
@@ -399,11 +329,6 @@ export default function Composer({
               )}
               <span className={CHAT_COMPOSER_HINT_CLASS}>Enter 发送 / Shift+Enter 换行</span>
             </div>
-            {documentUploadPending && (
-              <span className="shrink-0 text-[11px] text-[#68728a]" role="status" aria-live="polite">
-                模板分析中…（结构分析 + 分批 LLM 语义建议，大文档可能数分钟）
-              </span>
-            )}
           </div>
         </form>
       </div>

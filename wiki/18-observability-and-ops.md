@@ -70,13 +70,8 @@ Resource 属性：`service.name, service.version, deployment.environment.name,`
 | `hdb.governor.lease_lost` | counter | `resource`,`reason` | 租约失守 |
 | `hdb.rag.batch_fanout` / `rag.zero_hit` | histogram/counter | — | RAGFlow 客户端 |
 | `hdb.job.wait_time` / `execution_time` / `dead_letter_count` | histogram/counter | `kind` | worker/job |
-| `hdb.action.parallel.layers` / `layer_size` / `duration` | counter/histogram | `status` | action DAG |
 | `hdb.retrieval.executor.attempts` / `queue_wait` | counter/histogram | `status` | 共享检索池 |
 | `hdb.eval.runs` / `sample.duration` / `sample.failed` / `score.observations` / `score` | counter/histogram | `status`,`mode`,`metric` | 评估 |
-| `hdb.authoring.runs` / `run.duration` / `unit.outcome` / `unit.duration` | counter/histogram | `status`,`operation` | 文档生成 |
-| `hdb.document.authoring.compatibility.events` | counter | `kind`,`mode` | 兼容性遥测 |
-| `hdb.authoring.agent.runs/duration` / `agent.tool.calls/duration` | counter/histogram | `status`,`mode`,`tool` | agent 模式 |
-| `hdb.document.planning.shadow.runs/blocking_issues/issue_codes/validity/units/tables/duration` | counter/histogram | `status` | 影子计划（问题码只计数、不作标签） |
 | `hdb.export.jobs` / `job.duration` / `queue.wait` / `render.duration` / `artifact.bytes` / `downloads` | counter/histogram | `format`,`status` | 导出 |
 | `hdb.checkpoint.fork_latency` / `commit_latency` / `write_latency` | histogram | `reason` | attempt/观察器 |
 | `hdb.memory.*`（jobs_total、job_lease_expired、job_replayed、jobs_failed、outbox_dead_letter、`reflection_*`、`search_*`、`context_*`、`write_latency`、`sqlite_busy_retries`、`postgres_retries`、`reconcile_*`、`injected`） | counter/histogram | — | 记忆 |
@@ -139,12 +134,11 @@ W3C `propagate.inject/extract`；`TraceIdentity(trace_id, span_id)`；`use_trace
 
 ### 2.1 角色
 
-`WORKER_ROLE ∈ {all, chat, authoring, parse}`（默认 `all`，**仅开发**）：
+`WORKER_ROLE ∈ {all, chat, parse}`（默认 `all`，**仅开发**）：
 
 | 角色 | 循环内容 |
 |---|---|
 | `chat` | claim 可执行的 chat turn（按顺序/租约）并执行 |
-| `authoring` | 文档生成 job（`document_authoring_jobs`）+ 计划确认 submission 排空 |
 | `parse` | `PipelineRuntime.run_once()` × `WORKER_PARSE_BATCH_SIZE` + `refresh_parse_statuses` |
 | `all` | 以上全部 |
 
@@ -162,7 +156,6 @@ W3C `propagate.inject/extract`；`TraceIdentity(trace_id, span_id)`；`use_trace
 - 导出：`claim` + 心跳线程（见 [16](16-exports-and-external-conversations.md)）；
 - 记忆：`claim_next` + 心跳线程 + 熔断（见 [11](11-memory.md)）；
 - 附件：`claim_job` + watchdog + 协调器租约（见 [12](12-attachments.md)）；
-- 文档生成：`claim_harness_run` + fencing（见 [13](13-document-authoring.md)）；
 - 全局兜底：`requeue_stale_turns`（会话）、`_requeue_stuck_outbox`（记忆）、
   死信重排接口（解析）。
 
@@ -178,7 +171,7 @@ W3C `propagate.inject/extract`；`TraceIdentity(trace_id, span_id)`；`use_trace
 
 | 用途 | Key / 机制 | 配置 |
 |---|---|---|
-| 取消快路径 | `hdb:turn:cancel:{turn_id}`，TTL 7200 | `CANCEL_FAST_PATH_ENABLED=true` + `REDIS_URL` |
+| 取消快路径 | `hdb:turn:cancel:{turn_id}`，TTL 7200 | 配置 `REDIS_URL` 后自动启用（无独立开关） |
 | 跨进程 SSE | `hdb:turn:events:{turn_id}` Stream，TTL 7200，maxlen 5000 | `TURN_EVENT_STREAM_TTL_SECONDS` / `_MAXLEN` |
 | 分布式准入 L2 | 计数器 + TTL 120（**失败 fail-closed**） | `DISTRIBUTED_ADMISSION_ENABLED` |
 | 提供商配额 | RPM/TPM 预算（0=关；开启后 Redis 不可用即拒绝） | `PROVIDER_RPM_LIMIT` / `PROVIDER_TPM_LIMIT` |
@@ -202,7 +195,7 @@ cd frontend && npm ci && npm run dev      # 5176，/api 代理到 8001
 可选 `bash scripts/hdb.sh start|stop|restart|status|logs`：
 白名单读取 `.env` 的 `HDB_API_HOST/PORT`、`HDB_FRONT_PORT`、`HDB_WORKER_ROLES`；
 强制 `HDB_API_SPAWN_WORKER=0` / `HDB_API_SPAWN_EXPORT_WORKER=0` / `HDB_API_SPAWN_MEMORY_WORKER=0`；
-按角色启动 `worker-chat` / `worker-authoring` / `worker-parse` / `memory-worker` / `export-worker`；
+按角色启动 `worker-chat` / `worker-parse` / `memory-worker` / `export-worker`；
 pid 在 `storage/run/`，日志在 `storage/logs/`；前端用 `storage/nodeenv`（便携 Node）。
 
 实时面（必需）：`bash scripts/redis.sh up` 起项目自管 Redis（`127.0.0.1:6380`），
@@ -316,7 +309,7 @@ bash scripts/backup.sh list
   连接中断时 PG 结果可能不确定，启动前须确认 PG 与 storage 属于同一批次。
 - 可重建数据（`table_indexes/`、`circuits/`、`agent_checkpoints.db` 等）`--lean`
   时不备份，恢复后随首次解析重建；`auth.db`/`pipeline_documents.db`/
-  `chat_attachments.db`/`document_authoring.db`/`projects.db`/`exports` 永远是全量。
+  `chat_attachments.db`/`projects.db`/`exports` 永远是全量。
 
 ### 4.5 生产硬化脚本（`scripts/production_hardening/`）
 
@@ -330,7 +323,7 @@ bash scripts/backup.sh list
 | `migrate_chat_turn_sequence.py` | 扩列→回填→校验→NOT NULL（生产需停写） |
 | `verify_checkpoint_postgres.py` | PG checkpointer setup/put/get 一致性、fork 带 pending writes、删除隔离 |
 | `multi_instance_drill.py` | 双 API 副本：单 owner claim/fencing、共享会话、跨副本恢复、附件字节共享 |
-| `fault_isolation_drill.py` | 杀 authoring/parse/chat worker + 指向不可达 RAGFlow，断言聊天仍可完成 |
+| `fault_isolation_drill.py` | 杀 parse/chat worker + 指向不可达 RAGFlow，断言聊天仍可完成 |
 | `concurrency_compare_drill.py` | A/B（串行化+governor+共享执行器 关/开）跨用户负载、隔离、同会话突发顺序、429 过载 |
 | `control_plane_benchmark.py` | PG claim 吞吐/延迟、8 路单 owner 竞争、热会话 SKIP LOCKED 隔离 |
 | `connection_budget.py` | 汇总每副本池大小 vs `max_connections`/`pg_stat_activity` |
@@ -382,7 +375,6 @@ bash scripts/backup.sh list
 | `test_control_plane_store_contract.py` | SQLite 与 PG 执行存储的行为一致性（有序 claim、fencing、终态事务 + domain writer、陈旧重排） |
 | `test_memory_security_contract.py` | 记忆始终在 `<untrusted_memory>` 内；注入载荷无法逃逸 |
 | `test_auth_kb_scope.py` | 两级角色：sysadmin 不能访问 KB 内容；共享/所有权；旧角色迁移与权限表删除 |
-| `test_document_authoring_safety.py` + `test_document_generation_*` | 声明单元之外不得有模板/脚本执行；治理评审门 |
 | `test_provider_config_guard.py` / `test_settings_env_loading.py` | backend=postgres 无 DSN 拒绝启动；`.env` 重载正确 |
 | `test_migration_validation.py` | 迁移哈希/类型工具正确（派生表跳过、哈希稳定） |
 | `test_result_export.py` / `_followup.py` | 快照→产物的持久承诺在队列/渲染器重构后仍成立（真实渲染器 + OOXML 校验） |
@@ -412,7 +404,7 @@ bash scripts/backup.sh list
 | `/health/ready` 不 ready | `dependencies` 里哪一项 down：`database`（SQLite 锁/权限）、`control_plane`（PG DSN/schema 版本）、`storage`（可写） |
 | `/health/dependencies` worker 为 0 | 没起 worker 或心跳过期（`OBS_WORKER_STALE_SECONDS=30`）；看 `storage/logs/` |
 | 日志里 `hdb.governor.lease_lost` 频繁 | 任务超过租约且心跳失败：看 worker 是否被 SIGKILL、时钟是否漂移、DB 是否被锁 |
-| Prometheus 告警 `HdbQueueOldestJobWaiting` | 队列最老任务 >600s：看导出/文档生成 worker 是否在跑、是否有永久失败任务 |
+| Prometheus 告警 `HdbQueueOldestJobWaiting` | 队列最老任务 >600s：看导出 worker 是否在跑、是否有永久失败任务 |
 | PG 连接打满 | `connection_budget.py`；检查 checkpoint 池在 worker 上被计两次 |
 | `.env` 改动未生效 | 重启项清单（`/health/ready`）；worker 需要任务边界才 reload |
 | 遥测无数据 | `OBS_ENABLED`、endpoint 可达性；导出失败是 fail-open，业务日志里通常只有 debug |

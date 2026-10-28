@@ -18,17 +18,7 @@ DEFAULT_THRESHOLDS: dict[str, float] = {
     "forbidden_claims": 1.0,
 }
 
-DOCUMENT_GENERATION_HARD_ZERO_METRICS = {
-    "fixed_content_overwrite_rate",
-    "source_scope_violation_count",
-    "unsupported_required_field_fill_count",
-}
-
-FRACTION_METRICS = set(DEFAULT_THRESHOLDS) | {
-    "completeness", "honesty", "conflict_disclosure", "template_mapping_precision",
-    "fixed_content_overwrite_rate", "field_recall_at_k", "evidence_support_rate",
-    "auto_approval_rate",
-}
+FRACTION_METRICS = set(DEFAULT_THRESHOLDS)
 
 
 def evaluate_gate(
@@ -100,7 +90,7 @@ def evaluate_gate(
                 else not (metric is not None and metric.status == "not_applicable")
             )
             if applicable and (
-                name in active_thresholds or name in DOCUMENT_GENERATION_HARD_ZERO_METRICS
+                name in active_thresholds
                 or (required is not None and name in required)
             ):
                 expected[name] += 1
@@ -112,18 +102,12 @@ def evaluate_gate(
             valid = math.isfinite(score)
             if name in FRACTION_METRICS:
                 valid = valid and 0 <= score <= 1
-            elif name in DOCUMENT_GENERATION_HARD_ZERO_METRICS:
-                valid = valid and score >= 0
             if not valid:
                 insufficient.append(f"{sample.sample_id}: {name} has invalid score")
                 continue
             if not applicable:
                 continue
             scores[name].append(score)
-            if name in DOCUMENT_GENERATION_HARD_ZERO_METRICS and score != 0.0:
-                failures.append(
-                    f"{sample.sample_id}: {name} must be 0.0, got {score:.3f}"
-                )
             threshold = active_thresholds.get(name)
             if sample.critical and threshold is not None and score < threshold:
                 failures.append(

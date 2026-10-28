@@ -21,7 +21,7 @@ def main() -> None:
         os.environ.update({"HDB_ENV_PATH": os.devnull, "STORAGE_DIR": root, "AUTH_DB_PATH": str(Path(root) / "auth.db"),
                            "OBS_ENABLED": "false", "REDIS_REQUIRED": "false", "REDIS_URL": "", "MEMORY_ENABLED": "false", "NOTIFY_WEBHOOK_URL": "",
                            "AUTH_DEFAULT_ADMIN_USERNAME": "quality_admin", "AUTH_DEFAULT_ADMIN_PASSWORD": "BrowserTestPassword123!", "QUALITY_SAMPLE_RATE": "0"})
-        for prefix in ("CONTROL_PLANE", "EVALUATION_STORE", "MEMORY_STORE", "AGENT_CHECKPOINT", "DOCUMENT_AUTHORING_CHECKPOINTER", "RESOURCE_GOVERNOR", "PROJECT_STORE", "PIPELINE_DOCUMENT_STORE", "AUTHORING_STORE", "AUTH_STORE", "COMPATIBILITY_STORE"):
+        for prefix in ("CONTROL_PLANE", "EVALUATION_STORE", "MEMORY_STORE", "AGENT_CHECKPOINT", "RESOURCE_GOVERNOR", "PIPELINE_DOCUMENT_STORE", "AUTH_STORE"):
             os.environ[f"{prefix}_BACKEND"] = "sqlite"
         from src.api.app import create_app
         from src.api.deps import get_auth_service, get_pipeline

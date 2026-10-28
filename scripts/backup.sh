@@ -4,7 +4,7 @@
 # 数据端是两个物理对象，备份就是两件事，本脚本合成一条命令：
 #   1) PostgreSQL 控制面（Docker 业务栈或 deploy/postgres，pg_dump --format=custom）
 #   2) storage（auth.db、pipeline_documents.db、chat_attachments.db、
-#      document_authoring.db、projects.db、归档/导出字节等本地权威数据）
+#      归档/导出字节等本地权威数据）
 #
 # 用法：
 #   bash scripts/backup.sh create [--dir DIR] [--retention N] [--lean] [--skip-pg] [--dry-run]
@@ -57,7 +57,6 @@ LEAN_EXCLUDE=(
   storage/circuits
   storage/external_conversations
   storage/agent_checkpoints.db
-  storage/document_authoring_checkpoints.sqlite
   storage/resource_quotas.db
   storage/memory.db
 )
@@ -160,7 +159,7 @@ stop_writers() {
     detect_docker
     local service running
     running="$(compose_pg ps --services --status running)"
-    for service in api web worker-chat worker-authoring worker-parse worker-export worker-memory; do
+    for service in api web worker-chat worker-parse worker-export worker-memory; do
       if grep -qx "$service" <<< "$running"; then RESUME_SERVICES+=("$service"); fi
     done
     if [ "${#RESUME_SERVICES[@]}" -gt 0 ]; then

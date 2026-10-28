@@ -79,41 +79,6 @@ export interface UploadAck {
   messages: string[];
 }
 
-/**
- * Versioned reference passed from the chat shell to document-authoring tools.
- *
- * The field is intentionally optional at every API boundary below: older
- * servers do not persist or return document context yet, while the enabled
- * bridge can still send this stable object without changing the legacy chat
- * payload when no template has been attached.
- */
-export interface DocumentContextV1 {
-  analysis_id: string;
-  template_version_id: string;
-  knowledge_base_name: string;
-  version: 1 | 'v1';
-  expiry: string;
-  client_request_id: string;
-  generation_session_id?: string | null;
-}
-
-export interface DocumentContextV2 {
-  version: 'v2';
-  knowledge_base_name?: string | null;
-  attachment_ids?: string[];
-  source_scope?: 'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base';
-  task_id?: string | null;
-  generation_session_id?: string | null;
-  output_spec_id?: string | null;
-  output_spec_version?: number | null;
-  template_version_id?: string | null;
-  analysis_id?: string | null;
-  expiry: string;
-  client_request_id: string;
-}
-
-export type DocumentContext = DocumentContextV1 | DocumentContextV2;
-
 export interface AssetEvidenceView {
   id: number;
   file_id: string;
@@ -367,8 +332,6 @@ export interface SessionView {
   title: string;
   created_at: string;
   updated_at: string;
-  /** Optional until the conversation API exposes persisted document context. */
-  document_context?: DocumentContext | null;
   knowledge_scope?: KnowledgeScopeSnapshot | null;
   knowledge_selection_hash?: string;
   source_access_restricted?: boolean;
@@ -404,6 +367,22 @@ export interface AttachmentSnapshot {
   deleted?: boolean;
 }
 
+export interface AttachmentRevisionArtifact {
+  artifact_id: string;
+  stage?: string;
+  output_format?: string;
+  download_url?: string;
+}
+
+export interface AttachmentRevisionCard {
+  kind: 'attachment_revision';
+  status?: string;
+  content?: string;
+  candidate_state?: string;
+  release_state?: string;
+  artifacts?: AttachmentRevisionArtifact[];
+}
+
 export interface MessageView {
   id: number;
   session_id: number;
@@ -415,14 +394,12 @@ export interface MessageView {
   edited_at?: string | null;
   created_at: string;
   memory_context?: MemoryContextItem[];
-  /** Optional future projection; current servers omit this field. */
-  document_context?: DocumentContext | null;
   /** Frozen attachment snapshots of the owning turn (user messages). */
   attachments?: AttachmentSnapshot[];
   /** 紧凑引用列表（随消息持久化），刷新后"参考来源"面板的数据源。 */
   citations?: EvidenceItem[];
-  /** 该 turn 持久化的 document_card 事件（刷新后卡片回填；原始线格式）。 */
-  cards?: Record<string, unknown>[];
+  /** 该 turn 持久化的附件修订候选卡片（刷新后回填）。 */
+  cards?: AttachmentRevisionCard[];
   /** 该 turn 持久化的执行轨迹步骤（刷新后轨迹面板回填）。 */
   trace_steps?: QueryTraceStep[];
   /** 复杂任务的执行计划（agent todo 投影）。 */
@@ -539,8 +516,6 @@ export interface TurnView {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
-  /** Optional until Task 8 adds turn-context persistence to the API. */
-  document_context?: DocumentContext | null;
   source_scope?: string;
   attachments?: AttachmentSnapshot[];
   /** P0-004 queue visibility: blocking turn, reason and wait deadline. */
@@ -577,9 +552,6 @@ export interface CreateTurnRequest {
   query: string;
   client_request_id?: string | null;
   query_mode?: 'fast' | 'deep';
-  document_context?: DocumentContext | null;
-  /** Explicit document-flow override; sent only alongside document_context; absent keeps the server's regex fallback. */
-  document_flow?: boolean;
   /** Session attachment references; server re-verifies ownership + parse state. */
   attachment_ids?: string[];
   /** Scope selector; "auto" expands deterministically server-side. */
@@ -1325,366 +1297,6 @@ export interface EvaluationDatasetUploadResponse {
   file_name: string;
   sample_count: number;
 }
-
-export type DocumentUnit = {
-  unit_id: string;
-  label: string;
-  writable: boolean;
-  blocked_reason?: string | null;
-};
-
-export type DocumentSuggestion = {
-  semantic_unit_id: string;
-  label: string;
-  confidence: number;
-};
-
-export type DocumentAnalysis = {
-  analysis_id: string;
-  template_version_id: string;
-  format: string;
-  status: string;
-  units: DocumentUnit[];
-  suggestions: DocumentSuggestion[];
-  reason_codes?: string[];
-  auto_activated?: boolean;
-  /** Optional server-provided context lifetime; older responses omit it. */
-  expiry?: string | null;
-  expires_at?: string | null;
-};
-
-export type TemplateReviewUnit = DocumentUnit & {
-  structural_role_hint: string;
-  candidate_for_auto_fill: boolean;
-};
-
-export type TemplateReviewSuggestion = DocumentSuggestion & {
-  target_unit_ids: string[];
-  retrieval_terms: string[];
-  value_shape: 'scalar' | 'repeating_table';
-  overwrite_basis: 'placeholder' | 'sample_value' | null;
-};
-
-export type TemplateAnalysisReview = {
-  analysis_id: string;
-  template_version_id: string;
-  content_hash: string;
-  format: string;
-  status: string;
-  units: TemplateReviewUnit[];
-  suggestions: TemplateReviewSuggestion[];
-  locked_unit_ids: string[];
-  reason_codes: string[];
-};
-
-export type TemplateCorrectionRequest = {
-  expected_content_hash: string;
-  selected_suggestion_ids: string[];
-  locked_unit_ids: string[];
-  comment: string;
-};
-
-export type TemplateVersion = {
-  template_version_id: string;
-  template_id: string;
-  template_schema_id: string;
-  template_schema_version: string;
-  format: string;
-  status: string;
-};
-
-export type DocumentSchema = {
-  document_schema_id: string;
-  version: string;
-  status: string;
-};
-
-export type GenerationOptions = {
-  knowledge_bases: string[];
-  templates: TemplateVersion[];
-  schemas: DocumentSchema[];
-};
-
-export type GenerationBriefView = {
-  purpose: string;
-  scope: Record<string, unknown>;
-  source_policy: Record<string, unknown>;
-  output_policy: Record<string, unknown>;
-  missing_data_policy: string | null;
-  inference_policy: string | null;
-  confirmed: boolean;
-  confidence: number;
-  unresolved_requirements?: Array<Record<string, unknown>>;
-  resolved_fields?: Record<string, unknown>;
-  updated_at?: string;
-};
-
-export type ClarificationMessage = {
-  message_id: string;
-  role: 'assistant' | 'user' | 'system';
-  content: string;
-  question_id?: string | null;
-  options?: string[];
-  answer?: string | null;
-  reason?: string | null;
-  client_request_id?: string | null;
-  created_at?: string;
-};
-
-export type GenerationSession = {
-  session_id: string;
-  knowledge_base_name?: string;
-  status:
-    | 'needs_clarification'
-    | 'ready_to_generate'
-    | 'generating'
-    | 'completed'
-    | 'cancelled'
-    | 'awaiting_plan'
-    | 'awaiting_plan_confirmation'
-    | 'planned'
-    | 'blocked';
-  brief: GenerationBriefView;
-  messages: ClarificationMessage[];
-  work_order_id?: string | null;
-  conversation_id?: string | null;
-  initiating_turn_id?: string | null;
-  document_task_id?: string | null;
-  last_question_id?: string | null;
-  clarification_revision?: number;
-};
-
-export type WorkOrderStage =
-  | 'ready'
-  | 'scope_review_required'
-  | 'template_contract_review_required';
-
-export type CreateWorkOrderResult = {
-  work_order_id: string;
-  task_id?: string | null;
-  stage: WorkOrderStage;
-  exceptions?: unknown[];
-  issues?: unknown[];
-};
-
-export type WorkOrder = {
-  work_order_id: string;
-  task_id?: string | null;
-  status: string;
-  scope_type: string;
-  target_format?: string;
-  [k: string]: unknown;
-};
-
-export type HarnessRunView = {
-  run_id?: string;
-  status?: string;
-  current_node?: string;
-  completed_units?: number;
-  total_units?: number;
-  error?: string;
-} & Record<string, unknown>;
-
-/** One schema unit projected for the workbench coverage panel. */
-export type DocumentCoverageField = {
-  kind: 'field' | 'review';
-  field_id: string;
-  unit_id: string;
-  label: string;
-  required: boolean;
-  status: string;
-  coverage_status?: string | null;
-  display_value?: string | null;
-  evidence_count: number;
-};
-
-/** Per-field coverage projection served with the work-order status. */
-export type DocumentCoverage = {
-  fields: DocumentCoverageField[];
-  summary: {
-    covered: number;
-    missing: number;
-    conflicting: number;
-    failed: number;
-    pending: number;
-  };
-  total: number;
-};
-
-export type WorkOrderStatus = {
-  work_order_id: string | null;
-  task_id?: string | null;
-  status: string;
-  phase?: string;
-  display_label?: string;
-  progress?: number;
-  current_unit?: string;
-  error_code?: string;
-  error_message?: string;
-  retryable?: boolean;
-  next_actions?: string[];
-  pending_decisions?: Array<{
-    decision_id?: string;
-    group_key: string;
-    kind?: string;
-    title?: string;
-    options?: string[];
-    default_option?: string;
-    count?: number;
-    blocking?: boolean;
-  }>;
-  candidate_state?: 'none' | 'available' | 'blocked';
-  release_state?: 'not_requested' | 'pending' | 'approved' | 'rejected';
-  can_pause?: boolean;
-  can_resume?: boolean;
-  can_cancel?: boolean;
-  can_delete?: boolean;
-  generation_brief?: Record<string, unknown>;
-  clarification_session_id?: string;
-  scope_type: string;
-  knowledge_base_name?: string;
-  target_format?: string;
-  unit_statuses: Record<string, string>;
-  coverage?: DocumentCoverage;
-  harness_run?: HarnessRunView;
-  validation?: { status?: string; issues?: unknown[] };
-  pending_review?: Record<string, unknown> | null;
-  artifacts: Array<Record<string, unknown> & { artifact_id: string }>;
-  [k: string]: unknown;
-};
-
-/** Durable document-authoring task projected back into a chat session. */
-export type DocumentChatTaskView = {
-  session_id: number;
-  conversation_revision?: number | null;
-  task_id?: string | null;
-  work_order_id?: string | null;
-  kb_name: string;
-  job_status: string;
-  created_at: string;
-  updated_at: string;
-  status: WorkOrderStatus;
-};
-
-export type DocumentReview = {
-  review_id: string;
-  task_id: string;
-  work_order_id?: string | null;
-  artifact_id?: string | null;
-  review_kind: string;
-  status: string;
-  subject_hash: string;
-  source_snapshot_hash: string;
-  schema_hash: string;
-  decision?: unknown;
-  decision_client_request_id?: string | null;
-  client_request_id?: string | null;
-  [k: string]: unknown;
-};
-
-export type DocumentConflict = {
-  conflict_id: string;
-  fingerprint?: string;
-  field_key?: string;
-  subject?: string;
-  predicate?: string;
-  claims?: Array<Record<string, unknown>>;
-  severity?: string;
-  status?: string;
-  snapshot_hash?: string;
-  evidence_set_hash?: string;
-  affected_unit_ids?: string[];
-  allowed_actions?: string[];
-  row_version?: number;
-  decisions?: Array<Record<string, unknown>>;
-  [k: string]: unknown;
-};
-
-export type DocumentConflictDecisionInput = {
-  expected_fingerprint: string;
-  source_snapshot_hash: string;
-  evidence_set_hash: string;
-  expected_conflict_version?: number;
-  action: string;
-  selected_claim_id?: string;
-  selected_alternative_ids?: string[];
-  reason?: string;
-  rationale?: string;
-  idempotency_key: string;
-};
-
-export type ArtifactRevision = {
-  revision_id: string;
-  task_id: string;
-  work_order_id?: string | null;
-  parent_artifact_id: string;
-  child_artifact_id?: string | null;
-  status: string;
-  request_type: 'field_update' | 'section_update' | 'full_regeneration';
-  input_snapshot_hash: string;
-  source_snapshot_hash: string;
-  schema_hash: string;
-  impact_scope: Record<string, unknown>;
-  revalidation_scope: string[];
-  revalidation_status?: 'pending' | 'passed' | 'failed' | 'requires_human' | string;
-  revalidation_result?: Record<string, unknown>;
-  invalidated_approval_event_ids: string[];
-  client_request_id?: string | null;
-  [k: string]: unknown;
-};
-
-export type DocumentTaskProjection = {
-  task_id: string;
-  origin: string;
-  status: string;
-  conversation_refs: Record<string, string>;
-  generation_session_id?: string | null;
-  work_order_id?: string | null;
-  current_run_id?: string | null;
-  current_artifact_id?: string | null;
-  artifact_ids: string[];
-  knowledge_base_name?: string | null;
-  template_version_id?: string | null;
-  clarification_state?: Record<string, unknown> | null;
-  work_order?: Record<string, unknown> | null;
-  run?: Record<string, unknown> | null;
-  artifacts: Array<Record<string, unknown> & { artifact_id: string }>;
-  reviews: DocumentReview[];
-  revisions: ArtifactRevision[];
-  pending_decisions?: Array<{
-    decision_id?: string;
-    group_key: string;
-    kind?: string;
-    title?: string;
-    options?: string[];
-    default_option?: string;
-    count?: number;
-    blocking?: boolean;
-  }>;
-  candidate_state?: 'none' | 'available' | 'blocked';
-  release_state?: 'not_requested' | 'pending' | 'approved' | 'rejected';
-  pending_review?: Record<string, unknown> | null;
-  next_actions: string[];
-  created_at: string;
-  updated_at: string;
-};
-
-export type IcdScopeException = {
-  exception_id?: string;
-  kind?: string;
-  refdes?: string | null;
-  pin_name?: string | null;
-  recommended_action?: string;
-  user_instruction?: string;
-  source_names?: string[];
-};
-
-export type IcdScopeReview = {
-  status?: string;
-  pending_count?: number;
-  exceptions?: IcdScopeException[];
-  [k: string]: unknown;
-} | null;
 
 // ---------------------------------------------------------------------------
 // 外部 MCP 扩展（受治理的外部工具联邦）

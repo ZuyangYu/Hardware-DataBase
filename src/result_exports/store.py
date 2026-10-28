@@ -16,7 +16,7 @@ from typing import Any
 import zipfile
 
 import src.settings
-from src.document_authoring.ooxml import validate_ooxml_package
+from src.core.ooxml import validate_ooxml_package
 from src.result_exports.models import (
     EXPORT_JOB_STATUSES,
     Artifact,

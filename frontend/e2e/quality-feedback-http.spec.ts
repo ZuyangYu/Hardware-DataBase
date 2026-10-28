@@ -37,8 +37,6 @@ async function openChat(page: Page, unavailableStatus: number, legacyReview = fa
     if (path === '/api/v1/memory-consents') return route.fulfill({ json: { items: [] } });
     if (path === '/api/v1/plugins/mcp/write-proposals') return route.fulfill({ json: { items: [] } });
     if (path === '/api/v1/exports/formats') return route.fulfill({ json: [] });
-    if (path === '/api/v1/document-generation/chat-tasks/current') return route.fulfill({ json: null });
-    if (path === '/api/v1/document-generation/chat-tasks/events') return route.fulfill({ contentType: 'text/event-stream', body: ': idle\n\n' });
     if (path === '/api/v1/notifications') return route.fulfill({ json: { items: [], unread_count: 0 } });
     if (['/api/v1/kbs', '/api/v1/exports', '/api/v1/conversations/7/turns', '/api/v1/conversations/7/attachments'].includes(path)) return route.fulfill({ json: [] });
     unexpected.push(path);

@@ -132,8 +132,7 @@ curl -OJ $BASE/write-proposals/<proposal_id>/artifact -H "Authorization: Bearer 
 2. 在「扩展插件」页登记服务：slug、名称、传输、URL、凭据（请求头）、部门范围、
    超时、标签。凭据编辑时“留空即保留”，勾选“清除已保存凭据”才会删除。
    总开关被应急停用时仍可登记、编辑、删除，但不能启用，也不会发起外部连接：连接测试与
-   工具发现都会返回 409，除非显式打开独立的 break-glass 诊断开关
-   `SANDBOX_DIAGNOSTIC_TEST_ENABLED=true`。启用服务前需保持 `MCP_ENABLED` 开启
+   工具发现都会返回 409。诊断连接只由内部测试钩子控制，不是部署环境开关。启用服务前需保持 `MCP_ENABLED` 开启
    （默认开启；仅在应急时于「系统配置 → 外部 MCP 扩展」或 `.env` 停用）。
    `MCP_CREDENTIALS_KEY` 不出现在配置页，只能写在 `.env`。
 3. 点击「测试连接」：真实连接并发现工具，成功后记录当前配置指纹；

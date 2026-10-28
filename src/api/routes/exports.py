@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import re
 import uuid
 from urllib.parse import quote
@@ -12,20 +11,18 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 
 from src.api.context import build_context_for_user
-from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access
+from src.api.deps import current_user, get_auth_service, reject_system_admin_kb_access
 from src.api.schemas import (
     CreateExportRequest,
     ExportArtifactView,
     ExportBatchView,
     ExportJobView,
     ExportSourceRef,
-    LegacyArtifactView,
 )
 from src.core.auth import AuthService, AuthUser
 from src.core.app_logs import AppLogService
 from src.core.conversation import GENERAL_CHAT_KB_NAME, ChatTurn, ConversationService
-from src.document_authoring.artifact_preview import preview_artifact
-from src.document_authoring.work_order_store import DocumentAuthoringStore
+from src.result_exports.artifact_preview import preview_artifact
 from src.observability import metrics as observability_metrics
 from src.result_exports.content import envelope_from_turn
 from src.result_exports.models import Artifact, ExportJob, enabled_export_formats, is_export_format_enabled
@@ -34,16 +31,6 @@ from src.result_exports.store import ResultExportStore
 router = APIRouter(tags=["exports"])
 _RENDER_OPTION_KEYS = frozenset({"theme", "include_charts"})
 _PRESENTATION_THEMES = frozenset({"light", "dark", "blue"})
-_LEGACY_MIME_TYPES = {
-    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
-    "markdown": "text/markdown; charset=utf-8",
-    "md": "text/markdown; charset=utf-8",
-    "pdf": "application/pdf",
-    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-}
-
 
 def get_export_store() -> ResultExportStore:
     return ResultExportStore()
@@ -219,114 +206,6 @@ def _job_view(job: ExportJob, store: ResultExportStore, user: AuthUser) -> Expor
         department_id=job.department_id,
         knowledge_base_name=job.knowledge_base_name,
     )
-
-
-def _legacy_components(pipeline):
-    document_generation = getattr(pipeline, "document_generation", None)
-    store = getattr(document_generation, "store", None)
-    if store is None:
-        store = DocumentAuthoringStore()
-    return document_generation, store
-
-
-def _legacy_context(user: AuthUser, auth: AuthService, order):
-    kb_name = str(getattr(order, "knowledge_base_name", "") or "").strip()
-    if not kb_name:
-        if str(getattr(order, "scope_type", "project") or "project") != "project":
-            raise HTTPException(status_code=404, detail="artifact not found")
-        if not str(getattr(order, "project_id", "") or "").strip():
-            raise HTTPException(status_code=404, detail="artifact not found")
-        # Project-scoped work orders do not carry a KB name.  Build the same
-        # identity context and let the document service's project capability
-        # check authorize the artifact below.
-        ctx = build_context_for_user(user, auth=auth)
-        reject_system_admin_kb_access(ctx)
-        return ctx
-    owner_department = getattr(order, "resource_department_id", None)
-    if owner_department not in (None, "") and (
-        user.department_id in (None, "") or str(owner_department) != str(user.department_id)
-    ):
-        raise HTTPException(status_code=403, detail="department scope no longer permits this artifact")
-    ctx = build_context_for_user(user, kb_name, auth=auth)
-    reject_system_admin_kb_access(ctx)
-    if not ctx.has_kb_permission(kb_name, "read"):
-        raise HTTPException(status_code=403, detail="read permission required")
-    return ctx
-
-
-def _legacy_artifact_payload(
-    artifact_id: str,
-    *,
-    user: AuthUser,
-    auth: AuthService,
-    pipeline,
-) -> tuple[LegacyArtifactView, bytes]:
-    document_generation, store = _legacy_components(pipeline)
-    get_artifact = getattr(store, "get_artifact", None)
-    get_work_order = getattr(store, "get_work_order", None)
-    if not callable(get_artifact) or not callable(get_work_order):
-        raise HTTPException(status_code=404, detail="artifact not found")
-    artifact = get_artifact(artifact_id)
-    if artifact is None:
-        raise HTTPException(status_code=404, detail="artifact not found")
-    order = get_work_order(getattr(artifact, "work_order_id", ""))
-    if order is None:
-        raise HTTPException(status_code=404, detail="artifact not found")
-    ctx = _legacy_context(user, auth, order)
-    capability = (
-        "download_approved_release"
-        if getattr(artifact, "stage", "") == "approved_release"
-        else "download_review_candidate"
-    )
-    require_capability = getattr(document_generation, "require_work_order_capability", None)
-    if callable(require_capability):
-        try:
-            require_capability(ctx, order, capability)
-        except PermissionError as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-    document_reader = getattr(document_generation, "download_document_artifact", None)
-    store_reader = getattr(store, "read_artifact_content", None)
-    if not callable(document_reader) and not callable(store_reader):
-        raise HTTPException(status_code=404, detail="artifact file is unavailable")
-    try:
-        content = document_reader(ctx, artifact_id) if callable(document_reader) else store_reader(artifact_id)
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
-    except (KeyError, OSError, ValueError) as exc:
-        raise HTTPException(status_code=404, detail="artifact file is unavailable") from exc
-    target_format = str(
-        getattr(artifact, "output_format", None)
-        or getattr(order, "target_format", "bin")
-        or "bin"
-    ).strip().lower()
-    extension = "md" if target_format == "markdown" else target_format
-    safe_extension = re.sub(r"[^a-z0-9]+", "", extension) or "bin"
-    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "-", artifact_id).strip(".-") or "artifact"
-    created_at = getattr(artifact, "created_at", "")
-    if hasattr(created_at, "isoformat"):
-        created_at = created_at.isoformat()
-    view = LegacyArtifactView(
-        artifact_id=artifact_id,
-        work_order_id=str(getattr(artifact, "work_order_id", "")),
-        stage=str(getattr(artifact, "stage", "")),
-        format=target_format,
-        filename=f"document-{safe_id}.{safe_extension}",
-        mime_type=_LEGACY_MIME_TYPES.get(target_format, "application/octet-stream"),
-        size=len(content),
-        sha256=hashlib.sha256(content).hexdigest(),
-        preview=preview_artifact(content, target_format),
-        created_at=str(created_at),
-        preview_url=f"/api/v1/artifacts/document/{artifact_id}/preview",
-        download_url=f"/api/v1/artifacts/document/{artifact_id}/download",
-        tenant_id=str(getattr(order, "tenant_id", None) or getattr(artifact, "tenant_id", None) or "default"),
-        department_id=(
-            str(getattr(order, "resource_department_id"))
-            if getattr(order, "resource_department_id", None) not in (None, "")
-            else None
-        ),
-        knowledge_base_name=str(getattr(order, "knowledge_base_name", "") or ""),
-    )
-    return view, content
 
 
 @router.get("/artifacts", response_model=list[ExportArtifactView])
@@ -615,58 +494,6 @@ def cancel_export(
         raise HTTPException(status_code=404, detail="export job not found")
     _record_export_audit(user, action="cancel_export", target_type="export_job", target_id=export_job_id)
     return _job_view(updated, store, user)
-
-
-@router.get("/artifacts/document/{artifact_id}/preview", response_model=LegacyArtifactView)
-def legacy_artifact_preview(
-    artifact_id: str,
-    user: AuthUser = Depends(current_user),
-    auth: AuthService = Depends(get_auth_service),
-    pipeline=Depends(get_pipeline),
-):
-    view, _content = _legacy_artifact_payload(
-        artifact_id, user=user, auth=auth, pipeline=pipeline,
-    )
-    _record_export_audit(
-        user,
-        action="preview_document_artifact_unified",
-        target_type="document_artifact",
-        target_id=artifact_id,
-        kb_name=view.knowledge_base_name,
-    )
-    return view
-
-
-@router.get("/artifacts/document/{artifact_id}/download")
-def legacy_artifact_download(
-    artifact_id: str,
-    user: AuthUser = Depends(current_user),
-    auth: AuthService = Depends(get_auth_service),
-    pipeline=Depends(get_pipeline),
-):
-    view, content = _legacy_artifact_payload(
-        artifact_id, user=user, auth=auth, pipeline=pipeline,
-    )
-    _record_export_audit(
-        user,
-        action="download_document_artifact_unified",
-        target_type="document_artifact",
-        target_id=artifact_id,
-        kb_name=view.knowledge_base_name,
-        metadata={"format": view.format, "size": view.size, "sha256": view.sha256},
-    )
-    filename = re.sub(r"[\r\n\"]+", "-", view.filename)
-    ascii_filename = re.sub(r"[^A-Za-z0-9._-]+", "-", filename).strip(".-") or "document.bin"
-    return Response(
-        content=content,
-        media_type=view.mime_type,
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="{ascii_filename}"; '
-                f"filename*=UTF-8''{quote(filename, safe='._-')}"
-            )
-        },
-    )
 
 
 @router.get("/artifacts/{artifact_id}/preview", response_model=ExportArtifactView)

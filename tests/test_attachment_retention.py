@@ -113,13 +113,9 @@ class AttachmentRetentionTests(unittest.TestCase):
     def test_cleanup_failure_is_requeued_and_emits_cleanup_retry_metric(self):
         self.store.enqueue_session_cleanup(session_id=self.session.id, user_id=1)
         result_store = Mock()
-        document_jobs = Mock()
-        document_store = Mock()
         coordinator = SessionCleanupCoordinator(
             store=self.store,
             result_store=result_store,
-            document_job_store=document_jobs,
-            document_store=document_store,
             worker_id="cleanup-test",
         )
 

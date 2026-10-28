@@ -29,12 +29,8 @@ JSONL，每行一个 `EvaluationSample`（`extra="forbid"`）：
 校验：`_parse_dataset` 读 UTF-8-sig、跳空行、聚合错误 `line N: …`、重复 id 报首次行号；
 `validate_dataset` 返回错误表；`load_dataset` 抛 `DatasetValidationError("; ".join(errors))`。
 
-文档生成变体：`DocumentGenerationEvalRecord{id, template_fixture, field_id, expected_value,`
-`allowed_sources, required, critical, expected_value_type, expected_missing_policy, evidence_rationale}`。
-
 内置数据集：`evaluation/datasets/{aaa_hard_eval_v1.jsonl(47 例, kb AAA, 作用域 1739:AAA),`
-`hardware_qa_v1.jsonl(25 例), attachment_editing_v1.jsonl, document_generation_v1.jsonl(+manifest),`
-`template.jsonl}`。
+`hardware_qa_v1.jsonl(25 例), attachment_editing_v1.jsonl}`。
 
 ---
 
@@ -382,15 +378,6 @@ metric.max_retries = config.max_retries     # 仅诊断用
   - `forbidden_claims`：命中任一禁止断言 → 0.0，否则 1.0；rubric 为空 → `not_applicable`；
   - `evidence_consistency`：`(期望类型数 − 缺失数)/期望类型数`；无期望 → `not_applicable`；
   - 明确只做词法（语义质量交给 RAGAS）；
-- `score_document_generation(record, snapshot)` → `template_mapping_precision,`
-  `fixed_content_overwrite_rate, field_recall_at_k, evidence_support_rate, auto_approval_rate,`
-  `source_scope_violation_count, unsupported_required_field_fill_count`；
-- `document_generation_metrics.py`（库级，供 `tests/test_document_generation_metrics.py`）：
-  9 个 `METRIC_KEYS`（field_success_rate、typed_value_success_rate、writer_fallback_rate、
-  human_review_rate、avg_llm_calls_per_field、avg_duration_seconds_per_field、token_usage、
-  required_field_success_rate、optional_field_missing_rate）+ 方向；未知遥测 → `inconclusive`；
-  parity 指标版本 `icd-pin-definition-v1`（12 键），阈值版本/夹具不匹配即 fail-closed。
-
 ---
 
 ## 11. 门禁（`gates.py`）
@@ -410,7 +397,6 @@ DOCUMENT_GENERATION_HARD_ZERO_METRICS = {
 
 - 跳过 non_retrieval 队列的 RAGAS 指标；
 - `critical` + `status=="failed"` + 有阈值 → 失败 `critical sample {id}: {metric} evaluation failed`；
-- 文档生成硬零指标：`score != 0.0` → 失败；
 - `critical` + 分数 < 阈值 → 失败；
 - 覆盖率：`needed = ceil(0.8 * sample_total)`；评分数不足的指标**跳过阈值检查**；
 - 逐指标取成功分数的均值；越阈值 → `{metric}: {score:.3f} < {threshold:.3f}`；
@@ -587,7 +573,7 @@ DOCUMENT_GENERATION_HARD_ZERO_METRICS = {
 item 检查点、删除规则/穿越、孤儿→paused 恢复、部分报告、旧状态）、`history.py`、`history_import.py`
 （不覆盖、冲突、哈希复验、symlink/身份攻击）、`cohorts.py`、`presentation.py`、`cli.py`、
 `optimizations.py`（叙述剥离、近重复上下文折叠、预算前剥离 HTML、单样本覆盖）。
-另有 `tests/test_evaluation_api.py`、`test_e2e_runner.py`、`test_document_generation_metrics.py`、
+另有 `tests/test_evaluation_api.py`、`test_e2e_runner.py`、
 `test_reviewer_eval_harness.py`。
 
 核心不变量：

@@ -26,6 +26,40 @@ def _config_revision(path: str = ENV_FILE_PATH) -> str:
         return "missing"
 
 
+# Keys that used to be deployment flags but are now built-in behavior or an
+# internal constant.  They are intentionally ignored; startup warns once so
+# operators can delete them instead of keeping stale knobs forever.
+OBSOLETE_ENV_KEYS: dict[str, str] = {
+    "AGENT_COMPLEXITY_BUDGET_ENABLED": "built-in agent behavior",
+    "AGENT_PARTIAL_SYNTHESIS_ENABLED": "built-in agent behavior",
+    "AGENT_RESEARCH_SUBAGENT_ENABLED": "built-in agent behavior",
+    "AGENT_VERIFIER_ENABLED": "built-in agent behavior",
+    "CANCEL_FAST_PATH_ENABLED": "enabled automatically when REDIS_URL is set",
+    "CONVERSATION_UNIFIED_TOOLS_ENABLED": "built-in platform path",
+    "MULTI_KB_EXPLICIT_FIELDS_ENABLED": "internal field-contract constant",
+    "MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL": "security invariant (always on)",
+    "RESEARCH_AGENT_ENABLED": "internal subagent constant",
+    "REVIEWER_AGENT_ENABLED": "internal subagent constant",
+    "SANDBOX_DIAGNOSTIC_TEST_ENABLED": "test-only diagnostic hook",
+    "SHARED_RETRIEVAL_EXECUTOR_ENABLED": "built-in shared retrieval pool",
+}
+
+
+def obsolete_env_keys(path: str = ENV_FILE_PATH) -> tuple[str, ...]:
+    """Return obsolete keys present in the process env or the .env file."""
+    keys = set(os.environ)
+    try:
+        with open(path, encoding=ENV_FILE_ENCODING) as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                keys.add(stripped.split("=", 1)[0].strip())
+    except OSError:
+        pass
+    return tuple(sorted(key for key in keys if key in OBSOLETE_ENV_KEYS))
+
+
 def _env_bool(name: str, default: bool) -> bool:
     """Parse a boolean environment setting using the application's flag syntax."""
     return os.getenv(name, str(default).lower()).strip().lower() in {"1", "true", "yes", "on"}
@@ -174,98 +208,10 @@ LLM_BATCH_MAX_CONCURRENCY = int(os.getenv("LLM_BATCH_MAX_CONCURRENCY", "1"))
 LLM_QUEUE_TIMEOUT_SECONDS = int(os.getenv("LLM_QUEUE_TIMEOUT_SECONDS", "180"))
 LLM_QUEUE_WARN_SECONDS = int(os.getenv("LLM_QUEUE_WARN_SECONDS", "10"))
 LLM_STREAM_IDLE_TIMEOUT_SECONDS = int(os.getenv("LLM_STREAM_IDLE_TIMEOUT_SECONDS", "0"))
-# Agentic document authoring is built in and on by default.  Only documents
-# whose execution mode is explicitly ``external_agent`` use the deepagents
-# harness; everything else keeps ``internal_harness``/``deterministic_only``.
-# The harness degrades per field instead of failing when infrastructure is
-# unavailable.  The chat-tool flag stays separate so a document schema is not
-# implicitly exposed through the conversation agent.
-DOCUMENT_AUTHORING_AGENT_MODE_ENABLED = os.getenv(
-    "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED", "true"
-).strip().lower() in {"1", "true", "yes", "on"}
-AGENT_DOCUMENT_TOOLS_ENABLED = os.getenv(
-    "AGENT_DOCUMENT_TOOLS_ENABLED", "true"
-).strip().lower() in {"1", "true", "yes", "on"}
-DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND = os.getenv(
-    "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "sqlite"
-).strip().lower()
-DOCUMENT_AUTHORING_CHECKPOINTER_PATH = _resolve_storage_path(
-    os.getenv("DOCUMENT_AUTHORING_CHECKPOINTER_PATH"),
-    "document_authoring_checkpoints.sqlite",
-)
-DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL = os.getenv(
-    "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL", ""
-)
-# DocumentTask is introduced additively.  These gates allow task writes,
-# projections and the eventual association requirement to be enabled in
-# separate rollout steps and rolled back without deleting durable authoring
-# data.
-DOCUMENT_TASK_WRITE_ENABLED = _env_bool("DOCUMENT_TASK_WRITE_ENABLED", True)
-DOCUMENT_TASK_READ_ENABLED = _env_bool("DOCUMENT_TASK_READ_ENABLED", True)
-DOCUMENT_TASK_STREAM_ENABLED = _env_bool("DOCUMENT_TASK_STREAM_ENABLED", True)
-DOCUMENT_TASK_ASSOCIATION_REQUIRED = _env_bool("DOCUMENT_TASK_ASSOCIATION_REQUIRED", False)
-# Requirement resolution is additive and opt-in while existing schemas migrate
-# to field-level evidence contracts.  The per-request metadata flag may still
-# enable it for controlled pilots without changing deployment-wide behavior.
-DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED = _env_bool(
-    "DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED", False
-)
-# Conversation plans are proposed by a model but accepted and executed only at
-# the server boundary.  ``shadow`` records a plan without changing behaviour;
-# ``enabled`` replaces legacy document-flow routing for that turn.  The tool
-# flag may also be enabled in shadow to inspect the resulting capability view.
-CONVERSATION_ACTION_PLAN_MODE = os.getenv(
-    "CONVERSATION_ACTION_PLAN_MODE", "off"
-).strip().lower()
-if CONVERSATION_ACTION_PLAN_MODE not in {"off", "shadow", "enabled"}:
-    CONVERSATION_ACTION_PLAN_MODE = "off"
 # Platform plumbing, not a product switch: the governed unified tool surface
-# is the default path.  Legacy assembly only remains for internal callers that
+# is the default path. Legacy assembly only remains for internal callers that
 # have no RequestContext.
-CONVERSATION_UNIFIED_TOOLS_ENABLED = _env_bool(
-    "CONVERSATION_UNIFIED_TOOLS_ENABLED", True
-)
-# Phase 0 planning is observational only.  Keep the shadow compiler and the
-# later execution path independently gated so a rollout can be measured and
-# rolled back without changing legacy WorkOrder behavior.
-DOCUMENT_PLANNING_SHADOW_ENABLED = _env_bool("DOCUMENT_PLANNING_SHADOW_ENABLED", False)
-DOCUMENT_PLANNING_V2_ENABLED = _env_bool("DOCUMENT_PLANNING_V2_ENABLED", False)
-DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED = _env_bool(
-    "DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED", False
-)
-# Phase 2 plan-backed execution is independently gated from proposal/confirm
-# behavior.  Keep it disabled until graph, review and parity gates are signed
-# off for an allowlisted tenant/document type.
-DOCUMENT_PLAN_DAG_EXECUTION_ENABLED = _env_bool("DOCUMENT_PLAN_DAG_EXECUTION_ENABLED", False)
-DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS = _env_csv("DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS")
-DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES = _env_csv("DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES")
-DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS = _env_csv("DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS")
-# Preview evidence retrieval rides out transient embedding-endpoint outages.
-# ``attempts`` includes the first try; each consecutive delay doubles from the
-# base backoff and is capped at a few seconds.
-DOCUMENT_PREVIEW_RETRIEVAL_ATTEMPTS = max(
-    1, int(os.getenv("DOCUMENT_PREVIEW_RETRIEVAL_ATTEMPTS", "3") or "3")
-)
-DOCUMENT_PREVIEW_RETRIEVAL_BACKOFF_SECONDS = max(
-    0.0, float(os.getenv("DOCUMENT_PREVIEW_RETRIEVAL_BACKOFF_SECONDS", "0.5") or "0.5")
-)
-# Phase 3 template-free execution has an independent kill switch and exact
-# allowlists.  Empty defaults are intentional: recipe plans remain inert until
-# an operator enables the complete canary scope.
-DOCUMENT_TEMPLATE_FREE_EXECUTION_ENABLED = _env_bool("DOCUMENT_TEMPLATE_FREE_EXECUTION_ENABLED", False)
-DOCUMENT_TEMPLATE_FREE_ALLOWLIST_TENANTS = _env_csv("DOCUMENT_TEMPLATE_FREE_ALLOWLIST_TENANTS")
-DOCUMENT_TEMPLATE_FREE_ALLOWLIST_DOCUMENT_TYPES = _env_csv("DOCUMENT_TEMPLATE_FREE_ALLOWLIST_DOCUMENT_TYPES")
-DOCUMENT_TEMPLATE_FREE_ALLOWLIST_FORMATS = _env_csv("DOCUMENT_TEMPLATE_FREE_ALLOWLIST_FORMATS")
-DOCUMENT_TEMPLATE_FREE_ALLOWLIST_RECIPES = _env_csv("DOCUMENT_TEMPLATE_FREE_ALLOWLIST_RECIPES")
-# Phase 5 compatibility closure stays disabled until the two-release
-# no-new-legacy-write and backup/restore evidence is signed by operations.
-DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED = _env_bool(
-    "DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED", False
-)
-DOCUMENT_AUTHORING_COMPATIBILITY_DB_PATH = _resolve_storage_path(
-    os.getenv("DOCUMENT_AUTHORING_COMPATIBILITY_DB_PATH"),
-    "document_authoring_compatibility.sqlite",
-)
+CONVERSATION_UNIFIED_TOOLS_ENABLED = True
 
 # External conversation (外部对话) domain switches.
 EXTERNAL_CONVERSATION_LLM_STRUCTURE = os.getenv("EXTERNAL_CONVERSATION_LLM_STRUCTURE", "true").lower() in {"1", "true", "yes", "on"}
@@ -377,34 +323,24 @@ QUALITY_PHOENIX_API_KEY = os.getenv("QUALITY_PHOENIX_API_KEY", "").strip()
 QUALITY_PHOENIX_MAX_ATTEMPTS = int(os.getenv("QUALITY_PHOENIX_MAX_ATTEMPTS", "20"))
 COST_LEDGER_ENABLED = os.getenv("COST_LEDGER_ENABLED", "true").lower() == "true"
 COST_MODEL_REGISTRY = json.loads(os.getenv("COST_MODEL_REGISTRY", "{}"))
-# 本地台账域（projects / pipeline_documents）的存储后端。空值 = 跟随
+# 本地台账域（pipeline_documents）的存储后端。空值 = 跟随
 # CONTROL_PLANE_BACKEND（存储收敛的终态）；显式 sqlite 可以在迁移完成前
 # 让单个域先留在本地文件。DATABASE_URL 空 = CONTROL_PLANE_DATABASE_URL。
-PROJECT_STORE_BACKEND = os.getenv("PROJECT_STORE_BACKEND", "").strip().lower()
-PROJECT_STORE_DATABASE_URL = os.getenv("PROJECT_STORE_DATABASE_URL", "").strip()
 PIPELINE_DOCUMENT_STORE_BACKEND = os.getenv(
     "PIPELINE_DOCUMENT_STORE_BACKEND", ""
 ).strip().lower()
 PIPELINE_DOCUMENT_DATABASE_URL = os.getenv(
     "PIPELINE_DOCUMENT_DATABASE_URL", ""
 ).strip()
-# 文档生成域（document_authoring.db，46 张表）的后端。空值 = 跟随
-# CONTROL_PLANE_BACKEND；切换前先迁移（--group document_authoring）。
-AUTHORING_STORE_BACKEND = os.getenv("AUTHORING_STORE_BACKEND", "").strip().lower()
-AUTHORING_STORE_DATABASE_URL = os.getenv("AUTHORING_STORE_DATABASE_URL", "").strip()
 # 认证域（账号 + 审计）后端。**默认 sqlite**，不跟随控制面：PG 里这几张表
 # 早期按语义类型建过，必须先跑 rebuild_auth_domain.py 再显式切换。
 AUTH_STORE_BACKEND = os.getenv("AUTH_STORE_BACKEND", "sqlite").strip().lower()
 AUTH_STORE_DATABASE_URL = os.getenv("AUTH_STORE_DATABASE_URL", "").strip()
-# 文档生成兼容库（独立文件）。同样默认 sqlite，先重建再切换。
-COMPATIBILITY_STORE_BACKEND = os.getenv("COMPATIBILITY_STORE_BACKEND", "sqlite").strip().lower()
-COMPATIBILITY_STORE_DATABASE_URL = os.getenv("COMPATIBILITY_STORE_DATABASE_URL", "").strip()
 # Redis realtime plane (cancel fast path first; empty URL disables it).
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 # 硬依赖开关：true（默认）时 Redis 必须已配置且可达，否则 API/worker 拒绝启动，
 # /health/ready 也会因 Redis 不可用判为 not_ready。仅测试隔离时置 false。
 REDIS_REQUIRED = _env_bool("REDIS_REQUIRED", True)
-CANCEL_FAST_PATH_ENABLED = _env_bool("CANCEL_FAST_PATH_ENABLED", True)
 CANCEL_KEY_TTL_SECONDS = int(os.getenv("CANCEL_KEY_TTL_SECONDS", "7200"))
 TURN_EVENT_STREAM_TTL_SECONDS = int(os.getenv("TURN_EVENT_STREAM_TTL_SECONDS", "7200"))
 TURN_EVENT_STREAM_MAXLEN = int(os.getenv("TURN_EVENT_STREAM_MAXLEN", "5000"))
@@ -450,7 +386,6 @@ MCP_ENABLED = _env_bool("MCP_ENABLED", True)
 # of the built-in production path, repair those values in memory so startup
 # and ordinary settings changes do not get trapped behind hidden prerequisites.
 if MCP_ENABLED:
-    CONVERSATION_UNIFIED_TOOLS_ENABLED = True
     RESOURCE_GOVERNOR_ENABLED = True
 MCP_ALLOW_INSECURE_HTTP = _env_bool("MCP_ALLOW_INSECURE_HTTP", False)
 MCP_ALLOW_PRIVATE_HOSTS = _env_bool("MCP_ALLOW_PRIVATE_HOSTS", False)
@@ -498,7 +433,8 @@ SANDBOX_SERVICE_AUTH_REF = os.getenv("SANDBOX_SERVICE_AUTH_REF", "").strip()
 # interpreted as a bearer token by HDB.  A deployment may inject a short-lived
 # token through this owner-only file or configure a process-level provider.
 SANDBOX_SERVICE_TOKEN_FILE = os.getenv("SANDBOX_SERVICE_TOKEN_FILE", "").strip()
-SANDBOX_DIAGNOSTIC_TEST_ENABLED = _env_bool("SANDBOX_DIAGNOSTIC_TEST_ENABLED", False)
+# Test-only diagnostic hook; never a production deployment option.
+SANDBOX_DIAGNOSTIC_TEST_ENABLED = False
 SANDBOX_DEFAULT_NETWORK = os.getenv("SANDBOX_DEFAULT_NETWORK", "none").strip().lower() or "none"
 SANDBOX_MAX_CONCURRENT = int(os.getenv("SANDBOX_MAX_CONCURRENT", "2"))
 SANDBOX_TASK_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_TASK_TIMEOUT_SECONDS", "300"))
@@ -539,17 +475,20 @@ SKILLS_ENABLED = _env_bool("SKILLS_ENABLED", True)
 
 # P0b shared retrieval executor: one bounded pool per process for document
 # batch retrieval; per-request fan-out and the RAG governor are separate.
-# Rollout flag: off until stage acceptance opens it (plan §10.1).
-SHARED_RETRIEVAL_EXECUTOR_ENABLED = _env_bool("SHARED_RETRIEVAL_EXECUTOR_ENABLED", False)
+# Built-in optimization: always use the bounded shared pool.  Tests may still
+# override the module attribute to exercise the legacy fallback.
+SHARED_RETRIEVAL_EXECUTOR_ENABLED = True
 # R3: independent rollout switch; scope/API acceptance is still required.
 # The raw multi-select UI was removed in 2026-10.  The backend scope/retrieval
 # path is intentionally retained as the base for a future project-space mount;
 # keep this false until that surface is designed and accepted.
 MULTI_KB_CHAT_ENABLED = _env_bool("MULTI_KB_CHAT_ENABLED", False)
-MULTI_KB_EXPLICIT_FIELDS_ENABLED = _env_bool("MULTI_KB_EXPLICIT_FIELDS_ENABLED", False)
+# Internal field-contract switch; tests may override the module attribute.
+MULTI_KB_EXPLICIT_FIELDS_ENABLED = False
 MULTI_KB_HUMAN_REVIEW_ENABLED = _env_bool("MULTI_KB_HUMAN_REVIEW_ENABLED", False)
 MULTI_KB_CONFLICT_AUTO_RESOLVE_ENABLED = _env_bool("MULTI_KB_CONFLICT_AUTO_RESOLVE_ENABLED", False)
-MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL = _env_bool("MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL", True)
+# Security invariant: critical source conflicts always require approval.
+MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL = True
 MULTI_KB_MAX_SOURCES = int(os.getenv("MULTI_KB_MAX_SOURCES", "4"))
 MULTI_KB_PER_SOURCE_TOP_K = int(os.getenv("MULTI_KB_PER_SOURCE_TOP_K", "8"))
 MULTI_KB_PER_RECORD_CANDIDATES = int(os.getenv("MULTI_KB_PER_RECORD_CANDIDATES", "8"))
@@ -599,14 +538,13 @@ RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS = float(
     os.getenv("RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS", "10")
 )
 
-# P2 action DAG bounded parallelism.  Disabled by default; enable only after
-# the Phase 0 baseline shows serial execution is the actual bottleneck.
-ACTION_DAG_PARALLEL_ENABLED = _env_bool("ACTION_DAG_PARALLEL_ENABLED", False)
-ACTION_EXECUTOR_MAX_PARALLEL = int(os.getenv("ACTION_EXECUTOR_MAX_PARALLEL", "4"))
+# P2 action DAG bounded parallelism is an internal execution choice.  Keep it
+# as a module constant so tests can exercise both paths without an env surface.
 
-# P3 optional specialist subagents.  Off until evaluation proves a benefit.
-REVIEWER_AGENT_ENABLED = _env_bool("REVIEWER_AGENT_ENABLED", False)
-RESEARCH_AGENT_ENABLED = _env_bool("RESEARCH_AGENT_ENABLED", False)
+# P3 optional specialist subagents are internal evaluation switches.  They are
+# not deployment features; tests may override the module attributes.
+REVIEWER_AGENT_ENABLED = False
+RESEARCH_AGENT_ENABLED = False
 
 # P0b admission control: per-user/per-tenant RPM before accepting a request.
 ADMISSION_CONTROL_ENABLED = _env_bool("ADMISSION_CONTROL_ENABLED", True)
@@ -620,8 +558,6 @@ ADMISSION_RETRY_AFTER_SECONDS = float(os.getenv("ADMISSION_RETRY_AFTER_SECONDS",
 # tighten one dimension without redefining all of them.
 ADMISSION_DEEP_RPM_PER_USER = os.getenv("ADMISSION_DEEP_RPM_PER_USER", "")
 ADMISSION_DEEP_RPM_PER_TENANT = os.getenv("ADMISSION_DEEP_RPM_PER_TENANT", "")
-ADMISSION_DOCUMENT_RPM_PER_USER = os.getenv("ADMISSION_DOCUMENT_RPM_PER_USER", "")
-ADMISSION_DOCUMENT_RPM_PER_TENANT = os.getenv("ADMISSION_DOCUMENT_RPM_PER_TENANT", "")
 ADMISSION_EXPORT_RPM_PER_USER = os.getenv("ADMISSION_EXPORT_RPM_PER_USER", "")
 ADMISSION_EXPORT_RPM_PER_TENANT = os.getenv("ADMISSION_EXPORT_RPM_PER_TENANT", "")
 ADMISSION_OCR_RPM_PER_USER = os.getenv("ADMISSION_OCR_RPM_PER_USER", "")
@@ -640,11 +576,6 @@ ADMISSION_MAX_UNTERMINAL_TURNS_PER_USER = int(
     os.getenv("ADMISSION_MAX_UNTERMINAL_TURNS_PER_USER", "32")
 )
 
-DOCUMENT_AUTHORING_JOB_LEASE_SECONDS = int(os.getenv("DOCUMENT_AUTHORING_JOB_LEASE_SECONDS", "300"))
-DOCUMENT_AUTHORING_JOB_BATCH_SIZE = int(os.getenv("DOCUMENT_AUTHORING_JOB_BATCH_SIZE", "4"))
-DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS = float(
-    os.getenv("DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS", "10")
-)
 RESULT_EXPORT_MAX_BYTES = int(os.getenv("RESULT_EXPORT_MAX_BYTES", str(25 * 1024 * 1024)))
 RESULT_EXPORT_JOB_LEASE_SECONDS = int(os.getenv("RESULT_EXPORT_JOB_LEASE_SECONDS", "300"))
 RESULT_EXPORT_JOB_BATCH_SIZE = int(os.getenv("RESULT_EXPORT_JOB_BATCH_SIZE", "8"))
@@ -665,12 +596,8 @@ CHAT_TURN_LEASE_RENEW_SECONDS = int(os.getenv("CHAT_TURN_LEASE_RENEW_SECONDS", "
 # this many seconds before it fails and the next turn is released.
 WAITING_TURN_MAX_SECONDS = int(os.getenv("WAITING_TURN_MAX_SECONDS", "600"))
 WAITING_TURN_TIMEOUT_SCAN_SECONDS = float(os.getenv("WAITING_TURN_TIMEOUT_SCAN_SECONDS", "5"))
-DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES = os.getenv("DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES", "false").lower() == "true"
-DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS = os.getenv("DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS", "false").lower() == "true"
-DOCUMENT_AUTO_PUBLISH_VERIFIED = os.getenv("DOCUMENT_AUTO_PUBLISH_VERIFIED", "false").lower() == "true"
 # Upload endpoints pass bytes to parsers, so bound both the request read and the
 # downstream parser's maximum working set.
-DOCUMENT_TEMPLATE_MAX_BYTES = int(os.getenv("DOCUMENT_TEMPLATE_MAX_BYTES", str(50 * 1024 * 1024)))
 EVALUATION_DATASET_MAX_BYTES = int(os.getenv("EVALUATION_DATASET_MAX_BYTES", str(100 * 1024 * 1024)))
 
 # Chat attachments (会话附件): session-private, temporary, locally parsed data
@@ -811,16 +738,10 @@ RESTART_REQUIRED_SETTINGS = frozenset(
         "EVALUATION_STORE_BACKEND",
         "EVALUATION_STORE_DATABASE_URL",
         "EVAL_EXECUTION_MODE",
-        "PROJECT_STORE_BACKEND",
-        "PROJECT_STORE_DATABASE_URL",
         "PIPELINE_DOCUMENT_STORE_BACKEND",
         "PIPELINE_DOCUMENT_DATABASE_URL",
-        "AUTHORING_STORE_BACKEND",
-        "AUTHORING_STORE_DATABASE_URL",
         "AUTH_STORE_BACKEND",
         "AUTH_STORE_DATABASE_URL",
-        "COMPATIBILITY_STORE_BACKEND",
-        "COMPATIBILITY_STORE_DATABASE_URL",
         "REDIS_URL",
         "RESOURCE_GOVERNOR_BACKEND",
         "RESOURCE_GOVERNOR_DATABASE_URL",
@@ -829,9 +750,6 @@ RESTART_REQUIRED_SETTINGS = frozenset(
         "AGENT_CHECKPOINT_DATABASE_URL",
         "AGENT_CHECKPOINT_DB_PATH",
         "AGENT_CHECKPOINT_POOL_SIZE",
-        "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND",
-        "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL",
-        "DOCUMENT_AUTHORING_CHECKPOINTER_PATH",
         "MEMORY_STORE_BACKEND",
         "MEMORY_DATABASE_URL",
         "MEMORY_SQLITE_PATH",
@@ -906,38 +824,6 @@ DEFAULT_VALUES = {
     "LLM_QUEUE_TIMEOUT_SECONDS": "180",
     "LLM_QUEUE_WARN_SECONDS": "10",
     "LLM_STREAM_IDLE_TIMEOUT_SECONDS": "0",
-    "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED": "true",
-    "AGENT_DOCUMENT_TOOLS_ENABLED": "true",
-    "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND": "sqlite",
-    "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL": "",
-    "DOCUMENT_AUTHORING_CHECKPOINTER_PATH": os.path.join(
-        STORAGE_DIR, "document_authoring_checkpoints.sqlite"
-    ),
-    "DOCUMENT_TASK_WRITE_ENABLED": "true",
-    "DOCUMENT_TASK_READ_ENABLED": "true",
-    "DOCUMENT_TASK_STREAM_ENABLED": "true",
-    "DOCUMENT_TASK_ASSOCIATION_REQUIRED": "false",
-    "DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED": "false",
-    "CONVERSATION_ACTION_PLAN_MODE": "off",
-    "CONVERSATION_UNIFIED_TOOLS_ENABLED": "true",
-    "DOCUMENT_PLANNING_SHADOW_ENABLED": "false",
-    "DOCUMENT_PLANNING_V2_ENABLED": "false",
-    "DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED": "false",
-    "DOCUMENT_PLAN_DAG_EXECUTION_ENABLED": "false",
-    "DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS": "",
-    "DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES": "",
-    "DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS": "",
-    "DOCUMENT_PREVIEW_RETRIEVAL_ATTEMPTS": "3",
-    "DOCUMENT_PREVIEW_RETRIEVAL_BACKOFF_SECONDS": "0.5",
-    "DOCUMENT_TEMPLATE_FREE_EXECUTION_ENABLED": "false",
-    "DOCUMENT_TEMPLATE_FREE_ALLOWLIST_TENANTS": "",
-    "DOCUMENT_TEMPLATE_FREE_ALLOWLIST_DOCUMENT_TYPES": "",
-    "DOCUMENT_TEMPLATE_FREE_ALLOWLIST_FORMATS": "",
-    "DOCUMENT_TEMPLATE_FREE_ALLOWLIST_RECIPES": "",
-    "DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED": "false",
-    "DOCUMENT_AUTHORING_COMPATIBILITY_DB_PATH": os.path.join(
-        STORAGE_DIR, "document_authoring_compatibility.sqlite"
-    ),
     "MEMORY_ENABLED": "true",
     "MEMORY_STORE_BACKEND": "sqlite",
     "MEMORY_DATABASE_URL": "",
@@ -1009,19 +895,12 @@ DEFAULT_VALUES = {
     "QUALITY_PHOENIX_MAX_ATTEMPTS": "20",
     "COST_LEDGER_ENABLED": "true",
     "COST_MODEL_REGISTRY": "{}",
-    "PROJECT_STORE_BACKEND": "",
-    "PROJECT_STORE_DATABASE_URL": "",
     "PIPELINE_DOCUMENT_STORE_BACKEND": "",
     "PIPELINE_DOCUMENT_DATABASE_URL": "",
-    "AUTHORING_STORE_BACKEND": "",
-    "AUTHORING_STORE_DATABASE_URL": "",
     "AUTH_STORE_BACKEND": "sqlite",
     "AUTH_STORE_DATABASE_URL": "",
-    "COMPATIBILITY_STORE_BACKEND": "sqlite",
-    "COMPATIBILITY_STORE_DATABASE_URL": "",
     "CONTROL_PLANE_POOL_SIZE": "8",
     "REDIS_URL": "",
-    "CANCEL_FAST_PATH_ENABLED": "true",
     "CANCEL_KEY_TTL_SECONDS": "7200",
     "TURN_EVENT_STREAM_TTL_SECONDS": "7200",
     "TURN_EVENT_STREAM_MAXLEN": "5000",
@@ -1080,12 +959,9 @@ DEFAULT_VALUES = {
     "SKILLS_ENABLED": "true",
     # Deployment-only sandbox identity/endpoints are intentionally excluded
     # from the ordinary config API; these defaults document the closed state.
-    "SHARED_RETRIEVAL_EXECUTOR_ENABLED": "false",
     "MULTI_KB_CHAT_ENABLED": "false",
-    "MULTI_KB_EXPLICIT_FIELDS_ENABLED": "false",
     "MULTI_KB_HUMAN_REVIEW_ENABLED": "false",
     "MULTI_KB_CONFLICT_AUTO_RESOLVE_ENABLED": "false",
-    "MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL": "true",
     "MULTI_KB_MAX_SOURCES": "4",
     "MULTI_KB_PER_SOURCE_TOP_K": "8",
     "MULTI_KB_PER_RECORD_CANDIDATES": "8",
@@ -1101,10 +977,6 @@ DEFAULT_VALUES = {
     "RETRIEVAL_PER_REQUEST_FANOUT": "4",
     "RETRIEVAL_QUEUE_MAX_WAIT_SECONDS": "30",
     "RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS": "10",
-    "ACTION_DAG_PARALLEL_ENABLED": "false",
-    "ACTION_EXECUTOR_MAX_PARALLEL": "4",
-    "REVIEWER_AGENT_ENABLED": "false",
-    "RESEARCH_AGENT_ENABLED": "false",
     "ADMISSION_CONTROL_ENABLED": "true",
     "ADMISSION_CHAT_RPM_PER_USER": "30",
     "ADMISSION_CHAT_RPM_PER_TENANT": "120",
@@ -1113,8 +985,6 @@ DEFAULT_VALUES = {
     "ADMISSION_RETRY_AFTER_SECONDS": "5",
     "ADMISSION_DEEP_RPM_PER_USER": "",
     "ADMISSION_DEEP_RPM_PER_TENANT": "",
-    "ADMISSION_DOCUMENT_RPM_PER_USER": "",
-    "ADMISSION_DOCUMENT_RPM_PER_TENANT": "",
     "ADMISSION_EXPORT_RPM_PER_USER": "",
     "ADMISSION_EXPORT_RPM_PER_TENANT": "",
     "ADMISSION_OCR_RPM_PER_USER": "",
@@ -1128,9 +998,6 @@ DEFAULT_VALUES = {
     "WORKER_PARSE_BATCH_SIZE": "1",
     "WORKER_CLAIM_BATCH_SIZE": "8",
     "WORKER_TURN_CONCURRENCY": "1",
-    "DOCUMENT_AUTHORING_JOB_LEASE_SECONDS": "300",
-    "DOCUMENT_AUTHORING_JOB_BATCH_SIZE": "4",
-    "DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS": "10",
     "RESULT_EXPORT_MAX_BYTES": str(25 * 1024 * 1024),
     "RESULT_EXPORT_JOB_LEASE_SECONDS": "300",
     "RESULT_EXPORT_JOB_BATCH_SIZE": "8",
@@ -1144,7 +1011,6 @@ DEFAULT_VALUES = {
     "CHAT_TURN_LEASE_RENEW_SECONDS": "15",
     "WAITING_TURN_MAX_SECONDS": "600",
     "WAITING_TURN_TIMEOUT_SCAN_SECONDS": "5",
-    "DOCUMENT_TEMPLATE_MAX_BYTES": str(50 * 1024 * 1024),
     "EVALUATION_DATASET_MAX_BYTES": str(100 * 1024 * 1024),
     "CHAT_ATTACHMENTS_ENABLED": "true",
     "CHAT_ATTACHMENT_STORAGE_DIR": os.path.join(STORAGE_DIR, "chat_attachments"),
@@ -1209,9 +1075,6 @@ DEFAULT_VALUES = {
     "OBS_WORKER_STALE_SECONDS": "30",
     "OBS_DEPENDENCY_TIMEOUT_SECONDS": "5",
     "OBS_READINESS_CACHE_SECONDS": "1",
-    "DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES": "false",
-    "DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS": "false",
-    "DOCUMENT_AUTO_PUBLISH_VERIFIED": "false",
     "SYSTEM_PROMPT": SYSTEM_PROMPT,
     "NO_CONTEXT_PROMPT": NO_CONTEXT_PROMPT,
 }
@@ -1263,25 +1126,6 @@ def _reload_settings():
     global LLM_QUEUE_TIMEOUT_SECONDS, LLM_QUEUE_WARN_SECONDS, LLM_STREAM_IDLE_TIMEOUT_SECONDS
     global FINAL_TOP_K, AGENT_MAX_RETRIEVAL_ROUNDS
     global WORKER_POLL_INTERVAL_SECONDS, WORKER_PARSE_BATCH_SIZE, WORKER_CLAIM_BATCH_SIZE, WORKER_TURN_CONCURRENCY
-    global DOCUMENT_AUTHORING_AGENT_MODE_ENABLED, AGENT_DOCUMENT_TOOLS_ENABLED
-    global DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND, DOCUMENT_AUTHORING_CHECKPOINTER_PATH
-    global DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL
-    global DOCUMENT_TASK_WRITE_ENABLED, DOCUMENT_TASK_READ_ENABLED, DOCUMENT_TASK_STREAM_ENABLED
-    global DOCUMENT_TASK_ASSOCIATION_REQUIRED
-    global DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED
-    global CONVERSATION_ACTION_PLAN_MODE, CONVERSATION_UNIFIED_TOOLS_ENABLED
-    global DOCUMENT_PLANNING_SHADOW_ENABLED, DOCUMENT_PLANNING_V2_ENABLED
-    global DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED
-    global DOCUMENT_PLAN_DAG_EXECUTION_ENABLED
-    global DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS, DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES
-    global DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS
-    global DOCUMENT_TEMPLATE_FREE_EXECUTION_ENABLED
-    global DOCUMENT_TEMPLATE_FREE_ALLOWLIST_TENANTS
-    global DOCUMENT_TEMPLATE_FREE_ALLOWLIST_DOCUMENT_TYPES
-    global DOCUMENT_TEMPLATE_FREE_ALLOWLIST_FORMATS
-    global DOCUMENT_TEMPLATE_FREE_ALLOWLIST_RECIPES
-    global DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED
-    global DOCUMENT_AUTHORING_COMPATIBILITY_DB_PATH
     global FINAL_TOP_K, AGENT_MAX_RETRIEVAL_ROUNDS
     global WORKER_POLL_INTERVAL_SECONDS, WORKER_PARSE_BATCH_SIZE, WORKER_ROLE
     global RESOURCE_GOVERNOR_ENABLED, RESOURCE_GOVERNOR_SCOPE, RESOURCE_GOVERNOR_DB_PATH
@@ -1295,12 +1139,9 @@ def _reload_settings():
     global QUALITY_ENABLED, QUALITY_CAPTURE_CONTENT, QUALITY_SAMPLE_RATE, QUALITY_SAMPLE_DAILY_LIMIT
     global QUALITY_PHOENIX_SYNC_ENABLED, QUALITY_PHOENIX_ENDPOINT, QUALITY_PHOENIX_API_KEY, QUALITY_PHOENIX_MAX_ATTEMPTS
     global COST_LEDGER_ENABLED, COST_MODEL_REGISTRY
-    global PROJECT_STORE_BACKEND, PROJECT_STORE_DATABASE_URL
     global PIPELINE_DOCUMENT_STORE_BACKEND, PIPELINE_DOCUMENT_DATABASE_URL
-    global AUTHORING_STORE_BACKEND, AUTHORING_STORE_DATABASE_URL
     global AUTH_STORE_BACKEND, AUTH_STORE_DATABASE_URL
-    global COMPATIBILITY_STORE_BACKEND, COMPATIBILITY_STORE_DATABASE_URL
-    global REDIS_URL, REDIS_REQUIRED, CANCEL_FAST_PATH_ENABLED, CANCEL_KEY_TTL_SECONDS
+    global REDIS_URL, REDIS_REQUIRED, CANCEL_KEY_TTL_SECONDS
     global TURN_EVENT_STREAM_TTL_SECONDS, TURN_EVENT_STREAM_MAXLEN
     global DISTRIBUTED_ADMISSION_ENABLED, DISTRIBUTED_ADMISSION_TTL_SECONDS
     global PROVIDER_RPM_LIMIT
@@ -1325,7 +1166,7 @@ def _reload_settings():
     global SANDBOX_ENABLED, SANDBOX_BACKEND, SANDBOX_GATEWAY_ENABLED
     global SANDBOX_GATEWAY_URL, SANDBOX_RUNNER_URL, SANDBOX_SERVICE_AUTH_REF
     global SANDBOX_SERVICE_TOKEN_FILE
-    global SANDBOX_DIAGNOSTIC_TEST_ENABLED, SANDBOX_DEFAULT_NETWORK
+    global SANDBOX_DEFAULT_NETWORK
     global SANDBOX_MAX_CONCURRENT, SANDBOX_TASK_TIMEOUT_SECONDS, SANDBOX_TASK_LEASE_SECONDS
     global SANDBOX_MAX_CONCURRENT_PER_USER, SANDBOX_MAX_CONCURRENT_PER_DEPARTMENT
     global SANDBOX_MAX_OUTPUT_BYTES, SANDBOX_MAX_INPUT_BYTES, SANDBOX_ALLOW_DYNAMIC_INSTALL
@@ -1338,11 +1179,10 @@ def _reload_settings():
     global SANDBOX_SKILL_PIP_ALLOWED_HOSTS
     global SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS
     global SKILLS_ENABLED
-    global SHARED_RETRIEVAL_EXECUTOR_ENABLED, RETRIEVAL_EXECUTOR_MAX_WORKERS
+    global RETRIEVAL_EXECUTOR_MAX_WORKERS
     global MULTI_KB_CHAT_ENABLED
-    global MULTI_KB_EXPLICIT_FIELDS_ENABLED
     global MULTI_KB_HUMAN_REVIEW_ENABLED
-    global MULTI_KB_CONFLICT_AUTO_RESOLVE_ENABLED, MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL
+    global MULTI_KB_CONFLICT_AUTO_RESOLVE_ENABLED
     global MULTI_KB_MAX_SOURCES
     global MULTI_KB_PER_SOURCE_TOP_K, MULTI_KB_MAX_CALLS_PER_TURN
     global MULTI_KB_PER_RECORD_CANDIDATES, MULTI_KB_PER_SOURCE_CANDIDATES
@@ -1350,8 +1190,6 @@ def _reload_settings():
     global MULTI_KB_FUSION_MAX_BYTES, MULTI_KB_TURN_EVIDENCE_MAX_BYTES
     global RETRIEVAL_QUEUE_MAX_DEPTH, RETRIEVAL_PER_REQUEST_FANOUT, RETRIEVAL_QUEUE_MAX_WAIT_SECONDS
     global RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS
-    global ACTION_DAG_PARALLEL_ENABLED, ACTION_EXECUTOR_MAX_PARALLEL
-    global REVIEWER_AGENT_ENABLED, RESEARCH_AGENT_ENABLED
     global ADMISSION_CONTROL_ENABLED, ADMISSION_CHAT_RPM_PER_USER, ADMISSION_CHAT_RPM_PER_TENANT
     global ADMISSION_HEAVY_RPM_PER_USER, ADMISSION_HEAVY_RPM_PER_TENANT, ADMISSION_RETRY_AFTER_SECONDS
     global ADMISSION_MAX_UNTERMINAL_TURNS_PER_SESSION, ADMISSION_MAX_UNTERMINAL_TURNS_PER_USER
@@ -1361,15 +1199,13 @@ def _reload_settings():
     global ADMISSION_OCR_RPM_PER_USER, ADMISSION_OCR_RPM_PER_TENANT
     global ADMISSION_EVALUATION_RPM_PER_USER, ADMISSION_EVALUATION_RPM_PER_TENANT
     global ADMISSION_MODEL_RPM_PER_USER, ADMISSION_MODEL_RPM_PER_TENANT
-    global DOCUMENT_AUTHORING_JOB_LEASE_SECONDS, DOCUMENT_AUTHORING_JOB_BATCH_SIZE
-    global DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS
     global RESULT_EXPORT_MAX_BYTES, RESULT_EXPORT_JOB_LEASE_SECONDS, RESULT_EXPORT_JOB_BATCH_SIZE
     global RESULT_EXPORT_RETENTION_DAYS, RESULT_EXPORT_MAX_RUNNING_JOBS
     global RESULT_EXPORT_ORGANIZE_MAX_CHARS
     global CHAT_TURN_HEARTBEAT_TTL_SECONDS, CHAT_TURN_HEARTBEAT_INTERVAL_SECONDS
     global CONVERSATION_SERIALIZE_SAME_THREAD, CHAT_TURN_LEASE_SECONDS, CHAT_TURN_LEASE_RENEW_SECONDS
     global WAITING_TURN_MAX_SECONDS, WAITING_TURN_TIMEOUT_SCAN_SECONDS
-    global DOCUMENT_TEMPLATE_MAX_BYTES, EVALUATION_DATASET_MAX_BYTES
+    global EVALUATION_DATASET_MAX_BYTES
     global CHAT_ATTACHMENTS_ENABLED, CHAT_ATTACHMENT_STORAGE_DIR, CHAT_ATTACHMENT_INDEX_DB_PATH
     global CHAT_ATTACHMENT_MAX_BYTES, CHAT_ATTACHMENT_MAX_FILES_PER_SESSION
     global CHAT_ATTACHMENT_MAX_SESSION_BYTES, CHAT_ATTACHMENT_MAX_TENANT_BYTES, CHAT_ATTACHMENT_MAX_PAGES
@@ -1390,7 +1226,6 @@ def _reload_settings():
     global CHAT_ATTACHMENT_VISUAL_MAX_IMAGE_BYTES, CHAT_ATTACHMENT_VISUAL_TIMEOUT_SECONDS
     global ARK_API_KEY
     global CHAT_ATTACHMENT_JOB_LEASE_SECONDS, CHAT_ATTACHMENT_JOB_MAX_ATTEMPTS
-    global DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES, DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS, DOCUMENT_AUTO_PUBLISH_VERIFIED
     global OBS_ENABLED, OTEL_SERVICE_NAME, OTEL_EXPORTER_OTLP_ENDPOINT, OBS_ENVIRONMENT, OBS_SERVICE_VERSION
     global OBS_TRACE_SAMPLE_RATIO, OBS_CAPTURE_CONTENT, OBS_CAPTURE_QUERY, OBS_CAPTURE_EVIDENCE, OBS_CAPTURE_LLM_CONTENT
     global OBS_CAPTURE_MCP_CONTENT
@@ -1467,59 +1302,6 @@ def _reload_settings():
     AGENT_RATE_LIMIT_MAX_RETRIES = int(os.getenv("AGENT_RATE_LIMIT_MAX_RETRIES", "4"))
     AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS = float(os.getenv("AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS", "1"))
     AGENT_RATE_LIMIT_MAX_DELAY_SECONDS = float(os.getenv("AGENT_RATE_LIMIT_MAX_DELAY_SECONDS", "16"))
-    DOCUMENT_AUTHORING_AGENT_MODE_ENABLED = os.getenv(
-        "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED", "true"
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    AGENT_DOCUMENT_TOOLS_ENABLED = os.getenv(
-        "AGENT_DOCUMENT_TOOLS_ENABLED", "true"
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND = os.getenv(
-        "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "sqlite"
-    ).strip().lower()
-    DOCUMENT_AUTHORING_CHECKPOINTER_PATH = _resolve_storage_path(
-        os.getenv("DOCUMENT_AUTHORING_CHECKPOINTER_PATH"),
-        "document_authoring_checkpoints.sqlite",
-    )
-    DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL = os.getenv(
-        "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL", ""
-    )
-    DOCUMENT_TASK_WRITE_ENABLED = _env_bool("DOCUMENT_TASK_WRITE_ENABLED", True)
-    DOCUMENT_TASK_READ_ENABLED = _env_bool("DOCUMENT_TASK_READ_ENABLED", True)
-    DOCUMENT_TASK_STREAM_ENABLED = _env_bool("DOCUMENT_TASK_STREAM_ENABLED", True)
-    DOCUMENT_TASK_ASSOCIATION_REQUIRED = _env_bool("DOCUMENT_TASK_ASSOCIATION_REQUIRED", False)
-    DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED = _env_bool(
-        "DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED", False
-    )
-    CONVERSATION_ACTION_PLAN_MODE = os.getenv(
-        "CONVERSATION_ACTION_PLAN_MODE", "off"
-    ).strip().lower()
-    if CONVERSATION_ACTION_PLAN_MODE not in {"off", "shadow", "enabled"}:
-        CONVERSATION_ACTION_PLAN_MODE = "off"
-    CONVERSATION_UNIFIED_TOOLS_ENABLED = _env_bool(
-        "CONVERSATION_UNIFIED_TOOLS_ENABLED", True
-    )
-    DOCUMENT_PLANNING_SHADOW_ENABLED = _env_bool("DOCUMENT_PLANNING_SHADOW_ENABLED", False)
-    DOCUMENT_PLANNING_V2_ENABLED = _env_bool("DOCUMENT_PLANNING_V2_ENABLED", False)
-    DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED = _env_bool(
-        "DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED", False
-    )
-    DOCUMENT_PLAN_DAG_EXECUTION_ENABLED = _env_bool("DOCUMENT_PLAN_DAG_EXECUTION_ENABLED", False)
-    DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS = _env_csv("DOCUMENT_PLAN_DAG_ALLOWLIST_TENANTS")
-    DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES = _env_csv("DOCUMENT_PLAN_DAG_ALLOWLIST_DOCUMENT_TYPES")
-    DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS = _env_csv("DOCUMENT_PLAN_DAG_ALLOWLIST_FORMATS")
-    DOCUMENT_TEMPLATE_FREE_EXECUTION_ENABLED = _env_bool("DOCUMENT_TEMPLATE_FREE_EXECUTION_ENABLED", False)
-    DOCUMENT_TEMPLATE_FREE_ALLOWLIST_TENANTS = _env_csv("DOCUMENT_TEMPLATE_FREE_ALLOWLIST_TENANTS")
-    DOCUMENT_TEMPLATE_FREE_ALLOWLIST_DOCUMENT_TYPES = _env_csv("DOCUMENT_TEMPLATE_FREE_ALLOWLIST_DOCUMENT_TYPES")
-    DOCUMENT_TEMPLATE_FREE_ALLOWLIST_FORMATS = _env_csv("DOCUMENT_TEMPLATE_FREE_ALLOWLIST_FORMATS")
-    DOCUMENT_TEMPLATE_FREE_ALLOWLIST_RECIPES = _env_csv("DOCUMENT_TEMPLATE_FREE_ALLOWLIST_RECIPES")
-    DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED = _env_bool(
-        "DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED", False
-    )
-    DOCUMENT_AUTHORING_COMPATIBILITY_DB_PATH = _resolve_storage_path(
-        os.getenv("DOCUMENT_AUTHORING_COMPATIBILITY_DB_PATH"),
-        "document_authoring_compatibility.sqlite",
-    )
-
     LLM_MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "4"))
     LLM_BATCH_MAX_CONCURRENCY = int(os.getenv("LLM_BATCH_MAX_CONCURRENCY", "1"))
     LLM_QUEUE_TIMEOUT_SECONDS = int(os.getenv("LLM_QUEUE_TIMEOUT_SECONDS", "180"))
@@ -1570,23 +1352,16 @@ def _reload_settings():
     QUALITY_PHOENIX_MAX_ATTEMPTS = int(os.getenv("QUALITY_PHOENIX_MAX_ATTEMPTS", "20"))
     COST_LEDGER_ENABLED = os.getenv("COST_LEDGER_ENABLED", "true").lower() == "true"
     COST_MODEL_REGISTRY = json.loads(os.getenv("COST_MODEL_REGISTRY", "{}"))
-    PROJECT_STORE_BACKEND = os.getenv("PROJECT_STORE_BACKEND", "").strip().lower()
-    PROJECT_STORE_DATABASE_URL = os.getenv("PROJECT_STORE_DATABASE_URL", "").strip()
     PIPELINE_DOCUMENT_STORE_BACKEND = os.getenv(
         "PIPELINE_DOCUMENT_STORE_BACKEND", ""
     ).strip().lower()
     PIPELINE_DOCUMENT_DATABASE_URL = os.getenv(
         "PIPELINE_DOCUMENT_DATABASE_URL", ""
     ).strip()
-    AUTHORING_STORE_BACKEND = os.getenv("AUTHORING_STORE_BACKEND", "").strip().lower()
-    AUTHORING_STORE_DATABASE_URL = os.getenv("AUTHORING_STORE_DATABASE_URL", "").strip()
     AUTH_STORE_BACKEND = os.getenv("AUTH_STORE_BACKEND", "sqlite").strip().lower()
     AUTH_STORE_DATABASE_URL = os.getenv("AUTH_STORE_DATABASE_URL", "").strip()
-    COMPATIBILITY_STORE_BACKEND = os.getenv("COMPATIBILITY_STORE_BACKEND", "sqlite").strip().lower()
-    COMPATIBILITY_STORE_DATABASE_URL = os.getenv("COMPATIBILITY_STORE_DATABASE_URL", "").strip()
     REDIS_URL = os.getenv("REDIS_URL", "").strip()
     REDIS_REQUIRED = _env_bool("REDIS_REQUIRED", True)
-    CANCEL_FAST_PATH_ENABLED = _env_bool("CANCEL_FAST_PATH_ENABLED", True)
     CANCEL_KEY_TTL_SECONDS = int(os.getenv("CANCEL_KEY_TTL_SECONDS", "7200"))
     TURN_EVENT_STREAM_TTL_SECONDS = int(os.getenv("TURN_EVENT_STREAM_TTL_SECONDS", "7200"))
     TURN_EVENT_STREAM_MAXLEN = int(os.getenv("TURN_EVENT_STREAM_MAXLEN", "5000"))
@@ -1613,9 +1388,8 @@ def _reload_settings():
     RESOURCE_MEMORY_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_MEMORY_RESERVED_INTERACTIVE", "0"))
     MCP_ENABLED = _env_bool("MCP_ENABLED", True)
     if MCP_ENABLED:
-        # Keep the platform prerequisites automatic for both fresh and legacy
+        # Keep the platform prerequisite automatic for both fresh and legacy
         # environments. The public emergency kill switch remains authoritative.
-        CONVERSATION_UNIFIED_TOOLS_ENABLED = True
         RESOURCE_GOVERNOR_ENABLED = True
     MCP_ALLOW_INSECURE_HTTP = _env_bool("MCP_ALLOW_INSECURE_HTTP", False)
     MCP_ALLOW_PRIVATE_HOSTS = _env_bool("MCP_ALLOW_PRIVATE_HOSTS", False)
@@ -1649,7 +1423,6 @@ def _reload_settings():
     SANDBOX_RUNNER_URL = os.getenv("SANDBOX_RUNNER_URL", "").strip()
     SANDBOX_SERVICE_AUTH_REF = os.getenv("SANDBOX_SERVICE_AUTH_REF", "").strip()
     SANDBOX_SERVICE_TOKEN_FILE = os.getenv("SANDBOX_SERVICE_TOKEN_FILE", "").strip()
-    SANDBOX_DIAGNOSTIC_TEST_ENABLED = _env_bool("SANDBOX_DIAGNOSTIC_TEST_ENABLED", False)
     SANDBOX_DEFAULT_NETWORK = os.getenv("SANDBOX_DEFAULT_NETWORK", "none").strip().lower() or "none"
     SANDBOX_MAX_CONCURRENT = int(os.getenv("SANDBOX_MAX_CONCURRENT", "2"))
     SANDBOX_MAX_CONCURRENT_PER_USER = int(os.getenv("SANDBOX_MAX_CONCURRENT_PER_USER", "1"))
@@ -1683,12 +1456,9 @@ def _reload_settings():
         "json,csv,txt,zip,kicad_sch,kicad_pcb,kicad_pro",
     )
     SKILLS_ENABLED = _env_bool("SKILLS_ENABLED", True)
-    SHARED_RETRIEVAL_EXECUTOR_ENABLED = _env_bool("SHARED_RETRIEVAL_EXECUTOR_ENABLED", False)
     MULTI_KB_CHAT_ENABLED = _env_bool("MULTI_KB_CHAT_ENABLED", False)
-    MULTI_KB_EXPLICIT_FIELDS_ENABLED = _env_bool("MULTI_KB_EXPLICIT_FIELDS_ENABLED", False)
     MULTI_KB_HUMAN_REVIEW_ENABLED = _env_bool("MULTI_KB_HUMAN_REVIEW_ENABLED", False)
     MULTI_KB_CONFLICT_AUTO_RESOLVE_ENABLED = _env_bool("MULTI_KB_CONFLICT_AUTO_RESOLVE_ENABLED", False)
-    MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL = _env_bool("MULTI_KB_REVIEW_REQUIRE_APPROVAL_FOR_CRITICAL", True)
     MULTI_KB_MAX_SOURCES = int(os.getenv("MULTI_KB_MAX_SOURCES", "4"))
     MULTI_KB_PER_SOURCE_TOP_K = int(os.getenv("MULTI_KB_PER_SOURCE_TOP_K", "8"))
     MULTI_KB_PER_RECORD_CANDIDATES = int(os.getenv("MULTI_KB_PER_RECORD_CANDIDATES", "8"))
@@ -1707,10 +1477,6 @@ def _reload_settings():
     RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS = float(
         os.getenv("RETRIEVAL_SHUTDOWN_DEADLINE_SECONDS", "10")
     )
-    ACTION_DAG_PARALLEL_ENABLED = _env_bool("ACTION_DAG_PARALLEL_ENABLED", False)
-    ACTION_EXECUTOR_MAX_PARALLEL = int(os.getenv("ACTION_EXECUTOR_MAX_PARALLEL", "4"))
-    REVIEWER_AGENT_ENABLED = _env_bool("REVIEWER_AGENT_ENABLED", False)
-    RESEARCH_AGENT_ENABLED = _env_bool("RESEARCH_AGENT_ENABLED", False)
     ADMISSION_CONTROL_ENABLED = _env_bool("ADMISSION_CONTROL_ENABLED", True)
     ADMISSION_CHAT_RPM_PER_USER = int(os.getenv("ADMISSION_CHAT_RPM_PER_USER", "30"))
     ADMISSION_CHAT_RPM_PER_TENANT = int(os.getenv("ADMISSION_CHAT_RPM_PER_TENANT", "120"))
@@ -1719,8 +1485,6 @@ def _reload_settings():
     ADMISSION_RETRY_AFTER_SECONDS = float(os.getenv("ADMISSION_RETRY_AFTER_SECONDS", "5"))
     ADMISSION_DEEP_RPM_PER_USER = os.getenv("ADMISSION_DEEP_RPM_PER_USER", "")
     ADMISSION_DEEP_RPM_PER_TENANT = os.getenv("ADMISSION_DEEP_RPM_PER_TENANT", "")
-    ADMISSION_DOCUMENT_RPM_PER_USER = os.getenv("ADMISSION_DOCUMENT_RPM_PER_USER", "")
-    ADMISSION_DOCUMENT_RPM_PER_TENANT = os.getenv("ADMISSION_DOCUMENT_RPM_PER_TENANT", "")
     ADMISSION_EXPORT_RPM_PER_USER = os.getenv("ADMISSION_EXPORT_RPM_PER_USER", "")
     ADMISSION_EXPORT_RPM_PER_TENANT = os.getenv("ADMISSION_EXPORT_RPM_PER_TENANT", "")
     ADMISSION_OCR_RPM_PER_USER = os.getenv("ADMISSION_OCR_RPM_PER_USER", "")
@@ -1738,11 +1502,6 @@ def _reload_settings():
     WORKER_PARSE_BATCH_SIZE = int(os.getenv("WORKER_PARSE_BATCH_SIZE", "1"))
     WORKER_CLAIM_BATCH_SIZE = int(os.getenv("WORKER_CLAIM_BATCH_SIZE", "8"))
     WORKER_TURN_CONCURRENCY = int(os.getenv("WORKER_TURN_CONCURRENCY", "1"))
-    DOCUMENT_AUTHORING_JOB_LEASE_SECONDS = int(os.getenv("DOCUMENT_AUTHORING_JOB_LEASE_SECONDS", "300"))
-    DOCUMENT_AUTHORING_JOB_BATCH_SIZE = int(os.getenv("DOCUMENT_AUTHORING_JOB_BATCH_SIZE", "4"))
-    DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS = float(
-        os.getenv("DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS", "10")
-    )
     RESULT_EXPORT_STORAGE_DIR = _resolve_storage_path(os.getenv("RESULT_EXPORT_STORAGE_DIR"), "exports")
     RESULT_EXPORT_ENABLED = _env_bool("RESULT_EXPORT_ENABLED", True)
     RESULT_EXPORT_MD_ENABLED = _env_bool("RESULT_EXPORT_MD_ENABLED", True)
@@ -1766,7 +1525,6 @@ def _reload_settings():
     CHAT_TURN_LEASE_RENEW_SECONDS = int(os.getenv("CHAT_TURN_LEASE_RENEW_SECONDS", "15"))
     WAITING_TURN_MAX_SECONDS = int(os.getenv("WAITING_TURN_MAX_SECONDS", "600"))
     WAITING_TURN_TIMEOUT_SCAN_SECONDS = float(os.getenv("WAITING_TURN_TIMEOUT_SCAN_SECONDS", "5"))
-    DOCUMENT_TEMPLATE_MAX_BYTES = int(os.getenv("DOCUMENT_TEMPLATE_MAX_BYTES", str(50 * 1024 * 1024)))
     EVALUATION_DATASET_MAX_BYTES = int(os.getenv("EVALUATION_DATASET_MAX_BYTES", str(100 * 1024 * 1024)))
     CHAT_ATTACHMENTS_ENABLED = os.getenv("CHAT_ATTACHMENTS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
     CHAT_ATTACHMENT_STORAGE_DIR = _resolve_storage_path(
@@ -1820,9 +1578,6 @@ def _reload_settings():
     ARK_API_KEY = os.getenv("ARK_API_KEY", "").strip()
     CHAT_ATTACHMENT_JOB_LEASE_SECONDS = int(os.getenv("CHAT_ATTACHMENT_JOB_LEASE_SECONDS", "300"))
     CHAT_ATTACHMENT_JOB_MAX_ATTEMPTS = int(os.getenv("CHAT_ATTACHMENT_JOB_MAX_ATTEMPTS", "3"))
-    DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES = os.getenv("DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES", "false").lower() == "true"
-    DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS = os.getenv("DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS", "false").lower() == "true"
-    DOCUMENT_AUTO_PUBLISH_VERIFIED = os.getenv("DOCUMENT_AUTO_PUBLISH_VERIFIED", "false").lower() == "true"
     EXTERNAL_CONVERSATION_LLM_STRUCTURE = os.getenv("EXTERNAL_CONVERSATION_LLM_STRUCTURE", "true").lower() in {"1", "true", "yes", "on"}
     EXTERNAL_CONVERSATION_LLM_MAX_CHARS = int(os.getenv("EXTERNAL_CONVERSATION_LLM_MAX_CHARS", "12000"))
     EXTERNAL_CONVERSATION_LLM_SUMMARY = os.getenv("EXTERNAL_CONVERSATION_LLM_SUMMARY", "true").lower() in {"1", "true", "yes", "on"}
@@ -2038,8 +1793,6 @@ _INT_SETTING_KEYS = frozenset({
     "WORKER_PARSE_BATCH_SIZE",
     "WORKER_CLAIM_BATCH_SIZE",
     "WORKER_TURN_CONCURRENCY",
-    "DOCUMENT_AUTHORING_JOB_LEASE_SECONDS",
-    "DOCUMENT_AUTHORING_JOB_BATCH_SIZE",
     "RESULT_EXPORT_MAX_BYTES",
     "RESULT_EXPORT_JOB_LEASE_SECONDS",
     "RESULT_EXPORT_JOB_BATCH_SIZE",
@@ -2051,7 +1804,6 @@ _INT_SETTING_KEYS = frozenset({
     "CHAT_TURN_LEASE_SECONDS",
     "CHAT_TURN_LEASE_RENEW_SECONDS",
     "WAITING_TURN_MAX_SECONDS",
-    "DOCUMENT_TEMPLATE_MAX_BYTES",
     "EVALUATION_DATASET_MAX_BYTES",
     "RESOURCE_QUEUE_MAX_DEPTH",
     "RESOURCE_PERMIT_LEASE_SECONDS",
@@ -2114,7 +1866,6 @@ _INT_SETTING_KEYS = frozenset({
     "MULTI_KB_TURN_EVIDENCE_MAX_BYTES",
     "RETRIEVAL_QUEUE_MAX_DEPTH",
     "RETRIEVAL_PER_REQUEST_FANOUT",
-    "ACTION_EXECUTOR_MAX_PARALLEL",
     "ADMISSION_CHAT_RPM_PER_USER",
     "ADMISSION_CHAT_RPM_PER_TENANT",
     "ADMISSION_HEAVY_RPM_PER_USER",
@@ -2163,7 +1914,6 @@ _FLOAT_SETTING_KEYS = frozenset({
     "AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS",
     "AGENT_RATE_LIMIT_MAX_DELAY_SECONDS",
     "WORKER_POLL_INTERVAL_SECONDS",
-    "DOCUMENT_AUTHORING_JOB_BATCH_TIME_BUDGET_SECONDS",
     "MEMORY_REFLECTION_MIN_INTERVAL_SECONDS",
     "CHAT_ATTACHMENT_CONTEXT_RATIO",
     "CHAT_ATTACHMENT_PARSE_TIMEOUT_SECONDS",
@@ -2249,13 +1999,6 @@ def validate_settings_values(settings_dict: dict) -> None:
             )
         elif key == "MEMORY_STORE_BACKEND" and text.strip().lower() not in {"sqlite", "postgres"}:
             raise ValueError(f"MEMORY_STORE_BACKEND 必须是 sqlite 或 postgres，当前值: {text!r}")
-        elif key == "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND" and text.strip().lower() not in {
-            "sqlite", "memory", "postgres"
-        }:
-            raise ValueError(
-                "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND 必须是 sqlite、memory 或 postgres，"
-                f"当前值: {text!r}"
-            )
         elif key == "AGENT_CHECKPOINT_BACKEND" and text.strip().lower() not in {"sqlite", "postgres"}:
             raise ValueError(
                 f"AGENT_CHECKPOINT_BACKEND 必须是 sqlite 或 postgres，当前值: {text!r}"
@@ -2294,7 +2037,7 @@ def validate_provider_configuration(overrides: dict | None = None) -> None:
 
     # 本地台账域（存储收敛）：显式 postgres 必须给出可达目标；空值跟随
     # CONTROL_PLANE_*，由 resolve_domain_backend 在运行时解析。
-    for domain_prefix in ("PROJECT_STORE", "PIPELINE_DOCUMENT", "AUTHORING_STORE", "AUTH_STORE", "COMPATIBILITY_STORE", "EVALUATION_STORE"):
+    for domain_prefix in ("PIPELINE_DOCUMENT", "AUTH_STORE", "EVALUATION_STORE"):
         domain_backend = _value(f"{domain_prefix}_BACKEND").lower()
         if domain_backend and domain_backend not in {"sqlite", "postgres"}:
             raise ValueError(
@@ -2307,18 +2050,6 @@ def validate_provider_configuration(overrides: dict | None = None) -> None:
                 f"{domain_prefix}_BACKEND=postgres 需要 {domain_prefix}_DATABASE_URL"
                 " 或 CONTROL_PLANE_DATABASE_URL"
             )
-
-    authoring_backend = _value("DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND").lower() or "sqlite"
-    if authoring_backend not in {"sqlite", "memory", "postgres"}:
-        raise ValueError(
-            "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND 必须是 sqlite、memory 或 postgres，"
-            f"当前值: {authoring_backend!r}"
-        )
-    if authoring_backend == "postgres" and not _value("DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL"):
-        raise ValueError(
-            "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND=postgres 需要显式配置 "
-            "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL"
-        )
 
     memory_backend = _value("MEMORY_STORE_BACKEND").lower() or "sqlite"
     if memory_backend not in {"sqlite", "postgres"}:

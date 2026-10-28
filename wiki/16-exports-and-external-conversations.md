@@ -105,22 +105,16 @@ EXPORT_FORMAT_ALIASES = {markdown→md, md→md, excel→xlsx, xlsx→xlsx, word
    - `_NO_SOURCE_PATTERN`（不要来源/去掉引用…）→ `include_citations=False`；
    - `_SOURCE_REQUEST_PATTERN`（带来源/附引用…）→ `True`；
    - 二者都无 → `include_citations = not organize`（整理后的交付物默认干净；原样导出保留证据）；
-6. `is_template_generation_intent(query)` → 属于文档流，不走聊天导出。
-
-底层 `classify_intent` 的判定优先级（`src/core/intent.py:222-446`）：
+底层 `classify_intent` 的判定优先级（`src/core/intent.py`）：
 
 1. 空 → `general_qa`；
 2. **对比优先** → `compare`（0.99）；
-3. 修订命令（修订动词 + 目标 + 非问句）→ `document_authoring/revise`（0.95）；
-4. `result_export_command`（显式导出 + 结果来源 + 无模板标记）：
+3. `result_export_command`（显式导出 + 结果来源 + 无模板标记）：
    \>1 格式 → `export/clarify`（0.9，`multiple_output_formats`）；
    单格式 → `export/export`（0.96，`result_delivery_export`）；
-5. 歧义输出格式（多格式/不支持格式）→ `clarify`；
-6. 「整理成文档」无格式无模板 → `document_authoring/clarify`（0.78）；
-7. 模板命令 → `template_generation/generate`（0.98）；
-8. 生成命令 → `document_authoring/generate`（0.94）；
-9. 显式导出 → `export/export`（0.96）；
-10. 有附件 → `attachment_qa`；有 KB → `knowledge_base_qa`；否则 `general_qa`。
+4. 歧义/不支持输出格式 → `export/clarify`；
+5. 显式导出 → `export/export`（0.96）；
+6. 有附件 → `attachment_qa`；有 KB → `knowledge_base_qa`；否则 `general_qa`。
 
 格式正则（顺序固定）：`md`（markdown 或独立 md）、`xlsm`、`xlsx`（excel/xlsx/电子表格）、
 `docx`（word/woed/docx）、`pdf`、`pptx`（power point/pptx/演示文稿/幻灯片）；

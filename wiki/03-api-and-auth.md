@@ -20,7 +20,7 @@ def main()                            # console script hardware-database-server
 2. `init_observability(...)` → `instrument_fastapi(app)`（幂等，标记 `app.state.hdb_fastapi_instrumented`）；
 3. 域 schema 初始化：`AuthService._init_db`（含角色迁移/KB 共享迁移）、`ConversationService._init_db`
    （含 `turn_sequence` 回填）、`AppLogService._init_db`、`WikiService`、`DocumentAssetService`、
-   `ensure_memory_schema`、附件 store、文档生成 store；
+   `ensure_memory_schema`、附件 store；
 4. `_prune_query_traces_once()`：默认清理 30 天前的 `query_traces`/`retrieved_evidence`；
 5. `_harden_storage_permissions()`：`.env` 与 `storage/*.db(-wal/-shm)` chmod 600；
 6. 资源治理维护线程 + 可选共享检索池；
@@ -103,10 +103,6 @@ def main()                            # console script hardware-database-server
 
 见 [16](16-exports-and-external-conversations.md)（12 个端点，含 `/artifacts/document/{id}/*` 统一协议）。
 
-#### 文档生成 `routes/document_generation.py`
-
-40+ 端点（模板/会话/计划/工单/artifact/任务/评审/修订/chat-tasks SSE），见 [14](14-authoring-render-and-api.md#8-api-surface)。
-
 #### 管理 `routes/{users,departments,config,logs,governance,status,evaluation,notifications}.py`
 
 | 模块 | 端点要点 |
@@ -124,7 +120,6 @@ def main()                            # console script hardware-database-server
 
 - **全局**：`PermissionError→403`、`ValueError→400`、`RuntimeError→500`。
 - **路由级覆盖**（语义不同处显式捕获）：
-  - 文档生成：`KeyError→404`、`ValueError→409`（哈希/幂等/状态冲突）或 400（参数）；
   - 导出：非 completed turn → **409** `only completed turns can be exported`；格式关闭 → 409；
     options 过大/未知键 → 400；artifact 不存在 → 404；
   - 附件：NotFound/Permission → 404、UnsupportedType → 400、Quota → **413**；
@@ -307,7 +302,7 @@ query_trace_status(response, retrieval_summary)
 ## 4. 数据访问与治理要点
 
 - **所有 KB 级方法都必须 `KbScope.require_department()`**（`RAGFlowBackend` 全部入口、spreadsheet、
-  circuit、external conversation、文档生成 KB 路径）。
+  circuit、external conversation、KB 路径）。
 - **删除是分散的**：删文档 = 远端删除 + 归档删除 + 台账删除（RAGFlow handler）/ 索引删除 / 电路目录删除 /
   对话目录+索引删除；删库 = 逐文档删除 + `PipelineAssetCleanupService.cleanup_knowledge_base` 清理目录。
   部分失败会上报 `partial=True` 并保留可重试状态。

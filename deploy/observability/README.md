@@ -95,4 +95,4 @@ SDK 导出前 SIGKILL 的 10 条 span 未送达，正常关闭导出 10/10；这
 去重，保存 deadline/首 token 的单调违约事实；早取消单列，晚成功或晚取消不抹去已发生的违约。
 提供批准的 `HDB_CHAT_SLO_POLICY`（见 `.env.example`）后才启用 general/KB chat SLO。
 无流量没有 burn-rate 数值；多窗口 14.4×/6× 规则要求最低事件数。多个副本 gauge 以 max 聚合。
-authoring/attachment/export 的业务成功定义及 deadline、PG/Redis/主机/GPU exporter 继续接入。
+attachment/export 的业务成功定义及 deadline、PG/Redis/主机/GPU exporter 继续接入。

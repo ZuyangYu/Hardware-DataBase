@@ -475,34 +475,6 @@ class StoreTests(AttachmentDomainTestBase):
         self.assertFalse(artifact_path.exists())
         self.assertIsNone(result_store.get_snapshot(self.user_id, snapshot.snapshot_id))
 
-    def test_session_cleanup_coordinator_reclaims_document_resources(self):
-        from unittest.mock import Mock, patch
-
-        from src.core.session_cleanup import SessionCleanupCoordinator
-
-        document_jobs = Mock()
-        document_jobs.cancel_session.return_value = ["wo-chat-1"]
-        document_store = Mock()
-        result_store = Mock()
-        self.store.enqueue_session_cleanup(session_id=self.session.id, user_id=self.user_id)
-
-        coordinator = SessionCleanupCoordinator(
-            store=self.store,
-            result_store=result_store,
-            document_job_store=document_jobs,
-            document_store=document_store,
-            worker_id="cleanup-w",
-        )
-        with patch("src.agents.runner.forget_thread", return_value=True) as forget_thread:
-            self.assertTrue(coordinator.run_once())
-
-        document_jobs.cancel_session.assert_called_once_with(
-            session_id=self.session.id, reason="chat session deleted"
-        )
-        document_store.cleanup_work_orders.assert_called_once_with(["wo-chat-1"])
-        document_jobs.cleanup_session.assert_called_once_with(session_id=self.session.id)
-        result_store.cleanup_session.assert_called_once_with(session_id=self.session.id)
-        forget_thread.assert_called_once_with(str(self.session.id))
 
 
 class JobTests(AttachmentDomainTestBase):

@@ -54,11 +54,8 @@ def resolve_evidence_purpose(
     """
 
     text = str(query or "")
-    intent = str(getattr(conversation_plan, "intent", "") or getattr(intent_plan, "intent", ""))
     action = str(getattr(conversation_plan, "action", "") or getattr(intent_plan, "action", ""))
-    if intent in {"document_authoring", "template_generation"} or action in {
-        "create_document", "revise", "revise_document", "revise_attachment",
-    }:
+    if action in {"revise_attachment"}:
         return AUTHOR
     if _VISUAL_PATTERN.search(text):
         return VISUAL

@@ -39,7 +39,6 @@ i18n 库、ESLint/Prettier/Biome（无 lint 配置）。
 |---|---|
 | `VITE_API_BASE_URL` | 生产/跨域 API 源；空 → 同源 `/api`（走 dev 代理） |
 | `VITE_API_PROXY_TARGET` / `HDB_API_PORT` | dev 代理目标/端口 |
-| `VITE_AGENT_DOCUMENT_TOOLS_ENABLED` / `VITE_DOCUMENT_AUTHORING_CHAT_ENABLED` | 文档生成对话桥（**默认开**，falsy 关闭） |
 | `VITE_CHAT_ATTACHMENTS_ENABLED` | 附件 UI（默认开） |
 | `VITE_CHAT_ATTACHMENT_MAX_FILES` | 每会话附件上限（默认 20，与后端对齐） |
 
@@ -197,9 +196,6 @@ admin 删除、employee 创建。
   chunk / 设计）；记忆上下文单独以 `[M n]` 渲染；
 - **附件**：左侧「+」，`CHAT_ATTACHMENT_ACCEPT = .pdf,.docx,.txt,.md,.xlsx,.xlsm,.edf,.edif`；
   上传按需建会话；chip 显示解析状态与重试；解析失败阻止发送；已选附件跨轮保持；
-  「作为模板」把就绪的 `.xlsx/.xlsm/.docx` 附件转为模板分析；
-- **文档生成桥**（env 门控）：自然语言模板意图识别（正则 + 对比护栏）可自动选中唯一合格附件；
-  模板上传期间提示可能耗时数分钟；`document_context` chip 显示模板引用/过期时间；
 - **导出菜单**：每条助手消息 `ExportMenu`（按 `GET /api/v1/exports/formats` 过滤），
   后台任务逐消息跟踪预览/下载，另有全局任务中心；
 - **记忆控制**：会话自动抽取开关、「重新提炼」、创建个人记忆（opt-in 提示 + 同意事件）、
@@ -306,10 +302,7 @@ KB 选择（或内嵌模式）+ 过滤（query/page_type/status）+ 分页表（
 | `MessageBubble` | `memo`；用户气泡（纯文本 + 脱敏态 + 附件 chip）；助手 = markdown + 记忆面板 + 证据面板 + 动作行（写记忆/导出）+ 检索概览折叠 + 导出任务预览；流式变体含降级横幅、轨迹、光标 |
 | `StepGroup` / `EvidenceBlock` / `MemoryContextBlock` / `ExportJobs` / `ExportPreview` | 轨迹时间线（完成后折叠、流式中展开）、引用查看器、记忆上下文、导出任务行与预览（text_preview/paragraphs/sheets/warnings） |
 | `ExportMenu` | 按服务端能力列表过滤的格式下拉 |
-| `Composer` | KB 挂载选择、附件 chip（状态/重试/删除/作为模板）、document_context chip（含过期）、卡片快捷回复、自适应高度 textarea（最大 200px）、Enter/Shift+Enter、发送/停止、附件上限、模板分析进度提示 |
-| `DocumentStatusCard` | 文档生成生命周期卡（工作单 id、进度条与节点标签、错误、ICD 作用域门与待决项、阻塞/待评审文案、刷新、「申请正式发布审核」（仅 `review_candidate`）、产物下载） |
-| `OutputSpecConfirmationCard` | Gate-1 计划确认卡（交付格式、大纲/表格数、告警、阻塞、过期横幅；不展示哈希；用户以聊天文本「确认生成」确认） |
-| `documentCardModel.ts`（约 1050 行纯模型） | 解析/归一化 SSE 卡、澄清事件、chat-task/work-order/session 投影、身份/去重/合并、生命周期状态机、状态标签与色板、REST 路径构造与 `downloadDocumentArtifact` |
+| `Composer` | KB 挂载选择、附件 chip（状态/重试/删除/作为模板）、自适应高度 textarea（最大 200px）、Enter/Shift+Enter、发送/停止、附件上限、模板分析进度提示 |
 | `ChatHeader` / `ChatSessionSidebar` / `ChatEmptyState` | 头部（开关/台账/导出中心/用户菜单）、可拖拽会话列表（删除在流式中禁用）、空态示例问题 |
 | `WikiGraph` | 零依赖 SVG 近似力导（按度数同心环）、节点色按类型、边箭头、前 40 节点标签、点击跳 slug |
 | `DataTable` / `StatCard` / `Paginator` / `ConfirmDialog` / `UserMenu` / `AppIcon` / `BrandLogo` | 通用企业 UI 组件 |
@@ -334,7 +327,7 @@ KB 选择（或内嵌模式）+ 过滤（query/page_type/status）+ 分页表（
   轨迹用函数式 `setState`；用 `AbortController` + 单调 `streamTokenRef` 防止旧流覆盖新会话；
 - **错误**：`ApiError.message` → sonner；`isForbiddenError` → 整页态；
   全局 401 → 强制重登；若干后台轮询**故意吞错**（通知/导出中心/记忆摘要/附件列表）；
-- **并发守卫**：`documentCardRefreshInFlightRef`、`planConfirmInFlightRef`、`sendingRef`、
+- **并发守卫**：`sendingRef`、
   `attachmentMutationVersionRef`、导出中心的 `busyIds`。
 
 ---
@@ -386,20 +379,10 @@ localStorage 键: hdb_auth_session / hdb_sidebar_expanded / hdb.wikiAssist.<kb|_
 
 ## 9. 已知缺口与观察
 
-1. **文档生成没有独立工作台页面**：全部 UX 内嵌在聊天（状态卡、Gate-1 计划确认走聊天文本、
-   产物下载/放行请求）。`src/api/documentAuthoring.ts` 暴露了远多于 UI 使用的接口
-   （`analyzeTemplate`、`fetchDocumentTaskProjection`、`fetchDocumentTaskReviews/Revisions`、
-   `createDocumentRevision`、`completeDocumentRevision`、`submitDocumentReviewDecision`、
-   `resumeDocumentTask`、`createPlanProposal`、`requestDocumentArtifactConversion`、
-   `fetchDocumentChatTasks` 已定义并有单测，但无页面调用）；
-   `useKbChat` 返回 `answerDocumentCard` / `confirmDocumentPlanCard`，但 `ChatPage` 未解构使用
-   （快捷回复走 Composer），`documentCardConfirmingId` 亦未使用。
-2. `templateMappingCorrection.ts` 是**纯测试代码**——模板分析评审/纠错界面尚未实现
-   （DTO 已在 `api/types.ts` 定义）。
-3. **SSE 而非 EventSource**（设计使然）：需要服务端事件持久化 + `Last-Event-ID` 续传。
-4. 手写 markdown/SVG/高亮避免了依赖与注入风险（链接仅 http(s)；SVG 用 Blob `<img>` 而非 `innerHTML`），
+1. **SSE 而非 EventSource**（设计使然）：需要服务端事件持久化 + `Last-Event-ID` 续传。
+2. 手写 markdown/SVG/高亮避免了依赖与注入风险（链接仅 http(s)；SVG 用 Blob `<img>` 而非 `innerHTML`），
    代价是功能面较窄（无图片渲染、无语法高亮库）。
-5. 权限重复较多，`|| isEmployee` 是最宽松的一条。
-6. i18n 是桩（`t` 恒等），全部文案硬编码中文；时间格式化
+3. 权限重复较多，`|| isEmployee` 是最宽松的一条。
+4. i18n 是桩（`t` 恒等），全部文案硬编码中文；时间格式化
    （`lib/timezone.ts`）把后端无时区后缀的时间当 UTC，按浏览器时区渲染（回退 `Asia/Shanghai`）。
-7. `system_admin` 被刻意排除在 KB 内容与聊天之外（路由守卫 + 侧栏 + `Shell` 返回空 KB 列表）。
+5. `system_admin` 被刻意排除在 KB 内容与聊天之外（路由守卫 + 侧栏 + `Shell` 返回空 KB 列表）。

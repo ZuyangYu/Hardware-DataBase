@@ -24,14 +24,10 @@ class SessionCleanupCoordinator:
         store: AttachmentStore | None = None,
         worker_id: str = "cleanup-worker",
         result_store=None,
-        document_job_store=None,
-        document_store=None,
     ):
         self.store = store or AttachmentStore()
         self.worker_id = worker_id
         self.result_store = result_store
-        self.document_job_store = document_job_store
-        self.document_store = document_store
 
     def run_once(self, limit: int = 4) -> bool:
         entries = self.store.list_pending_cleanups(limit=limit)
@@ -122,27 +118,3 @@ class SessionCleanupCoordinator:
             result_store = ResultExportStore()
             self.result_store = result_store
         result_store.cleanup_session(session_id=session_id)
-
-        document_job_store = self.document_job_store
-        if document_job_store is None:
-            from src.document_authoring.job_store import DocumentAuthoringJobStore
-
-            document_job_store = DocumentAuthoringJobStore()
-            self.document_job_store = document_job_store
-        cancel_session = getattr(document_job_store, "cancel_session", None)
-        work_order_ids = (
-            list(cancel_session(session_id=session_id, reason="chat session deleted"))
-            if callable(cancel_session)
-            else []
-        )
-        document_store = self.document_store
-        if document_store is None:
-            from src.document_authoring.work_order_store import DocumentAuthoringStore
-
-            document_store = DocumentAuthoringStore()
-            self.document_store = document_store
-        if work_order_ids:
-            document_store.cleanup_work_orders(work_order_ids)
-        cleanup_jobs = getattr(document_job_store, "cleanup_session", None)
-        if callable(cleanup_jobs):
-            cleanup_jobs(session_id=session_id)

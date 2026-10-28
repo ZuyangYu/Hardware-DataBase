@@ -18,8 +18,6 @@ async function installChat(page: Page) {
         metadata: { kb_id: kbId, local_record_id: 7, source_content_hash: `hash-${kbId}`, ...processingIdentity },
       })),
     }] });
-    if (path === '/api/v1/document-generation/chat-tasks/current') return route.fulfill({ json: { current: null, tasks: [] } });
-    if (path === '/api/v1/document-generation/chat-tasks/events') return route.fulfill({ contentType: 'text/event-stream', body: '' });
     if (path === '/api/v1/notifications') return route.fulfill({ json: { items: [], unread_count: 0 } });
     if (path === '/api/v1/plugins/mcp') return route.fulfill({ json: { enabled: false, items: [] } });
     if (path === '/api/v1/memory-consents') return route.fulfill({ json: { items: [], total: 0 } });

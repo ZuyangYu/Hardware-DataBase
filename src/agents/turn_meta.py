@@ -76,22 +76,17 @@ def _normalize_citation_labels(text: str) -> str:
     return _CITATION_LABEL_RE.sub(r"[\1]", str(text or ""))
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-COMPLEXITY_BUDGET_ENABLED = _env_bool("AGENT_COMPLEXITY_BUDGET_ENABLED", True)
+# These are built-in agent behaviors.  Keep the switches as module constants
+# so tests can exercise the fallbacks without exposing deployment knobs.
+COMPLEXITY_BUDGET_ENABLED = True
 RECURSION_LIMIT_MAX = int(os.getenv("AGENT_RECURSION_LIMIT_MAX", "72") or 72)
-PARTIAL_SYNTHESIS_ENABLED = _env_bool("AGENT_PARTIAL_SYNTHESIS_ENABLED", True)
+PARTIAL_SYNTHESIS_ENABLED = True
 PARTIAL_SYNTHESIS_MAX_EVIDENCE_BYTES = int(
     os.getenv("AGENT_PARTIAL_SYNTHESIS_MAX_EVIDENCE_BYTES", "24000") or 24000
 )
-VERIFIER_ENABLED = _env_bool("AGENT_VERIFIER_ENABLED", True)
+VERIFIER_ENABLED = True
 VERIFIER_MIN_ANSWER_CHARS = int(os.getenv("AGENT_VERIFIER_MIN_ANSWER_CHARS", "600") or 0)
-RESEARCH_SUBAGENT_ENABLED = _env_bool("AGENT_RESEARCH_SUBAGENT_ENABLED", True)
+RESEARCH_SUBAGENT_ENABLED = True
 PARTIAL_SYNTHESIS_MAX_TOKENS = int(
     os.getenv("AGENT_PARTIAL_SYNTHESIS_MAX_TOKENS", "8192") or 8192
 )
@@ -261,7 +256,6 @@ def _turn_complexity(
     query_mode: str,
     attachment_refs: list[Any] | None,
     knowledge_scope: Any | None,
-    document_flow: bool | None,
 ) -> dict[str, Any]:
     """Score the *shape* of the request, not its topic.
 
@@ -309,9 +303,6 @@ def _turn_complexity(
     if attachments and kb_count:
         score += 2
         signals.append("mixed_sources")
-    if document_flow:
-        score += 2
-        signals.append("document_flow")
     hardware = _hardware_profile(text)
     if hardware["is_hardware"]:
         # Hardware questions are often short but multi-hop: exact refdes,
@@ -339,14 +330,11 @@ def _agent_recursion_limit(
     query_mode: str,
     attachment_refs: list[Any] | None,
     knowledge_scope: Any | None,
-    document_flow: bool | None,
 ) -> tuple[int, dict[str, Any]]:
     """Return the hard loop limit plus a persisted budget explanation."""
 
     rounds = max(1, int(settings.AGENT_MAX_RETRIEVAL_ROUNDS))
-    if document_flow:
-        base = max(24, rounds * 8)
-    elif query_mode == "deep":
+    if query_mode == "deep":
         base = max(12, rounds * 12)
     else:
         base = max(8, rounds * 6)
@@ -355,12 +343,11 @@ def _agent_recursion_limit(
         query_mode=query_mode,
         attachment_refs=attachment_refs,
         knowledge_scope=knowledge_scope,
-        document_flow=document_flow,
     )
     enabled = COMPLEXITY_BUDGET_ENABLED
     max_limit = max(base, RECURSION_LIMIT_MAX)
     if enabled:
-        multiplier = 4 if query_mode == "deep" else 3 if document_flow else 2
+        multiplier = 4 if query_mode == "deep" else 2
         limit = min(max_limit, base + int(complexity["score"]) * multiplier)
     else:
         limit = base

@@ -19,8 +19,6 @@ STORAGE = REPO_ROOT / "storage"
 DEFAULT_DATABASES: tuple[str, ...] = (
     "auth.db",
     "agent_checkpoints.db",
-    "document_authoring_checkpoints.sqlite",
-    "document_authoring_compatibility.sqlite",
     "memory.db",
     "chat_attachments.db",
     "pipeline_documents.db",

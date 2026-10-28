@@ -40,7 +40,6 @@ def _legacy_schema(db_path: str) -> None:
                 department_id INTEGER,
                 kb_id INTEGER,
                 title TEXT NOT NULL,
-                document_context_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -78,7 +77,6 @@ def _legacy_schema(db_path: str) -> None:
                 footer TEXT NOT NULL DEFAULT '',
                 metrics_json TEXT NOT NULL DEFAULT '{}',
                 trace_context_json TEXT NOT NULL DEFAULT '{}',
-                document_context_json TEXT NOT NULL DEFAULT '{}',
                 export_plan_json TEXT NOT NULL DEFAULT '{}',
                 error_message TEXT NOT NULL DEFAULT '',
                 worker_id TEXT NOT NULL DEFAULT '',

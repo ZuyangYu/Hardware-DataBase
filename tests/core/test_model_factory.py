@@ -89,20 +89,14 @@ def test_explicit_provider_strings_are_normalized(monkeypatch, provider):
     assert calls[0][0].startswith(f"{provider}:") if provider == "ollama" else calls[0][0].startswith("openai:")
 
 
-def test_profiles_preserve_timeout_and_retry_contract(monkeypatch):
+def test_external_conversation_profile_preserves_timeout_contract(monkeypatch):
     _configure_agent(monkeypatch, provider=settings.Provider.CUSTOM)
     calls = _recording_init(monkeypatch)
 
-    model_factory.create_chat_model(profile="authoring_auxiliary")
-    model_factory.create_chat_model(profile="template_suggestion")
     model_factory.create_chat_model(profile="external_conversation")
 
-    assert calls[0][1]["timeout"] == 20
+    assert calls[0][1]["timeout"] < 60
     assert calls[0][1]["max_retries"] == 0
-    assert calls[1][1]["timeout"] == 60
-    assert calls[1][1]["max_retries"] == 4
-    assert calls[2][1]["timeout"] < 60
-    assert calls[2][1]["max_retries"] == 0
 
 
 def test_memory_profile_prefers_memory_overrides(monkeypatch):

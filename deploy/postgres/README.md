@@ -12,7 +12,7 @@ bash scripts/hdb.sh restart          # 后端开关是重启生效项
 ```
 
 `write-env` 会设置：`CONTROL_PLANE_*`、`MEMORY_STORE_*`、`AGENT_CHECKPOINT_*`、
-`DOCUMENT_AUTHORING_CHECKPOINTER_*`、`RESOURCE_GOVERNOR_*`（含 `SCOPE=deployment`），
+`RESOURCE_GOVERNOR_*`（含 `SCOPE=deployment`），
 DSN 全部指向本实例（默认 `127.0.0.1:55433/hdb`）。
 
 ## 实例参数

@@ -150,7 +150,6 @@ def main(argv: list[str] | None = None) -> int:
                     "query": case["question"],
                     "client_request_id": f"optimization-{args.round}-{case['id']}",
                     "source_scope": "knowledge_base_only",
-                    "document_flow": False,
                 }
                 if selection:
                     request_body["knowledge_scope"] = selection

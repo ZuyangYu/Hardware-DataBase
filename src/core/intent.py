@@ -2,9 +2,8 @@
 
 The chat UI may use a lightweight copy of these rules for interaction hints,
 but routing and durable export decisions must be made by the server.  The
-planner is deliberately conservative: comparison wins over generation, an
-export requires an explicit output format, and a recommendation follow-up
-only means generation when a live template context exists.
+planner is deliberately conservative: comparison wins over export, and an
+export requires an explicit output format.
 """
 
 from __future__ import annotations
@@ -19,16 +18,13 @@ IntentName = Literal[
     "knowledge_base_qa",
     "attachment_qa",
     "compare",
-    "template_generation",
-    "document_authoring",
     "export",
 ]
-IntentAction = Literal["answer", "compare", "generate", "revise", "export", "clarify"]
+IntentAction = Literal["answer", "compare", "export", "clarify"]
 IntentTarget = Literal[
     "conversation",
     "knowledge_base",
     "attachment",
-    "template",
     "document",
     "report",
     "unknown",
@@ -39,46 +35,14 @@ _COMPARISON_PATTERN = re.compile(
     r"对比|比较|区别|差异|差别|异同|对照|compare|comparison|difference|diff",
     re.IGNORECASE,
 )
-_REVISION_ACTION_PATTERN = re.compile(
-    r"修改|修订|调整|更新|替换|改成|改为|换成|"
-    r"revise|modify|update|replace|change",
-    re.IGNORECASE,
-)
-_REVISION_TARGET_PATTERN = re.compile(
-    r"第\s*[0-9一二三四五六七八九十百两]+\s*(?:章|节|部分|篇|条|个?章节)"
-    r"|(?:chapter|section)\s*[0-9]+"
-    r"|字段|章节|文档|文件|报告|候选|上一版|当前版本|artifact|section|field",
-    re.IGNORECASE,
-)
-_REVISION_QUESTION_PATTERN = re.compile(
-    r"是什么|为何|为什么|原因|是否|怎么|如何|吗[？?]?|"
-    r"what|why|whether|how",
-    re.IGNORECASE,
-)
-_GENERATION_ACTION_PATTERN = re.compile(
-    r"生成|创建|填写|填充|回填|出具|制作|撰写|起草|"
-    r"做成|整理成|汇总成|编成|汇编成|"
-    r"generate|create|draft|produce|fill|write",
-    re.IGNORECASE,
-)
 _EXPORT_ACTION_PATTERN = re.compile(
-    r"导出|输出|整理成|转换为|下载|保存为|另存为|"
-    r"export|output|download|convert|save\s+as",
-    re.IGNORECASE,
-)
-_DOCUMENT_ACTION_PATTERN = re.compile(
-    rf"(?:{_GENERATION_ACTION_PATTERN.pattern}|{_EXPORT_ACTION_PATTERN.pattern})",
+    r"导出|输出|整理成|转换为|下载|保存为|另存为|生成|制作|"
+    r"export|output|download|convert|save\s+as|generate|produce",
     re.IGNORECASE,
 )
 _DOCUMENT_TARGET_PATTERN = re.compile(
     r"模板|模版|文档|文件|报告|说明书|设计说明|规范|手册|工单|ICD|表格|表单|"
     r"template|document|report|specification|manual|guide|sheet|form|work\s*order",
-    re.IGNORECASE,
-)
-_TEMPLATE_MARKER_PATTERN = re.compile(r"模板|模版|template", re.IGNORECASE)
-_RECOMMENDED_PATTERN = re.compile(
-    r"按(?:照)?推荐|使用推荐值|直接执行|无需澄清|"
-    r"use\s+(?:the\s+)?recommended\s+defaults?",
     re.IGNORECASE,
 )
 _EXPORT_NEGATION_PATTERN = re.compile(
@@ -93,11 +57,6 @@ _CURRENT_RESULT_PATTERN = re.compile(
 _RESULT_EXPORT_SOURCE_PATTERN = re.compile(
     r"检索结果|查询结果|搜索结果|当前结果|刚才结果|本次结果|"
     r"结果|答案|回答|result|answer|response",
-    re.IGNORECASE,
-)
-_AMBIGUOUS_DOCUMENT_PATTERN = re.compile(
-    r"(?:整理|汇总|组织|compile|整理一下).{0,12}(?:成|为|into|as)?\s*"
-    r"(?:文档|文件|document|file)\s*$",
     re.IGNORECASE,
 )
 
@@ -126,7 +85,6 @@ class IntentPlan:
     intent: IntentName
     action: IntentAction
     target: IntentTarget
-    template_required: bool = False
     comparison_requested: bool = False
     export_requested: bool = False
     requested_formats: tuple[str, ...] = ()
@@ -159,58 +117,12 @@ def extract_requested_formats(query: str) -> tuple[str, ...]:
     )
 
 
-def _action_before_target(text: str) -> bool:
-    return bool(
-        re.search(
-            rf"(?:{_DOCUMENT_ACTION_PATTERN.pattern})[\s\S]{{0,80}}"
-            rf"(?:{_DOCUMENT_TARGET_PATTERN.pattern})",
-            text,
-            re.IGNORECASE,
-        )
-    )
-
-
-def _generation_action_before_target(text: str) -> bool:
-    return bool(
-        re.search(
-            rf"(?:{_GENERATION_ACTION_PATTERN.pattern})[\s\S]{{0,80}}"
-            rf"(?:{_DOCUMENT_TARGET_PATTERN.pattern})",
-            text,
-            re.IGNORECASE,
-        )
-    )
-
-
-def _generation_target_before_action(text: str) -> bool:
-    return bool(
-        re.search(
-            rf"(?:{_DOCUMENT_TARGET_PATTERN.pattern})[\s\S]{{0,80}}"
-            rf"(?:{_GENERATION_ACTION_PATTERN.pattern})",
-            text,
-            re.IGNORECASE,
-        )
-    )
-
-
-def _target_before_action(text: str) -> bool:
-    return bool(
-        re.search(
-            rf"(?:{_DOCUMENT_TARGET_PATTERN.pattern})[\s\S]{{0,80}}"
-            rf"(?:{_DOCUMENT_ACTION_PATTERN.pattern})",
-            text,
-            re.IGNORECASE,
-        )
-    )
-
-
 def _target_for(text: str, *, has_attachments: bool, has_kb: bool) -> IntentTarget:
-    if _TEMPLATE_MARKER_PATTERN.search(text):
-        return "template"
     if re.search(r"工单|work\s*order", text, re.IGNORECASE):
         return "document"
     if re.search(r"ICD|报告|report", text, re.IGNORECASE):
         return "report"
-    if re.search(r"文档|文件|说明书|设计说明|规范|手册|document|specification|manual|guide", text, re.IGNORECASE):
+    if _DOCUMENT_TARGET_PATTERN.search(text):
         return "document"
     if has_attachments:
         return "attachment"
@@ -222,16 +134,15 @@ def _target_for(text: str, *, has_attachments: bool, has_kb: bool) -> IntentTarg
 def classify_intent(
     query: str,
     *,
-    has_template_context: bool = False,
     has_attachments: bool = False,
     has_kb: bool = True,
 ) -> IntentPlan:
     """Classify one chat query using precedence-safe deterministic rules.
 
-    Precedence is important here: comparison is checked before template
-    generation so phrases such as “参考模板比较差异” cannot overwrite or
-    fill a template.  A generic export is only recognized when an explicit
-    format is present; mentioning a PDF while asking a question is retrieval.
+    Comparison is checked before export so phrases such as “对比后导出 PDF”
+    remain an evidence-comparison request with an optional delivery format.
+    A generic export is only recognized when an explicit format is present;
+    mentioning a PDF while asking a question is retrieval.
     """
 
     text = str(query or "").strip()
@@ -247,8 +158,6 @@ def classify_intent(
     formats = extract_requested_formats(text)
     target = _target_for(text, has_attachments=has_attachments, has_kb=has_kb)
 
-    # Safety/semantic precedence: a comparison remains evidence retrieval even
-    # when it contains “模板”, “生成” or an explicit PDF output request.
     if is_document_comparison_query(text):
         return IntentPlan(
             intent="compare",
@@ -261,55 +170,18 @@ def classify_intent(
             reason_codes=("comparison_requested",),
         )
 
-    # A targeted revision is a document-authoring operation, even when the
-    # request contains no generation verb.  Requiring both an explicit
-    # revision verb and a document/section reference keeps ordinary retrieval
-    # questions such as “更新协议的原因是什么” on the QA route.  This branch
-    # intentionally follows comparison precedence: a request to compare
-    # revisions is still an evidence-comparison request.
-    revision_command = bool(
-        _REVISION_ACTION_PATTERN.search(text)
-        and _REVISION_TARGET_PATTERN.search(text)
-        and not _REVISION_QUESTION_PATTERN.search(text)
-    )
-    if revision_command:
-        revision_target = target if target not in {"conversation", "knowledge_base"} else "document"
-        return IntentPlan(
-            intent="document_authoring",
-            action="revise",
-            target=revision_target,
-            template_required=False,
-            requested_formats=formats,
-            confidence=0.95,
-            reason_codes=("document_revision_command",),
-        )
-
-    document_command = bool(_action_before_target(text) or _target_before_action(text))
-    generation_command = bool(
-        _generation_action_before_target(text) or _generation_target_before_action(text)
-    )
-    recommended_followup = bool(has_template_context and _RECOMMENDED_PATTERN.search(text))
-    explicit_template_command = bool(
-        _TEMPLATE_MARKER_PATTERN.search(text)
-        and document_command
-    )
-    fill_command = bool(
-        re.search(r"填充|填写|回填|fill", text, re.IGNORECASE)
-        and document_command
-    )
     explicit_export = bool(
         formats
         and _EXPORT_ACTION_PATTERN.search(text)
         and not _EXPORT_NEGATION_PATTERN.search(text)
     )
-    # “整理成” is also a valid authoring verb for a new named document.  If
-    # the user explicitly points at an already-produced result/answer, the
-    # requested artifact is a generic result export instead of a second
-    # document-generation workflow.
+    # “整理成” is also a valid delivery verb for an already-produced result.
+    # If the user explicitly points at a result/answer, the requested artifact
+    # is a generic result export.
     result_export_command = bool(
         explicit_export
         and _RESULT_EXPORT_SOURCE_PATTERN.search(text)
-        and not _TEMPLATE_MARKER_PATTERN.search(text)
+        and not re.search(r"模板|模版|template", text, re.IGNORECASE)
     )
     if result_export_command:
         if len(formats) > 1:
@@ -332,20 +204,18 @@ def classify_intent(
             reason_codes=("result_delivery_export",),
         )
     ambiguous_output_format = bool(
-        (generation_command or explicit_export)
+        explicit_export
         and (
             len(formats) > 1
             or _UNSUPPORTED_OUTPUT_FORMAT_PATTERN.search(text)
         )
     )
     if ambiguous_output_format:
-        is_generation = generation_command
         return IntentPlan(
-            intent="document_authoring" if is_generation else "export",
+            intent="export",
             action="clarify",
-            target=target if is_generation else "conversation",
-            template_required=False,
-            export_requested=bool(formats) or not is_generation,
+            target="conversation",
+            export_requested=True,
             requested_formats=formats,
             confidence=0.9,
             reason_codes=(
@@ -354,56 +224,19 @@ def classify_intent(
                 else "unsupported_output_format",
             ),
         )
-    # “整理成文档” leaves both the source material and output contract
-    # underspecified.  Keep it in the governed authoring route, but expose a
-    # clarification action so no worker/job can be started by keyword alone.
-    ambiguous_document = bool(
-        _AMBIGUOUS_DOCUMENT_PATTERN.search(text)
-        and not formats
-        and not _TEMPLATE_MARKER_PATTERN.search(text)
-    )
-    if ambiguous_document:
+    if (
+        _EXPORT_ACTION_PATTERN.search(text)
+        and _UNSUPPORTED_OUTPUT_FORMAT_PATTERN.search(text)
+        and not _EXPORT_NEGATION_PATTERN.search(text)
+    ):
         return IntentPlan(
-            intent="document_authoring",
+            intent="export",
             action="clarify",
-            target=target,
-            confidence=0.78,
-            reason_codes=("ambiguous_document_request",),
-        )
-    # A generic “输出 Excel 表格” is an export even when a template happens to
-    # be mounted in the session.  Generation verbs, template markers and fill
-    # verbs retain the document-flow meaning.
-    template_command = bool(
-        recommended_followup
-        or explicit_template_command
-        or fill_command
-        or (has_template_context and document_command and not explicit_export)
-    )
-    if template_command:
-        reasons = (
-            ("recommended_followup",)
-            if recommended_followup and not document_command
-            else ("template_targeted_command",)
-        )
-        return IntentPlan(
-            intent="template_generation",
-            action="generate",
-            target=target,
-            template_required=True,
+            target="conversation",
+            export_requested=True,
             requested_formats=formats,
-            confidence=0.98,
-            reason_codes=reasons,
-        )
-
-    if generation_command:
-        return IntentPlan(
-            intent="document_authoring",
-            action="generate",
-            target=target,
-            template_required=False,
-            requested_formats=formats,
-            confidence=0.94,
-            reason_codes=("document_authoring_command",),
+            confidence=0.9,
+            reason_codes=("unsupported_output_format",),
         )
 
     if explicit_export:
@@ -446,14 +279,12 @@ def classify_intent(
     )
 
 
-def is_template_generation_query(
-    query: str,
-    *,
-    has_template_context: bool = False,
-) -> bool:
-    """Compatibility helper for callers that only need the route decision."""
-
-    return classify_intent(
-        query,
-        has_template_context=has_template_context,
-    ).intent == "template_generation"
+__all__ = [
+    "IntentAction",
+    "IntentName",
+    "IntentPlan",
+    "IntentTarget",
+    "classify_intent",
+    "extract_requested_formats",
+    "is_document_comparison_query",
+]

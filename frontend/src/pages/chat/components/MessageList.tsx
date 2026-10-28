@@ -2,7 +2,7 @@
  * 消息列表(对齐 MessageList:滚动容器 + 自动滚底 + 空态)。
  * 把会话侧栏选中状态、消息加载、流式气泡组合在这里。
  */
-import { useEffect, useMemo, useRef } from 'react';
+import { Fragment, useEffect, useMemo, useRef } from 'react';
 
 import type {
   EvidenceItem,
@@ -19,6 +19,7 @@ import type {
 import { Skeleton } from '@/components/ui/skeleton';
 import { CHAT_MESSAGES_CLASS, CHAT_MESSAGE_STACK_CLASS } from '../chatPageStyles';
 import MessageBubble from './MessageBubble';
+import AttachmentRevisionCardView from './AttachmentRevisionCard';
 import ChatEmptyState from './ChatEmptyState';
 
 type Props = {
@@ -137,8 +138,8 @@ export default function MessageList({
           </div>
         )}
         {messages.filter((msg) => msg.role !== 'assistant' || msg.content.trim()).map((msg) => (
+          <Fragment key={msg.id}>
           <MessageBubble
-            key={msg.id}
             msg={msg}
             evidence={
               msg.role === 'assistant'
@@ -160,6 +161,12 @@ export default function MessageList({
             onContinue={msg.role === 'assistant' ? onContinue : undefined}
             onNarrowScope={msg.role === 'assistant' ? onNarrowScope : undefined}
           />
+          {(msg.cards ?? [])
+            .filter((card) => card.kind === 'attachment_revision')
+            .map((card, index) => (
+              <AttachmentRevisionCardView key={`${msg.id}-card-${index}`} card={card} />
+            ))}
+          </Fragment>
         ))}
         {streaming && (
           <MessageBubble

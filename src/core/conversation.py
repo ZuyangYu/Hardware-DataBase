@@ -27,7 +27,6 @@ class ChatSession:
     title: str
     created_at: str
     updated_at: str
-    document_context: dict | None = None
     knowledge_selection: dict | None = None
     knowledge_selection_hash: str = ""
 
@@ -44,7 +43,6 @@ class ChatMessage:
     edited_at: str | None = None
     redacted: bool = False
     memory_context: list[dict] = field(default_factory=list)
-    document_context: dict | None = None
     # 紧凑引用列表（来自 turn summary.evidence，内容截断），让"参考来源"
     # 面板在刷新后仍可用，而不必重放 turn 事件。
     citations: list[dict] = field(default_factory=list)
@@ -78,7 +76,6 @@ class ChatTurn:
     created_at: str
     started_at: str | None
     finished_at: str | None
-    document_context: dict | None = None
     export_plan: dict = field(default_factory=dict)
     source_scope: str = "auto"
     required_attachment_ids: list[str] = field(default_factory=list)
@@ -243,7 +240,6 @@ class ConversationService:
                     department_id INTEGER,
                     kb_id INTEGER,
                     title TEXT NOT NULL,
-                    document_context_json TEXT NOT NULL DEFAULT '{}',
                     -- Next sequence value to hand to a new turn of this session.
                     -- Legacy rows are reconciled to MAX(turn_sequence)+1 on init.
                     next_turn_sequence INTEGER NOT NULL DEFAULT 1,
@@ -291,7 +287,6 @@ class ConversationService:
                     footer TEXT NOT NULL DEFAULT '',
                     metrics_json TEXT NOT NULL DEFAULT '{}',
                     trace_context_json TEXT NOT NULL DEFAULT '{}',
-                    document_context_json TEXT NOT NULL DEFAULT '{}',
                     export_plan_json TEXT NOT NULL DEFAULT '{}',
                     error_message TEXT NOT NULL DEFAULT '',
                     worker_id TEXT NOT NULL DEFAULT '',
@@ -369,7 +364,6 @@ class ConversationService:
             )
             self._ensure_column(conn, "chat_sessions", "department_id", "INTEGER")
             self._ensure_column(conn, "chat_sessions", "kb_id", "INTEGER")
-            self._ensure_column(conn, "chat_sessions", "document_context_json", "TEXT NOT NULL DEFAULT '{}'" )
             from src.storage.control_plane.knowledge_scope_migration import apply_sqlite as migrate_scope
 
             migrate_scope(conn)
@@ -381,7 +375,6 @@ class ConversationService:
             self._ensure_column(conn, "chat_turns", "query_mode", "TEXT NOT NULL DEFAULT 'fast'")
             self._ensure_column(conn, "chat_turns", "metrics_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "chat_turns", "trace_context_json", "TEXT NOT NULL DEFAULT '{}'")
-            self._ensure_column(conn, "chat_turns", "document_context_json", "TEXT NOT NULL DEFAULT '{}'" )
             self._ensure_column(conn, "chat_turns", "export_plan_json", "TEXT NOT NULL DEFAULT '{}'" )
             self._ensure_column(conn, "chat_messages", "edited_at", "TEXT")
             self._ensure_column(conn, "chat_messages", "redacted", "INTEGER NOT NULL DEFAULT 0")
@@ -714,8 +707,7 @@ class ConversationService:
                 """
                 SELECT m.*, COALESCE(t.footer, '') AS footer,
                        t.id AS turn_id,
-                       COALESCE(t.summary_json, '{}') AS turn_summary,
-                       COALESCE(t.document_context_json, '{}') AS turn_document_context
+                       COALESCE(t.summary_json, '{}') AS turn_summary
                 FROM chat_messages m
                 LEFT JOIN chat_turns t
                   ON t.assistant_message_id = m.id OR t.user_message_id = m.id
@@ -1043,7 +1035,6 @@ class ConversationService:
         query_mode: str = "fast",
         trace_context: dict[str, str] | None = None,
         wiki_assist: bool = False,
-        document_context: dict | Any | None = None,
         attachment_ids: list[str] | None = None,
         source_scope: str = "auto",
         *,
@@ -1063,13 +1054,6 @@ class ConversationService:
             raise ValueError("query must not be empty")
         request_id = (client_request_id or "").strip()[:128] or None
         query_mode = query_mode if query_mode in {"fast", "deep"} else "fast"
-        if hasattr(document_context, "model_dump"):
-            document_context = document_context.model_dump(mode="json")
-        if document_context is not None and not isinstance(document_context, dict):
-            raise ValueError("document_context must be an object")
-        document_context_json = json.dumps(
-            document_context or {}, ensure_ascii=False, sort_keys=True, default=str,
-        )
         attachment_ids = [str(item or "").strip() for item in (attachment_ids or []) if str(item or "").strip()]
         session = self.get_session(user_id, session_id)
         if session is None:
@@ -1140,7 +1124,7 @@ class ConversationService:
                 )
 
                 scope = turn_scope_payload(knowledge_scope, user_id=user_id, anchor_kb_id=session_row["kb_id"], stored_hash=session_row["knowledge_selection_hash"])
-                fingerprint = request_fingerprint(scope=scope, query=query, source_scope=effective_scope, attachment_ids=attachment_ids, document_context=document_context or {}, query_mode=query_mode, wiki_assist=wiki_assist)
+                fingerprint = request_fingerprint(scope=scope, query=query, source_scope=effective_scope, attachment_ids=attachment_ids, query_mode=query_mode, wiki_assist=wiki_assist)
                 if request_id:
                     existing = conn.execute(
                         "SELECT * FROM chat_turns WHERE session_id = ? AND client_request_id = ?",
@@ -1181,12 +1165,11 @@ class ConversationService:
                     """UPDATE chat_sessions
                        SET updated_at = ?,
                            next_turn_sequence = ?,
-                           title = CASE WHEN title = '新对话' THEN ? ELSE title END,
-                           document_context_json = CASE WHEN ? = '{}' THEN document_context_json ELSE ? END
+                           title = CASE WHEN title = '新对话' THEN ? ELSE title END
                        WHERE id = ?""",
                     (
                         now, turn_sequence + 1, query.replace("\n", " ")[:32] or "新对话",
-                        document_context_json, document_context_json, session_id,
+                        session_id,
                     ),
                 )
                 turn_id = str(uuid.uuid4())
@@ -1207,10 +1190,10 @@ class ConversationService:
                         id, session_id, user_message_id, assistant_message_id, kb_name, query, query_mode,
                         department_id, kb_id, status, client_request_id, turn_sequence,
                         trace_context_json, created_at,
-                        document_context_json, export_plan_json, source_scope, required_attachment_ids,
+                        export_plan_json, source_scope, required_attachment_ids,
                         wiki_assist, knowledge_scope_json, knowledge_selection_hash, knowledge_request_fingerprint,
                         summary_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         turn_id,
@@ -1227,7 +1210,6 @@ class ConversationService:
                         turn_sequence,
                         json.dumps(trace_context or {}, ensure_ascii=False),
                         now,
-                        document_context_json,
                         export_plan_json,
                         effective_scope,
                         json.dumps(required_ids, ensure_ascii=False),
@@ -2926,11 +2908,6 @@ def _lease_active(expires_at: Any, now: str) -> bool:
 
 
 def row_to_session(row) -> ChatSession:
-    try:
-        raw_context = json.loads(row["document_context_json"] or "{}") if "document_context_json" in row.keys() else {}
-    except (TypeError, ValueError, json.JSONDecodeError):
-        raw_context = {}
-    context = raw_context if isinstance(raw_context, dict) and raw_context else None
     return ChatSession(
         id=int(row["id"]),
         user_id=int(row["user_id"]),
@@ -2940,7 +2917,6 @@ def row_to_session(row) -> ChatSession:
         title=row["title"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
-        document_context=context,
         knowledge_selection=json.loads(row["knowledge_selection_json"] or "{}") or None if "knowledge_selection_json" in row.keys() else None,
         knowledge_selection_hash=row["knowledge_selection_hash"] if "knowledge_selection_hash" in row.keys() else "",
     )
@@ -2988,11 +2964,6 @@ def row_to_message(row) -> ChatMessage:
                         "metadata": citation_metadata,
                     }
                 )
-    try:
-        raw_context = json.loads(row["turn_document_context"] or "{}") if "turn_document_context" in row.keys() else {}
-    except (TypeError, ValueError, json.JSONDecodeError):
-        raw_context = {}
-    document_context = raw_context if isinstance(raw_context, dict) and raw_context else None
     legacy_suffix = f"\n\n---\n{footer}" if footer else ""
     if legacy_suffix and content.endswith(legacy_suffix):
         content = content[:-len(legacy_suffix)]
@@ -3007,7 +2978,6 @@ def row_to_message(row) -> ChatMessage:
         edited_at=row["edited_at"] if "edited_at" in row.keys() else None,
         redacted=bool(row["redacted"]) if "redacted" in row.keys() else False,
         memory_context=memory_context,
-        document_context=document_context,
         citations=citations,
     )
 
@@ -3027,14 +2997,6 @@ def row_to_turn(row) -> ChatTurn:
         trace_context = {}
     if not isinstance(trace_context, dict):
         trace_context = {}
-    try:
-        raw_document_context = (
-            json.loads(row["document_context_json"] or "{}")
-            if "document_context_json" in row.keys() else {}
-        )
-    except (TypeError, ValueError, json.JSONDecodeError):
-        raw_document_context = {}
-    document_context = raw_document_context if isinstance(raw_document_context, dict) and raw_document_context else None
     try:
         raw_export_plan = (
             json.loads(row["export_plan_json"] or "{}")
@@ -3078,7 +3040,6 @@ def row_to_turn(row) -> ChatTurn:
         created_at=row["created_at"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
-        document_context=document_context,
         export_plan=export_plan,
         source_scope=row["source_scope"] if "source_scope" in row.keys() else "auto",
         required_attachment_ids=required_ids,

@@ -1,6 +1,6 @@
 """PG parity for the domain stores (storage-convergence phase 1).
 
-``ProjectStore`` and ``PipelineDocumentStore`` gain a PostgreSQL backend via
+``PipelineDocumentStore`` gains a PostgreSQL backend via
 ``src/storage/domain_pg.py``: tables are provisioned from the store's own
 SQLite bootstrap with the *mechanical* type mapping (TEXT timestamps keep the
 "''"-sentinel semantics), and the same statements then run through
@@ -26,18 +26,6 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 import src.settings as app_settings
 from src.pipelines.document_store import PipelineDocumentStore
 from src.storage import domain_pg
-from src.projects.models import (
-    LogicalDocument,
-    ProcessingArtifact,
-    Project,
-    ProjectBaseline,
-    ProjectKnowledgeBinding,
-    ProjectSourceBinding,
-    SourceAsset,
-    SourceSetSnapshot,
-    SourceVersion,
-)
-from src.projects.store import ProjectStore
 
 DSN = os.environ.get("HDB_TEST_POSTGRES_DSN", "")
 
@@ -81,8 +69,6 @@ class _DomainParityCase(unittest.TestCase):
             ("CONTROL_PLANE_BACKEND", app_settings.CONTROL_PLANE_BACKEND),
             ("CONTROL_PLANE_DATABASE_URL", app_settings.CONTROL_PLANE_DATABASE_URL),
             ("STORAGE_DIR", app_settings.STORAGE_DIR),
-            ("PROJECT_STORE_BACKEND", app_settings.PROJECT_STORE_BACKEND),
-            ("PROJECT_STORE_DATABASE_URL", app_settings.PROJECT_STORE_DATABASE_URL),
             ("PIPELINE_DOCUMENT_STORE_BACKEND", app_settings.PIPELINE_DOCUMENT_STORE_BACKEND),
             ("PIPELINE_DOCUMENT_DATABASE_URL", app_settings.PIPELINE_DOCUMENT_DATABASE_URL),
             (
@@ -102,8 +88,6 @@ class _DomainParityCase(unittest.TestCase):
         # 守卫视为"全新部署"直接放行。
         app_settings.STORAGE_DIR = self.tmp.name
         # conftest 会把这些键强制成 sqlite 做隔离；本套件要验证"跟随控制面"。
-        app_settings.PROJECT_STORE_BACKEND = ""
-        app_settings.PROJECT_STORE_DATABASE_URL = ""
         app_settings.PIPELINE_DOCUMENT_STORE_BACKEND = ""
         app_settings.PIPELINE_DOCUMENT_DATABASE_URL = ""
 
@@ -130,109 +114,6 @@ def _serializable(value):
 
 
 @unittest.skipUnless(DSN, "HDB_TEST_POSTGRES_DSN is not configured")
-class ProjectStoreParityTests(_DomainParityCase):
-    def _sample_graph(self) -> dict[str, object]:
-        """Build the full FK chain: project -> version/artifact -> bindings."""
-        project = Project(project_id="proj-1", department_id="dept-7", name="ADAS")
-        logical = LogicalDocument(
-            document_id="doc-1", title="电源规格书", document_role="design",
-            owner_department_id="dept-7",
-        )
-        asset = SourceAsset(
-            asset_id="asset-1",
-            original_file_name="schematic.pdf",
-            content_hash="hash-1",
-            content_kind="circuit",
-            parser_kind="spydrnet",
-            processing_status="ready",
-        )
-        version = SourceVersion(
-            version_id="ver-1", document_id="doc-1", asset_id="asset-1"
-        )
-        artifact = ProcessingArtifact(
-            artifact_id="art-1",
-            asset_id="asset-1",
-            processor_kind="spydrnet",
-            processor_version="1",
-            content_fingerprint="fp-1",
-            status="ready",
-        )
-        baseline = ProjectBaseline(baseline_id="bl-1", project_id="proj-1", name="v1")
-        knowledge = ProjectKnowledgeBinding(
-            binding_id="pkb-1",
-            project_id="proj-1",
-            kb_id="kb-9",
-            owner_department_id="dept-7",
-            binding_type="project_private",
-        )
-        source_binding = ProjectSourceBinding(
-            binding_id="psb-1",
-            project_id="proj-1",
-            version_id="ver-1",
-            usage_type="project_fact",
-        )
-        snapshot = SourceSetSnapshot(
-            source_set_snapshot_id="snap-1",
-            work_order_id="wo-1",
-            project_id="proj-1",
-            baseline_id="bl-1",
-            baseline_content_hash="hash-b1",
-            baseline_item_ids=["item-1"],
-            source_version_ids=["ver-1"],
-            authorization_snapshot_id="auth-snap-1",
-        )
-        return {
-            "project": project,
-            "logical": logical,
-            "asset": asset,
-            "version": version,
-            "artifact": artifact,
-            "baseline": baseline,
-            "knowledge": knowledge,
-            "source_binding": source_binding,
-            "snapshot": snapshot,
-        }
-
-    def test_full_graph_round_trip_is_identical(self) -> None:
-        graph = self._sample_graph()
-        sqlite_store = self._sqlite_twin(ProjectStore, "parity-projects-sqlite.db")
-        pg_store = self._pg_store(ProjectStore)
-
-        for store in (sqlite_store, pg_store):
-            store.create_project(graph["project"])
-            store.create_logical_document(graph["logical"])
-            store.create_source_asset(graph["asset"])
-            store.create_source_version(graph["version"])
-            store.create_processing_artifact(graph["artifact"])
-            store.add_knowledge_binding(graph["knowledge"])
-            store.add_project_source_binding(graph["source_binding"])
-            store.create_baseline(graph["baseline"])
-            store.create_source_set_snapshot(graph["snapshot"])
-
-        checks = {
-            "project": lambda s: s.get_project("proj-1"),
-            "project_list": lambda s: s.list_projects("default", "dept-7"),
-            "knowledge_bindings": lambda s: s.list_knowledge_bindings("proj-1", "default"),
-            "source_bindings": lambda s: s.list_project_source_bindings("proj-1", "default"),
-            "version": lambda s: s.get_source_version("ver-1", "default"),
-            "ready_artifacts": lambda s: s.ready_artifacts_for_version("ver-1", "default"),
-            "baseline": lambda s: s.get_baseline("bl-1", "default"),
-            "snapshot": lambda s: s.get_source_set_snapshot("snap-1", "default"),
-        }
-        for name, query in checks.items():
-            sqlite_result = query(sqlite_store)
-            pg_result = query(pg_store)
-            if isinstance(sqlite_result, list):
-                self.assertEqual(
-                    [_serializable(item) for item in sqlite_result],
-                    [_serializable(item) for item in pg_result],
-                    f"parity mismatch for {name}",
-                )
-            else:
-                self.assertEqual(
-                    _serializable(sqlite_result), _serializable(pg_result), name
-                )
-
 
 @unittest.skipUnless(DSN, "HDB_TEST_POSTGRES_DSN is not configured")
 class PipelineDocumentStoreParityTests(_DomainParityCase):

@@ -383,7 +383,7 @@ API 暴露：`GET /kbs/{kb}/structured/test-reports`、`GET /kbs/{kb}/structured
 `test_circuit_index_service.py`、`test_circuit_index_lock.py`、`test_circuit_graph_store.py`、
 `test_component_identity_index.py`、`test_circuit_capabilities.py`、`test_circuit_structure_query.py`、
 `test_circuit_vector_detachment.py`、`test_icd_pin_definition_benchmark.py`、
-`test_icd_generation.py`（ICD 在文档生成侧）。
+`test_icd_generation.py`。
 
 ---
 

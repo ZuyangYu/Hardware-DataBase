@@ -105,10 +105,6 @@ def settings_connection_budget(
     """
     checkpoint_pool = int(getattr(settings, "AGENT_CHECKPOINT_POOL_SIZE", 4) or 4)
     control_pool = int(getattr(settings, "CONTROL_PLANE_POOL_SIZE", 8) or 8)
-    authoring_pg = (
-        str(getattr(settings, "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "sqlite")).lower()
-        == "postgres"
-    )
     memory_pg = str(getattr(settings, "MEMORY_STORE_BACKEND", "sqlite")).lower() == "postgres"
     checkpoint_pg = str(getattr(settings, "AGENT_CHECKPOINT_BACKEND", "sqlite")).lower() == "postgres"
     # Pointer schema setup/commit hold an advisory-lock connection while their
@@ -122,7 +118,7 @@ def settings_connection_budget(
         api_unpooled=4,
         worker_replicas=worker_replicas,
         worker_control_pool=control_pool,
-        worker_checkpoint_pool=checkpoint_pool + (checkpoint_pool if authoring_pg else 0),
+        worker_checkpoint_pool=checkpoint_pool,
         worker_unpooled=4,
         extra_processes={
             "memory": 1 if memory_pg else 0,

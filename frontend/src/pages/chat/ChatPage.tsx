@@ -9,7 +9,7 @@ import { useNavigate } from 'react-router-dom';
 
 import type { AuthSession } from '../../auth';
 import { api, downloadBlob } from '@/api/client';
-import { analyzeTemplateFromAttachment } from '@/api/documentAuthoring';
+import { createClientRequestId } from '@/api/clientRequestId';
 import {
   deleteAttachment,
   listAttachments,
@@ -21,14 +21,8 @@ import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { CHAT_MAIN_CLASS, chatBubbleClass, chatRowClass } from './chatPageStyles';
-import {
-  buildDocumentContext,
-  createClientRequestId,
-  useKbChat,
-} from './useKbChat';
-import DocumentStatusCard, { documentCardIdentity } from './components/DocumentStatusCard';
+import { useKbChat } from './useKbChat';
 import McpWriteProposalCard from './components/McpWriteProposalCard';
-import { planConfirmationStaleKey } from './useKbChat';
 import ChatSessionSidebar from './components/ChatSessionSidebar';
 import ChatHeader from './components/ChatHeader';
 import MessageList from './components/MessageList';
@@ -48,13 +42,9 @@ type Props = {
   kbName?: string;
   availableKbs?: KbView[];
   onLogout: () => void;
-  /** Opt-out override for the Task 9 bridge; omitted means the env flag/default. */
-  documentAuthoringEnabled?: boolean;
 };
 
-const DOCUMENT_TEMPLATE_EXTENSIONS = ['.xlsx', '.xlsm', '.docx'];
 const ATTACHMENT_STATUS_POLL_INTERVAL_MS = 2_000;
-const DOCUMENT_COMPARISON_PATTERN = /对比|比较|区别|差异|差别|异同|对照|compare|comparison|difference|diff/i;
 
 /**
  * Attachments stay mounted for the whole session: opening a session selects
@@ -79,126 +69,6 @@ export function retainExistingAttachmentIds(
 }
 
 /**
- * Detect the natural-language command that means "use the attached office
- * file as a template and produce a filled document".  The backend remains
- * authoritative; when exactly one unambiguous office attachment is selected,
- * this client hint lets the turn auto-convert it without a separate action.
- */
-export function isTemplateGenerationChatIntent(query: string): boolean {
-  const text = String(query || '').trim();
-  if (!text) return false;
-  // Comparison is a retrieval/reporting operation.  It must win over words
-  // such as “模板” and “生成” so the UI never converts a comparison into a
-  // template-fill request before the server sees the turn.
-  if (DOCUMENT_COMPARISON_PATTERN.test(text)) return false;
-  // Auto-conversion to a template is an expensive server analysis (structure
-  // plus batched LLM suggestions, minutes on large documents).  It only runs
-  // when the user explicitly talks about a template or a fill operation;
-  // generic “生成/整理成文档” requests go straight to the server, which owns
-  // the authoritative route decision.
-  const explicitTemplate = /模板|模版|template/i.test(text);
-  const fillVerb = /填充|填写|回填|\bfill\b/i.test(text);
-  if (!explicitTemplate && !fillVerb) return false;
-  const action = '(?:参考|按照|按|基于|根据|填充|填写|回填|生成|创建|制作|撰写|起草|导出|输出|整理成|generate|create|fill|draft|produce|write|export|output)';
-  const target = '(?:模板|模版|文档|文件|报告|ICD|表格|表单|template|document|report|sheet|form)';
-  // Users naturally place the object first ("将模板…回填") or the
-  // action first ("参考模板生成文档").  Both forms represent the same
-  // server-side document-generation intent.
-  return new RegExp(`${action}[\\s\\S]{0,80}${target}|${target}[\\s\\S]{0,80}${action}`, 'i').test(text);
-}
-
-export function listTemplateCandidateAttachments(
-  query: string,
-  attachments: AttachmentView[],
-): AttachmentView[] {
-  if (!isTemplateGenerationChatIntent(query)) return [];
-  const seen = new Set<string>();
-  return attachments.filter((attachment) => {
-    const extension = String(attachment.extension || '').toLowerCase()
-      || `.${String(attachment.filename || '').split('.').pop() || ''}`.toLowerCase();
-    const id = String(attachment.attachment_id || '');
-    if (!DOCUMENT_TEMPLATE_EXTENSIONS.includes(extension)
-      || (attachment.parse_status !== 'ready' && attachment.parse_status !== 'degraded')
-      || (id && seen.has(id))) {
-      return false;
-    }
-    if (id) seen.add(id);
-    return true;
-  });
-}
-
-export type TemplateAttachmentRoute = {
-  intent: boolean;
-  /** The server owns executor selection; this is only a client-side hint. */
-  authority: 'backend';
-  candidates: AttachmentView[];
-  autoTemplate: AttachmentView | null;
-  pendingCandidates: AttachmentView[];
-  waitingForTemplate: boolean;
-  requiresSelection: boolean;
-  requiresTemplate: boolean;
-};
-
-export function resolveTemplateAttachmentRoute(
-  query: string,
-  attachments: AttachmentView[],
-  hasDocumentContext = false,
-): TemplateAttachmentRoute {
-  const intent = isTemplateGenerationChatIntent(query);
-  // An already attached context is an explicit template choice.  Do not let
-  // additional Office evidence files make that choice ambiguous.
-  const candidates = intent && !hasDocumentContext
-    ? listTemplateCandidateAttachments(query, attachments)
-    : [];
-  const pendingCandidates = intent && !hasDocumentContext
-    ? attachments.filter((attachment) => {
-      const extension = String(attachment.extension || '').toLowerCase()
-        || `.${String(attachment.filename || '').split('.').pop() || ''}`.toLowerCase();
-      return DOCUMENT_TEMPLATE_EXTENSIONS.includes(extension)
-        && !['ready', 'degraded', 'failed'].includes(attachment.parse_status);
-    })
-    : [];
-  return {
-    intent,
-    authority: 'backend',
-    candidates,
-    autoTemplate: candidates.length === 1 ? candidates[0] : null,
-    pendingCandidates,
-    waitingForTemplate: candidates.length === 0 && pendingCandidates.length > 0,
-    requiresSelection: intent && !hasDocumentContext && candidates.length > 1,
-    requiresTemplate: intent && !hasDocumentContext && candidates.length === 0,
-  };
-}
-
-export function pickAutoTemplateAttachment(
-  query: string,
-  attachments: AttachmentView[],
-): AttachmentView | null {
-  const candidates = listTemplateCandidateAttachments(query, attachments);
-  // More than one possible template is ambiguous; preserve the explicit UI
-  // action so the user can choose the intended file.
-  return candidates.length === 1 ? candidates[0] : null;
-}
-
-/**
- * 对话侧文档工具桥默认开启;部署方将环境变量设为 falsy 字符串(如 "false")显式关闭。
- */
-export function isDocumentAuthoringChatEnabled(value: unknown = undefined): boolean {
-  const configured = value ?? import.meta.env.VITE_AGENT_DOCUMENT_TOOLS_ENABLED
-    ?? import.meta.env.VITE_DOCUMENT_AUTHORING_CHAT_ENABLED;
-  const normalized = String(configured ?? '').trim().toLowerCase();
-  // 两个变量都未配置(或为空)时默认开启。
-  if (normalized === '') {
-    return true;
-  }
-  return ['1', 'true', 'yes', 'on'].includes(normalized);
-}
-
-export function resolveDocumentAuthoringEnabled(override?: boolean): boolean {
-  return override ?? isDocumentAuthoringChatEnabled();
-}
-
-/**
  * 会话附件入口默认开启；部署方可将 VITE_CHAT_ATTACHMENTS_ENABLED
  * 设为 falsy 字符串显式关闭。
  */
@@ -214,16 +84,12 @@ export default function ChatPage({
   kbName = '',
   availableKbs = [],
   onLogout,
-  documentAuthoringEnabled: documentAuthoringEnabledOverride,
 }: Props) {
   const navigate = useNavigate();
   const [mountedKbName, setMountedKbName] = useState(kbName);
-  const [documentContextLabel, setDocumentContextLabel] = useState<string | null>(null);
-  const [documentUploadPending, setDocumentUploadPending] = useState(false);
   const [exportJobsByMessageId, setExportJobsByMessageId] = useState<Record<number, ExportJobView[]>>({});
   const [exportPreviewsByJobId, setExportPreviewsByJobId] = useState<Record<string, ExportArtifactView>>({});
   const [exportFormats, setExportFormats] = useState<ExportFormat[] | undefined>(undefined);
-  const documentAuthoringEnabled = resolveDocumentAuthoringEnabled(documentAuthoringEnabledOverride);
   const visibleKbs = useMemo(() => {
     const rows = availableKbs.filter((kb) => kb.permission);
     if (!mountedKbName || rows.some((kb) => kb.name === mountedKbName)) {
@@ -247,7 +113,6 @@ export default function ChatPage({
 
   useEffect(() => {
     setMountedKbName(kbName);
-    setDocumentContextLabel(null);
   }, [kbName]);
 
   const wikiAssistKey = `hdb.wikiAssist.${mountedKbName || '__general__'}`;
@@ -312,7 +177,6 @@ export default function ChatPage({
 
   const chat = useKbChat(mountedKbName, {
     username: auth.user.username,
-    documentContextEnabled: documentAuthoringEnabled,
   });
   const {
     sessions,
@@ -344,18 +208,10 @@ export default function ChatPage({
     liveVerification,
     liveSubagents,
     degradedNotes,
-    documentCards,
     turnQueueNotice,
-    documentCardRefreshingId,
-    documentCardReleaseRequestingId,
-    requestDocumentCardRelease,
-    refreshDocumentCardStatus,
-    documentCardStaleKeys,
     send,
     abortStream,
     forbidden,
-    documentContext,
-  setDocumentContext,
     mcpWriteCards,
     updateMcpWriteCard,
     refreshMcpWriteCards,
@@ -406,21 +262,6 @@ export default function ChatPage({
       notify.error(error instanceof Error ? error.message : '下载候选产物失败');
     }
   }
-
-  const documentQuickReplies = useMemo(() => {
-    const card = documentCards[0];
-    if (!card) return [];
-    if (card.kind === 'output_spec_confirmation') return ['确认生成', '修改计划'];
-    if (card.status === 'needs_input' || card.status === 'needs_clarification') {
-      return card.options ?? [];
-    }
-    return [];
-  }, [documentCards]);
-
-  // 标签跟随上下文生命周期:hook 侧清空模板上下文(新建/切换/删除会话)时同步清掉 chip 文案。
-  useEffect(() => {
-    if (documentContext == null) setDocumentContextLabel(null);
-  }, [documentContext]);
 
   // 导出任务只保存 Artifact/任务引用，不把二进制塞进消息；刷新或切换会话后从服务端重新对账。
   useEffect(() => {
@@ -514,26 +355,7 @@ export default function ChatPage({
     }
   }
 
-  const canUploadDocumentTemplate = Boolean(
-    documentAuthoringEnabled
-      && mountedKbName
-      && ['write', 'admin'].includes(
-        availableKbs.find((kb) => kb.name === mountedKbName)?.permission ?? '',
-      ),
-  );
   const chatAttachmentsEnabled = isChatAttachmentsUiEnabled();
-
-  useEffect(() => {
-    if (!documentAuthoringEnabled) {
-      setDocumentContext(null);
-      setDocumentContextLabel(null);
-    }
-  }, [documentAuthoringEnabled, setDocumentContext]);
-
-  function clearDocumentContext() {
-    setDocumentContext(null);
-    setDocumentContextLabel(null);
-  }
 
   // ---- 会话附件(design §15) ----
   const [draftAttachments, setDraftAttachments] = useState<AttachmentView[]>([]);
@@ -644,106 +466,12 @@ export default function ChatPage({
   }
 
   async function handleSendWithAttachments() {
-    const query = input.trim();
-    let currentAttachments = draftAttachments;
-    let selectedAttachments = currentAttachments.filter((item) =>
+    const selectedAttachments = draftAttachments.filter((item) =>
       selectedAttachmentIds.includes(item.attachment_id),
     );
-    let failed = selectedAttachments.find((item) => item.parse_status === 'failed');
+    const failed = selectedAttachments.find((item) => item.parse_status === 'failed');
     if (failed) {
       notify.error(`附件“${failed.filename}”解析失败，请先重试或移除`);
-      return;
-    }
-
-    // Natural-language template requests should create a template context
-    // before the turn is persisted.  The context override is passed to
-    // useKbChat.send in the same tick, avoiding a stale React state read.
-    // If a context already exists, it is the explicit template choice and
-    // unrelated Office attachments remain evidence.  Otherwise inspect all
-    // draft attachments: one eligible candidate can be auto-selected; with
-    // multiple candidates the backend remains authoritative and can clarify.
-    let templateRoute = resolveTemplateAttachmentRoute(query, selectedAttachments, documentContext != null);
-    if (templateRoute.waitingForTemplate) {
-      if (activeSessionId == null) {
-        notify.error('模板附件仍在解析，请稍后再试');
-        return;
-      }
-      try {
-        currentAttachments = await listAttachments(activeSessionId);
-        setDraftAttachments(currentAttachments);
-        selectedAttachments = currentAttachments.filter((item) =>
-          selectedAttachmentIds.includes(item.attachment_id),
-        );
-        failed = selectedAttachments.find((item) => item.parse_status === 'failed');
-        if (failed) {
-          notify.error(`附件“${failed.filename}”解析失败，请先重试或移除`);
-          return;
-        }
-        templateRoute = resolveTemplateAttachmentRoute(query, selectedAttachments, documentContext != null);
-      } catch {
-        notify.error('无法刷新模板解析状态，请稍后再试');
-        return;
-      }
-      if (templateRoute.waitingForTemplate) {
-        notify.error('模板附件仍在解析，请等待显示“已就绪”后再发送');
-        return;
-      }
-    }
-    // These checks remain UI hints for affordances and copy.  They must not
-    // block the turn: the backend ConversationPlan is authoritative and can
-    // route an ambiguous request to clarification, retrieval, or chat.
-    const autoTemplate = templateRoute.autoTemplate;
-    if (autoTemplate && (!canUploadDocumentTemplate || activeSessionId == null)) {
-      notify.error(
-        !canUploadDocumentTemplate
-          ? '当前知识库没有模板写权限，无法发起文档生成'
-          : '请先建立会话后再发起模板生成',
-      );
-      return;
-    }
-    if (autoTemplate && canUploadDocumentTemplate && activeSessionId != null) {
-      setDocumentUploadPending(true);
-      try {
-        const analysis = await analyzeTemplateFromAttachment(
-          mountedKbName,
-          activeSessionId,
-          autoTemplate.attachment_id,
-          autoTemplate.filename,
-        );
-        const context = buildDocumentContext(analysis, mountedKbName, createClientRequestId());
-        if (!context) throw new Error('分析响应缺少可用的模板引用');
-        setDocumentContext(context);
-        setDocumentContextLabel(autoTemplate.filename);
-        if (analysis.auto_activated === false) {
-          notify.info('模板已识别，填充区域仍待校验；先整理知识库资料，暂不写入模板');
-        }
-        const sourceAttachments = selectedAttachments.filter(
-          (item) => item.attachment_id !== autoTemplate.attachment_id,
-        );
-        const sourceIds = sourceAttachments.map((item) => item.attachment_id);
-        const snapshots = sourceAttachments.map((item) => ({
-          attachment_id: item.attachment_id,
-          filename: item.filename,
-          media_type: item.media_type,
-          parse_status: item.parse_status,
-        }));
-        void send({
-          attachmentIds: sourceIds,
-          snapshots,
-          documentContextOverride: context,
-          documentFlowOverride: true,
-          wikiAssist,
-        });
-        // The template is now mounted as document context; keep the other
-        // attachments selected so they stay available for later turns.
-        setSelectedAttachmentIds((previous) =>
-          previous.filter((id) => id !== autoTemplate.attachment_id),
-        );
-      } catch (error) {
-        notify.error(error instanceof Error ? error.message : '附件自动转换模板失败');
-      } finally {
-        setDocumentUploadPending(false);
-      }
       return;
     }
 
@@ -897,9 +625,8 @@ export default function ChatPage({
   }
 
   function handleKbChange(nextKbName: string) {
-    if (streaming || documentUploadPending) return;
+    if (streaming) return;
     setMountedKbName(nextKbName);
-    clearDocumentContext();
     navigate(nextKbName ? `/chat?kb=${encodeURIComponent(nextKbName)}` : '/chat', { replace: true });
   }
 
@@ -990,26 +717,6 @@ export default function ChatPage({
             </div>
           </div>
         )}
-        {documentCards.length > 0 && (
-          <div className="shrink-0 px-[24px] pb-[6px]">
-            <div className="mx-auto flex w-full max-w-[820px] flex-col gap-[10px]">
-              {documentCards.map((card, index) => (
-                <div key={`${documentCardIdentity(card)}-${index}`} className={chatRowClass('assistant')}>
-                  <div className={chatBubbleClass('assistant')}>
-                    <DocumentStatusCard
-                      card={card}
-                      refreshing={documentCardRefreshingId === documentCardIdentity(card)}
-                      requestingRelease={documentCardReleaseRequestingId === documentCardIdentity(card)}
-                      stale={documentCardStaleKeys.has(planConfirmationStaleKey(card))}
-                      onRefreshStatus={(target) => void refreshDocumentCardStatus(target)}
-                      onRequestRelease={(target, artifactId) => void requestDocumentCardRelease(target, artifactId)}
-                    />
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
         {mcpWriteCards.length > 0 && (
           <div className="shrink-0 px-[24px] pb-[6px]">
             <div className="mx-auto flex w-full max-w-[820px] flex-col gap-[10px]">
@@ -1037,12 +744,6 @@ export default function ChatPage({
           onKbChange={handleKbChange}
           onSend={handleSendWithAttachments}
           onStop={abortStream}
-          quickReplies={documentQuickReplies}
-          documentAuthoringEnabled={documentAuthoringEnabled}
-          documentContext={documentContext}
-          documentContextLabel={documentContextLabel ?? undefined}
-          documentUploadPending={documentUploadPending}
-          onClearDocumentContext={clearDocumentContext}
           attachmentsEnabled={chatAttachmentsEnabled}
           draftAttachments={draftAttachments}
           attachmentUploadPending={attachmentUploadPending}

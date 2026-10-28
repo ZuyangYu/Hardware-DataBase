@@ -23,7 +23,6 @@ REQUIRED_TESTS: tuple[str, ...] = (
     "tests/test_document_search_batch.py",
     "tests/test_conversation_action_executor.py",
     "tests/test_worker_fairness.py",
-    "tests/test_document_authoring_job_store.py",
     "tests/test_chat_attachments.py",
     "tests/evaluation/test_hardware_metrics.py",
 )
