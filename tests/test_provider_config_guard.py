@@ -24,15 +24,6 @@ class ProviderConfigGuardTests(unittest.TestCase):
             }
         )
 
-    def test_postgres_authoring_checkpointer_requires_database_url(self):
-        with self.assertRaises(ValueError) as ctx:
-            src.settings.validate_provider_configuration(
-                {
-                    "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND": "postgres",
-                    "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL": "",
-                }
-            )
-        self.assertIn("DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL", str(ctx.exception))
 
     def test_postgres_governor_requires_database_url(self):
         with self.assertRaises(ValueError) as ctx:
@@ -66,7 +57,6 @@ class ProviderConfigGuardTests(unittest.TestCase):
     def test_unknown_backend_values_are_rejected(self):
         for key, value in (
             ("AGENT_CHECKPOINT_BACKEND", "redis"),
-            ("DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "redis"),
             ("MEMORY_STORE_BACKEND", "redis"),
             ("RESOURCE_GOVERNOR_BACKEND", "redis"),
         ):
@@ -83,7 +73,7 @@ class ProviderConfigGuardTests(unittest.TestCase):
         src.settings.reload_settings = lambda: None
         try:
             with self.assertRaises(ValueError):
-                AppPipeline.apply_settings({"DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND": "postgres"})
+                AppPipeline.apply_settings({"AGENT_CHECKPOINT_BACKEND": "redis"})
         finally:
             src.settings.validate_settings_values = original_validate
             src.settings.save_settings_to_env = original_save

@@ -13,8 +13,8 @@ PostgreSQL 上直接起 API 会因为缺表而拒绝启动。本模块把"建表
 1. ``CONTROL_PLANE_BACKEND=postgres`` 时：
    - 缺 ``control_plane_schema`` → ``apply_schema`` + ``record_schema_version``；
    - 已存在 → ``assert_schema_compatible``（版本不符即失败，绝不静默放行）；
-2. 逐域幂等建表（projects / pipeline_documents / document_authoring /
-   认证域 / 兼容库），机械映射，表结构由各 store 自己的 SQLite bootstrap 生成；
+2. 逐域幂等建表（pipeline_documents / 认证域），机械映射，
+   表结构由各 store 自己的 SQLite bootstrap 生成；
    控制面 PG 上另外建 memory / result_exports 账本，以及认证镜像表 users /
    departments（认证域保持 SQLite 时）；
 3. 认证域额外做形状校验（早期按控制面语义建过的库会在此 fail-closed 并提示
@@ -102,11 +102,8 @@ def _postgres_dsns() -> list[str]:
     if str(getattr(settings, "CONTROL_PLANE_BACKEND", "sqlite") or "").strip().lower() == "postgres":
         dsns.add(str(getattr(settings, "CONTROL_PLANE_DATABASE_URL", "") or "").strip())
     for prefix in (
-        "PROJECT_STORE",
         "PIPELINE_DOCUMENT",
-        "AUTHORING_STORE",
         "AUTH_STORE",
-        "COMPATIBILITY_STORE",
         "EVALUATION_STORE",
     ):
         try:
@@ -117,7 +114,6 @@ def _postgres_dsns() -> list[str]:
             dsns.add(domain_dsn)
     for backend_key, url_key in (
         ("AGENT_CHECKPOINT_BACKEND", "AGENT_CHECKPOINT_DATABASE_URL"),
-        ("DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL"),
     ):
         if str(getattr(settings, backend_key, "") or "").strip().lower() == "postgres":
             dsns.add(str(getattr(settings, url_key, "") or "").strip())
@@ -205,17 +201,12 @@ def _bootstrap() -> int:
             return 3
 
     groups: list[tuple[str, tuple[type, ...]]] = []
-    from src.document_authoring.pg_support import compat_classes, store_classes
     from src.pipelines.document_store_sqlite import PipelineDocumentStore
-    from src.projects.store import ProjectStore
     from src.storage.auth_domain import domain_classes
 
     groups = [
-        ("projects", (ProjectStore,)),
         ("pipeline_documents", (PipelineDocumentStore,)),
-        ("document_authoring", store_classes()),
         ("auth", domain_classes()),
-        ("compatibility", compat_classes()),
     ]
 
     failed = 0
@@ -265,11 +256,6 @@ def _bootstrap() -> int:
             "agent-checkpoint",
             getattr(settings, "AGENT_CHECKPOINT_BACKEND", "sqlite"),
             getattr(settings, "AGENT_CHECKPOINT_DATABASE_URL", ""),
-        ),
-        (
-            "authoring-checkpoint",
-            getattr(settings, "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND", "sqlite"),
-            getattr(settings, "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL", ""),
         ),
     )
     for name, checkpoint_backend, checkpoint_dsn in checkpoint_targets:
@@ -450,11 +436,8 @@ class _ResultExportTemplate:
 
 def _prefix_for(group: str) -> str:
     return {
-        "projects": "PROJECT_STORE",
         "pipeline_documents": "PIPELINE_DOCUMENT",
-        "document_authoring": "AUTHORING_STORE",
         "auth": "AUTH_STORE",
-        "compatibility": "COMPATIBILITY_STORE",
     }[group]
 
 

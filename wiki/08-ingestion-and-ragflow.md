@@ -499,7 +499,7 @@ Step 8 文件名回退：仍无证据且提供 source_names 且此前是因 sour
 | `FINAL_TOP_K` | `5` | 兜底 top_k |
 | `SPREADSHEET_SKIP_BOILERPLATE_SHEETS` | `true` | 跳过模板/封面/变更历史表 |
 | `WORKER_POLL_INTERVAL_SECONDS` / `WORKER_PARSE_BATCH_SIZE` / `WORKER_CLAIM_BATCH_SIZE` | `0.5` / `1` / `8` | worker 节拍 |
-| `WORKER_ROLE` | `all` | `all|chat|authoring|parse` |
+| `WORKER_ROLE` | `all` | `all|chat|parse` |
 | `EXTERNAL_CONVERSATION_LLM_*` | `true/12000/true/60` | 外部对话 LLM 后处理 |
 
 硬编码常量：`RAGFLOW_PARSE_START_DELAY_SECONDS=2.0`、`RAGFLOW_DOCUMENT_READY_TIMEOUT_SECONDS=10.0`、

@@ -8,18 +8,18 @@ stored on a durable turn, emitted over SSE and asserted in shared tests.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import re
 from typing import Any, Literal
 
 from src.core.intent import IntentName, IntentPlan, classify_intent
+from src.services.evidence_policy import resolve_evidence_purpose
 
 
 ConversationRoute = Literal[
     "chat",
     "retrieval",
     "attachment_analysis",
-    "document_authoring",
 ]
 
 _SOURCE_SCOPES = {
@@ -45,8 +45,6 @@ class ConversationPlan:
     target: str
     authority: Literal["backend"]
     routed_by: Literal["explicit", "deterministic", "fallback"]
-    document_flow: bool
-    template_required: bool = False
     comparison_requested: bool = False
     export_requested: bool = False
     requested_formats: tuple[str, ...] = ()
@@ -83,9 +81,6 @@ class ConversationOrchestrator:
         context: Any | None = None,
         *,
         query: str | None = None,
-        document_context: Any | None = None,
-        has_document_tools: bool | None = None,
-        explicit_flow: bool | None = None,
         has_attachments: bool | None = None,
         has_kb: bool | None = None,
         source_scope: str | None = None,
@@ -100,18 +95,6 @@ class ConversationOrchestrator:
         query = str(
             query if query is not None else _value(request, "query", "")
         ).strip()
-        if document_context is None:
-            document_context = _value(request, "document_context", None)
-        if document_context is None:
-            document_context = _value(context, "document_context", None)
-        if explicit_flow is None:
-            explicit_flow = _value(request, "document_flow", None)
-        if explicit_flow is None:
-            explicit_flow = _value(context, "document_flow", None)
-        if has_document_tools is None:
-            has_document_tools = bool(
-                _value(request, "has_document_tools", _value(context, "has_document_tools", False))
-            )
         if has_attachments is None:
             has_attachments = bool(
                 _value(request, "has_attachments", _value(context, "has_attachments", False))
@@ -129,15 +112,8 @@ class ConversationOrchestrator:
         else:
             invalid_scope = False
 
-        expired = bool(_value(document_context, "expired", False))
-        context_valid = bool(document_context is not None and not expired)
-        document_capable = bool(has_document_tools and context_valid)
-        template_context = bool(
-            context_valid and _value(document_context, "template_version_id", None)
-        )
         intent = classify_intent(
             query,
-            has_template_context=template_context,
             has_attachments=bool(has_attachments),
             has_kb=bool(has_kb),
         )
@@ -145,54 +121,12 @@ class ConversationOrchestrator:
         if invalid_scope:
             reasons.append("invalid_source_scope_fallback")
 
-        if explicit_flow is True:
-            if document_capable:
-                route: ConversationRoute = "document_authoring"
-                document_flow = True
-                routed_by: Literal["explicit", "deterministic", "fallback"] = "explicit"
-                reasons.append("explicit_document_flow")
-            else:
-                route, document_flow = self._non_document_route(
-                    intent,
-                    query=query,
-                    has_attachments=bool(has_attachments),
-                    has_kb=bool(has_kb),
-                )
-                routed_by = "fallback"
-                document_flow = False
-                if document_context is None:
-                    reasons.append("document_context_missing")
-                elif expired:
-                    reasons.append("document_context_expired")
-                if not has_document_tools:
-                    reasons.append("document_tools_unavailable")
-        elif explicit_flow is False:
-            route, document_flow = self._non_document_route(
-                intent,
-                query=query,
-                has_attachments=bool(has_attachments),
-                has_kb=bool(has_kb),
-            )
-            routed_by = "explicit"
-            reasons.append("explicit_document_flow_disabled")
-        elif document_capable and intent.intent in {"template_generation", "document_authoring"}:
-            route = "document_authoring"
-            document_flow = True
-            routed_by = "deterministic"
-            if intent.action != "clarify":
-                reasons.append("backend_document_intent")
-        else:
-            route, document_flow = self._non_document_route(
-                intent,
-                query=query,
-                has_attachments=bool(has_attachments),
-                has_kb=bool(has_kb),
-            )
-            routed_by = "deterministic"
-
-        from dataclasses import replace
-
-        from src.services.evidence_policy import resolve_evidence_purpose
+        route = self._route(
+            intent,
+            query=query,
+            has_attachments=bool(has_attachments),
+            has_kb=bool(has_kb),
+        )
 
         plan = ConversationPlan(
             schema_version=self.schema_version,
@@ -201,9 +135,7 @@ class ConversationOrchestrator:
             action=intent.action,
             target=intent.target,
             authority="backend",
-            routed_by=routed_by,
-            document_flow=document_flow,
-            template_required=bool(intent.template_required and document_flow),
+            routed_by="deterministic",
             comparison_requested=intent.comparison_requested,
             export_requested=intent.export_requested,
             requested_formats=intent.requested_formats,
@@ -222,25 +154,23 @@ class ConversationOrchestrator:
         )
 
     @staticmethod
-    def _non_document_route(
+    def _route(
         intent: IntentPlan,
         *,
         query: str,
         has_attachments: bool,
         has_kb: bool,
-    ) -> tuple[ConversationRoute, bool]:
+    ) -> ConversationRoute:
         if has_attachments and _ATTACHMENT_ANALYSIS_PATTERN.search(query):
-            return "attachment_analysis", False
+            return "attachment_analysis"
         if intent.intent in {"knowledge_base_qa", "attachment_qa", "compare", "export"}:
-            return "retrieval", False
+            return "retrieval"
         if has_kb or has_attachments:
-            return "retrieval", False
-        return "chat", False
+            return "retrieval"
+        return "chat"
 
     @staticmethod
     def _allowed_tools(route: ConversationRoute, has_attachments: bool) -> tuple[str, ...]:
-        if route == "document_authoring":
-            return ("document_authoring", "evidence") + (("attachment",) if has_attachments else ())
         if route == "attachment_analysis":
             return ("attachment",)
         if route == "retrieval":

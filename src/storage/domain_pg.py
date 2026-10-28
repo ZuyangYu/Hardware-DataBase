@@ -11,7 +11,7 @@
   ``BEGIN IMMEDIATE``、``INSERT OR IGNORE``），本模块再加两条 SQLite 方言：
   ``strftime('%s', x)`` 与 ``CURRENT_TIMESTAMP``。
 
-后端选择按域配置（``PROJECT_STORE_BACKEND`` 等）：留空跟随
+后端选择按域配置（``PIPELINE_DOCUMENT_STORE_BACKEND`` 等）：留空跟随
 ``CONTROL_PLANE_BACKEND``，收敛的终态就是"翻控制面开关，其余域跟上"。
 显式给 store 传 ``db_path`` 一律强制 SQLite（测试依赖这一点）。
 
@@ -355,7 +355,7 @@ def resolve_store_backend(
 def _template_metadata(store_classes: tuple[type, ...]) -> dict[str, Any]:
     """用这些 store 自己的 SQLite bootstrap 在一个临时库里建表，读回 PRAGMA 元数据。
 
-    多个类共享同一个库（如 document_authoring.db）时，必须让它们都实例化到
+    多个类共享同一个库（如 pipeline_documents.db）时，必须让它们都实例化到
     **同一个**临时文件上，这样跨类的表与外键才能一起被看到。
     """
     cache_key = "|".join(

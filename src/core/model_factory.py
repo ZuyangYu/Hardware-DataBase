@@ -22,8 +22,6 @@ from src.core.model_gateway import build_governed_model
 _SETTINGS_GENERATION = 0
 _PROFILE_NAMES = frozenset({
     "default",
-    "authoring_auxiliary",
-    "template_suggestion",
     "external_conversation",
     "memory",
 })
@@ -134,12 +132,7 @@ def resolve_chat_model_config(
         ).strip()
         default_retries = int(getattr(settings_source, "AGENT_RATE_LIMIT_MAX_RETRIES", 4))
 
-    if profile_name == "authoring_auxiliary":
-        timeout = 20
-        default_retries = 0
-    elif profile_name == "template_suggestion":
-        timeout = 60
-    elif profile_name == "external_conversation":
+    if profile_name == "external_conversation":
         outer_timeout = int(
             getattr(settings_source, "EXTERNAL_CONVERSATION_LLM_TIMEOUT_SECONDS", 60)
         )

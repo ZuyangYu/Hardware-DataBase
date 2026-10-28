@@ -77,7 +77,6 @@ def test_complexity_budget_scores_multi_part_attachment_turn():
         query_mode="deep",
         attachment_refs=[object(), object()],
         knowledge_scope=SimpleNamespace(sources=[object()]),
-        document_flow=False,
     )
     assert budget["complexity"]["level"] == "complex"
     assert budget["complexity"]["numbered_items"] >= 6
@@ -92,7 +91,6 @@ def test_simple_turn_keeps_historical_recursion_limit():
         query_mode="deep",
         attachment_refs=[],
         knowledge_scope=None,
-        document_flow=False,
     )
     assert limit == 36
     assert budget["complexity"]["level"] == "simple"
@@ -105,7 +103,6 @@ def test_short_hardware_question_gets_complex_budget_and_evidence_room():
         query_mode="deep",
         attachment_refs=[],
         knowledge_scope=None,
-        document_flow=False,
     )
     assert budget["complexity"]["hardware"]["is_hardware"] is True
     assert budget["complexity"]["level"] == "complex"
@@ -727,7 +724,6 @@ def test_message_view_projects_persisted_turn_metadata():
         edited_at=None,
         redacted=False,
         memory_context=[],
-        document_context=None,
         citations=[],
     )
     view = _message_view(

@@ -33,22 +33,12 @@ from src.storage import domain_pg  # noqa: E402
 from src.storage.auth_domain import TABLES, domain_classes  # noqa: E402
 
 
-def _compat_spec() -> tuple[tuple[str, ...], tuple[type, ...], str]:
-    from src.document_authoring.pg_support import (
-        COMPAT_PRIMARY_TABLE,
-        COMPAT_TABLES,
-        compat_classes,
-    )
-
-    return COMPAT_TABLES, compat_classes(), COMPAT_PRIMARY_TABLE
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dsn", required=True, help="目标 PostgreSQL 连接串")
     parser.add_argument(
         "--domain",
-        choices=("auth", "compatibility"),
+        choices=("auth",),
         default="auth",
         help="重建哪一组（默认 auth：账号 + 审计 + 治理杂项）",
     )
@@ -60,13 +50,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="只报告将要做什么")
     args = parser.parse_args(argv)
 
-    if args.domain == "auth":
-        tables = TABLES
-        classes = domain_classes()
-        default_source = REPO_ROOT / "storage" / "auth.db"
-    else:
-        tables, classes, _primary = _compat_spec()
-        default_source = REPO_ROOT / "storage" / "document_authoring_compatibility.sqlite"
+    tables = TABLES
+    classes = domain_classes()
+    default_source = REPO_ROOT / "storage" / "auth.db"
     source = Path(args.source) if args.source else default_source
     if not source.is_file():
         print(f"[rebuild-auth] 找不到源库: {source}", file=sys.stderr)

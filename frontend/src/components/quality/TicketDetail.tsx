@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import { api, ApiError } from '@/api/client';
-import { createClientRequestId } from '@/api/documentAuthoring';
+import { createClientRequestId } from '@/api/clientRequestId';
 import type { FeedbackTicketDetail, TicketAction } from '@/api/types';
 import { Button } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ConfirmDialog';

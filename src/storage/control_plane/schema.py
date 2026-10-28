@@ -63,7 +63,6 @@ CORE_TABLE_DDL: dict[str, str] = {
             auto_memory BOOLEAN NOT NULL DEFAULT TRUE,
             rolling_summary TEXT NOT NULL DEFAULT '',
             summary_covered_message_id BIGINT NOT NULL DEFAULT 0,
-            document_context_json JSONB NOT NULL DEFAULT '{}'::jsonb,
             knowledge_selection_json JSONB NOT NULL DEFAULT '{}'::jsonb,
             knowledge_selection_hash TEXT NOT NULL DEFAULT '',
             next_turn_sequence BIGINT NOT NULL DEFAULT 0,
@@ -112,7 +111,6 @@ CORE_TABLE_DDL: dict[str, str] = {
             started_at TIMESTAMPTZ,
             finished_at TIMESTAMPTZ,
             trace_context_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-            document_context_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             export_plan_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             knowledge_scope_json JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             knowledge_selection_hash TEXT NOT NULL DEFAULT '',
@@ -330,9 +328,6 @@ AUTH_DOMAIN_TABLES: frozenset[str] = frozenset(
         "asset_candidates",
         "asset_evidence",
         "notifications",
-        "document_authoring_compatibility_events",
-        "document_authoring_compatibility_releases",
-        "document_authoring_legacy_backfill_markers",
     }
 )
 

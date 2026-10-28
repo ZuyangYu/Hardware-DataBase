@@ -1,10 +1,8 @@
 import unittest
 
-from src.evaluation.hardware_metrics import score_document_generation, score_hardware_rules
+from src.evaluation.hardware_metrics import score_hardware_rules
 from src.evaluation.schemas import (
     AnswerSnapshot,
-    DocumentGenerationEvalRecord,
-    DocumentGenerationSnapshot,
     EvaluationSample,
     SampleRubric,
 )
@@ -104,32 +102,6 @@ class HardwareMetricTests(unittest.TestCase):
         self.assertEqual(metric.score, 1.0)
         self.assertEqual(metric.details["missing_evidence_types"], [])
 
-    def test_document_generation_metrics_measure_mapping_evidence_and_safety(self):
-        record = DocumentGenerationEvalRecord(
-            id="doc-1",
-            template_fixture="current_review.xlsx",
-            field_id="rated_current",
-            expected_value="10 A",
-            allowed_sources=["power_spec.pdf"],
-        )
-        snapshot = DocumentGenerationSnapshot(
-            sample_id="doc-1",
-            template_fixture="current_review.xlsx",
-            mapped_field_id="rated_current",
-            filled_value="10 A",
-            evidence_sources=["power_spec.pdf"],
-            retrieved_evidence_sources=["power_spec.pdf"],
-            attempted_fill_count=1,
-            auto_approved=True,
-        )
-
-        metrics = {metric.metric_name: metric.score for metric in score_document_generation(record, snapshot)}
-
-        self.assertEqual(metrics["template_mapping_precision"], 1.0)
-        self.assertEqual(metrics["field_recall_at_k"], 1.0)
-        self.assertEqual(metrics["evidence_support_rate"], 1.0)
-        self.assertEqual(metrics["fixed_content_overwrite_rate"], 0.0)
-        self.assertEqual(metrics["auto_approval_rate"], 1.0)
 
 
 if __name__ == "__main__":

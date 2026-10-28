@@ -58,14 +58,14 @@ def turn_scope_payload(scope, *, user_id: int, anchor_kb_id: int | None, stored_
     return parsed.model_dump(mode="json")
 
 
-def request_fingerprint(*, scope: dict, query: str, source_scope: str, attachment_ids: list[str], document_context: dict, query_mode: str, wiki_assist: bool) -> str:
+def request_fingerprint(*, scope: dict, query: str, source_scope: str, attachment_ids: list[str], query_mode: str, wiki_assist: bool) -> str:
     if not scope:
         return ""
     payload = {
         "version": 1, "query": query.strip(),
         "knowledge_selection_hash": scope["selection_hash"],
         "source_scope": source_scope, "attachment_ids": sorted(set(attachment_ids)),
-        "document_context": document_context, "query_mode": query_mode, "wiki_assist": bool(wiki_assist),
+        "query_mode": query_mode, "wiki_assist": bool(wiki_assist),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
 

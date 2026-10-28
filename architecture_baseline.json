@@ -4,8 +4,6 @@
     "src.agents.mcp.client",
     "src.agents.mcp.policy",
     "src.agents.mcp.store",
-    "src.agents.orchestration.capabilities",
-    "src.agents.orchestration.contracts",
     "src.agents.tools.retrieval_executor",
     "src.api.routes.quality",
     "src.api.routes.quality_tickets",
@@ -34,20 +32,6 @@
     "src.costs.capture",
     "src.costs.sink",
     "src.costs.store",
-    "src.document_authoring",
-    "src.document_authoring.compatibility",
-    "src.document_authoring.generation_sessions",
-    "src.document_authoring.harness.runtime",
-    "src.document_authoring.pg_support",
-    "src.document_authoring.planning.legacy",
-    "src.document_authoring.planning.service",
-    "src.document_authoring.planning.store",
-    "src.document_authoring.planning.submissions",
-    "src.document_authoring.reviews",
-    "src.document_authoring.revisions",
-    "src.document_authoring.service",
-    "src.document_authoring.tasks",
-    "src.document_authoring.work_order_store",
     "src.evaluation.run_control",
     "src.memory.catalog",
     "src.memory.jobs",
@@ -91,7 +75,7 @@
     "src.storage.control_plane.terminal_domain",
     "src.storage.domain_pg"
   ],
-  "scc_edge_count": 248,
+  "scc_edge_count": 197,
   "forbidden_edges": [
     {
       "source": "src.quality.service",
@@ -119,10 +103,9 @@
     }
   ],
   "line_budgets": {
-    "src/core/app_pipeline.py": 6657,
-    "src/document_authoring/service.py": 5610,
-    "src/agents/runner.py": 4308,
-    "src/settings.py": 2412
+    "src/core/app_pipeline.py": 794,
+    "src/agents/runner.py": 2418,
+    "src/settings.py": 2165
   },
-  "runtime_alter_count": 93
+  "runtime_alter_count": 63
 }

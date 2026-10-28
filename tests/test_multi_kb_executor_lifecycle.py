@@ -179,12 +179,10 @@ def test_readiness_reports_enabled_pool_unavailable_then_ready(monkeypatch):
 
 def test_settings_reload_enables_multi_kb_without_changing_legacy_flag(monkeypatch):
     monkeypatch.setenv("MULTI_KB_CHAT_ENABLED", "true")
-    monkeypatch.setenv("SHARED_RETRIEVAL_EXECUTOR_ENABLED", "false")
     monkeypatch.setattr(settings, "MULTI_KB_CHAT_ENABLED", False)
-    monkeypatch.setattr(settings, "SHARED_RETRIEVAL_EXECUTOR_ENABLED", True)
     settings.reload_settings()
     pools.initialize_retrieval_executor()
-    assert settings.SHARED_RETRIEVAL_EXECUTOR_ENABLED is False
+    assert settings.SHARED_RETRIEVAL_EXECUTOR_ENABLED is True
     assert pools.get_multi_kb_retrieval_executor().submit(lambda: "reloaded").result(timeout=1) == "reloaded"
 
 

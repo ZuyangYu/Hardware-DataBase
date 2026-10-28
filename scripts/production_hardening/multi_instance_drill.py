@@ -12,7 +12,7 @@ Starts two API processes against the same storage (SQLite default), then:
    checkpoint) resumes on another replica.
 
 With ``--checkpoint-backend postgres --postgres-dsn <dsn>`` both replicas use
-the PostgreSQL agent/authoring checkpoint providers and the PostgreSQL memory
+the PostgreSQL agent checkpoint provider and the PostgreSQL memory
 projection, so the drill exercises the production service-backed state path
 instead of the SQLite default.  It also uploads a chat attachment on replica A
 and verifies metadata plus bytes on replica B (shared file storage contract).
@@ -191,8 +191,6 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "AGENT_CHECKPOINT_BACKEND": "postgres",
                 "AGENT_CHECKPOINT_DATABASE_URL": args.postgres_dsn,
-                "DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND": "postgres",
-                "DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL": args.postgres_dsn,
                 "MEMORY_STORE_BACKEND": "postgres",
                 "MEMORY_DATABASE_URL": args.postgres_dsn,
             }

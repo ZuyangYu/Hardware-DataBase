@@ -30,9 +30,9 @@ PROVIDER_KEYS = (
     "RAGFLOW_BASE_URL", "RAGFLOW_API_KEY", "RAGFLOW_TIMEOUT_SECONDS",
 )
 STORE_PREFIXES = (
-    "CONTROL_PLANE", "PROJECT_STORE", "PIPELINE_DOCUMENT_STORE", "AUTHORING_STORE",
+    "CONTROL_PLANE", "PIPELINE_DOCUMENT_STORE",
     "AUTH_STORE", "COMPATIBILITY_STORE", "MEMORY_STORE", "AGENT_CHECKPOINT",
-    "DOCUMENT_AUTHORING_CHECKPOINTER", "RESOURCE_GOVERNOR",
+    "RESOURCE_GOVERNOR",
 )
 TEST_PASSWORD = "AcceptanceTestPassword123!"
 
@@ -113,8 +113,8 @@ class IsolatedDeployment:
                 "RESOURCE_GOVERNOR_SCOPE": "deployment",
                 "RESOURCE_GOVERNOR_DEPLOYMENT_ID": "acceptance-" + secrets.token_hex(5),
                 "HDB_API_SPAWN_WORKER": "1", "HDB_API_SPAWN_EXPORT_WORKER": "1",
-                "HDB_API_SPAWN_MEMORY_WORKER": "0", "HDB_REQUIRED_WORKER_ROLES": "chat,authoring,parse,export",
-                "DOCUMENT_AUTHORING_AGENT_MODE_ENABLED": "true", "CHAT_ATTACHMENTS_ENABLED": "true",
+                "HDB_API_SPAWN_MEMORY_WORKER": "0", "HDB_REQUIRED_WORKER_ROLES": "chat,parse,export",
+                "CHAT_ATTACHMENTS_ENABLED": "true",
                 "CONVERSATION_SERIALIZE_SAME_THREAD": "true",
                 "ADMISSION_CONTROL_ENABLED": "false",
             }

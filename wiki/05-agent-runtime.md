@@ -27,12 +27,12 @@
 **问题长度/显式子任务数/附件数/知识库数** 增加预算，并由
 `AGENT_RECURSION_LIMIT_MAX` 封顶。复杂度只影响预算和可选质量机制，不决定工具面或路由。
 步数耗尽后不会只返回错误：先发 `budget_exhausted`，再用已登记证据做一次
-**非工具收尾 synthesis**（`AGENT_PARTIAL_SYNTHESIS_ENABLED`），输出“部分结果 + 缺口”；
+**非工具收尾 synthesis**（内置常量 `PARTIAL_SYNTHESIS_ENABLED=true`），输出“部分结果 + 缺口”；
 模型失败时回退到确定性证据摘要。`context_compacted` 事件记录证据压缩；压缩会优先保留
 短附件/每个来源的代表块，避免把一份短 BOM 只截成前两行。收尾答案会追加回 checkpoint，
 下一轮追问仍能看到它。复杂轮次还会提供可选的只读 research 子代理
-（`AGENT_RESEARCH_SUBAGENT_ENABLED`）和独立语义 rubric 校验
-（`AGENT_VERIFIER_ENABLED`，同一模型、独立调用，不是发布门禁）。
+（内置常量 `RESEARCH_SUBAGENT_ENABLED=true`）和独立语义 rubric 校验
+（内置常量 `VERIFIER_ENABLED=true`，同一模型、独立调用，不是发布门禁）。
 模型输出 `[K6]`/`[A2]`/`【知识库:6】` 时，会在持久化前归一化为 `[6]`，引用面板继续按
 evidence metadata 区分附件与知识库。
 
@@ -51,7 +51,7 @@ evidence metadata 区分附件与知识库。
 MultiSourceAgentRunner.stream(
     query, kb_name, history=..., ctx=None, agent_thread_id="", event_callback=None,
     query_mode="deep", should_cancel=None, persist_thread=False, wiki_assist=False,
-    document_context=None, document_flow=None, attachments=None, source_scope="auto",
+    attachments=None, source_scope="auto",
     attachment_user_id=None, action_scope=None,
 )
 ```
@@ -88,7 +88,6 @@ messages = [{"role":"user","content":query}] if has_state else _build_messages(q
 2. 基础提示词（settings.SYSTEM_PROMPT 覆盖，否则内置 _SYSTEM_PROMPT），
    含 {kb_name} / {workflow} 占位（_Fast/_Deep workflow）
 3. 导出协议 _EXPORT_PROMPT（仅当服务端判定导出意图时）
-4. 文档流提示 _DOCUMENT_FLOW_PROMPT（document_flow=True 时）
 5. 记忆上下文（<untrusted_memory>，在固定规则之后 → 不能改变证据优先级）
 6. 附件预检（<untrusted_attachment>，≤12000 字符）
 7. action 收据摘要（enabled 模式下执行过的动作摘要行）
@@ -120,7 +119,6 @@ messages = [{"role":"user","content":query}] if has_state else _build_messages(q
 | `memory_search` | `make_memory_tool` | `MemoryService.search` | **`_ALWAYS_AVAILABLE`**（通用对话也挂） |
 | `list_kb_sources` | `make_catalog_tool` | `scan_kb_sources`（非检索工具） | 常开 |
 | 附件工具族 | `build_attachment_tools` | `AttachmentService` / 附件检索 / 修订 | 仅当作用域允许且有 refs |
-| 文档生成工具族 | `document_authoring_tools.as_tools` | `DocumentGenerationService` | 仅 `AGENT_DOCUMENT_TOOLS_ENABLED=true` |
 | `attachment_*` 的 capability 映射 | `tool_assembly.TOOL_CAPABILITIES` | — | `attachment.search` / `attachment.revise` |
 
 `ToolRuntime`（见 [06-tools-and-evidence.md](06-tools-and-evidence.md)）是所有工具共享的
@@ -134,9 +132,7 @@ messages = [{"role":"user","content":query}] if has_state else _build_messages(q
   `filter_tools_by_capability` 直接丢弃（fail-closed）。
 - 常用映射：检索工具 → `knowledge_base.search`；`list_kb_sources` → `knowledge_base.catalog`；
   附件读 → `attachment.search`；`attachment_edit` → `attachment.revise`；
-  文档写入 → `document.authoring` / `document.revise`；读 → `document.task.read`；
-  控制 → `document.task.control` / `document.task.resume`；
-  `resolve_icd_scope_exception` → `document.scope.resolve`；`request_document_release` → `document.release.request`。
+  附件写 → `attachment.revise`；导出 → `result.export`。
 - `_ALWAYS_AVAILABLE = {"memory_search"}`。
 - `_ACTION_PLAN_NARRATION_TOOLS`：执行计划后只保留检索类 + 附件读 + 状态查询 + `memory_search`，
   **所有写入类与 wiki_search 从「叙述循环」隐藏**。
@@ -150,27 +146,16 @@ messages = [{"role":"user","content":query}] if has_state else _build_messages(q
 ```python
 ConversationPlan(
     schema_version="v1",
-    route ∈ {chat, retrieval, attachment_analysis, document_authoring},
+    route ∈ {chat, retrieval, attachment_analysis},
     intent, action, target,
     authority="backend",                 # 恒为后端权威
-    routed_by ∈ {explicit, deterministic, fallback},
-    document_flow: bool,
-    template_required, comparison_requested, export_requested, requested_formats,
+    routed_by="deterministic",
+    comparison_requested, export_requested, requested_formats,
     source_scope, has_attachments, has_kb, confidence, reason_codes, allowed_tools,
 )
 ```
 
-判定表：
-
-| 条件 | route | document_flow | routed_by |
-|---|---|---|---|
-| `explicit_flow=True` 且有文档能力 | `document_authoring` | True | `explicit` |
-| `explicit_flow=True` 但无能力 | 非文档路由 | False | `fallback`（原因 `document_context_missing/expired` 或 `document_tools_unavailable`） |
-| `explicit_flow=False` | 非文档路由 | False | `explicit` |
-| 有文档能力 且 intent ∈ {template_generation, document_authoring} | `document_authoring` | True | `deterministic` |
-| 其它 | 非文档路由 | False | `deterministic` |
-
-非文档路由（`_non_document_route`）：
+判定顺序（`_route`）：
 
 1. 有附件 且 query 命中分析动词（`分析|解析|提取|识别|总结|读取|extract|analy[sz]e|parse|summari[sz]e`）
    → `attachment_analysis`；
@@ -182,61 +167,11 @@ ConversationPlan(
 
 | route | allowed_tools |
 |---|---|
-| `document_authoring` | `("document_authoring","evidence")` + 有附件时 `("attachment",)` |
 | `attachment_analysis` | `("attachment",)` |
 | `retrieval` | `("retrieval",)` + 有附件时 `("attachment",)` |
 | `chat` | `()` |
 
-runner 侧：`document_flow_routed = conversation_plan.document_flow`；
-`routed_by` 映射为旧 trace 值（`deterministic+document → "regex"`，`fallback → "explicit"`）。
-
 `source_scope` 非法值会被静默归一为 `auto` 并附 reason `invalid_source_scope_fallback`。
-
----
-
-## 5. Action Plan（结构化动作计划）
-
-三态灰度：`CONVERSATION_ACTION_PLAN_MODE ∈ {off, shadow, enabled}`。
-
-| 模式 | 行为 |
-|---|---|
-| `off` | 完全不编译 |
-| `shadow` | 编译并记录/发事件，但不执行、不限制工具 |
-| `enabled` | 执行；注入收据；对模型隐藏写工具（`legacy_direct_shortcuts=False`） |
-
-### 5.1 契约
-
-- `contracts.py` 定义计划结构（动作、依赖、约束）。
-- `intent_parser.py` 把模型输出解析为 `StructuredActionPlanParser` 结果；
-- **确定性高风险护栏永远优先**：多格式/不支持格式、附件精确文本替换等；
-- `validate_action_plan` 拦截：未知动作、未授权、未解析引用、能力缺失、循环依赖、
-  显式 `forbid_action` 约束；
-- `capabilities.py` 解析 `deployed ∩ authorized ∩ scope ∩ object state ∩ constraints`，
-  同一集合既决定工具可见性也用于计划校验。
-
-### 5.2 执行与收据
-
-- `executor.py`：`ConversationActionExecutor.execute` 只派发给
-  `GovernedToolActionAdapters` 注册的 handler，且只能调用「本 turn 已挂载」的工具；
-  依赖状态必须是 `completed`。
-- `adapters.py`：把工具结果归一化为 receipt 状态
-  （`succeeded/ok/completed → completed`；`accepted/queued/running/waiting_human → accepted`；
-  `blocked/unavailable → blocked`；`rejected/denied → rejected`；`failed/error → failed`），
-  并从 payload 提取类型化引用（`task_id/work_order_id/run_id/artifact_id/attachment_id/revision_id/...`）。
-- `receipts.py`（P2-001 持久收据）：
-  - 稳定键 `(tenant_id, session_generation, turn_id, plan_version, action_id)`；
-  - `action_receipts` 表 + `action_plans` 表（SQLite 在 `AUTH_DB_PATH`，PG 在控制面 schema）；
-  - `REPLAYABLE_STATUSES={failed,skipped}`、`REUSABLE_STATUSES={completed,accepted,blocked,rejected}`；
-    `needs_reconciliation` 时不可重放；
-  - `upsert` 用单调 revision（旧 revision 到达被忽略并返回已存值）；
-  - `settle_domain_job(reference, status, ...)` 让领域任务完成后回填收据并唤醒所属计划；
-  - 收据存储创建失败 → `receipt_store=None`，**绝不影响 turn**。
-- `decisions.py`：把领域「待决项」聚合成 `PendingDecision`（按 `(kind, group_key)` 分组、
-  blocking 优先、`decision_id="decision:{kind}:{group}"`）；策略
-  `resolve_decision_policy`（`continue_with_defaults | ask_before_write | block`）。
-  例如 ICD 引脚暴露异常分组，默认 `include`（continue）或 `exclude`（ask）。
-- 审计：`_conversation_action_audit_fields` 把 `conversation_action_plan_mode`、
-  `conversation_action_plan`、`_issues`、`_execution` 写进 `retrieval_summary`（持久可查）。
 
 ---
 
@@ -327,14 +262,14 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 | `attachment_search` / `attachment_visual` | 附件检索/视觉失败（视觉失败另记 `record_attachment("visual_failure","degraded")`） |
 
 控制路径的 `stage` 状态：`blocked`/`error` 标失败原因码
-（`document_flow_unavailable`、`conversation_action_execution`、`document_edf_scope_replacement`、
+（`intent_clarification`、`attachment_proposal`、
 `document_plan_confirmation`、`document_clarification_answer`、`attachment_edit`）。
 
 ---
 
 ## 8. `claim_evidence.py`（声明/需求/覆盖词表）
 
-用途：文档生成与项目检索共享的**类型化契约**（chat 主链不用）。
+用途：项目检索使用的**类型化契约**。
 
 | 类型 | 关键字段 |
 |---|---|
@@ -352,7 +287,7 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 
 真正的证据匹配在：
 - chat：`runner._build_claim_coverage`（引用近似，见 §7）；
-- 文档生成：`InformationRequirement` + `ProjectEvidenceRetrievalService.retrieve`（严格作用域）。
+- 项目检索：`InformationRequirement` + `ProjectEvidenceRetrievalService.retrieve`（严格作用域）。
 
 ---
 
@@ -363,14 +298,14 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 
 ### 9.1 research_agent
 
-- `RESEARCH_AGENT_ENABLED`（默认 false）；`ResearchAgent(evidence_loader=..., max_depth=1)`；
+- 代码内常量 `RESEARCH_AGENT_ENABLED=false`（仅测试/脚本覆盖，不是部署开关）；`ResearchAgent(evidence_loader=..., max_depth=1)`；
 - `research(goal, scope, evidence_refs, should_cancel)`：**不调用模型**，
   纯确定性证据收集器；只接受 `evidence_refs` 白名单内的证据（「永不扩大访问」）；
   产出 `ResearchResult(findings, evidence_refs, conflicts, missing_information, depth)`。
 
 ### 9.2 reviewer_agent
 
-- `REVIEWER_AGENT_ENABLED`（默认 false）；`REVIEWER_VERSION="reviewer-v1"`；
+- 代码内常量 `REVIEWER_AGENT_ENABLED=false`（仅测试/脚本覆盖，不是部署开关）；`REVIEWER_VERSION="reviewer-v1"`；
 - 确定性检查：`unknown_citation`（`[n]` 越界）、`no_evidence`、`missing_required_fact`、
   `forbidden_claim_present`；
 - 可选语义检查（注入模型时）：中文 JSON 提示词，检查 `unsupported_claims` / `evidence_conflicts`；
@@ -401,10 +336,10 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `AGENT_MAX_RETRIEVAL_ROUNDS` | `3` | 基础 recursion_limit（deep×12 / fast×6） |
-| `AGENT_COMPLEXITY_BUDGET_ENABLED` / `AGENT_RECURSION_LIMIT_MAX` | `true` / `72` | 复杂度感知预算与封顶 |
-| `AGENT_PARTIAL_SYNTHESIS_ENABLED` / `..._MAX_EVIDENCE_BYTES` / `..._MAX_TOKENS` | `true` / `24000` / `8192` | 步数耗尽后的部分答案收尾、证据压缩与输出预算 |
-| `AGENT_VERIFIER_ENABLED` / `AGENT_VERIFIER_MIN_ANSWER_CHARS` | `true` / `600` | 复杂回答的独立 rubric 校验 |
-| `AGENT_RESEARCH_SUBAGENT_ENABLED` | `true` | 复杂 deep 任务提供只读 research 子代理 |
+| `AGENT_RECURSION_LIMIT_MAX` | `72` | 复杂度感知预算封顶（预算开关为内置常量 `true`） |
+| `..._MAX_EVIDENCE_BYTES` / `..._MAX_TOKENS` | `24000` / `8192` | 部分答案收尾与证据压缩预算（收尾开关为内置常量 `true`） |
+| `AGENT_VERIFIER_MIN_ANSWER_CHARS` | `600` | rubric 校验阈值（校验开关为内置常量 `true`） |
+| research 子代理 | 内置常量 `true` | 复杂 deep 任务提供只读 research 子代理 |
 | `FINAL_TOP_K` | `5` | 后端默认 top_k（agent 实际用 `rt.top_k`：deep 8 / fast 5） |
 | `AGENT_EVIDENCE_BUDGET` / `AGENT_ATTACHMENT_EVIDENCE_BUDGET` / `AGENT_HARDWARE_EVIDENCE_BUDGET` | `30` / `80` / `80` | 证据堆预算；硬件问题按位号/表号/阈值识别后提高 |
 | `AGENT_MODEL_MAX_INPUT_TOKENS` | `65536` | 上下文压缩触发（0=关） |
@@ -412,15 +347,12 @@ API 侧用它把 checkpoint 引用实时登记到 `conversation_execution_state`
 | `AGENT_RATE_LIMIT_MAX_RETRIES` | `4` | custom 提供商重试（ollama 为 0） |
 | `AGENT_LLM_PROVIDER` | `ollama` | `ollama|custom` |
 | `SYSTEM_PROMPT` / `NO_CONTEXT_PROMPT` | 内置中文 | 可覆盖；须保留 `{kb_name}`/`{workflow}` 占位 |
-| `AGENT_DOCUMENT_TOOLS_ENABLED` | `false` | 挂载文档生成工具 |
-| `DOCUMENT_PLANNING_V2_ENABLED` | `false` | v2 计划面 |
-| `CONVERSATION_ACTION_PLAN_MODE` | `off` | `off|shadow|enabled` |
-| `CONVERSATION_UNIFIED_TOOLS_ENABLED` | `false` | 统一工具集装配 |
-| `ACTION_DAG_PARALLEL_ENABLED` / `ACTION_EXECUTOR_MAX_PARALLEL` | `false` / `4` | action DAG 并行层 |
-| `DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED` | `false` | 低风险计划自动确认 |
-| `REVIEWER_AGENT_ENABLED` / `RESEARCH_AGENT_ENABLED` | `false` / `false` | 子代理（未接线） |
+| 文档计划/风险门开关 | 代码内常量 `false` | v2 计划面、低风险计划自动确认；测试可覆盖模块属性 |
+| 统一工具/动作计划 | 代码内常量 `true` / `off` | 平台内置管线，不是部署开关 |
+| `ACTION_EXECUTOR_MAX_PARALLEL` | `4` | action DAG 并行层线程上限（并行路径为代码内常量 `false`） |
+| 子代理开关 | 代码内常量 `false` / `false` | 未接线；仅测试/脚本覆盖 |
 | `AGENT_CHECKPOINT_BACKEND` / `_DB_PATH` / `_DATABASE_URL` / `_POOL_SIZE` | `sqlite` / `storage/agent_checkpoints.db` / `""` / `4` | checkpoint |
-| `SHARED_RETRIEVAL_EXECUTOR_ENABLED` + `RETRIEVAL_*` | `false` + 8/256/4/30/10 | 共享检索池 |
+| `RETRIEVAL_*` | 8/256/4/30/10 | 共享检索池参数（执行器开关为内置常量 `true`） |
 | `MULTI_KB_CHAT_ENABLED` / `MULTI_KB_MAX_SOURCES` | `false` / `4` | 多库独立开关与选库上限；前端原始多选入口已下线，后端保留给后续“项目空间”挂载 |
 | `HDB_WIKI_SEARCH_EXPAND` | 未设置 | 环境变量级覆盖 `wiki_search` 的 `include_linked` |
 

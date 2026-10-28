@@ -15,7 +15,7 @@ const PAGES: Array<{ path: string; name: string }> = [
   { path: '/admin/evaluation', name: 'RAGAS 评估' },
   { path: '/admin/departments', name: '部门管理' },
   { path: '/admin/users', name: '员工管理' },
-  { path: '/admin/kb-mount', name: '知识库挂载' },
+  { path: '/admin/kb-mount', name: '知识库分配' },
   { path: '/admin/status', name: '系统状态' },
   { path: '/admin/plugins', name: '平台扩展' },
   { path: '/admin/config', name: '系统配置' },

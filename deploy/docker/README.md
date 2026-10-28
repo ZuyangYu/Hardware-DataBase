@@ -30,7 +30,7 @@
                                    └──> redis:6379（内部网络，不存独有数据）
 ```
 
-生产 Compose 启动独立的 chat/authoring/parse/export/memory/evaluation/quality worker，
+生产 Compose 启动独立的 chat/parse/export/memory/evaluation/quality worker，
 API 的自动拉起开关在 Compose 中关闭；各进程通过持久账本协调。生产默认另起观测组件。
 
 ---
@@ -272,7 +272,7 @@ bash offline-install.sh --upgrade --target <旧部署目录>
 
 ## 5. 多角色/多副本（可选）
 
-生产 Docker 编排默认关闭 API 内嵌 worker，并为 chat/authoring/parse/export/memory
+生产 Docker 编排默认关闭 API 内嵌 worker，并为 chat/parse/export/memory
 各起一个独立服务，避免直接扩容 API 时重复消费同一队列。宿主机单进程开发模式仍可
 保留内嵌 worker；多副本 API 部署应明确设置 `HDB_API_SPAWN_*` 为 `0`。
 

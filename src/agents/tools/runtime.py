@@ -197,10 +197,6 @@ class AdmissionResult:
 class ToolRuntime:
     kb_name: str
     ctx: RequestContext | None
-    # Server-normalized, owner-bound document context.  It is intentionally
-    # opaque to ordinary retrieval tools; only the explicitly gated document
-    # tool factory consumes it.
-    document_context: Any | None = None
     document_store: Any | None = None
     knowledge_scope: KnowledgeScopeSnapshot | None = None
     # Server-resolved explicit file/sheet/pin targets for this turn. Tools

@@ -6,6 +6,7 @@ modules. The Streamlit app and any later frontend become HTTP clients of it.
 """
 from __future__ import annotations
 
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -24,7 +25,6 @@ from src.api.routes import (
     conversations,
     departments,
     doc_assets,
-    document_generation,
     evaluation,
     files,
     governance,
@@ -120,6 +120,12 @@ async def lifespan(app: FastAPI):
     keeping it a separate OS process (crash isolation + DB-level claim queue).
     """
     import src.settings
+
+    obsolete = src.settings.obsolete_env_keys()
+    if obsolete:
+        logging.getLogger(__name__).warning(
+            "配置中包含已废弃/内置项，可删除: %s", ", ".join(obsolete)
+        )
 
     # P0-008: fail fast on provider selections that cannot run; never fall back
     # to a silently created local database.
@@ -336,7 +342,6 @@ def create_app() -> FastAPI:
     app.include_router(upload.router, prefix=api_v1)
     app.include_router(users.router, prefix=api_v1)
     app.include_router(departments.router, prefix=api_v1)
-    app.include_router(document_generation.router, prefix=api_v1)
     app.include_router(kb_assign.router, prefix=api_v1)
     app.include_router(governance.router, prefix=api_v1)
     app.include_router(config.router, prefix=api_v1)

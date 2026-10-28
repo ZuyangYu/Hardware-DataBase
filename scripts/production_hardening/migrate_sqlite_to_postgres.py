@@ -7,10 +7,6 @@ Groups map to source databases (see the migration runbook):
 - ``projection``:  storage/memory.db (rebuildable search projection)
 - ``attachments``: storage/chat_attachments.db
 - ``pipeline``:    storage/pipeline_documents.db
-- ``projects``:    storage/projects.db (project-first governance ledger)
-- ``document_authoring``: storage/document_authoring.db (templates, planning,
-                    sessions, reviews, revisions, tasks)
-- ``compatibility``: storage/document_authoring_compatibility.sqlite
 
 Safety: run with writes stopped for the selected group.  The script creates
 missing tables, copies rows idempotently, then compares row counts and a
@@ -38,9 +34,6 @@ GROUP_DATABASES: dict[str, str] = {
     "projection": "memory.db",
     "attachments": "chat_attachments.db",
     "pipeline": "pipeline_documents.db",
-    "projects": "projects.db",
-    "document_authoring": "document_authoring.db",
-    "compatibility": "document_authoring_compatibility.sqlite",
 }
 
 _INTEGER_TYPES = ("INT", "BIGINT", "SMALLINT", "TINYINT", "BOOLEAN")

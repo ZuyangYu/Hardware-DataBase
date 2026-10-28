@@ -23,7 +23,7 @@ class Evidence:                    # document_rag/schemas.py:59
 
 `EvidenceEnvelope` 是其治理扩展（项目/基线/源版本/处理产物/文档角色/模块范围/修订/审批状态/
 有效期/定位器/事实类型/确定性/权威策略/内容哈希/引用片段/血缘组/检索时间），
-用于项目级检索与文档生成；chat 主链只用 `Evidence`。
+用于项目级检索；chat 主链只用 `Evidence`。
 
 **约定**：
 
@@ -182,21 +182,13 @@ memory_search(query: str, scope: str = "all", status: str = "all", top_k: int = 
 - 血缘遍历最多 200 条 session 修订；
 - 成功事件：`attachment_revision` + `document_card`（含下载 URL）。
 
-### 3.9 文档生成工具族（`tools/document_authoring_tools.py`，2457-2529）
-
-仅 `AGENT_DOCUMENT_TOOLS_ENABLED=true` 时挂载；提供计划确认、任务状态/投影读取、
-修订创建/完成、评审决策、ICD 作用域异常解决、放行请求等。
-在 action plan enabled 模式下，写入类工具对叙述循环隐藏（见 [05](05-agent-runtime.md#3-工具装配与可见性)）。
-
----
-
 ## 4. 批量检索执行器（`tools/retrieval_executor.py`，278 行）
 
-用途：文档生成 harness 的**单元级并行检索**（chat 主链不用）。
+用途：批量检索的**单元级并行执行器**。
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `SHARED_RETRIEVAL_EXECUTOR_ENABLED` | `false` | 是否使用共享线程池（false 时每次请求自建） |
+| 共享检索执行器 | 代码内常量 `true` | 内置共享线程池；测试可覆盖，不是部署开关 |
 | `RETRIEVAL_EXECUTOR_MAX_WORKERS` | `8` | 池大小 |
 | `RETRIEVAL_QUEUE_MAX_DEPTH` | `256` | 队列深度 |
 | `RETRIEVAL_PER_REQUEST_FANOUT` | `4` | 单请求扇出 |

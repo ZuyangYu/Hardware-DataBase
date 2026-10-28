@@ -22,7 +22,6 @@ services:
     depends_on:
       otel-collector:
         condition: service_started
-  worker-authoring: *observed-worker
   worker-parse: *observed-worker
   worker-export: *observed-worker
   worker-memory: *observed-worker

@@ -39,32 +39,19 @@ REACHABLE = _redis_reachable(_TEST_URL)
 class CancelFastPathDisabledTests(unittest.TestCase):
     def setUp(self):
         self._original_url = src.settings.REDIS_URL
-        self._original_enabled = src.settings.CANCEL_FAST_PATH_ENABLED
         self.addCleanup(setattr, src.settings, "REDIS_URL", self._original_url)
-        self.addCleanup(
-            setattr, src.settings, "CANCEL_FAST_PATH_ENABLED", self._original_enabled
-        )
         self.addCleanup(redis_cancel.reset_client)
 
     def test_empty_url_disables_every_helper(self):
         src.settings.REDIS_URL = ""
-        src.settings.CANCEL_FAST_PATH_ENABLED = True
         redis_cancel.reset_client()
         self.assertFalse(redis_cancel.fast_path_enabled())
         self.assertFalse(redis_cancel.publish_cancel("turn-1"))
         self.assertFalse(redis_cancel.is_cancel_requested("turn-1"))
         self.assertFalse(redis_cancel.clear_cancel("turn-1"))
 
-    def test_flag_disables_every_helper(self):
-        src.settings.REDIS_URL = _TEST_URL
-        src.settings.CANCEL_FAST_PATH_ENABLED = False
-        redis_cancel.reset_client()
-        self.assertFalse(redis_cancel.fast_path_enabled())
-        self.assertFalse(redis_cancel.publish_cancel("turn-1"))
-
     def test_client_errors_are_fail_soft(self):
         src.settings.REDIS_URL = _TEST_URL
-        src.settings.CANCEL_FAST_PATH_ENABLED = True
         redis_cancel.reset_client()
 
         class _Broken:
@@ -91,17 +78,12 @@ class CancelFastPathDisabledTests(unittest.TestCase):
 class CancelFastPathTests(unittest.TestCase):
     def setUp(self):
         self._original_url = src.settings.REDIS_URL
-        self._original_enabled = src.settings.CANCEL_FAST_PATH_ENABLED
         self._original_ttl = src.settings.CANCEL_KEY_TTL_SECONDS
         self.addCleanup(setattr, src.settings, "REDIS_URL", self._original_url)
-        self.addCleanup(
-            setattr, src.settings, "CANCEL_FAST_PATH_ENABLED", self._original_enabled
-        )
         self.addCleanup(
             setattr, src.settings, "CANCEL_KEY_TTL_SECONDS", self._original_ttl
         )
         src.settings.REDIS_URL = _TEST_URL
-        src.settings.CANCEL_FAST_PATH_ENABLED = True
         src.settings.CANCEL_KEY_TTL_SECONDS = 120
         redis_cancel.reset_client()
         self.addCleanup(redis_cancel.reset_client)

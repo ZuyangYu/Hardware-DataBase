@@ -5,7 +5,7 @@
 #
 # 拓扑（默认全在一个 compose 里，新机器一条命令起全套）：
 #   migrate(一次性) ──> api(8001) ──> web(8080->80)
-#        │                └ 独立 chat/authoring/parse/export/memory workers
+#        │                └ 独立 chat/parse/export/memory workers
 #        └ postgres(pgvector, 内部网络)   redis(内部网络，必需)
 #   外部依赖（不在本编排内）：RAGFlow、LLM（Ollama 或 OpenAI 兼容 API）
 #
@@ -44,8 +44,6 @@ x-pg-env: &pg-env
   MEMORY_DATABASE_URL: *pg-dsn
   AGENT_CHECKPOINT_BACKEND: postgres
   AGENT_CHECKPOINT_DATABASE_URL: *pg-dsn
-  DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND: postgres
-  DOCUMENT_AUTHORING_CHECKPOINTER_DATABASE_URL: *pg-dsn
   RESOURCE_GOVERNOR_BACKEND: postgres
   RESOURCE_GOVERNOR_DATABASE_URL: *pg-dsn
   RESOURCE_GOVERNOR_SCOPE: deployment
@@ -99,7 +97,7 @@ services:
     <<: *app
     environment:
       <<: [*app-env, *pg-env]
-      HDB_REQUIRED_WORKER_ROLES: chat,authoring,parse,export,memory,evaluation,quality
+      HDB_REQUIRED_WORKER_ROLES: chat,parse,export,memory,evaluation,quality
       # Only the dedicated nginx network may supply forwarded client IPs.
       FORWARDED_ALLOW_IPS: ${HDB_PROXY_SUBNET:-172.30.91.0/24}
     networks:
@@ -128,9 +126,6 @@ services:
   worker-chat:
     <<: *worker
     command: ["hardware-database-worker", "--role", "chat"]
-  worker-authoring:
-    <<: *worker
-    command: ["hardware-database-worker", "--role", "authoring"]
   worker-parse:
     <<: *worker
     command: ["hardware-database-worker", "--role", "parse"]

@@ -28,7 +28,7 @@ MEMORY_WORKER_PID_FILE="$PID_DIR/memory-worker.pid"
 EXPORT_WORKER_PID_FILE="$PID_DIR/export-worker.pid"
 # Worker 角色进程: 默认 chat/authoring/parse 三个独立进程(互不阻塞)。
 # HDB_WORKER_ROLES=all 时回退为单进程 legacy 模式。
-WORKER_ROLES="${HDB_WORKER_ROLES:-chat authoring parse}"
+WORKER_ROLES="${HDB_WORKER_ROLES:-chat parse}"
 
 # 后台 worker 命令名:聊天/文档轮次在 worker 进程内执行(agent 工具、
 # 计划提交、记忆提炼),重复启动会留下携带旧代码的僵尸实例,因此

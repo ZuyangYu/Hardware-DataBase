@@ -21,11 +21,10 @@ Hardware DataBase（包名 `hardware-database`）是面向**硬件设计资产**
 | 电路（`.edf/.edif`，配套原理图 PDF） | 内置 SpyDrNet + 自研查询引擎 | 确定性结构化查询 + 可选语义向量补充 |
 | 外部对话（`.txt/.md`） | 本地解析 + LLM 结构化/摘要 | 关键词索引 + 可选向量 |
 
-在此之上还有三块「重资产」子系统：
+在此之上还有两块「重资产」子系统：
 
 1. **Agent 查询运行时**：基于 `deepagents` 的有界 ReAct 循环，模型自主决定调用哪些检索工具、多跳顺序与次数；前端实时展示工具轨迹。
-2. **文档生成（Document Authoring）**：模板驱动的受控工程文档生产（ICD / FPT / 需求规格 / 通用报告），具备哈希绑定的不可变输入、证据接地、确定性渲染、人工放行门。约 4.9 万行，是仓库最大的子系统。
-3. **RAGAS 评估**：管理员可用的回答质量评估子系统，支持在线采集 + 离线复评，带阈值门禁与历史基线对比。
+2. **RAGAS 评估**：管理员可用的回答质量评估子系统，支持在线采集 + 离线复评，带阈值门禁与历史基线对比。
 
 ---
 
@@ -44,7 +43,6 @@ Hardware DataBase（包名 `hardware-database`）是面向**硬件设计资产**
 | 改电路解析/查询 | [10-circuit.md](10-circuit.md) |
 | 改长期记忆 | [11-memory.md](11-memory.md) |
 | 改对话附件/文档修订 | [12-attachments.md](12-attachments.md) |
-| 改文档生成/模板/ICD | [13-document-authoring.md](13-document-authoring.md) + [14-authoring-render-and-api.md](14-authoring-render-and-api.md) |
 | 改 Wiki / 资产 / 项目治理 | [15-wiki-assets-projects.md](15-wiki-assets-projects.md) |
 | 改导出 / 外部对话 / 评估 | [16-exports-and-external-conversations.md](16-exports-and-external-conversations.md) / [17-evaluation.md](17-evaluation.md) |
 | 改前端 | [19-frontend.md](19-frontend.md) |
@@ -73,8 +71,6 @@ Hardware DataBase（包名 `hardware-database`）是面向**硬件设计资产**
 | 10 | [circuit](10-circuit.md) | 领域模型、EDF 解析与 SpyDrNet 补丁、索引与存储、查询引擎、电源/偏置/防护推导、图与向量、datasheet 链接 |
 | 11 | [memory](11-memory.md) | 记忆 Catalog、candidate/verified 生命周期、consent 不可变、outbox、worker、检索与 `<untrusted_memory>` 注入 |
 | 12 | [attachments](12-attachments.md) | 会话附件模型、上传配额、本地解析器、FTS/trigram/dense 检索、文档修订与放行、job/lease/协调器 |
-| 13 | [document-authoring](13-document-authoring.md) | 核心概念与 ID/状态机、两条入口路径、模板分析、planning v2、harness 图与 agent、receipt/lease/边界 |
-| 14 | [authoring-render-and-api](14-authoring-render-and-api.md) | Writer 与渲染器、模板消毒、持久化表结构、迁移、ICD 生成/对比、API 与灰度开关 |
 | 15 | [wiki-assets-projects](15-wiki-assets-projects.md) | Wiki 蒸馏与检索、文档资产、硬件资产候选、项目治理与 source set snapshot |
 | 16 | [exports-and-external-conversations](16-exports-and-external-conversations.md) | ResultSnapshot 不可变导出、5 种渲染器、导出 worker、外部对话解析/索引/LLM 结构化 |
 | 17 | [evaluation](17-evaluation.md) | RAGAS 评估：CLI/服务/运行控制、采集 QC、评分、门禁、报告、历史与导入、API |

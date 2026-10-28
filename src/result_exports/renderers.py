@@ -21,7 +21,7 @@ from xml.sax.saxutils import escape
 from src.result_exports.answer import is_full_html_document, strip_export_fallback_markup
 from src.result_exports.markdown import parse_markdown_blocks
 from src.result_exports.models import RenderedResult, ResultEnvelope, normalize_content_shape, normalize_export_format
-from src.document_authoring.ooxml import sanitize_xml10_text, validate_ooxml_package
+from src.core.ooxml import sanitize_xml10_text, validate_ooxml_package
 
 
 MARKDOWN_MIME = "text/markdown; charset=utf-8"

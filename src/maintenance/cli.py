@@ -42,38 +42,6 @@ def _reparse_attachments(args: argparse.Namespace) -> int:
     return 0 if result["scanned"] == 0 or result["queued"] > 0 else 1
 
 
-def _compatibility_readiness(args: argparse.Namespace) -> int:
-    from src.document_authoring.compatibility import (
-        AUTO_CONFIRMATION_ATTEMPT,
-        LEGACY_DIRECT_EXECUTION,
-        LEGACY_WRITE,
-        NEW_WRITE,
-        PLAN_BACKED_EXECUTION,
-        DocumentAuthoringCompatibilityService,
-    )
-
-    service = DocumentAuthoringCompatibilityService()
-    report = service.evaluate_closure_readiness()
-    payload = {
-        "ready": report.ready,
-        "reasons": report.reasons,
-        "release_count": report.release_count,
-        "backup_verified": report.backup_verified,
-        "restore_verified": report.restore_verified,
-        "old_fields_read_only": report.old_fields_read_only,
-        "no_new_legacy_writes": report.no_new_legacy_writes,
-        "closure_flag_enabled": service.closure_enabled,
-        "legacy_markers": len(service.store.list_markers()),
-        "event_counts": {
-            LEGACY_WRITE: service.store.count_events(LEGACY_WRITE),
-            NEW_WRITE: service.store.count_events(NEW_WRITE),
-            LEGACY_DIRECT_EXECUTION: service.store.count_events(LEGACY_DIRECT_EXECUTION),
-            PLAN_BACKED_EXECUTION: service.store.count_events(PLAN_BACKED_EXECUTION),
-            AUTO_CONFIRMATION_ATTEMPT: service.store.count_events(AUTO_CONFIRMATION_ATTEMPT),
-        },
-    }
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0 if report.ready else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -103,11 +71,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reparse.set_defaults(handler=_reparse_attachments)
 
-    readiness = subparsers.add_parser(
-        "compatibility-readiness",
-        help="report the document-authoring legacy closure gates before flipping the flag",
-    )
-    readiness.set_defaults(handler=_compatibility_readiness)
     return parser
 
 

@@ -556,45 +556,7 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual(created.status_code, 201, created.text)
         self.assertEqual(created.json()["turn"]["query_mode"], "deep")
 
-    def test_turn_document_flow_true_requires_document_context(self):
-        t = self._token("user1")
-        session = self.client.post(
-            "/api/v1/conversations",
-            json={"kb_name": "shared", "title": "新对话"},
-            headers=self._auth(t),
-        ).json()
-        created = self.client.post(
-            f"/api/v1/conversations/{session['id']}/turns",
-            json={"query": "问", "document_flow": True},
-            headers=self._auth(t),
-        )
-        self.assertEqual(created.status_code, 422, created.text)
 
-    def test_turn_document_flow_follow_up_accepts_existing_document_context(self):
-        t = self._token("user1")
-        session = self.client.post(
-            "/api/v1/conversations",
-            json={"kb_name": "shared", "title": "文档续答"},
-            headers=self._auth(t),
-        ).json()
-        created = self.client.post(
-            f"/api/v1/conversations/{session['id']}/turns",
-            json={
-                "query": "确认",
-                "document_flow": True,
-                "document_context": {
-                    "version": "v1",
-                    "knowledge_base_name": "shared",
-                    "analysis_id": "analysis-1",
-                    "template_version_id": "template-v1",
-                    "expiry": "2099-01-01T00:00:00Z",
-                    "client_request_id": "context-key-1",
-                },
-            },
-            headers=self._auth(t),
-        )
-        self.assertEqual(created.status_code, 201, created.text)
-        self.assertEqual(created.json()["turn"]["document_context"]["analysis_id"], "analysis-1")
 
     def test_pending_turn_can_be_cancelled_without_starting(self):
         t = self._token("user1")

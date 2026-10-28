@@ -31,12 +31,6 @@ from src.core.conversation import (
     ConversationService,
     StaleTurnOwner,
 )
-from src.core.intent import classify_intent
-from src.document_authoring.chat_context import (
-    DocumentAuthoringContext,
-    DocumentContext,
-    build_document_context,
-)
 from src.observability import (
     current_trace_identity,
     extract_trace_context,
@@ -82,48 +76,8 @@ _DELTA_FLUSH_SECONDS = 0.12
 _SHORT_TERM_HISTORY_LIMIT = 5
 
 
-def _parse_document_context(value: Any) -> DocumentContext | DocumentAuthoringContext | None:
-    """Parse either the legacy v1 template context or the v2 authoring scope."""
-
-    if not value:
-        return None
-    if isinstance(value, (DocumentContext, DocumentAuthoringContext)):
-        return value
-    payload = value if isinstance(value, dict) else getattr(value, "model_dump", lambda **_: value)(mode="json")
-    if str(payload.get("version", "")).strip().lower() == "v2":
-        return DocumentAuthoringContext.model_validate(payload)
-    return DocumentContext.model_validate(payload)
 
 
-def _authoring_context_candidate(
-    *,
-    query: str,
-    document_flow: bool | None,
-    kb_name: str,
-    has_attachments: bool,
-) -> bool:
-    """Return whether the server should mount a v2 authoring context.
-
-    This is only a capability hint.  It never starts a job; the durable
-    planner/confirmation boundary remains responsible for execution.
-    """
-
-    if document_flow is False:
-        return False
-    plan = classify_intent(
-        query,
-        has_template_context=False,
-        has_attachments=has_attachments,
-        has_kb=bool(str(kb_name or "").strip()) and kb_name != GENERAL_CHAT_KB_NAME,
-    )
-    if plan.action == "revise" and document_flow is not True:
-        # “完善附件第N章并替换” edits the attachment itself through
-        # attachment_edit; mounting a governed document context here would
-        # hijack it into the document-authoring flow (and can fail on
-        # unrelated task references).  Only an explicit document_flow=true
-        # still requests the governed route.
-        return False
-    return plan.intent in {"template_generation", "document_authoring"}
 
 
 def _publish_turn_event(turn_id: str, seq: int | None, event_type: str, payload: dict) -> None:
@@ -228,9 +182,9 @@ def _make_event_callback(emit_stage, emit):
             return
         if etype == "stage":
             payload = evt.get("payload") or {}
-            # Non-core payload keys (e.g. document_flow_routed's routed_by)
-            # are forwarded so durable/SSE consumers keep the full routing
-            # provenance instead of only key/label/status/detail.
+            # Non-core payload keys are forwarded so durable/SSE consumers
+            # keep the full routing provenance instead of only
+            # key/label/status/detail.
             extra = {
                 extra_key: extra_value
                 for extra_key, extra_value in payload.items()
@@ -249,18 +203,6 @@ def _make_event_callback(emit_stage, emit):
     return _on_event
 
 
-def _decode_document_flow(trace_context: dict[str, str] | None) -> bool | None:
-    """Decode the explicit document-flow flag persisted by ``create_turn``
-    (which writes ``trace_context["document_flow"]`` when the client sends an
-    explicit ``document_flow`` value).  Only the exact "true"/"false" markers
-    are meaningful; a missing, empty, or unknown value keeps the legacy
-    regex fallback (``None``) instead of being coerced to a decision.
-    """
-
-    raw = (trace_context or {}).get("document_flow")
-    if raw is None:
-        return None
-    return {"true": True, "false": False}.get(str(raw).strip().lower())
 
 
 def _conv_service() -> ConversationService:
@@ -307,14 +249,6 @@ def _turn_view(
     attachments: list[AttachmentSnapshotView] | None = None,
 ) -> TurnView:
     queue_context = _turn_queue_context(turn)
-    document_context = None
-    if turn.document_context:
-        try:
-            document_context = _parse_document_context(turn.document_context)
-        except Exception:
-            # A historical/malformed context is never allowed to become an
-            # active tool capability, but it remains hidden from the DTO.
-            document_context = None
     return TurnView(
         id=turn.id,
         session_id=turn.session_id,
@@ -334,7 +268,6 @@ def _turn_view(
         created_at=turn.created_at,
         started_at=turn.started_at,
         finished_at=turn.finished_at,
-        document_context=document_context,
         source_scope=str(getattr(turn, "source_scope", "") or "auto"),
         attachments=attachments if attachments is not None else _turn_attachments_for(turn),
         blocked_by_turn_id=queue_context.get("blocked_by_turn_id"),
@@ -356,7 +289,6 @@ def _restricted_turn_view(turn: ChatTurn) -> TurnView:
             footer="",
             metrics={},
             knowledge_scope=None,
-            document_context=None,
             attachments=[],
         ),
         attachments=[],
@@ -370,14 +302,6 @@ def _message_view(
     *,
     attachments: list[AttachmentSnapshotView] | None = None,
 ) -> MessageView:
-    document_context = None
-    if getattr(message, "document_context", None):
-        try:
-            document_context = _parse_document_context(message.document_context)
-        except Exception:
-            # Historical malformed context is never an active capability and
-            # must not turn a refresh into a 500 response.
-            document_context = None
     return MessageView(
         id=message.id,
         session_id=message.session_id,
@@ -387,7 +311,6 @@ def _message_view(
         footer=message.footer,
         created_at=message.created_at,
         memory_context=getattr(message, "memory_context", []),
-        document_context=document_context,
         attachments=attachments or [],
     )
 
@@ -409,26 +332,6 @@ def _existing_turn_cancel_signal(turn_id: str) -> threading.Event | None:
 def _clear_turn_cancel_signal(turn_id: str) -> None:
     with _TURN_CANCEL_LOCK:
         _TURN_CANCEL_SIGNALS.pop(turn_id, None)
-
-
-def _bind_document_task_trace(ctx: Any, turn: ChatTurn) -> None:
-    """Expose only the persisted Chat provenance to document authoring.
-
-    ``RequestContext.session_id`` is not sufficient provenance because
-    Workbench/API callers may use synthetic session values.  The durable turn
-    worker is the trusted boundary that knows both the numeric conversation id
-    and the real turn id.
-    """
-    metadata = getattr(ctx, "metadata", None)
-    if not isinstance(metadata, dict):
-        metadata = {}
-        setattr(ctx, "metadata", metadata)
-    metadata.update({
-        "document_task_origin": "chat",
-        "conversation_id": str(turn.session_id),
-        "initiating_turn_id": str(turn.id),
-        "document_task_idempotency_key": f"chat-turn:{turn.id}:document-generation",
-    })
 
 
 @attributed("chat", "chat", "turn_id")
@@ -473,7 +376,6 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             except StaleTurnOwner:
                 pass
             return
-    _bind_document_task_trace(ctx, turn)
     # P0a attempt isolation: the runner writes to an attempt-scoped checkpoint
     # thread; the visible thread only moves through the guarded commit below.
     visible_thread = str(turn.session_id)
@@ -488,9 +390,9 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             knowledge_scope = KnowledgeScopeSnapshot.model_validate(turn.knowledge_scope)
             knowledge_scope_resolver = KnowledgeScopeResolver(AuthService())
             knowledge_scope_resolver.revalidate(user.id, knowledge_scope)
-            # Document authoring and its worker adapters receive the same
-            # server-owned snapshot; they must never reconstruct scope from
-            # the client query or the anchor-only RequestContext.
+            # Worker adapters receive the same server-owned snapshot; they
+            # must never reconstruct scope from the client query or the
+            # anchor-only RequestContext.
             metadata = getattr(ctx, "metadata", None)
             if isinstance(metadata, dict):
                 metadata["knowledge_scope_snapshot"] = knowledge_scope.model_dump(mode="json")
@@ -563,18 +465,6 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
                 )
             except Exception:
                 checkpoint_observer = None
-    document_context = None
-    if turn.document_context:
-        try:
-            document_context = _parse_document_context(turn.document_context)
-            document_context.assert_scope(ctx=ctx, expected_kb=turn.kb_name, required_permission="read")
-        except PermissionError:
-            # The query itself remains durable, but an invalidated attachment
-            # must not be exposed to the agent as a capability.
-            document_context = None
-        except Exception:
-            document_context = None
-    document_flow = _decode_document_flow(turn.trace_context)
     # Attachment scope for this turn: refs are rebuilt server-side from the
     # frozen turn_attachments snapshots so a stale client can never widen it.
     attachment_refs: list = []
@@ -886,8 +776,6 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             cancelled,
             persist_thread=True,
             wiki_assist=turn.wiki_assist,
-            document_context=document_context,
-            document_flow=document_flow,
             attachments=attachment_refs,
             source_scope=str(getattr(turn, "source_scope", "") or "auto"),
             propagate_errors=True,
@@ -1256,23 +1144,6 @@ def create_turn(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if (
-        body.document_flow is True
-        and body.document_context is None
-        and (
-            not _authoring_context_candidate(
-                query=body.query,
-                document_flow=body.document_flow,
-                kb_name=session.kb_name,
-                has_attachments=has_attachments,
-            )
-            or (session.kb_name == GENERAL_CHAT_KB_NAME and not has_attachments)
-        )
-    ):
-        raise HTTPException(
-            status_code=422,
-            detail="document_flow=true requires an authorized knowledge-base, attachment, or task scope",
-        )
     if has_attachments and scope_allows_attachments(effective_scope):
         if not src.settings.CHAT_ATTACHMENTS_ENABLED:
             raise HTTPException(status_code=404, detail="chat attachments are not enabled")
@@ -1293,56 +1164,7 @@ def create_turn(
                     "attachment_ids": blocked[:10],
                 },
             )
-    document_context = None
-    raw_document_context: Any = body.document_context
-    if raw_document_context is None and _authoring_context_candidate(
-        query=body.query,
-        document_flow=body.document_flow,
-        kb_name=session.kb_name,
-        has_attachments=has_attachments,
-    ):
-        # A v2 context can be created from the already authorized session and
-        # frozen attachment references.  No browser-provided tenant/user
-        # fields participate in this construction.
-        raw_document_context = {
-            "version": "v2",
-            "knowledge_base_name": (
-                None if session.kb_name == GENERAL_CHAT_KB_NAME else session.kb_name
-            ),
-            "attachment_ids": requested_attachment_ids,
-            "source_scope": effective_scope,
-        }
-    if body.document_flow is True and raw_document_context is None:
-        raise HTTPException(
-            status_code=422,
-            detail="document_flow=true requires an authorized knowledge-base, attachment, or task scope",
-        )
-    if raw_document_context is not None:
-        if session.kb_name == GENERAL_CHAT_KB_NAME:
-            payload_version = str(
-                getattr(raw_document_context, "version", None)
-                or (raw_document_context.get("version") if isinstance(raw_document_context, dict) else "")
-                or ""
-            ).strip().lower()
-            if payload_version != "v2" or not has_attachments:
-                raise HTTPException(status_code=400, detail="document context requires an authorized source scope")
-        try:
-            document_context = build_document_context(
-                raw_document_context,
-                ctx=ctx,
-                expected_kb=(None if session.kb_name == GENERAL_CHAT_KB_NAME else session.kb_name),
-            )
-        except PermissionError as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
     trace_context = inject_trace_context()
-    if body.document_flow is not None:
-        # The durable worker re-runs the turn outside this request, so the
-        # explicit routing decision must survive persistence.  The turn's
-        # trace_context dict is the only string-keyed per-turn carrier
-        # available without a schema migration.
-        trace_context["document_flow"] = "true" if body.document_flow else "false"
     try:
         turn = conv.create_turn(
         user.id,
@@ -1352,7 +1174,6 @@ def create_turn(
         query_mode,
         trace_context=trace_context,
         wiki_assist=body.wiki_assist,
-        document_context=document_context,
         attachment_ids=[ref.attachment_id for ref in attachment_refs],
             source_scope=effective_scope,
             **({"knowledge_scope": knowledge_scope} if knowledge_scope is not None else {}),
@@ -1437,8 +1258,7 @@ def list_active_turns(
         raise HTTPException(status_code=403, detail="read permission required")
     if include_terminal:
         # Refresh/reopen recovery needs the newest turn even when it already
-        # finished (document context restore); live SSE remains for running
-        # turns only.
+        # finished; live SSE remains for running turns only.
         turns = conv.list_recent_turns(user.id, session_id)
     else:
         turns = conv.list_active_turns(user.id, session_id)
@@ -1624,8 +1444,6 @@ def _query_generator(
     should_cancel=None,
     persist_thread=False,
     wiki_assist=False,
-    document_context=None,
-    document_flow=None,
     attachments=None,
     source_scope="auto",
     propagate_errors=False,
@@ -1649,10 +1467,6 @@ def _query_generator(
             kwargs["persist_thread"] = True
         if "wiki_assist" in params:
             kwargs["wiki_assist"] = wiki_assist
-        if "document_context" in params:
-            kwargs["document_context"] = document_context
-        if "document_flow" in params:
-            kwargs["document_flow"] = document_flow
         if "attachments" in params:
             kwargs["attachments"] = attachments
         if "source_scope" in params:
@@ -1685,10 +1499,6 @@ def _query_generator(
         kwargs["persist_thread"] = True
     if "wiki_assist" in params:
         kwargs["wiki_assist"] = wiki_assist
-    if "document_context" in params:
-        kwargs["document_context"] = document_context
-    if "document_flow" in params:
-        kwargs["document_flow"] = document_flow
     if "attachments" in params:
         kwargs["attachments"] = attachments
     if "source_scope" in params:

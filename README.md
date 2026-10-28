@@ -2,7 +2,7 @@
 
 # Hardware DataBase
 
-**面向硬件设计资料的多源智能问答与文档生成基座**
+**面向硬件设计资料的多源智能问答与知识治理基座**
 
 把散落在技术文档、结构化表格、电路设计（EDF 网表 / 原理图）与历史对话中的硬件知识，
 收敛为一个**可检索、可追溯、可治理、可导出**的统一数据基座。
@@ -66,7 +66,7 @@ bash deploy/docker/quickstart.sh
 ```
 
 脚本会：生成 PostgreSQL、观测栈与管理员口令（打印在终端）→ 构建镜像 → 启动
-`postgres/redis → migrate → api + 独立 chat/authoring/parse/export/memory worker → web`，
+`postgres/redis → migrate → api + 独立 chat/parse/export/memory worker → web`，
 并默认启动观测栈。访问 `http://<主机IP>:8080`，用 `admin` + 终端打印的口令登录。
 
 - 只准备文件不启动：`bash deploy/docker/quickstart.sh --no-start`
@@ -128,14 +128,14 @@ uvicorn src.api.app:create_app --factory --host 127.0.0.1 --port 8000
 | 进程 | 命令 | 作用 |
 |---|---|---|
 | API | `hardware-database-server` | FastAPI 唯一后端入口（源码单机默认自启统一 Worker 与 Export Worker） |
-| Worker | `hardware-database-worker` | 解析任务与对话 turn 消费（支持 `--role chat/authoring/parse` 拆分） |
+| Worker | `hardware-database-worker` | 解析任务与对话 turn 消费（支持 `--role chat/parse` 拆分） |
 | Export worker | `hardware-database-export-worker` | Markdown / Excel / Word / PDF / PPTX 产物生成 |
 | Memory worker | `hardware-database-memory-worker` | LangMem 低优先级记忆提炼 |
 | Maintenance | `hardware-database-maintenance` | 运维 CLI |
 | Eval | `hardware-database-eval` | RAGAS 评估 CLI |
 | E2E | `hardware-database-e2e` | 端到端回归 |
 
-> Docker 生产编排以独立容器运行各 Worker（chat / authoring / parse / export / memory），API 不内嵌 Worker；使用 `bash scripts/hdb.sh start` 管理宿主机进程时会关闭 API 自启，并为各角色各启动一次。
+> Docker 生产编排以独立容器运行各 Worker（chat / parse / export / memory），API 不内嵌 Worker；使用 `bash scripts/hdb.sh start` 管理宿主机进程时会关闭 API 自启，并为各角色各启动一次。
 
 ## 📖 文档导航
 
@@ -163,7 +163,7 @@ uvicorn src.api.app:create_app --factory --host 127.0.0.1 --port 8000
                       ├─ Catalog-first 记忆检索（仅作为不可信历史线索）
                       └─ 每步 tool_started / tool_result 事件驱动前端实时轨迹
        ├─ 统一模型封装 (src.core.model_factory) → Ollama / OpenAI 兼容
-       └─ 持久化任务队列 → chat / authoring / parse / export / memory worker
+       └─ 持久化任务队列 → chat / parse / export / memory worker
 ```
 
 **存储平面**
@@ -188,7 +188,6 @@ Hardware-DataBase/
 │   ├── core/                # AppPipeline、鉴权、model_factory、会话、source group 路由
 │   ├── pipelines/           # 多源 pipeline（document_rag / spreadsheet / registry / runtime）
 │   ├── circuit/             # 电路网表 / 原理图解析与结构化检索
-│   ├── document_authoring/  # 文档生成与模板
 │   ├── result_exports/      # 结果导出（Markdown / Excel / Word / PDF / PPTX）
 │   ├── memory/              # LangMem 长期记忆
 │   ├── evaluation/          # RAGAS 评估子系统（CLI / service / metrics / gates）

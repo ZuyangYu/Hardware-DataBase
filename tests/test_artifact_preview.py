@@ -3,7 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from src.document_authoring.artifact_preview import preview_artifact
+from src.result_exports.artifact_preview import preview_artifact
 
 
 def _xlsx_bytes() -> bytes:

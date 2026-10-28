@@ -94,9 +94,9 @@ project-managed under `deploy/` and wrapped by scripts:
   random password, AOF) enables the realtime plane (`REDIS_URL`: cancel fast path +
   cross-process SSE). Fail-soft; absent Redis degrades to DB polling.
 - `bash scripts/postgres.sh up` + `write-env` -> `deploy/postgres/`
-  (pgvector/pgvector:pg17, `127.0.0.1:55433`) writes the five PostgreSQL backends
+  (pgvector/pgvector:pg17, `127.0.0.1:55433`) writes the four PostgreSQL backends
   (`CONTROL_PLANE_*`, `MEMORY_STORE_*`, `AGENT_CHECKPOINT_*`,
-  `DOCUMENT_AUTHORING_CHECKPOINTER_*`, `RESOURCE_GOVERNOR_*`). Control-plane schema
+  `RESOURCE_GOVERNOR_*`). Control-plane schema
   is hand-pinned DDL, fail-closed on readiness; migration/rehearsal commands live in
   `deploy/postgres/README.md`.
 
@@ -108,6 +108,48 @@ SiliconFlow) plus a stale block of dead old-architecture variables
 `.env.example`, which is the accurate current template (including the optional
 `EVAL_*` eval-embedding block). Eval config (`EVAL_LLM_*` / `EVAL_EMBEDDING_*`)
 is read by `src/evaluation/config.py`, not `settings.py`.
+
+### Configuration boundary (read before adding a setting)
+
+**Do not add a new environment variable or `settings.py` flag by default.**
+Configuration is a supported contract, not a scratchpad. Every exposed knob
+creates tests, docs, UI, migration and support work.
+
+Allowed in env/config:
+
+- deployment differences: database/Redis, object storage, model endpoint/key,
+  ports, concurrency and quotas;
+- security/ops kill switches: sandbox, MCP write, private-host access;
+- short-lived rollout flags with an owner and a removal date.
+
+Not in env/config:
+
+- stable product behavior: default on; do not add `*_ENABLED`;
+- internal algorithms/execution paths: module constants; tests may monkeypatch;
+- product policy/quotas: database or admin policy surface;
+- values derivable from a profile or machine capacity.
+
+Decision rule:
+
+1. Does it differ per deployment? No -> code constant.
+2. Does it differ per tenant/user? Yes -> database/admin policy.
+3. Does it need emergency rollback? Yes -> one subsystem kill switch.
+4. Otherwise -> do not add it.
+
+Prefer a small profile (`fast` / `balanced` / `deep`) only when several values
+are tuned together and have a user-facing meaning. A profile is still config;
+do not add one just to rename ten numeric knobs.
+
+Guardrails:
+
+- `tests/test_internal_setting_constants.py` enforces internal constants and the
+  allowlist of remaining `_env_bool` flags.
+- `settings.OBSOLETE_ENV_KEYS` plus the API/worker startup warning identify
+  removed keys. Do not re-add them.
+- Internal constants must not appear in `DEFAULT_VALUES`, `.env.example`, or
+  `ConfigPage`; tests may override the module attribute directly.
+- When changing config behavior, update `.env.example`,
+  `wiki/20-config-and-storage.md` and the relevant tests.
 
 ## Architecture
 
@@ -325,13 +367,11 @@ space.
 
 When the PostgreSQL backends are on, these files are **retired** (present but no
 longer written): `agent_checkpoints.db`, `memory.db`, `resource_quotas.db`,
-`document_authoring_checkpoints.sqlite`. Still live: `auth.db` (auth/audit),
-`chat_attachments.db`, `pipeline_documents.db`, `projects.db`,
-`document_authoring.db` (work orders), and the derived index dirs.
+Still live: `auth.db` (auth/audit), `chat_attachments.db`,
+`pipeline_documents.db`, `projects.db`, and the derived index dirs.
 
 Tests must never touch the production backends: `tests/conftest.py` forces
-`CONTROL_PLANE_/MEMORY_/AGENT_CHECKPOINT_/DOCUMENT_AUTHORING_CHECKPOINTER_/
-RESOURCE_GOVERNOR_` to sqlite in both `settings` and `os.environ` (so spawned
+`CONTROL_PLANE_/MEMORY_/AGENT_CHECKPOINT_/RESOURCE_GOVERNOR_` to sqlite in both `settings` and `os.environ` (so spawned
 subprocesses inherit it). PG-gated suites opt in via `HDB_TEST_POSTGRES_DSN`
 pointing at a disposable database such as `hdb_rehearsal`.
 

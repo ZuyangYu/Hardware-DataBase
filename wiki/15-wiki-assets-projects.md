@@ -347,7 +347,6 @@ DB：`ProjectStore` 默认 `storage/projects.db`（独立于 auth.db）。
 | `WIKI_*` 常量 | 见 §1.1 | 无独立 env，常量在代码中 |
 | Wiki 蒸馏模型 | `create_chat_model(priority=PRIORITY_BATCH)` | 与用户交互流量隔离（共享 `LLM_BATCH_MAX_CONCURRENCY`） |
 | `ProjectStore` 路径 | `storage/projects.db` | 无 env 覆盖 |
-| `DOCUMENT_AUTO_PUBLISH_VERIFIED` | false | 与文档资产无关（属文档生成） |
 
 **数据一致性**：
 - Wiki 页引用的 `source_refs` 指向解析 chunk；文件删除后 link 会变死链（由 `cleanup_dead_links` 清理）；

@@ -211,7 +211,6 @@ list_turn_events(user_id, turn_id, after_seq=0)
 | `tool_started` | `{tool, args, seq, automatic?}` | 插入活动轨迹项 |
 | `tool_result` | `{tool, status, hit_count, ...}` | 结束轨迹项；失败标红 |
 | `degraded` | `{stage, reason}` | 降级横幅 |
-| `document_card` | 文档生成卡片快照 | 渲染/更新状态卡 |
 | `document_clarification_question` / `_ready` | 澄清问答 | 快捷回复 |
 | `done` | `{answer, footer, summary{evidence,memory_context}, ...}` | **权威回答**（覆盖流式文本） |
 | `error` | `{message, cancelled?}` | 错误展示 |
@@ -327,7 +326,7 @@ Agent 侧的取消：`should_cancel` 回调（由 API 传入）让 RAGFlow 请�
 | `CHAT_TURN_LEASE_RENEW_SECONDS` | `15` | 续租步长 |
 | `WAITING_TURN_MAX_SECONDS` / `WAITING_TURN_TIMEOUT_SCAN_SECONDS` | `600` / `5` | 附件等待上限与扫描间隔 |
 | `CHAT_QUEUE_DEADLINE_SECONDS` | `600` | 排队超时 |
-| `CANCEL_FAST_PATH_ENABLED` / `CANCEL_KEY_TTL_SECONDS` | `true` / `7200` | Redis 取消键 |
+| `CANCEL_KEY_TTL_SECONDS` | `7200` | Redis 取消键（配置 `REDIS_URL` 后自动启用） |
 | `TURN_EVENT_STREAM_TTL_SECONDS` / `MAXLEN` | `7200` / `5000` | Redis 事件流 |
 | `REDIS_URL` | `""` | 为空则禁实时平面（重启生效） |
 | `CONTROL_PLANE_BACKEND` / `_DATABASE_URL` / `_POOL_SIZE` | `sqlite` / `""` / `8` | 控制面后端（重启生效） |

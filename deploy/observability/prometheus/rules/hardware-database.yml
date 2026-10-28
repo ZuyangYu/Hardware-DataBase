@@ -186,7 +186,7 @@ groups:
           summary: "Attachment waits are timing out; queued turns were released"
 
       - alert: HdbHeavyQueueStarvation
-        expr: max by (queue) (hdb_queue_oldest_age_seconds{queue=~"document_authoring|export"}) > 600
+        expr: max by (queue) (hdb_queue_oldest_age_seconds{queue=~"export"}) > 600
         for: 10m
         labels:
           severity: warning

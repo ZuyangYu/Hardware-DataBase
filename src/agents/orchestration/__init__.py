@@ -1,2 +1,1 @@
-"""Server-validated conversational action planning."""
-
+"""Capability and tool-visibility boundaries for the conversation agent."""

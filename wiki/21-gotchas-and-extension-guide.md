@@ -23,14 +23,12 @@
 
 | 功能 | 现状 |
 |---|---|
-| `RESEARCH_AGENT_ENABLED` / `REVIEWER_AGENT_ENABLED` | 两个子代理**未接入 runner/AppPipeline**，只被测试与 `scripts/production_hardening/reviewer_eval.py` 使用 |
+| 子代理开关（代码内常量） | 两个子代理**未接入 runner/AppPipeline**，只被测试与 `scripts/production_hardening/reviewer_eval.py` 使用；不是部署开关 |
 | `PipelineRuntime.ensure_worker_running()` | 有意 no-op（上传绝不内联解析） |
 | `clear_finished_parse_tasks` | RAGFlow 后端未覆写 → no-op（已完成行本来就被隐藏） |
 | `_wait_archived_document_result` / `_wait_parse_progress` | 死代码（无调用者） |
 | `classify_source_group` / `expand_source_group_for_file` / `display_source_group` | `src/` 内无调用者（前端直接传具体分组） |
 | `src/test_data/` | 只有模型/store/词法查询骨架；**没有解析器**、没有 `manifest.py`；`PARSER_REGISTRY` 运行期为空 |
-| `templateMappingCorrection.ts`（前端） | 仅单测引用，无页面消费 |
-| `documentAuthoring.ts` 的大部分函数 | 已定义并有单测，但无页面调用（文档生成没有独立工作台） |
 | `CircuitStatus.PARTIAL_EDF/PARTIAL_PDF` | 摄取路径不用 |
 | `CircuitStructureCoverage.title_block/coordinates/visual_layout` | 恒 `UNAVAILABLE`（为未来解析器预留三态） |
 | `power_tree.ambiguous_edges` / `control_edges` | 恒空列表（预留输出） |
@@ -88,17 +86,6 @@
 25. XLSX 修订会拒绝跨表引用/`INDIRECT`/`OFFSET` 公式；PDF 修订是**加注记**而非改字形。
 26. `CHAT_ATTACHMENTS_ENABLED=false` 时所有附件端点返回 **404**（不是 403）。
 
-### 2.6 文档生成
-
-27. 代码库 docstring 里有一处「confrontational」拼写（`planning/` 注释），不影响功能。
-28. `WorkOrder` 指纹 v1/v2/v3 有兼容窗口：**绝不能**把 `task_id`/`revision_id` 纳入冻结输入。
-29. 计划路由要求三个字段齐全，部分绑定会抛 `PlanExecutionRouteError`——**不会**回退 legacy。
-30. 已提交收据但缺持久化草稿 → `PlanExecutionRouteError`（崩溃恢复的硬约束）。
-31. `idempotency_key` 冲突但载荷不同 → 明确报错，不是覆盖。
-32. 渲染器只认注册区域与 `deterministic_only|validated_draft` 写策略；运行时无法获得新写入位置。
-33. 受控文档类型（icd/fpt/requirements/specification）与修订**永不自动发布**。
-34. `legacy_template_claims` / `harness_checkpoints` 旧表**永不删除或重写**（迁移只读它们）。
-
 ### 2.7 会话/并发
 
 35. `failed` 是**可复活**的（SSE 掉线标记），`completed`/`cancelled` 才是终态。
@@ -132,10 +119,9 @@
 ### 2.9 PostgreSQL 控制面（单机也走 PG 之后）
 
 51. 切到 PG 后，`storage/` 里这些库**退休**（文件可能还在，但已无人写入）：
-    `agent_checkpoints.db`、`memory.db`、`resource_quotas.db`、
-    `document_authoring_checkpoints.sqlite`。仍在用的是：`auth.db`（鉴权/审计）、
-    `chat_attachments.db`、`pipeline_documents.db`、`projects.db`、
-    `document_authoring.db`（work order），以及 `table_indexes/`、`circuits/` 等派生文件。
+    `agent_checkpoints.db`、`memory.db`、`resource_quotas.db`。
+    仍在用的是：`auth.db`（鉴权/审计）、`chat_attachments.db`、
+    `pipeline_documents.db`、`projects.db`，以及 `table_indexes/`、`circuits/` 等派生文件。
 52. 控制面 schema 是**手写固定 DDL**（`src/storage/control_plane/schema.py`），
     SQLite 源库加列**不会**自动同步：装载会报 `UndefinedColumn`，readiness 报
     schema 不匹配。新增列必须同步固定 DDL（已发生：`chat_sessions.rolling_summary`、
@@ -234,17 +220,6 @@
 7. 测试：渲染、载荷校验、意图识别、preview
 ```
 
-### 3.4 新增文档生成渲染器/配方
-
-```
-1. renderers/ 实现渲染器（包校验 + 完整性清单）
-2. planning/registry.py 注册 renderer capability（精确版本）
-3. planning/recipes.py 加结构配方/profile 限制
-4. models.py 的 output_format 枚举 + conversion 路径（如需要）
-5. 模板消毒/校验（若是模板型）
-6. 测试：结构渲染、包校验、绑定覆盖、评估指标
-```
-
 ### 3.5 新增记忆类型
 
 ```
@@ -261,7 +236,7 @@
 1. cohorts.py：判断是否 RAGAS 指标 / 归属队列
 2. 若是 RAGAS：ragas_adapter 的 STANDARD_METRICS / 字段映射 / 适用性 / 批量分组
 3. 若是域指标：hardware_metrics.py + 在 service.score 里对 allowed+success 运行
-4. gates.py：默认阈值（可选）+ 文档生成硬零集合（如适用）
+4. gates.py：默认阈值（可选）
 5. presentation.py：中文标签 + 排序
 6. 测试：schema 严格性、不适用、重试/失败语义、门禁退出码
 ```
@@ -327,7 +302,6 @@
 | 优先级 | 项 | 影响 |
 |---|---|---|
 | 高 | 目标部署多实例 checkpoint 故障验收 | PG 指针和跨进程锁已实现；发布前验证真实 Worker 接管与存储拓扑 |
-| 高 | 文档生成独立工作台页面（评审/纠错/修订/计划确认 UI） | 当前全部靠聊天文本，评审能力未释放 |
 | 高 | `TOOL_CAPABILITIES` 补全（wiki_search / release / revision_history） | 统一工具模式下这些工具会被静默过滤 |
 | 中 | `RESOURCE_GOVERNOR_ENABLED` 语义统一（去掉 `getattr(..., True)`） | 避免误判许可生效 |
 | 中 | 附件存储加 PG/对象存储后端 | 附件仍是 SQLite-only，多实例靠共享文件系统 |
@@ -385,12 +359,10 @@
 | 想找… | 去哪 |
 |---|---|
 | 一次提问发生了什么 | `src/api/routes/query.py::_run_turn` → `src/agents/runner.py::stream` |
-| 为什么走了文档流 | `src/core/conversation_orchestrator.py::plan` + `src/core/intent.py::classify_intent` |
 | 为什么没有检索到 | `document_rag_tool` → `ragflow_backend.retrieve` → `_filter_chunks` |
 | 为什么表格答错 | `spreadsheet_tools`（SQL 校验链）→ `table_store._sheet_semantic_rows`（语义行） |
 | 为什么记忆没出来 | `memory/service.py::search`（candidate 语义索引不健康会跳过）+ consent/opt-in |
 | 为什么附件被拒 | `attachments/service.py::upload`（配额/魔数）+ `resolve_refs_for_turn` |
-| 为什么生成不出文档 | `document_authoring/service.py` 预检 + `harness/runtime.py::execute` 的降级原因 |
 | 为什么任务卡住 | 对应 worker 的 claim/lease 表 + 心跳列 + `/system/status` |
 | 配置默认值 | `src/settings.py`（`DEFAULT_VALUES`） + 本 Wiki [20](20-config-and-storage.md) |
 | 表结构 | 各域 `_init_db`；PG 见 `src/storage/control_plane/schema.py` |

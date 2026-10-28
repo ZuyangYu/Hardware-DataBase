@@ -73,40 +73,6 @@ class EvaluationSample(BaseModel):
             raise ValueError(f"request_context contains unsupported fields: {', '.join(unsupported)}")
         return value
 
-class DocumentGenerationEvalRecord(BaseModel):
-    """One expected field result for a controlled document template."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    id: str = Field(min_length=1)
-    template_fixture: str = Field(min_length=1)
-    field_id: str = Field(min_length=1)
-    expected_value: str = Field(min_length=1)
-    allowed_sources: list[str] = Field(min_length=1)
-    required: bool = True
-    critical: bool = True
-    expected_value_type: str | None = None
-    expected_missing_policy: Literal["mark_tbd", "keep_blank", "block_section"] | None = None
-    evidence_rationale: str | None = None
-
-    @field_validator("id", "template_fixture", "field_id", "expected_value")
-    @classmethod
-    def strip_document_generation_text(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("must not be blank")
-        return value
-
-    @field_validator("allowed_sources")
-    @classmethod
-    def validate_allowed_sources(cls, value: list[str]) -> list[str]:
-        normalized = [item.strip() for item in value if item.strip()]
-        if len(normalized) != len(set(normalized)):
-            raise ValueError("allowed_sources must be unique")
-        if not normalized:
-            raise ValueError("allowed_sources must not be empty")
-        return normalized
-
 
 class AnswerSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -144,30 +110,6 @@ class AnswerSnapshot(BaseModel):
             if item.get("content")
         ]
 
-
-class DocumentGenerationSnapshot(BaseModel):
-    """Observed output needed to score a document-generation eval record."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    sample_id: str
-    template_fixture: str
-    mapped_field_id: str | None = None
-    filled_value: str | None = None
-    evidence_sources: list[str] = Field(default_factory=list)
-    retrieved_evidence_sources: list[str] = Field(default_factory=list)
-    attempted_fill_count: int = Field(default=0, ge=0)
-    fixed_content_overwrite_count: int = Field(default=0, ge=0)
-    source_scope_violation_count: int = Field(default=0, ge=0)
-    unsupported_required_field_fill_count: int = Field(default=0, ge=0)
-    auto_approved: bool = False
-    typed_value_ok: bool | None = None
-    writer_mode: str | None = None
-    writer_fallback: bool = False
-    requires_human: bool = False
-    llm_calls: int | None = None
-    duration_seconds: float | None = None
-    token_usage: dict[str, Any] = Field(default_factory=dict)
 
 
 class MetricResult(BaseModel):

@@ -47,8 +47,6 @@ FORBIDDEN_LAYER_EDGES: tuple[tuple[str, str, str], ...] = (
     ("src.agents", "src.workers", "agents must not import workers"),
     ("src.pipelines", "src.api", "pipelines must not import the API layer"),
     ("src.pipelines", "src.workers", "pipelines must not import workers"),
-    ("src.document_authoring", "src.api", "document_authoring must not import the API layer"),
-    ("src.document_authoring", "src.workers", "document_authoring must not import workers"),
     ("src.storage", "src.api", "storage must not import the API layer"),
     ("src.storage", "src.agents", "storage must not import agent orchestration"),
     ("src.storage", "src.pipelines", "storage must not import pipeline orchestration"),
@@ -63,7 +61,6 @@ LINE_BUDGET_TOLERANCE = 25
 
 LINE_BUDGETS = (
     "src/core/app_pipeline.py",
-    "src/document_authoring/service.py",
     "src/agents/runner.py",
     "src/settings.py",
 )

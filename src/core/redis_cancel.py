@@ -21,11 +21,9 @@ __all__ = [
 
 
 def fast_path_enabled() -> bool:
-    import src.settings as settings
+    """Redis is the optional fast path; the durable cancel flag is authoritative."""
 
-    return bool(
-        getattr(settings, "CANCEL_FAST_PATH_ENABLED", True)
-    ) and bool(redis_url())
+    return bool(redis_url())
 
 
 def _key(turn_id: str) -> str:

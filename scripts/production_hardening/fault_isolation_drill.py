@@ -4,11 +4,10 @@ Scenarios (all processes are owned by this drill; the shared RAGFlow service is
 never touched):
 
 1. baseline: a general-chat turn completes with a healthy chat worker;
-2. authoring worker killed → the next general-chat turn still completes;
-3. parse worker killed → the next general-chat turn still completes;
-4. the healthy chat worker killed → the surviving chat replica still
+2. parse worker killed → the next general-chat turn still completes;
+3. the healthy chat worker killed → the surviving chat replica still
    completes a general-chat turn;
-5. a second API replica configured with an unreachable ``RAGFLOW_BASE_URL``
+4. a second API replica configured with an unreachable ``RAGFLOW_BASE_URL``
    still serves ``/health`` and completes general-chat turns (retrieval fault
    ≠ API/main-link outage).
 
@@ -181,13 +180,12 @@ def main(argv: list[str] | None = None) -> int:
 
     api = _start_api(args.port, storage_env)
     chat_worker = _start_worker("chat", storage_env)
-    authoring_worker = _start_worker("authoring", storage_env)
     parse_worker = _start_worker("parse", storage_env)
     bad_api = _start_api(args.bad_ragflow_port, {**storage_env, "RAGFLOW_BASE_URL": "http://127.0.0.1:9"})
     bad_worker = _start_worker(
         "chat", {**storage_env, "RAGFLOW_BASE_URL": "http://127.0.0.1:9"}
     )
-    processes = [api, chat_worker, authoring_worker, parse_worker, bad_api, bad_worker]
+    processes = [api, chat_worker, parse_worker, bad_api, bad_worker]
     report: dict[str, object] = {
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "scenarios": {},
@@ -208,14 +206,6 @@ def main(argv: list[str] | None = None) -> int:
         token = str(login.json()["token"])
 
         report["scenarios"]["baseline_chat"] = _run_chat_turn(base_url, token, label="baseline")
-
-        authoring_worker.kill()
-        report["scenarios"]["authoring_worker_killed"] = _run_chat_turn(
-            base_url, token, label="after-authoring-kill"
-        )
-        report["health"]["after_authoring_kill"] = httpx.get(
-            f"{base_url}/health", timeout=5
-        ).status_code
 
         parse_worker.kill()
         report["scenarios"]["parse_worker_killed"] = _run_chat_turn(
@@ -249,11 +239,9 @@ def main(argv: list[str] | None = None) -> int:
         completed = lambda name: checks.get(name, {}).get("status") == "completed"  # noqa: E731
         report["ok"] = (
             completed("baseline_chat")
-            and completed("authoring_worker_killed")
             and completed("parse_worker_killed")
             and completed("chat_worker_killed")
             and completed("ragflow_unreachable_chat")
-            and report["health"].get("after_authoring_kill") == 200
             and report["health"].get("after_parse_kill") == 200
             and checks.get("ragflow_unreachable_health") == 200
         )

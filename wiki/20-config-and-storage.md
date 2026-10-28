@@ -1,11 +1,22 @@
 # 20 · 配置与数据存储参考
 
-对应：`src/settings.py`（1731 行，单一配置事实来源）、`src/storage/control_plane/`、
+对应：`src/settings.py`（单一配置事实来源）、`src/storage/control_plane/`、
 各域的 `_init_db`、`scripts/production_hardening/`。
 
 ---
 
 ## 1. 配置系统
+
+### 1.0 配置边界
+
+- **env 只放部署差异**：数据库/Redis、对象存储、模型地址与密钥、端口、并发/配额、
+  外部集成凭据，以及少量高风险子系统的应急 kill switch。
+- **核心功能默认开启**：代码合并即生效，不再要求部署方设置 `*_ENABLED=true`。
+- **内部算法/执行路径用代码内常量**：如 planning v2、shadow、DAG、共享执行器、
+  子代理、并行 action；测试可覆盖模块属性，但不进入 `.env`/管理端。
+- **产品策略放管理端/数据库**：租户配额、审批策略、导出格式可见性等，不写成代码分支。
+- **临时灰度 flag 必须有 owner 和过期时间**；验证完成后默认开启并删除，不能永久化。
+- **安全不变量不可配置**：权限、审计、证据准入、关键冲突审批等不允许用 env 关闭。
 
 ### 1.1 机制
 
@@ -15,7 +26,7 @@
     不允许 rename（EBUSY），故 `.env` 必须落在挂载目录里；见 `deploy/docker/README.md`）；
 - 路径类配置若为相对路径，统一相对 `STORAGE_DIR` 解析（默认 `<repo>/storage`，可由 env 配置）；
 - 布尔值接受 `1/true/yes/on`；CSV 用 `_env_csv`（casefold 集合）；
-- `DEFAULT_VALUES` 镜像全部键，供系统配置页与校验回退；
+- `DEFAULT_VALUES` 只镜像可部署配置的键（内部执行常量不进入），供系统配置页与校验回退；
 - `CONFIG_REVISION = sha256(.env)[:16]`（每次保存更新，`/health/ready` 返回）；
 - 热重载：`PUT /api/v1/config` → `validate_settings_values` → `validate_provider_configuration`
   → `save_settings_to_env`（原子替换）→ `reload_settings()` → 清模型缓存；
@@ -24,7 +35,7 @@
   `STORAGE_DIR, AUTH_DB_PATH, CONTROL_PLANE_{BACKEND,DATABASE_URL,POOL_SIZE}, REDIS_URL,`
   `RESOURCE_GOVERNOR_{BACKEND,DATABASE_URL,SCOPE}, AGENT_CHECKPOINT_{BACKEND,DATABASE_URL},`
    `MEMORY_STORE_BACKEND, MEMORY_DATABASE_URL, MEMORY_SQLITE_PATH, WORKER_ROLE, HDB_API_HOST, HDB_API_PORT`；
-  还包含 checkpoint 路径/池、authoring checkpoint 和 OTel bootstrap 参数；完整清单以代码为准。
+  还包含 checkpoint 路径/池和 OTel bootstrap 参数；完整清单以代码为准。
   内容采集策略、探针 timeout 等继续支持热重载；
 - **provider 交叉校验**（fail-closed，启动与保存时都跑）：选 postgres 必须给显式 DSN
   （`AGENT_CHECKPOINT_*`、`DOCUMENT_AUTHORING_CHECKPOINTER_*`、`MEMORY_*`、
@@ -45,8 +56,6 @@
 | `AGENT_CHECKPOINT_DB_PATH` | `storage/agent_checkpoints.db`（`AGENT_CHECKPOINT_BACKEND=postgres` 时退休） |
 | `MEMORY_SQLITE_PATH` | `storage/memory.db`（`MEMORY_STORE_BACKEND=postgres` 时退休） |
 | `RESOURCE_GOVERNOR_DB_PATH` | `storage/resource_quotas.db`（`RESOURCE_GOVERNOR_BACKEND=postgres` 时退休） |
-| `DOCUMENT_AUTHORING_CHECKPOINTER_PATH` | `storage/document_authoring_checkpoints.sqlite`（切 postgres 时退休） |
-| `DOCUMENT_AUTHORING_COMPATIBILITY_DB_PATH` | `storage/document_authoring_compatibility.sqlite` |
 | `CHAT_ATTACHMENT_STORAGE_DIR` / `_INDEX_DB_PATH` | `storage/chat_attachments` / `storage/chat_attachments.db` |
 | `RESULT_EXPORT_STORAGE_DIR` | `storage/exports` |
 | （非 env）`storage/projects.db` | `ProjectStore` 默认 |
@@ -125,7 +134,7 @@
 | `CHAT_TURN_LEASE_SECONDS` / `_RENEW_SECONDS` | `120` / `15` |
 | `WAITING_TURN_MAX_SECONDS` / `_TIMEOUT_SCAN_SECONDS` | `600` / `5` |
 | `CHAT_QUEUE_DEADLINE_SECONDS` | `600` |
-| `CANCEL_FAST_PATH_ENABLED` / `CANCEL_KEY_TTL_SECONDS` | `true` / `7200` |
+| `CANCEL_KEY_TTL_SECONDS` | `7200`（配置 `REDIS_URL` 后自动启用取消快路径，无独立开关） |
 | `TURN_EVENT_STREAM_TTL_SECONDS` / `_MAXLEN` | `7200` / `5000` |
 | `REDIS_REQUIRED` | `true`（硬依赖：Redis 未配置/不可达则 API 与 worker 拒绝启动，`/health/ready` 判 not_ready；仅测试隔离置 false） |
 | `REDIS_URL` | `""`（项目自管实例由 `bash scripts/redis.sh up` 写入） |
@@ -153,15 +162,14 @@
 | `RESOURCE_CHAT_MAX_CONCURRENT` / `_RESERVED_INTERACTIVE` | `4` / `0` |
 | `RESOURCE_HEAVY_JOB_MAX_CONCURRENT` / `_RESERVED_INTERACTIVE` | `4` / `1` |
 | `RESOURCE_OCR_*` / `RESOURCE_EXPORT_*` / `RESOURCE_MEMORY_*` | `1/0` / `4/0` / `1/0` |
-| `SHARED_RETRIEVAL_EXECUTOR_ENABLED` / `RETRIEVAL_EXECUTOR_MAX_WORKERS` / `_QUEUE_MAX_DEPTH` / `_PER_REQUEST_FANOUT` / `_QUEUE_MAX_WAIT_SECONDS` / `_SHUTDOWN_DEADLINE_SECONDS` | `false` / `8` / `256` / `4` / `30` / `10` |
-| `ACTION_DAG_PARALLEL_ENABLED` / `ACTION_EXECUTOR_MAX_PARALLEL` | `false` / `4` |
-| `REVIEWER_AGENT_ENABLED` / `RESEARCH_AGENT_ENABLED` | `false` / `false`（未接线） |
+| `RETRIEVAL_EXECUTOR_MAX_WORKERS` / `_QUEUE_MAX_DEPTH` / `_PER_REQUEST_FANOUT` / `_QUEUE_MAX_WAIT_SECONDS` / `_SHUTDOWN_DEADLINE_SECONDS` | `8` / `256` / `4` / `30` / `10`（共享执行器为内置常量 `true`） |
+| `ACTION_EXECUTOR_MAX_PARALLEL` | `4`（并行路径开关是代码内常量 `false`） |
 
 #### Worker
 
 | 变量 | 默认 |
 |---|---|
-| `WORKER_ROLE` | `all`（`all\|chat\|authoring\|parse`） |
+| `WORKER_ROLE` | `all`（`all\|chat\|parse`） |
 | `WORKER_POLL_INTERVAL_SECONDS` | `0.5` |
 | `WORKER_PARSE_BATCH_SIZE` / `WORKER_CLAIM_BATCH_SIZE` / `WORKER_TURN_CONCURRENCY` | `1` / `8` / `1` |
 
@@ -202,23 +210,6 @@
 `MAX_BYTES=26214400`、`JOB_LEASE_SECONDS=300`、`JOB_BATCH_SIZE=8`、`RETENTION_DAYS=30`、
 `MAX_RUNNING_JOBS=4`；`RESULT_EXPORT_PDF_FONT`（未设置）。
 `EXTERNAL_CONVERSATION_LLM_STRUCTURE=true`、`_SUMMARY=true`、`_MAX_CHARS=12000`、`_TIMEOUT_SECONDS=60`。
-
-#### 文档生成
-
-内置默认开启：`DOCUMENT_AUTHORING_AGENT_MODE_ENABLED`（external_agent，逐字段可降级）、
-`AGENT_DOCUMENT_TOOLS_ENABLED`（chat 文档工具）。
-灰度（默认关闭）：`DOCUMENT_REQUIREMENT_RESOLUTION_ENABLED`、`DOCUMENT_PLANNING_SHADOW_ENABLED`、
-`DOCUMENT_PLANNING_V2_ENABLED`、`DOCUMENT_RISK_BASED_PLAN_GATE_ENABLED`、
-`DOCUMENT_PLAN_DAG_EXECUTION_ENABLED`、`DOCUMENT_TEMPLATE_FREE_EXECUTION_ENABLED`、
-`DOCUMENT_AUTHORING_COMPATIBILITY_CLOSURE_ENABLED`、`DOCUMENT_AUTO_ACTIVATE_SAFE_TEMPLATES`、
-`DOCUMENT_AUTO_ACCEPT_AI_TEMPLATE_RECOMMENDATIONS`、`DOCUMENT_AUTO_PUBLISH_VERIFIED`；
-默认开启：`DOCUMENT_TASK_WRITE_ENABLED/READ/STREAM=true`、`DOCUMENT_TASK_ASSOCIATION_REQUIRED=false`；
-白名单 CSV：`DOCUMENT_PLAN_DAG_ALLOWLIST_{TENANTS,DOCUMENT_TYPES,FORMATS}`、
-`DOCUMENT_TEMPLATE_FREE_ALLOWLIST_{TENANTS,DOCUMENT_TYPES,FORMATS,RECIPES}`；
-其它：`DOCUMENT_AUTHORING_CHECKPOINTER_BACKEND=sqlite`、`_DATABASE_URL=""`、
-`DOCUMENT_PREVIEW_RETRIEVAL_ATTEMPTS=3`、`_BACKOFF_SECONDS=0.5`、
-`DOCUMENT_AUTHORING_JOB_LEASE_SECONDS=300`、`_BATCH_SIZE=4`、`_BATCH_TIME_BUDGET_SECONDS=10`；
-`CONVERSATION_ACTION_PLAN_MODE=off`、`CONVERSATION_UNIFIED_TOOLS_ENABLED=true`（平台内置管线，非用户开关）。
 
 #### 可观测性
 
@@ -263,18 +254,15 @@ Docker 同网络 endpoint=`http://otel-collector:4317`（宿主进程使用 `htt
 | 解析台账 | `storage/pipeline_documents.db` | `pipeline_documents, pipeline_datasets, pipeline_document_profiles, pipeline_profile_outbox` |
 | 表格索引 | `storage/table_indexes/departments/<dept>/kbs/<kb>/table_indexes.db` | `table_documents, table_sheets, table_rows, table_cells, table_text_blocks, table_semantic_rows, sql_table_registry` + 物化表 `t_<record>_<seq>` |
 | 附件 | `storage/chat_attachments.db` | `chat_attachments, chat_attachment_assets, chat_attachment_parts, chat_attachment_embeddings, chat_attachment_visual_cache, chat_attachment_jobs, chat_attachment_revisions, chat_attachment_edit_proposals, session_cleanup_outbox, coordinator_leases` + FTS5 虚表 `attachment_parts_fts`, `attachment_parts_trigram` |
-| 文档生成 | `storage/document_authoring.db` | 30+ 表（见 [14](14-authoring-render-and-api.md#41-work_order_storepydocument_authoringdb)） |
-| 生成 checkpoint | `storage/document_authoring_checkpoints.sqlite` | LangGraph checkpoint |
 | 项目 | `storage/projects.db` | `projects, project_knowledge_bindings, project_principal_bindings, source_assets, logical_documents, source_versions, processing_artifacts, project_source_bindings, project_baselines, source_region_policies, source_set_snapshots, schema_migrations` |
 | Agent checkpoint | `storage/agent_checkpoints.db` | LangGraph `checkpoints`, `writes`, … + `hdb_checkpoint_attempts`, `hdb_checkpoint_pointers` |
 | 资源配额 | `storage/resource_quotas.db` | 许可/队列/额度（governor） |
 | 导出（同认证库） | `AUTH_DB_PATH` | `result_snapshots, result_export_jobs, result_export_outbox, result_artifacts` |
 | 外部对话索引 | `storage/external_conversations/departments/<dept>/kbs/<kb>/index.db` | `conversations`, `messages` |
-| 文档生成兼容性 | `storage/document_authoring_compatibility.sqlite` | 兼容性遥测/闭包 |
 | 评估 | 文件系统 `storage/evaluations/` | JSON/JSONL/CSV/HTML（无 DB） |
 
 **PRAGMA 约定**：几乎全部 `journal_mode=WAL` + `synchronous=NORMAL`；
-`foreign_keys=ON` 视域而定（会话库、表格库、文档生成库开启；部分库为性能关闭）。
+`foreign_keys=ON` 视域而定（会话库、表格库开启；部分库为性能关闭）。
 写事务统一 `BEGIN IMMEDIATE`（避免升级锁竞争）。
 
 ---
@@ -284,7 +272,7 @@ Docker 同网络 endpoint=`http://otel-collector:4317`（宿主进程使用 `htt
 ### 3.1 范围
 
 启用 `CONTROL_PLANE_BACKEND=postgres` 后接管：会话执行协议（8 张核心表）+ 记忆账本 +
-导出账本；**auth/审计/文档生成/附件字节刻意留在 SQLite**。
+导出账本；**auth/审计/附件字节刻意留在 SQLite**。
 
 ### 3.2 Schema 管理
 
@@ -325,9 +313,6 @@ storage/
 ├── memory.db
 ├── resource_quotas.db
 ├── agent_checkpoints.db
-├── document_authoring.db
-├── document_authoring_checkpoints.sqlite
-├── document_authoring_compatibility.sqlite
 ├── projects.db
 ├── chat_attachments.db
 ├── pipeline_archives/departments/<dept>/kbs/<kb>/<source_group>/<file>
@@ -341,7 +326,6 @@ storage/
 ├── test_data/<kb>/<report_id>/report.json
 ├── chat_attachments/{sources,circuits,table_indexes}/<session_id>/...
 ├── exports/artifact-<hex>.<ext>
-├── document_authoring/                    # 模板与产物字节
 ├── evaluations/{uploads/, <run_id>/, e2e/}
 ├── chroma/                                # 仅在安装 chromadb 且绑定嵌入时
 ├── logs/rag_YYYY-MM-DD.log
@@ -391,9 +375,8 @@ storage/
 ## 6. 数据一致性要点
 
 1. **一个事务内完成的事**：turn 回答 + 终态事件 + 导出快照/任务 + 记忆 outbox；
-   文档生成的计划确认（plan/OutputSpec/submission 一起）；记忆的 candidate 提交（record/revision/
-   sources/outbox 一起）。
-2. **投影可重建**：记忆 Store、Agent checkpoint、文档生成 checkpoint、资源配额；
+   记忆的 candidate 提交（record/revision/sources/outbox 一起）。
+2. **投影可重建**：记忆 Store、Agent checkpoint、资源配额；
    其余为权威数据。
 3. **文件与行强绑定**：附件 / 导出 / 电路 / 表格索引都遵循「先删行后删文件或反之有明确顺序」，
    失败会留下可重试状态而不是静默丢失。

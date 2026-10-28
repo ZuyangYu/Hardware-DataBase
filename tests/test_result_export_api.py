@@ -12,7 +12,7 @@ from fastapi import HTTPException
 
 import src.settings
 from src.api.app import create_app
-from src.api.deps import get_auth_service, get_pipeline
+from src.api.deps import get_auth_service
 from src.api.routes.exports import _authorize_snapshot
 from src.core.conversation import ConversationService
 from src.core.auth import AuthUser
@@ -327,85 +327,3 @@ class ResultExportApiTests(unittest.TestCase):
         self.assertEqual(entry["download_url"], "")
         self.assertEqual(entry["snapshot_id"], created.json()["snapshot_id"])
         self.assertEqual(entry["sha256"], artifact.sha256)
-
-    def test_legacy_document_artifact_has_unified_preview_and_download_routes(self):
-        token = self._token("user1")
-        content = b"legacy-document-bytes"
-        legacy_store = SimpleNamespace(
-            get_artifact=lambda artifact_id: SimpleNamespace(
-                artifact_id=artifact_id,
-                tenant_id="default",
-                work_order_id="legacy-wo-1",
-                stage="review_candidate",
-                created_at=datetime.now(timezone.utc),
-            ),
-            get_work_order=lambda _work_order_id: SimpleNamespace(
-                tenant_id="default",
-                knowledge_base_name="shared",
-                resource_department_id=str(self.user.department_id),
-                target_format="docx",
-            ),
-            read_artifact_content=lambda _artifact_id: content,
-        )
-        legacy_service = SimpleNamespace(store=legacy_store)
-        self.app.dependency_overrides[get_pipeline] = lambda: SimpleNamespace(
-            document_generation=legacy_service,
-        )
-
-        preview = self.client.get(
-            "/api/v1/artifacts/document/legacy-artifact-1/preview",
-            headers=self._auth(token),
-        )
-        self.assertEqual(preview.status_code, 200, preview.text)
-        self.assertEqual(preview.json()["artifact_id"], "legacy-artifact-1")
-        self.assertEqual(preview.json()["format"], "docx")
-        self.assertEqual(
-            preview.json()["download_url"],
-            "/api/v1/artifacts/document/legacy-artifact-1/download",
-        )
-
-        download = self.client.get(
-            "/api/v1/artifacts/document/legacy-artifact-1/download",
-            headers=self._auth(token),
-        )
-        self.assertEqual(download.status_code, 200, download.text)
-        self.assertEqual(download.content, content)
-        self.assertIn("attachment", download.headers.get("content-disposition", ""))
-
-    def test_project_document_artifact_uses_project_capability_for_unified_route(self):
-        token = self._token("user1")
-        content = b"project-document-bytes"
-        capability_calls = []
-        legacy_store = SimpleNamespace(
-            get_artifact=lambda artifact_id: SimpleNamespace(
-                artifact_id=artifact_id,
-                tenant_id="default",
-                work_order_id="project-wo-1",
-                stage="approved_release",
-                created_at=datetime.now(timezone.utc),
-            ),
-            get_work_order=lambda _work_order_id: SimpleNamespace(
-                tenant_id="default",
-                scope_type="project",
-                project_id="project-1",
-                knowledge_base_name=None,
-                resource_department_id=None,
-                target_format="xlsx",
-            ),
-            read_artifact_content=lambda _artifact_id: content,
-        )
-        legacy_service = SimpleNamespace(
-            store=legacy_store,
-            require_work_order_capability=lambda _ctx, _order, capability: capability_calls.append(capability),
-        )
-        self.app.dependency_overrides[get_pipeline] = lambda: SimpleNamespace(
-            document_generation=legacy_service,
-        )
-
-        preview = self.client.get(
-            "/api/v1/artifacts/document/project-artifact-1/preview",
-            headers=self._auth(token),
-        )
-        self.assertEqual(preview.status_code, 200, preview.text)
-        self.assertEqual(preview.json()["format"], "xlsx")
-        self.assertEqual(capability_calls, ["download_approved_release"])
