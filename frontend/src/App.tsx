@@ -1,4 +1,14 @@
-import { lazy, Suspense, useCallback, useEffect, useState, type CSSProperties } from 'react';
+import {
+  Component,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useState,
+  type CSSProperties,
+  type ErrorInfo,
+  type ReactNode,
+} from 'react';
 import {
   BrowserRouter,
   Navigate,
@@ -49,6 +59,64 @@ const ExtensionsPage = lazy(() => import('./pages/ExtensionsPage'));
 const MemoryPage = lazy(() => import('./pages/MemoryPage'));
 
 const SIDEBAR_STORAGE_KEY = 'hdb_sidebar_expanded';
+
+type AppErrorBoundaryProps = { children: ReactNode };
+type AppErrorBoundaryState = { hasError: boolean };
+
+class AppErrorBoundary extends Component<AppErrorBoundaryProps, AppErrorBoundaryState> {
+  state: AppErrorBoundaryState = { hasError: false };
+
+  static getDerivedStateFromError(): AppErrorBoundaryState {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    // Keep the fallback usable even when an individual lazy page fails.
+    console.error('应用渲染失败', error, info.componentStack);
+  }
+
+  render() {
+    if (!this.state.hasError) return this.props.children;
+    return (
+      <main className="grid min-h-screen place-items-center bg-background p-6 text-foreground">
+        <section className="w-full max-w-[420px] rounded-2xl border bg-card p-6 text-center shadow-sm" role="alert">
+          <h1 className="text-lg font-semibold">页面暂时无法显示</h1>
+          <p className="mt-2 text-sm text-muted-foreground">页面遇到异常，请重新加载后继续操作。</p>
+          <button
+            type="button"
+            className="mt-5 inline-flex h-9 items-center justify-center rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+            onClick={() => window.location.reload()}
+          >
+            重新加载
+          </button>
+        </section>
+      </main>
+    );
+  }
+}
+
+function AuthCheckingState({ timedOut, onRetry }: { timedOut: boolean; onRetry: () => void }) {
+  return (
+    <main className="grid min-h-screen place-items-center bg-background p-6 text-foreground">
+      <section className="w-full max-w-[360px] rounded-2xl border bg-card p-6 text-center shadow-sm" role="status" aria-live="polite">
+        <div className="mx-auto size-5 animate-spin rounded-full border-2 border-muted border-t-foreground" aria-hidden="true" />
+        <p className="mt-3 text-sm font-medium">正在验证登录状态…</p>
+        {timedOut && (
+          <>
+            <p className="mt-2 text-sm text-muted-foreground">服务器响应时间较长，请检查网络后重试。</p>
+            <button
+              type="button"
+              className="mt-4 inline-flex h-9 items-center justify-center rounded-lg border border-border bg-background px-4 text-sm font-medium hover:bg-muted focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+              onClick={onRetry}
+            >
+              重试
+            </button>
+          </>
+        )}
+      </section>
+    </main>
+  );
+}
 
 function KbChatRedirect() {
   const { kbName = '' } = useParams();
@@ -166,7 +234,13 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
     >
       <AppSidebar auth={auth} onLogout={onLogout} />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <div className="content flex-1">
+        <div id="main-content" className="content flex-1" tabIndex={-1}>
+          <a
+            href="#main-content"
+            className="sr-only fixed left-3 top-3 z-[100] rounded-md bg-foreground px-3 py-2 text-sm text-background focus:not-sr-only focus:outline focus:outline-2 focus:outline-offset-2 focus:outline-ring"
+          >
+            跳到主要内容
+          </a>
           <NavigationSectionContext.Provider
             value={{
               primary: primaryNavigation,
@@ -353,15 +427,22 @@ function AuthedApp({ auth, onLogout }: { auth: AuthSession; onLogout: () => void
 export default function App() {
   const [auth, setAuth] = useState<AuthSession | null>(() => getAuthSession());
   const [authChecked, setAuthChecked] = useState(() => !auth?.token);
+  const [authCheckTimedOut, setAuthCheckTimedOut] = useState(false);
+  const [authCheckAttempt, setAuthCheckAttempt] = useState(0);
 
   // 启动时用 whoami 校验本地 token 仍有效(被撤销/停用则强制重登)
   useEffect(() => {
     if (!auth?.token) {
       setAuthChecked(true);
+      setAuthCheckTimedOut(false);
       return undefined;
     }
     let cancelled = false;
     setAuthChecked(false);
+    setAuthCheckTimedOut(false);
+    const timeout = window.setTimeout(() => {
+      if (!cancelled) setAuthCheckTimedOut(true);
+    }, 10_000);
     api
       .get<UserInfo>('/api/v1/whoami')
       .then((user) => {
@@ -370,6 +451,7 @@ export default function App() {
         setAuthSession(refreshed);
         setAuth(refreshed);
         setAuthChecked(true);
+        setAuthCheckTimedOut(false);
       })
       .catch((error) => {
         if (cancelled) return;
@@ -379,13 +461,13 @@ export default function App() {
         }
         // 网络类错误不清 session(后端短暂不可达不应踢人)
         setAuthChecked(true);
-      });
+      })
+      .finally(() => window.clearTimeout(timeout));
     return () => {
       cancelled = true;
+      window.clearTimeout(timeout);
     };
-    // 仅在 token 变化时重校验
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [auth?.token]);
+  }, [auth?.token, authCheckAttempt]);
 
   const handleLogout = useCallback(() => {
     // 先撤销服务端 session,再清本地;失败也照样清本地
@@ -414,29 +496,35 @@ export default function App() {
   }, []);
 
   return (
-    <TooltipProvider>
-      <BrowserRouter>
-        <Routes>
-          <Route
-            path="/*"
-            element={
-              auth == null ? (
-                authChecked ? (
-                  <LoginPage
-                    onLogin={(session) => {
-                      setAuthSession(session);
-                      setAuth(session);
-                    }}
-                  />
-                ) : null
-              ) : !authChecked ? null : (
-                <AuthedApp auth={auth} onLogout={handleLogout} />
-              )
-            }
-          />
-        </Routes>
-      </BrowserRouter>
-      <Toaster richColors closeButton position="top-center" />
-    </TooltipProvider>
+    <AppErrorBoundary>
+      <TooltipProvider>
+        <BrowserRouter>
+          <Routes>
+            <Route
+              path="/*"
+              element={
+                auth == null ? (
+                  authChecked ? (
+                    <LoginPage
+                      onLogin={(session) => {
+                        setAuthSession(session);
+                        setAuth(session);
+                      }}
+                    />
+                  ) : (
+                    <AuthCheckingState timedOut={authCheckTimedOut} onRetry={() => setAuthCheckAttempt((value) => value + 1)} />
+                  )
+                ) : !authChecked ? (
+                  <AuthCheckingState timedOut={authCheckTimedOut} onRetry={() => setAuthCheckAttempt((value) => value + 1)} />
+                ) : (
+                  <AuthedApp auth={auth} onLogout={handleLogout} />
+                )
+              }
+            />
+          </Routes>
+        </BrowserRouter>
+        <Toaster richColors closeButton position="top-center" />
+      </TooltipProvider>
+    </AppErrorBoundary>
   );
 }

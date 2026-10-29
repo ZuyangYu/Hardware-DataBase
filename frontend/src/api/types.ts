@@ -151,6 +151,7 @@ export interface AssetSourceLinkView {
 export type DocLifecycleStatus = 'draft' | 'effective' | 'in_revision' | 'obsolete' | 'archived';
 export type DocCategory =
   | 'design_doc'
+  | 'datasheet'
   | 'schematic'
   | 'bom'
   | 'netlist'
@@ -208,6 +209,9 @@ export interface DocAssetView {
   title: string;
   category: DocCategory;
   description: string;
+  manufacturer: string;
+  mpn: string;
+  revision: string;
   tags: string[];
   lifecycle_status: DocLifecycleStatus;
   current_version_id: number | null;

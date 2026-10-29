@@ -37,6 +37,8 @@ export type DataTableProps<T> = {
   emptyText?: ReactNode;
   loadingText?: ReactNode;
   onRowClick?: (row: T, index: number) => void;
+  /** Accessible name for a row that opens a detail view. */
+  rowAriaLabel?: (row: T, index: number) => string;
   /** Body row height. `default` = 64px, `compact` = 46px. */
   size?: 'default' | 'compact';
   /** Zebra striping: even rows get a subtle `#fbfbfb` fill. */
@@ -56,7 +58,7 @@ const ALIGN_CLASS = {
 
 const HEAD_CELL_CLASS =
   'h-[36px] bg-[#f2f3f7] px-[16px] py-[12px] align-middle text-[12px] font-normal text-[#464c5e]';
-const BODY_CELL_CLASS = 'px-[16px] py-[12px] align-middle text-[12px] text-[#858b9c]';
+const BODY_CELL_CLASS = 'px-[16px] py-[12px] align-middle text-[12px] text-[#5b6478]';
 const BODY_HEIGHT = {
   default: 'min-h-[64px]',
   compact: 'min-h-[46px]',
@@ -75,6 +77,7 @@ export function DataTable<T>({
   emptyText = '暂无数据',
   loadingText = '加载中…',
   onRowClick,
+  rowAriaLabel,
   size = 'default',
   striped = false,
   bordered = false,
@@ -125,6 +128,19 @@ export function DataTable<T>({
                 <TableRow
                   key={rowKey(row, index)}
                   onClick={onRowClick ? () => onRowClick(row, index) : undefined}
+                  onKeyDown={
+                    onRowClick
+                      ? (event) => {
+                          if (event.target !== event.currentTarget) return;
+                          if (event.key !== 'Enter' && event.key !== ' ') return;
+                          event.preventDefault();
+                          onRowClick(row, index);
+                        }
+                      : undefined
+                  }
+                  tabIndex={onRowClick ? 0 : undefined}
+                  aria-label={onRowClick ? rowAriaLabel?.(row, index) ?? '打开此行' : undefined}
+                  aria-keyshortcuts={onRowClick ? 'Enter Space' : undefined}
                   className={cn(
                     'has-aria-expanded:bg-transparent',
                     bordered
@@ -135,7 +151,7 @@ export function DataTable<T>({
                         ? 'bg-[#fbfbfb] hover:bg-[#f2f3f7]'
                         : 'bg-white hover:bg-[#f2f3f7]'
                       : 'hover:bg-[#fafbfc]',
-                    onRowClick && 'cursor-pointer',
+                    onRowClick && 'cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring',
                   )}
                 >
                   {columns.map((column) => (
@@ -161,7 +177,7 @@ export function DataTable<T>({
               ))
             ) : (
               <TableRow className="hover:bg-transparent">
-                <TableCell colSpan={columns.length} className="h-[160px] text-center align-middle text-[13px] text-[#858b9c]">
+                <TableCell colSpan={columns.length} className="h-[160px] text-center align-middle text-[13px] text-[#5b6478]">
                   {loading ? loadingText : emptyText}
                 </TableCell>
               </TableRow>

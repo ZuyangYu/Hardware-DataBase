@@ -79,4 +79,4 @@ def build_context_for_user(
     # (picking up live role / active state) and assembles allowed_kbs /
     # kb_permissions / metadata identically. A deactivated user collapses to
     # an anonymous context, which is the desired fail-closed behaviour.
-    return build_request_context(session_state)
+    return build_request_context(session_state, auth_service=auth)

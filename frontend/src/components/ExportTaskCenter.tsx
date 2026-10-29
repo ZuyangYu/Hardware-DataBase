@@ -86,8 +86,13 @@ export default function ExportTaskCenter({ variant = 'floating' }: Props) {
     void loadJobs();
     // 有任务时 5s 刷新进度; 空闲时降频到 30s, 避免每个页面都高频轮询。
     const intervalMs = jobs.length > 0 ? 5000 : 30000;
-    const timer = window.setInterval(() => void loadJobs(), intervalMs);
-    return () => window.clearInterval(timer);
+    const poll = () => { if (!document.hidden) void loadJobs(); };
+    const timer = window.setInterval(poll, intervalMs);
+    document.addEventListener('visibilitychange', poll);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', poll);
+    };
   }, [loadJobs, jobs.length > 0]);
 
   const activeCount = useMemo(() => countActiveExportJobs(jobs), [jobs]);

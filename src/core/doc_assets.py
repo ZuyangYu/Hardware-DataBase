@@ -23,6 +23,7 @@ LIFECYCLE_STATES = ("draft", "effective")
 VERSION_STATES = ("draft", "effective", "superseded", "deleted")
 DOC_CATEGORIES = (
     "design_doc",
+    "datasheet",
     "schematic",
     "bom",
     "netlist",
@@ -171,6 +172,20 @@ class DocumentAssetService:
                 CREATE INDEX IF NOT EXISTS idx_doc_assets_scope
                     ON doc_assets(kb_id, department_id, updated_at DESC);
 
+                CREATE TABLE IF NOT EXISTS doc_asset_identifiers (
+                    asset_id INTEGER PRIMARY KEY,
+                    manufacturer TEXT NOT NULL DEFAULT '',
+                    mpn TEXT NOT NULL DEFAULT '',
+                    revision TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(asset_id) REFERENCES doc_assets(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_doc_asset_identifiers_mpn
+                    ON doc_asset_identifiers(mpn);
+                CREATE INDEX IF NOT EXISTS idx_doc_asset_identifiers_manufacturer
+                    ON doc_asset_identifiers(manufacturer);
+                CREATE INDEX IF NOT EXISTS idx_doc_asset_identifiers_revision
+                    ON doc_asset_identifiers(revision);
+
                 CREATE TABLE IF NOT EXISTS doc_asset_versions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     asset_id INTEGER NOT NULL,
@@ -260,6 +275,9 @@ class DocumentAssetService:
         project: str = "",
         description: str = "",
         tags: list[str] | None = None,
+        manufacturer: str = "",
+        mpn: str = "",
+        revision: str = "",
         initial_version: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         title = (title or "").strip()
@@ -288,6 +306,24 @@ class DocumentAssetService:
                     ),
                 )
                 asset_id = int(cursor.lastrowid)
+                if manufacturer or mpn or revision:
+                    conn.execute(
+                        """
+                        INSERT INTO doc_asset_identifiers
+                            (asset_id, manufacturer, mpn, revision)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(asset_id) DO UPDATE SET
+                            manufacturer = excluded.manufacturer,
+                            mpn = excluded.mpn,
+                            revision = excluded.revision
+                        """,
+                        (
+                            asset_id,
+                            (manufacturer or "").strip(),
+                            (mpn or "").strip(),
+                            (revision or "").strip(),
+                        ),
+                    )
                 if initial_version:
                     version_id = self._insert_version(conn, asset_id, 1, initial_version, actor_user_id, now)
                     conn.execute("UPDATE doc_asset_versions SET state = 'effective' WHERE id = ?", (version_id,))
@@ -300,7 +336,15 @@ class DocumentAssetService:
                 )
                 self._log_event(conn, asset_id, version_id, "created", actor_user_id, "", now)
                 conn.execute("COMMIT")
-                row = conn.execute("SELECT * FROM doc_assets WHERE id = ?", (asset_id,)).fetchone()
+                row = conn.execute(
+                    """
+                    SELECT a.*, i.manufacturer, i.mpn, i.revision
+                    FROM doc_assets a
+                    LEFT JOIN doc_asset_identifiers i ON i.asset_id = a.id
+                    WHERE a.id = ?
+                    """,
+                    (asset_id,),
+                ).fetchone()
                 return self._asset_row(row, conn)
             except Exception:
                 conn.execute("ROLLBACK")
@@ -320,9 +364,12 @@ class DocumentAssetService:
         params: list[Any] = [kb_id, department_id]
         needle = query.strip()
         if needle:
-            clauses.append("(a.title LIKE ? OR a.doc_no LIKE ? OR a.project LIKE ?)")
+            clauses.append(
+                "(a.title LIKE ? OR a.doc_no LIKE ? OR a.project LIKE ? "
+                "OR i.manufacturer LIKE ? OR i.mpn LIKE ? OR i.revision LIKE ?)"
+            )
             like = f"%{needle}%"
-            params.extend([like, like, like])
+            params.extend([like, like, like, like, like, like])
         if status:
             clauses.append("a.lifecycle_status = ?")
             params.append(status)
@@ -333,11 +380,12 @@ class DocumentAssetService:
             clauses.append("a.project = ?")
             params.append(project.strip())
         sql = f"""
-            SELECT a.*,
+            SELECT a.*, i.manufacturer, i.mpn, i.revision,
                    (SELECT COUNT(*) FROM doc_asset_versions v WHERE v.asset_id = a.id) AS version_count,
                    (SELECT v.version_no FROM doc_asset_versions v
                      WHERE v.id = a.current_version_id AND v.state = 'effective') AS effective_version_no
             FROM doc_assets a
+            LEFT JOIN doc_asset_identifiers i ON i.asset_id = a.id
             WHERE {' AND '.join(clauses)}
             ORDER BY a.updated_at DESC
         """
@@ -348,7 +396,12 @@ class DocumentAssetService:
     def get_asset(self, *, asset_id: int, kb_id: int, department_id: int) -> dict[str, Any] | None:
         with closing(self._connect()) as conn:
             row = conn.execute(
-                "SELECT * FROM doc_assets WHERE id = ? AND kb_id = ? AND department_id = ?",
+                """
+                SELECT a.*, i.manufacturer, i.mpn, i.revision
+                FROM doc_assets a
+                LEFT JOIN doc_asset_identifiers i ON i.asset_id = a.id
+                WHERE a.id = ? AND a.kb_id = ? AND a.department_id = ?
+                """,
                 (asset_id, kb_id, department_id),
             ).fetchone()
             if row is None:
@@ -397,7 +450,16 @@ class DocumentAssetService:
         actor_user_id: int | None,
         fields: dict[str, Any],
     ) -> dict[str, Any]:
-        allowed = {"title", "doc_no", "category", "project", "description", "tags"}
+        identifier_keys = {"manufacturer", "mpn", "revision"}
+        allowed = {
+            "title",
+            "doc_no",
+            "category",
+            "project",
+            "description",
+            "tags",
+            *identifier_keys,
+        }
         unknown = set(fields) - allowed
         if unknown:
             raise DocumentAssetError(f"不支持的字段: {', '.join(sorted(unknown))}")
@@ -418,7 +480,12 @@ class DocumentAssetService:
             updates["tags_json"] = json.dumps(
                 [str(t).strip() for t in (fields["tags"] or []) if str(t).strip()], ensure_ascii=False
             )
-        if not updates:
+        identifiers = {
+            key: str(fields[key] or "").strip()
+            for key in identifier_keys
+            if key in fields
+        }
+        if not updates and not identifiers:
             raise DocumentAssetError("没有需要更新的字段")
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -430,14 +497,46 @@ class DocumentAssetService:
                     if "影子档" in tags:
                         tags = [t for t in tags if t != "影子档"]
                         updates["tags_json"] = json.dumps(tags, ensure_ascii=False)
-                sets = ", ".join(f"{key} = ?" for key in updates)
-                conn.execute(
-                    f"UPDATE doc_assets SET {sets}, updated_at = ? WHERE id = ?",
-                    (*updates.values(), utc_now(), asset_id),
-                )
+                if updates:
+                    sets = ", ".join(f"{key} = ?" for key in updates)
+                    conn.execute(
+                        f"UPDATE doc_assets SET {sets}, updated_at = ? WHERE id = ?",
+                        (*updates.values(), utc_now(), asset_id),
+                    )
+                if identifiers:
+                    conn.execute(
+                        """
+                        INSERT INTO doc_asset_identifiers
+                            (asset_id, manufacturer, mpn, revision)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(asset_id) DO UPDATE SET
+                            manufacturer = excluded.manufacturer,
+                            mpn = excluded.mpn,
+                            revision = excluded.revision
+                        """,
+                        (
+                            asset_id,
+                            identifiers.get("manufacturer", ""),
+                            identifiers.get("mpn", ""),
+                            identifiers.get("revision", ""),
+                        ),
+                    )
+                    if not updates:
+                        conn.execute(
+                            "UPDATE doc_assets SET updated_at = ? WHERE id = ?",
+                            (utc_now(), asset_id),
+                        )
                 self._log_event(conn, asset_id, None, "info_updated", actor_user_id, "", utc_now())
                 conn.execute("COMMIT")
-                row = conn.execute("SELECT * FROM doc_assets WHERE id = ?", (asset_id,)).fetchone()
+                row = conn.execute(
+                    """
+                    SELECT a.*, i.manufacturer, i.mpn, i.revision
+                    FROM doc_assets a
+                    LEFT JOIN doc_asset_identifiers i ON i.asset_id = a.id
+                    WHERE a.id = ?
+                    """,
+                    (asset_id,),
+                ).fetchone()
                 return self._asset_row(row, conn)
             except Exception:
                 conn.execute("ROLLBACK")
@@ -826,6 +925,9 @@ class DocumentAssetService:
     def _asset_row(self, row: sqlite3.Row, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
         data = dict(row)
         data["tags"] = json.loads(data.pop("tags_json") or "[]")
+        data["manufacturer"] = str(data.get("manufacturer") or "")
+        data["mpn"] = str(data.get("mpn") or "")
+        data["revision"] = str(data.get("revision") or "")
         if conn is not None:
             count = conn.execute(
                 "SELECT COUNT(*) FROM doc_asset_versions WHERE asset_id = ?", (data["id"],)

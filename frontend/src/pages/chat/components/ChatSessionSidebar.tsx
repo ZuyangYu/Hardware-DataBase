@@ -170,21 +170,28 @@ export default function ChatSessionSidebar({
               <div
                 key={session.id}
                 className={cn(
-                  'group relative flex min-w-0 cursor-pointer items-center gap-[6px] overflow-hidden rounded-[10px] border px-[11px] py-[9px] text-[12px] transition-all',
+                  'group relative flex min-w-0 items-center gap-[6px] overflow-hidden rounded-[10px] border px-[5px] py-[5px] text-[12px] transition-all',
                   active
                     ? 'border-[#e6e9f0] bg-white text-[#18181a] shadow-[0_1px_3px_rgba(24,24,26,0.05)]'
                     : 'border-transparent text-[#6b7280] hover:border-[#eceef3] hover:bg-white/70 hover:text-[#18181a]',
                 )}
-                onClick={() => onSelect(session.id)}
               >
-                <span
-                  className={cn(
-                    'absolute bottom-[10px] left-0 top-[10px] w-[2px] rounded-full bg-[#18181a] transition-opacity',
-                    active ? 'opacity-100' : 'opacity-0',
-                  )}
-                  aria-hidden
-                />
-                <span className="min-w-0 flex-1 truncate pl-[2px]">{session.title}</span>
+                <button
+                  type="button"
+                  aria-label={`打开会话 ${session.title}`}
+                  aria-pressed={active}
+                  onClick={() => onSelect(session.id)}
+                  className="relative flex min-w-0 flex-1 items-center gap-[6px] rounded-[7px] px-[6px] py-[4px] text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring"
+                >
+                  <span
+                    className={cn(
+                      'absolute bottom-[4px] left-0 top-[4px] w-[2px] rounded-full bg-[#18181a] transition-opacity',
+                      active ? 'opacity-100' : 'opacity-0',
+                    )}
+                    aria-hidden
+                  />
+                  <span className="min-w-0 flex-1 truncate pl-[2px]">{session.title}</span>
+                </button>
                 <button
                   type="button"
                   aria-label="删除会话"

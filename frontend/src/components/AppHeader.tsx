@@ -50,12 +50,12 @@ export default function AppHeader({
   const leftContent = left ?? (
     (title !== undefined || description !== undefined) ? (
       <div className="flex min-h-[44px] flex-col justify-center gap-[3px]">
-        {section && <p className="text-[11px] font-semibold tracking-[0.04em] text-[#7b879d] md:text-[12px]" aria-label="当前导航分组">{section}</p>}
+        {section && <p className="text-[11px] font-semibold tracking-[0.04em] text-[#596174] md:text-[12px]" aria-label="当前导航分组">{section}</p>}
         {title !== undefined && (
           <h1 className="text-[18px] font-semibold leading-[1.25] tracking-[-0.01em] text-[#24324a] md:text-[20px]">{title}</h1>
         )}
         {description !== undefined && (
-          <p className="text-[13px] leading-[1.5] text-[#718099] md:text-[14px]">{description}</p>
+          <p className="text-[13px] leading-[1.5] text-[#596174] md:text-[14px]">{description}</p>
         )}
       </div>
     ) : null
@@ -99,7 +99,7 @@ export default function AppHeader({
                   to={item.path}
                   aria-current={active ? 'page' : undefined}
                   className={cn(
-                    'relative inline-flex min-h-[32px] items-center whitespace-nowrap rounded-[9px] px-[11px] text-[13px] text-[#718099] transition-colors hover:bg-white/70 hover:text-[#24324a] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8797c5] focus-visible:ring-offset-1 md:min-h-[36px] md:px-[13px] md:text-[14px]',
+                    'relative inline-flex min-h-[32px] items-center whitespace-nowrap rounded-[9px] px-[11px] text-[13px] text-[#596174] transition-colors hover:bg-white/70 hover:text-[#24324a] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8797c5] focus-visible:ring-offset-1 md:min-h-[36px] md:px-[13px] md:text-[14px]',
                     active && 'bg-white font-semibold text-[#24324a] shadow-[0_1px_3px_rgba(36,50,74,0.10)]',
                   )}
                 >

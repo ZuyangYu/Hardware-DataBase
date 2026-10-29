@@ -7,6 +7,8 @@ import { visibleMemoryConsents } from './memoryViewModel';
 import AppHeader from '@/components/AppHeader';
 import AppIcon from '@/components/AppIcon';
 import { Button } from '@/components/ui/button';
+import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input, Label, Textarea } from '@/components/ui';
 import { Skeleton } from '@/components/ui/skeleton';
 import { notify } from '@/components/ui/app-toast';
 import { formatDateTime } from '@/lib/enterprise-ui';
@@ -18,15 +20,16 @@ type Props = {
 };
 
 type ListStatus = MemoryListStatus;
+type MemoryAction = 'verify' | 'reject' | 'supersede' | 'delete';
 
 const STATUS_LABEL: Record<ListStatus, string> = {
   all: '全部状态',
   active: '当前有效',
-  candidate: 'Candidate',
+  candidate: '候选',
   verification_pending: '待审核',
   supersede_pending: '待替代',
   needs_rebuild: '待重建',
-  verified: 'Verified',
+  verified: '已验证',
   superseded: '已替代',
   rejected: '已驳回',
   deleted: '已删除',
@@ -54,6 +57,14 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
   const [settings, setSettings] = useState<UserMemorySettingsView | null>(null);
   const [consents, setConsents] = useState<MemoryConsentView[]>([]);
   const [detail, setDetail] = useState<MemoryView | null>(null);
+  const [governTarget, setGovernTarget] = useState<{ memory: MemoryView; action: MemoryAction } | null>(null);
+  const [successorId, setSuccessorId] = useState('');
+  const [governBusy, setGovernBusy] = useState(false);
+  const [editTarget, setEditTarget] = useState<MemoryView | null>(null);
+  const [editText, setEditText] = useState('');
+  const [editBusy, setEditBusy] = useState(false);
+  const [revokeTarget, setRevokeTarget] = useState<MemoryConsentView | null>(null);
+  const [revokeBusy, setRevokeBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const activeConsents = visibleMemoryConsents(consents);
@@ -116,12 +127,20 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
   }
 
   async function govern(memory: MemoryView, action: 'verify' | 'reject' | 'supersede' | 'delete') {
+    setSuccessorId('');
+    setGovernTarget({ memory, action });
+  }
+
+  async function confirmGovern() {
+    if (!governTarget) return;
+    const { memory, action } = governTarget;
     const actionLabel = action === 'verify' ? '审核通过' : action === 'reject' ? '驳回' : action === 'supersede' ? '标记为已替代' : '删除';
-    if (!window.confirm(`确定${actionLabel}这条记忆吗？`)) return;
-    const successor = action === 'supersede'
-      ? window.prompt('请输入同一范围内用于替代的新 Memory ID')?.trim()
-      : undefined;
-    if (action === 'supersede' && !successor) return;
+    const successor = action === 'supersede' ? successorId.trim() : undefined;
+    if (action === 'supersede' && !successor) {
+      notify.error('请输入用于替代的新 Memory ID');
+      return;
+    }
+    setGovernBusy(true);
     const body = {
       expected_revision: memory.revision,
       reason: `长期记忆页面执行${actionLabel}`,
@@ -140,6 +159,9 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
       void load();
     } catch (error) {
       notify.error(error instanceof Error ? error.message : `${actionLabel}失败`);
+    } finally {
+      setGovernBusy(false);
+      setGovernTarget(null);
     }
   }
 
@@ -156,26 +178,44 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
   }
 
   async function editDraft(memory: MemoryView) {
-    const value = window.prompt('修改 Candidate 正文', memoryText(memory));
-    if (value == null || !value.trim() || value.trim() === memoryText(memory)) return;
+    setEditText(memoryText(memory));
+    setEditTarget(memory);
+  }
+
+  async function confirmEditDraft() {
+    if (!editTarget) return;
+    const value = editText.trim();
+    if (!value || value === memoryText(editTarget)) {
+      setEditTarget(null);
+      return;
+    }
+    setEditBusy(true);
     try {
-      await api.patch(`/api/v1/memories/${encodeURIComponent(memory.memory_id)}/draft`, {
-        content: { ...memory.content, content: value.trim() },
-        expected_revision: memory.revision,
-        reason: '长期记忆页面编辑 Candidate',
+      await api.patch(`/api/v1/memories/${encodeURIComponent(editTarget.memory_id)}/draft`, {
+        content: { ...editTarget.content, content: value },
+        expected_revision: editTarget.revision,
+        reason: '长期记忆页面编辑候选记忆',
         request_id: `memory-ui-draft-${Date.now()}`,
       });
-      notify.success('Draft 更新请求已提交');
+      notify.success('候选草稿更新请求已提交');
+      setEditTarget(null);
       void load();
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '编辑 Candidate 失败');
+      notify.error(error instanceof Error ? error.message : '编辑候选记忆失败');
+    } finally {
+      setEditBusy(false);
     }
   }
 
   async function revokeConsent(consent: MemoryConsentView) {
-    if (!window.confirm(`撤销会话 #${consent.session_id} 的个人记忆授权吗？相关记忆会立即撤下。`)) return;
+    setRevokeTarget(consent);
+  }
+
+  async function confirmRevokeConsent() {
+    if (!revokeTarget) return;
+    setRevokeBusy(true);
     try {
-      await api.delete(`/api/v1/memory-consents/${encodeURIComponent(consent.consent_event_id)}`, {
+      await api.delete(`/api/v1/memory-consents/${encodeURIComponent(revokeTarget.consent_event_id)}`, {
         reason: '长期记忆页面撤销授权',
         request_id: `memory-ui-revoke-${Date.now()}`,
       });
@@ -183,6 +223,9 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
       void load();
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '撤销个人记忆授权失败');
+    } finally {
+      setRevokeBusy(false);
+      setRevokeTarget(null);
     }
   }
 
@@ -194,9 +237,10 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
       />
 
       <div className="mt-[28px] flex flex-wrap items-center gap-[10px] rounded-[14px] border border-[#e3e7f1] bg-white px-[16px] py-[12px]">
-        <div className="flex rounded-[9px] bg-[#f4f6fa] p-[3px]">
+        <div className="flex rounded-[9px] bg-[#f4f6fa] p-[3px]" role="group" aria-label="记忆范围">
           <button
             type="button"
+            aria-pressed={scope === 'user'}
             onClick={() => setScope('user')}
             className={`rounded-[7px] px-[12px] py-[6px] text-[12px] ${scope === 'user' ? 'bg-white font-medium text-[#18181a] shadow-sm' : 'text-[#757f9c]'}`}
           >
@@ -204,6 +248,7 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
           </button>
           <button
             type="button"
+            aria-pressed={scope === 'project'}
             onClick={() => setScope('project')}
             className={`rounded-[7px] px-[12px] py-[6px] text-[12px] ${scope === 'project' ? 'bg-white font-medium text-[#18181a] shadow-sm' : 'text-[#757f9c]'}`}
           >
@@ -280,7 +325,7 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
               <div className="mt-[14px] flex flex-wrap items-center gap-[14px] border-t border-[#eef1f6] pt-[10px] text-[11px] text-[#858b9c]">
                 <span>{memory.scope === 'user' ? '个人范围' : '项目范围'}</span>
                 <span>来源 {memory.source_count} 条</span>
-                <span>{memory.projection_status || 'projection pending'}</span>
+                <span>{memory.projection_status || '待投影'}</span>
                 <span className="ml-auto">更新于 {formatDateTime(memory.updated_at)}</span>
                 <Button type="button" size="sm" variant="ghost" onClick={() => void toggleDetail(memory)}>
                   {detail?.memory_id === memory.memory_id ? '收起详情' : '查看来源与审计'}
@@ -330,6 +375,64 @@ export default function MemoryPage({ auth, onLogout, kbs }: Props) {
           </div>
         </section>
       )}
+
+      <ConfirmDialog
+        open={governTarget !== null && governTarget.action !== 'supersede'}
+        onOpenChange={(open) => {
+          if (!open && !governBusy) setGovernTarget(null);
+        }}
+        title={`${governTarget?.action === 'verify' ? '审核通过' : governTarget?.action === 'reject' ? '驳回' : '删除'}这条记忆？`}
+        description="操作会写入长期记忆审计记录，请确认目标和当前版本。"
+        confirmText={governTarget?.action === 'verify' ? '审核通过' : governTarget?.action === 'reject' ? '驳回' : '删除'}
+        destructive={governTarget?.action === 'delete'}
+        loading={governBusy}
+        onConfirm={() => void confirmGovern()}
+      />
+
+      <Dialog open={governTarget?.action === 'supersede'} onOpenChange={(open) => { if (!open && !governBusy) setGovernTarget(null); }}>
+        <DialogContent className="w-[calc(100%-32px)] max-w-[440px] rounded-[16px]">
+          <DialogHeader>
+            <DialogTitle>标记记忆为已替代</DialogTitle>
+            <DialogDescription>请输入同一范围内用于替代的新 Memory ID。</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-2">
+            <Label htmlFor="memory-successor-id">新 Memory ID</Label>
+            <Input id="memory-successor-id" value={successorId} onChange={(event) => setSuccessorId(event.target.value)} autoFocus />
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="outline" disabled={governBusy} onClick={() => setGovernTarget(null)}>取消</Button>
+            <Button type="button" disabled={governBusy} onClick={() => void confirmGovern()}>{governBusy ? '提交中…' : '确认替代'}</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={editTarget !== null} onOpenChange={(open) => { if (!open && !editBusy) setEditTarget(null); }}>
+        <DialogContent className="w-[calc(100%-32px)] max-w-[560px] rounded-[16px]">
+          <DialogHeader>
+            <DialogTitle>修改候选记忆正文</DialogTitle>
+            <DialogDescription>修改后会按当前版本提交草稿更新请求。</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-2">
+            <Label htmlFor="memory-draft-content">正文</Label>
+            <Textarea id="memory-draft-content" value={editText} onChange={(event) => setEditText(event.target.value)} rows={8} autoFocus />
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button type="button" variant="outline" disabled={editBusy} onClick={() => setEditTarget(null)}>取消</Button>
+            <Button type="button" disabled={editBusy || !editText.trim()} onClick={() => void confirmEditDraft()}>{editBusy ? '保存中…' : '保存草稿'}</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <ConfirmDialog
+        open={revokeTarget !== null}
+        onOpenChange={(open) => { if (!open && !revokeBusy) setRevokeTarget(null); }}
+        title={`撤销会话 #${revokeTarget?.session_id} 的个人记忆授权？`}
+        description="相关记忆会立即撤下，之后不会再被检索或重放。"
+        confirmText="撤销授权"
+        destructive
+        loading={revokeBusy}
+        onConfirm={() => void confirmRevokeConsent()}
+      />
     </div>
   );
 }

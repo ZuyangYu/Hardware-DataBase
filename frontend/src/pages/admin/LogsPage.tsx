@@ -254,6 +254,7 @@ function AuditPanel() {
             rowKey={(e) => e.id}
             size="compact"
             emptyText="暂无审计日志"
+            rowAriaLabel={(e) => `查看审计日志 ${e.action} ${e.target_type || ''}`}
             onRowClick={(e) => setDetail(e)}
           />
         )}
@@ -473,6 +474,7 @@ function QueryPanel() {
             rowKey={(t) => t.id}
             size="compact"
             emptyText="暂无查询日志"
+            rowAriaLabel={(t) => `查看查询日志 ${t.original_query || ''}`}
             onRowClick={(t) => openDetail(t)}
           />
         )}

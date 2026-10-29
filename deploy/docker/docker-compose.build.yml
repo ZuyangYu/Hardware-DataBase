@@ -20,6 +20,8 @@ services:
       args:
         APT_MIRROR: ${APT_MIRROR:-}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        UV_INDEX_URL: ${UV_INDEX_URL:-}
+        UV_DEFAULT_INDEX: ${UV_DEFAULT_INDEX:-}
         HDB_INSTALL_EVAL: ${HDB_INSTALL_EVAL:-0}
 
   web:
