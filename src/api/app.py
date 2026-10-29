@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
@@ -17,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.errors import install_error_handlers
 from src.api.deps import require_system_admin
 from src.api.routes import (
+    api_keys,
     assets,
     attachments,
     auth,
@@ -26,6 +30,7 @@ from src.api.routes import (
     departments,
     doc_assets,
     evaluation,
+    external,
     files,
     governance,
     kb_assign,
@@ -286,7 +291,9 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     import src.settings as settings
+    import src.external_settings as external_settings
 
+    external_settings.validate_external_settings()
     init_observability(
         "hardware-database-api",
         service_version=settings.OBS_SERVICE_VERSION,
@@ -295,6 +302,53 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Hardware DataBase API", version="0.1.0", lifespan=lifespan)
     instrument_fastapi(app)
     install_error_handlers(app)
+
+    @app.middleware("http")
+    async def attach_request_id(request, call_next):
+        request.state.started_at = time.monotonic()
+        supplied = str(request.headers.get("X-Request-ID", "") or "").strip()
+        request.state.request_id = (
+            supplied
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,99}", supplied)
+            else f"req_{uuid.uuid4().hex}"
+        )
+        is_external_upload = (
+            request.method == "POST"
+            and request.url.path.startswith("/api/v1/external/kbs/")
+            and request.url.path.endswith("/files")
+        )
+        if (
+            request.url.path.startswith("/api/v1/external")
+            and request.method in {"POST", "PUT", "PATCH"}
+            and not is_external_upload
+        ):
+            max_bytes = int(external_settings.HDB_EXTERNAL_MAX_REQUEST_BYTES or 0)
+            if max_bytes > 0:
+                declared = request.headers.get("content-length")
+                try:
+                    length = int(declared) if declared not in (None, "") else None
+                except ValueError:
+                    length = None
+                # Require an explicit length rather than buffering an
+                # unbounded chunked body in the middleware.  P0 clients send
+                # JSON, for which HTTP libraries set Content-Length.
+                if length is None or length < 0 or length > max_bytes:
+                    rid = request.state.request_id
+                    return JSONResponse(
+                        status_code=422,
+                        headers={"X-Request-ID": rid},
+                        content={
+                            "request_id": rid,
+                            "error": {
+                                "code": "INVALID_REQUEST",
+                                "message": "请求体缺失长度或超过大小限制",
+                                "retryable": False,
+                            },
+                        },
+                    )
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request.state.request_id
+        return response
 
     # CORS: allow browser-based clients and agent tools to reach the API.
     # allow_origins=["*"] + allow_credentials=True is rejected by browsers, so
@@ -321,10 +375,13 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Request-ID", "Retry-After"],
     )
 
     api_v1 = "/api/v1"
     app.include_router(auth.router, prefix=api_v1)
+    app.include_router(api_keys.router, prefix=api_v1)
+    app.include_router(external.router, prefix=api_v1)
     app.include_router(assets.router, prefix=api_v1)
     app.include_router(doc_assets.router, prefix=api_v1)
     app.include_router(wiki.router, prefix=api_v1)

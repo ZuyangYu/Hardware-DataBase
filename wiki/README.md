@@ -84,6 +84,7 @@ Hardware DataBase（包名 `hardware-database`）是面向**硬件设计资产**
 | 25 | [production-quality-feedback](25-production-quality-feedback.md) | 固定回答/证据、反馈幂等、指定员工共享/撤销、复核队列、事务 outbox 与 Phoenix 标量投影 |
 | 26 | [quality-experiments-cost-ledger](26-quality-experiments-cost-ledger.md) | 授权数据集、固定证据回答实验、发布/回访、调用费用、spool、确定性报告与聊天 SLO |
 | 27 | [production-feedback-cost-observability-plan](../docs/superpowers/plans/2026-10-8-production-feedback-cost-observability-plan.md) / [实施记录](../docs/superpowers/plans/2026-10-8-production-feedback-cost-observability-implementation.md) | 生产反馈闭环、调用级成本归因、Phoenix 分析报告与优化工作台、Collector/SLO 与分阶段验收 |
+| 28 | [external-api](28-external-api.md) | 外部消费者 API：API Key、知识库/文件、检索、证据、上传、表格和电路查询 |
 
 ---
 

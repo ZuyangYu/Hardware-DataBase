@@ -222,9 +222,16 @@ export default function ChatPage({
       return undefined;
     }
     const timer = window.setInterval(() => {
-      void refreshMcpWriteCards().catch(() => undefined);
-    }, 2_000);
-    return () => window.clearInterval(timer);
+      if (!document.hidden) void refreshMcpWriteCards().catch(() => undefined);
+    }, 3_000);
+    const onVisibilityChange = () => {
+      if (!document.hidden) void refreshMcpWriteCards().catch(() => undefined);
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   }, [mcpWriteCards, refreshMcpWriteCards]);
 
   async function confirmMcpWriteCard(card: typeof mcpWriteCards[number]) {
@@ -381,6 +388,7 @@ export default function ChatPage({
     let disposed = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const sync = async () => {
+      if (disposed || document.hidden) return;
       const mutationVersion = attachmentMutationVersionRef.current;
       try {
         const attachments = await listAttachments(activeSessionId);
@@ -398,13 +406,23 @@ export default function ChatPage({
         // The backend flag is independently configurable; a transient list
         // failure must not interrupt normal chat input.
       } finally {
-        if (!disposed) timer = setTimeout(() => void sync(), ATTACHMENT_STATUS_POLL_INTERVAL_MS);
+        if (!disposed && !document.hidden) {
+          timer = setTimeout(() => {
+            timer = null;
+            void sync();
+          }, ATTACHMENT_STATUS_POLL_INTERVAL_MS);
+        }
       }
     };
+    const onVisibilityChange = () => {
+      if (!document.hidden && !disposed && timer == null) void sync();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
     void sync();
     return () => {
       disposed = true;
       if (timer) clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, [activeSessionId, chatAttachmentsEnabled]);
 
@@ -516,7 +534,7 @@ export default function ChatPage({
     }
   }
 
-  // ---- 确认弹窗(单例 state,替代 window.confirm) ----
+  // ---- 确认弹窗(单例 state) ----
   const [extractConfirmOpen, setExtractConfirmOpen] = useState(false);
   const [extracting, setExtracting] = useState(false);
   const [userMemoryTarget, setUserMemoryTarget] = useState<number[] | null>(null);
@@ -603,7 +621,7 @@ export default function ChatPage({
       if (result?.status === 'already_covered') {
         notify.info('该轮已包含在最近一次项目提炼中，无需重复创建');
       } else {
-        notify.success('已提交项目记忆提炼，结果进入 Candidate 待审核');
+        notify.success('已提交项目记忆提炼，结果进入候选状态待审核');
       }
       void refreshMemorySummary();
     } catch (error) {
@@ -769,7 +787,7 @@ export default function ChatPage({
           if (!next) setExtractConfirmOpen(false);
         }}
         title="重新提炼本项目记忆？"
-        description="将基于当前会话历史重新生成项目记忆，结果先进入 Candidate，仍需审核。"
+        description="将基于当前会话历史重新生成项目记忆，结果先进入候选状态，仍需审核。"
         confirmText="重新提炼"
         destructive={false}
         loading={extracting}

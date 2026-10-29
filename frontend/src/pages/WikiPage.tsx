@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 
 import { api } from '../api/client';
@@ -75,6 +75,7 @@ export default function WikiPage({ auth, onLogout, kbs, embedded = false }: Prop
   const [statusFilter, setStatusFilter] = useState<'published' | 'archived'>('published');
   const [maxPagesInput, setMaxPagesInput] = useState('');
   const [job, setJob] = useState<WikiJobState | null>(null);
+  const wikiPollTimerRef = useRef<number | null>(null);
   const [detail, setDetail] = useState<WikiPageDetailView | null>(null);
   const [editOpen, setEditOpen] = useState(false);
   const [editForm, setEditForm] = useState<{ title: string; content: string; summary: string; aliasesText: string; version: number } | null>(null);
@@ -143,13 +144,17 @@ export default function WikiPage({ auth, onLogout, kbs, embedded = false }: Prop
   }, [openSlug, kbName]);
 
   const pollJob = useCallback(() => {
-    if (!kbName) return;
+    if (!kbName || document.hidden) return;
     api
       .get<WikiJobState>(`/api/v1/kbs/${encodeURIComponent(kbName)}/wiki/status`)
       .then((state) => {
         setJob(state);
         if (state.running) {
-          setTimeout(pollJob, 4000);
+          if (wikiPollTimerRef.current != null) window.clearTimeout(wikiPollTimerRef.current);
+          wikiPollTimerRef.current = window.setTimeout(() => {
+            wikiPollTimerRef.current = null;
+            pollJob();
+          }, 4000);
         } else if (state.stage === '完成') {
           load();
         }
@@ -159,6 +164,17 @@ export default function WikiPage({ auth, onLogout, kbs, embedded = false }: Prop
 
   useEffect(() => {
     pollJob();
+    const onVisibilityChange = () => {
+      if (!document.hidden) pollJob();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (wikiPollTimerRef.current != null) {
+        window.clearTimeout(wikiPollTimerRef.current);
+        wikiPollTimerRef.current = null;
+      }
+    };
   }, [pollJob]);
 
   const startIngest = useCallback(
@@ -171,7 +187,11 @@ export default function WikiPage({ auth, onLogout, kbs, embedded = false }: Prop
         .then(() => {
           notify.success('Wiki 生成已启动');
           setJob({ running: true, stage: '排队中' });
-          setTimeout(pollJob, 1500);
+          if (wikiPollTimerRef.current != null) window.clearTimeout(wikiPollTimerRef.current);
+          wikiPollTimerRef.current = window.setTimeout(() => {
+            wikiPollTimerRef.current = null;
+            pollJob();
+          }, 1500);
         })
         .catch((error) => notify.error(error instanceof Error ? error.message : '启动失败'));
     },
@@ -370,6 +390,7 @@ export default function WikiPage({ auth, onLogout, kbs, embedded = false }: Prop
           </label>
         )}
         <select
+          aria-label="Wiki 状态"
           value={statusFilter}
           onChange={(event) => setStatusFilter(event.target.value as 'published' | 'archived')}
           className="h-[30px] rounded-full border border-[#e3e7f1] bg-white px-[10px] text-[12px] text-[#18181a] outline-none focus:border-[#9cabc8]"
@@ -377,25 +398,30 @@ export default function WikiPage({ auth, onLogout, kbs, embedded = false }: Prop
           <option value="published">已发布</option>
           <option value="archived">已归档</option>
         </select>
-        <button
-          type="button"
-          onClick={() => setTypeFilter('')}
-          className={`h-[30px] rounded-full border px-[12px] text-[12px] ${typeFilter === '' ? 'border-[#18181a] bg-[#18181a] text-white' : 'border-[#e3e7f1] bg-white text-[#5b6478] hover:border-[#9cabc8]'}`}
-        >
-          全部
-        </button>
-        {(Object.keys(TYPE_LABEL) as WikiPageType[]).map((t) => (
+        <div className="flex flex-wrap items-center gap-[8px]" role="group" aria-label="Wiki 类型">
           <button
-            key={t}
             type="button"
-            onClick={() => setTypeFilter(t)}
-            className={`h-[30px] rounded-full border px-[12px] text-[12px] ${typeFilter === t ? 'border-[#18181a] bg-[#18181a] text-white' : 'border-[#e3e7f1] bg-white text-[#5b6478] hover:border-[#9cabc8]'}`}
+            aria-pressed={typeFilter === ''}
+            onClick={() => setTypeFilter('')}
+            className={`h-[30px] rounded-full border px-[12px] text-[12px] ${typeFilter === '' ? 'border-[#18181a] bg-[#18181a] text-white' : 'border-[#e3e7f1] bg-white text-[#5b6478] hover:border-[#9cabc8]'}`}
           >
-            {TYPE_LABEL[t]}
+            全部
           </button>
-        ))}
+          {(Object.keys(TYPE_LABEL) as WikiPageType[]).map((t) => (
+            <button
+              key={t}
+              type="button"
+              aria-pressed={typeFilter === t}
+              onClick={() => setTypeFilter(t)}
+              className={`h-[30px] rounded-full border px-[12px] text-[12px] ${typeFilter === t ? 'border-[#18181a] bg-[#18181a] text-white' : 'border-[#e3e7f1] bg-white text-[#5b6478] hover:border-[#9cabc8]'}`}
+            >
+              {TYPE_LABEL[t]}
+            </button>
+          ))}
+        </div>
         <div className="ml-auto flex flex-wrap items-center gap-[8px]">
           <input
+            aria-label="搜索 Wiki 页面"
             value={searchInput}
             onChange={(event) => setSearchInput(event.target.value)}
             onKeyDown={(event) => {
@@ -407,6 +433,7 @@ export default function WikiPage({ auth, onLogout, kbs, embedded = false }: Prop
           {canWrite && (
             <>
               <input
+                aria-label="生成页数上限"
                 value={maxPagesInput}
                 onChange={(event) => setMaxPagesInput(event.target.value.replace(/[^\d]/g, '').slice(0, 4))}
                 placeholder="页上限"
@@ -542,6 +569,7 @@ export default function WikiPage({ auth, onLogout, kbs, embedded = false }: Prop
               rowKey={(row) => row.id}
               size="compact"
               emptyText="还没有 Wiki 页面;点击「生成 Wiki」由管线蒸馏生成。"
+              rowAriaLabel={(page) => `打开 Wiki 页面 ${page.title}`}
               onRowClick={(page) => void openDetail(page.slug)}
             />
           )}

@@ -4,9 +4,12 @@
 ``AppLogService`` 建的 ``audit_events``）：
 
 - ``AuthService``: users / departments / auth_sessions / login_attempts / knowledge_bases
+  / employee_api_keys / employee_api_key_kbs / external_kb_refs / external_file_refs
+  / external_asset_refs / external_source_scopes / external_evidence
+  / external_ingestion_jobs / external_upload_idempotency
 - ``AppLogService``: audit_events / query_traces / retrieved_evidence
 - ``WikiService``: wiki_pages / wiki_page_revisions / wiki_jobs
-- ``DocumentAssetService``: doc_assets / doc_asset_versions / doc_asset_events / doc_asset_links
+- ``DocumentAssetService``: doc_assets / doc_asset_identifiers / doc_asset_versions / doc_asset_events / doc_asset_links
 - ``AssetService``: hardware_assets / asset_candidates / asset_evidence
 - ``NotificationService``: notifications
 
@@ -32,6 +35,15 @@ TABLES: tuple[str, ...] = (
     "auth_sessions",
     "login_attempts",
     "knowledge_bases",
+    "employee_api_keys",
+    "employee_api_key_kbs",
+    "external_kb_refs",
+    "external_file_refs",
+    "external_asset_refs",
+    "external_source_scopes",
+    "external_evidence",
+    "external_ingestion_jobs",
+    "external_upload_idempotency",
     "audit_events",
     "query_traces",
     "retrieved_evidence",
@@ -39,6 +51,7 @@ TABLES: tuple[str, ...] = (
     "wiki_page_revisions",
     "wiki_jobs",
     "doc_assets",
+    "doc_asset_identifiers",
     "doc_asset_versions",
     "doc_asset_events",
     "doc_asset_links",

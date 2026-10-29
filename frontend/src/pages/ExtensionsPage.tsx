@@ -557,10 +557,15 @@ export default function ExtensionsPage({ auth }: Props) {
 
   useEffect(() => {
     if (!skillTask || ['succeeded', 'failed', 'cancelled', 'rejected', 'expired', 'reconcile_required'].includes(skillTask.status)) return;
-    const timer = window.setInterval(() => {
-      void refreshSkillTask(skillTask.task_id).catch(() => {});
-    }, 2500);
-    return () => window.clearInterval(timer);
+    const poll = () => {
+      if (!document.hidden) void refreshSkillTask(skillTask.task_id).catch(() => {});
+    };
+    const timer = window.setInterval(poll, 2500);
+    document.addEventListener('visibilitychange', poll);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', poll);
+    };
   }, [skillTask?.task_id, skillTask?.status, refreshSkillTask]);
 
   function run(slug: string, action: () => Promise<unknown>, message: string) {

@@ -50,7 +50,7 @@ export default function ChatEmptyState({ userName, kbName, suggestions = DEFAULT
               {tag}
             </span>
           ))}
-          <span className="ml-auto hidden text-[10px] text-[#a1a7b5] sm:inline">
+          <span className="ml-auto hidden text-[10px] text-[#6b7280] sm:inline">
             Enter 发送 · Shift+Enter 换行
           </span>
         </div>
@@ -63,7 +63,7 @@ export default function ChatEmptyState({ userName, kbName, suggestions = DEFAULT
             <div className="mt-[2px] text-[11px] text-[#9aa1b1]">点击后填入输入框，可继续修改</div>
           </div>
           {mounted && (
-            <span className="inline-flex items-center gap-[5px] rounded-full bg-[#f4f5f7] px-[8px] py-[3px] text-[10px] text-[#6b7280]">
+            <span className="inline-flex items-center gap-[5px] rounded-full bg-[#f4f5f7] px-[8px] py-[3px] text-[10px] text-[#5b6478]">
               <span className="size-[5px] rounded-full bg-[#8b93a7]" aria-hidden />
               {kbName}
             </span>

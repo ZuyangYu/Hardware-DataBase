@@ -158,61 +158,65 @@ export default function AppSidebar({ auth, onLogout }: Props) {
         )}
 
         {/* 只保留一级工作区;具体页面在 AppHeader 下的二级导航中切换。 */}
-        <SidebarContent className={cn(collapsed ? 'items-center justify-center px-0 py-[14px]' : 'px-[16px] pt-[14px]')}>
-          <SidebarMenu className={cn(collapsed ? 'items-center gap-[12px]' : 'gap-[8px]')}>
-            {primaryItems.map((item, itemIndex) => {
-              const active = isPrimaryNavItemActive(item, location.pathname);
-              const separated = itemIndex > 0 && (item.id === 'governance' || item.id === 'management');
-              return (
-                <PrimaryNavButton
-                  key={item.id}
-                  label={item.label}
-                  iconName={item.icon}
-                  active={active}
-                  collapsed={collapsed}
-                  onClick={() => navigateAndClose(item.path)}
-                  tooltip={`${item.label}：${item.description}`}
-                  className={cn(
-                    separated && !collapsed && 'mt-[12px] border-t border-sidebar-border pt-[16px]',
-                    separated && collapsed && 'mt-[10px] border-t border-sidebar-border pt-[12px]',
-                  )}
-                />
-              );
-            })}
-          </SidebarMenu>
-        </SidebarContent>
+        <nav aria-label="主导航" className="min-h-0 flex-1">
+          <SidebarContent className={cn(collapsed ? 'items-center justify-center px-0 py-[14px]' : 'px-[16px] pt-[14px]')}>
+            <SidebarMenu className={cn(collapsed ? 'items-center gap-[12px]' : 'gap-[8px]')}>
+              {primaryItems.map((item, itemIndex) => {
+                const active = isPrimaryNavItemActive(item, location.pathname);
+                const separated = itemIndex > 0 && (item.id === 'governance' || item.id === 'management');
+                return (
+                  <PrimaryNavButton
+                    key={item.id}
+                    label={item.label}
+                    iconName={item.icon}
+                    active={active}
+                    collapsed={collapsed}
+                    onClick={() => navigateAndClose(item.path)}
+                    tooltip={`${item.label}：${item.description}`}
+                    className={cn(
+                      separated && !collapsed && 'mt-[12px] border-t border-sidebar-border pt-[16px]',
+                      separated && collapsed && 'mt-[10px] border-t border-sidebar-border pt-[12px]',
+                    )}
+                  />
+                );
+              })}
+            </SidebarMenu>
+          </SidebarContent>
+        </nav>
 
         {/* 底部:用户菜单(保留退出;AppHeader 也有,这里冗余但常见) */}
         <SidebarFooter className="px-[20px] pb-[20px] group-data-[collapsible=icon]:px-[12px]">
-          <SidebarMenu className="mb-2">
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                asChild
-                tooltip="使用帮助（在新标签页打开）"
-                className={cn(
-                  'h-[40px] rounded-[12px] text-[14px] text-[#5b6478]',
-                  collapsed ? 'mx-auto flex h-[46px]! w-[46px]! justify-center p-0!' : 'gap-[10px] px-[8px]',
-                )}
-              >
-                <a href="/help" target="_blank" rel="noopener noreferrer" aria-label="使用帮助" title="使用帮助（在新标签页打开）">
-                  <BookOpen className="size-[20px] shrink-0" aria-hidden="true" />
-                  {!collapsed && <span>使用帮助</span>}
-                  <span className="sr-only">在新标签页打开</span>
-                </a>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          </SidebarMenu>
+          <nav aria-label="辅助导航">
+            <SidebarMenu className="mb-2">
+              <SidebarMenuItem>
+                <SidebarMenuButton
+                  asChild
+                  tooltip="使用帮助（在新标签页打开）"
+                  className={cn(
+                    'h-[40px] rounded-[12px] text-[14px] text-[#5b6478]',
+                    collapsed ? 'mx-auto flex h-[46px]! w-[46px]! justify-center p-0!' : 'gap-[10px] px-[8px]',
+                  )}
+                >
+                  <a href="/help" target="_blank" rel="noopener noreferrer" aria-label="使用帮助" title="使用帮助（在新标签页打开）">
+                    <BookOpen className="size-[20px] shrink-0" aria-hidden="true" />
+                    {!collapsed && <span>使用帮助</span>}
+                    <span className="sr-only">在新标签页打开</span>
+                  </a>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            </SidebarMenu>
+          </nav>
           <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
-                  aria-label="打开个人菜单"
                   className={cn(
                     'flex w-full items-center rounded-[14px] py-[8px] text-left transition-colors hover:bg-sidebar-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring',
                     collapsed ? 'justify-center px-0' : 'gap-[10px] px-[8px]',
                   )}
                 >
-                  <span className="grid size-[32px] shrink-0 place-items-center overflow-hidden rounded-full bg-[#eef1fb] text-[13px] font-bold text-[#7e96dc]">
+                  <span className="sr-only">打开个人菜单</span>
+                  <span aria-hidden="true" className="grid size-[32px] shrink-0 place-items-center overflow-hidden rounded-full bg-[#eef1fb] text-[13px] font-bold text-[#7e96dc]">
                     {initial}
                   </span>
                   {!collapsed && <span className="min-w-0 flex-1">

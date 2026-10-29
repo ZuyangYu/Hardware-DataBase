@@ -62,14 +62,26 @@ export default function FeedbackTicketsPage({ auth }: { auth: AuthSession; onLog
   }, [ticketId]);
   useEffect(() => {
     void load();
-    const timer = window.setInterval(() => void load(), 30_000);
-    return () => { window.clearInterval(timer); listSeq.current += 1; };
+    const poll = () => { if (!document.hidden) void load(); };
+    const timer = window.setInterval(poll, 30_000);
+    document.addEventListener('visibilitychange', poll);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', poll);
+      listSeq.current += 1;
+    };
   }, [load]);
   useEffect(() => {
     setDetail(null); setDetailError('');
     void readDetail();
-    const timer = window.setInterval(() => void readDetail(), 15_000);
-    return () => { window.clearInterval(timer); detailSeq.current += 1; };
+    const poll = () => { if (!document.hidden) void readDetail(); };
+    const timer = window.setInterval(poll, 15_000);
+    document.addEventListener('visibilitychange', poll);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', poll);
+      detailSeq.current += 1;
+    };
   }, [readDetail]);
   useEffect(() => {
     if (!admin) return;

@@ -228,6 +228,7 @@ export default function Composer({
               ref={attachmentInputRef}
               id="chat-attachment-upload"
               type="file"
+              aria-label="上传附件"
               accept={CHAT_ATTACHMENT_ACCEPT}
               className="sr-only"
               disabled={uploadBlocked}
@@ -239,6 +240,8 @@ export default function Composer({
             />
             <textarea
               ref={textareaRef}
+              aria-label="聊天输入"
+              aria-describedby="chat-composer-hint"
               value={input}
               onChange={(event) => setInput(event.target.value)}
               placeholder={kbName ? `向「${kbName}」提问,Enter 发送 / Shift+Enter 换行` : '未选择知识库，直接提问'}
@@ -327,7 +330,7 @@ export default function Composer({
                   </Tooltip>
                 </TooltipProvider>
               )}
-              <span className={CHAT_COMPOSER_HINT_CLASS}>Enter 发送 / Shift+Enter 换行</span>
+              <span id="chat-composer-hint" className={CHAT_COMPOSER_HINT_CLASS}>Enter 发送 / Shift+Enter 换行</span>
             </div>
           </div>
         </form>

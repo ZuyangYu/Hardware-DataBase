@@ -27,7 +27,13 @@ else echo "[smoke] 错误: 找不到 docker-compose.yml，请传入部署目录"
 
 cd "$DOCKER_DIR" || exit 2
 COMPOSE=(docker compose -f docker-compose.yml)
-[ -f docker-compose.observability.yml ] && COMPOSE+=(-f docker-compose.observability.yml)
+# quickstart.sh supports a resource-constrained deployment without the
+# observability overlay.  Keep smoke-test aligned with that explicit choice;
+# otherwise merely having the overlay file present makes absent observability
+# services look like deployment failures.
+if [ "${HDB_WITH_OBSERVABILITY:-1}" != "0" ] && [ -f docker-compose.observability.yml ]; then
+  COMPOSE+=(-f docker-compose.observability.yml)
+fi
 
 PASS=0; FAIL=0; WARN=0
 ok()   { PASS=$((PASS+1)); printf '  [PASS] %s\n' "$*"; }
@@ -52,10 +58,17 @@ log "1) 容器与服务健康"
 SERVICES="$(${COMPOSE[@]} config --services 2>/dev/null)"
 for svc in $SERVICES; do
   cid="$(${COMPOSE[@]} ps -q "$svc" 2>/dev/null | head -n 1)"
-  if [ -z "$cid" ]; then [ "$svc" = "migrate" ] || bad "$svc 无容器"; continue; fi
+  if [ -z "$cid" ]; then
+    # One-shot init services are normally exited and omitted by `compose ps`
+    # unless -a is used.  They are still valid when their exit code is zero.
+    if [ "$svc" = "migrate" ] || [ "$svc" = "otel-storage-init" ]; then
+      cid="$(${COMPOSE[@]} ps -aq "$svc" 2>/dev/null | head -n 1)"
+    fi
+    [ -n "$cid" ] || { bad "$svc 无容器"; continue; }
+  fi
   state="$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null)"
   restarts="$(docker inspect -f '{{.RestartCount}}' "$cid" 2>/dev/null)"
-  if [ "$svc" = "migrate" ]; then
+  if [ "$svc" = "migrate" ] || [ "$svc" = "otel-storage-init" ]; then
     code="$(docker inspect -f '{{.State.ExitCode}}' "$cid" 2>/dev/null)"
     expect "migrate 退出码" 0 "$code"
   else

@@ -210,14 +210,19 @@ export default function LoginPage({ onLogin }: { onLogin: (session: AuthSession)
             <form
               className="mt-[24px] flex w-[320px] flex-col duration-300 ease-out animate-in fade-in slide-in-from-top-4"
               onSubmit={handleSubmit}
+              aria-label="登录表单"
             >
               <div className="relative">
+                <label htmlFor="login-username" className="sr-only">用户名</label>
                 <input
+                  id="login-username"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                   placeholder="用户名"
                   autoComplete="username"
                   autoFocus
+                  aria-invalid={Boolean(errorText)}
+                  aria-describedby={errorText ? 'login-error' : undefined}
                   className={inputClass}
                 />
                 {username && (
@@ -225,32 +230,38 @@ export default function LoginPage({ onLogin }: { onLogin: (session: AuthSession)
                     type="button"
                     aria-label="清除"
                     onClick={() => setUsername('')}
-                    className="absolute right-[12px] top-1/2 -translate-y-1/2 text-[#b3b8c4] hover:text-[#18181a]"
+                    className="absolute right-[6px] top-1/2 grid size-9 -translate-y-1/2 place-items-center text-[#6b7280] hover:text-[#18181a]"
                   >
                     <AppIcon name="close" size={16} />
                   </button>
                 )}
               </div>
               <div className="relative mt-[16px]">
+                <label htmlFor="login-password" className="sr-only">密码</label>
                 <input
+                  id="login-password"
                   type={showPassword ? 'text' : 'password'}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="密码"
                   autoComplete="current-password"
+                  aria-invalid={Boolean(errorText)}
+                  aria-describedby={errorText ? 'login-error' : undefined}
                   className={inputClass}
                 />
                 <button
                   type="button"
                   aria-label={showPassword ? '隐藏密码' : '显示密码'}
                   onClick={() => setShowPassword((v) => !v)}
-                  className="absolute right-[12px] top-1/2 -translate-y-1/2 text-[#b3b8c4] hover:text-[#18181a]"
+                  className="absolute right-[6px] top-1/2 grid size-9 -translate-y-1/2 place-items-center text-[#6b7280] hover:text-[#18181a]"
                 >
                   {showPassword ? <AppIcon name="eye-off" size={16} /> : <AppIcon name="eye" size={16} />}
                 </button>
               </div>
               {errorText && (
-                <p className="mt-[10px] text-[13px] text-[#d20b0b]">{errorText}</p>
+                <p id="login-error" className="mt-[10px] text-[13px] text-[#b42318]" role="alert" aria-live="assertive">
+                  {errorText}
+                </p>
               )}
               <button
                 type="submit"
@@ -274,7 +285,7 @@ export default function LoginPage({ onLogin }: { onLogin: (session: AuthSession)
                   <div className="mb-[14px] flex size-[42px] items-center justify-center rounded-[14px] bg-[#f6f6f6] text-[#18181a]">
                     <AppIcon name={card.icon as Parameters<typeof AppIcon>[0]['name']} size={20} />
                   </div>
-                  <h3 className="text-center text-[16px] font-semibold text-[#18181a]">{card.title}</h3>
+                   <h2 className="text-center text-[16px] font-semibold text-[#18181a]">{card.title}</h2>
                   <p className="mt-[10px] self-stretch text-left text-[13px] leading-[20px] text-[#757f9c]">{card.text}</p>
                 </div>
               </article>

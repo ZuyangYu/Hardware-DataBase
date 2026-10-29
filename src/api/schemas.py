@@ -176,7 +176,15 @@ class ConfirmAssetCandidateRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 DocCategory = Literal[
-    "design_doc", "schematic", "bom", "netlist", "test_report", "requirement", "standard", "other"
+    "design_doc",
+    "datasheet",
+    "schematic",
+    "bom",
+    "netlist",
+    "test_report",
+    "requirement",
+    "standard",
+    "other",
 ]
 DocRelationType = Literal["derived_from", "companion", "references", "verified_by"]
 
@@ -229,6 +237,9 @@ class DocAssetView(BaseModel):
     title: str
     category: str = "other"
     description: str = ""
+    manufacturer: str = ""
+    mpn: str = ""
+    revision: str = ""
     tags: list[str] = Field(default_factory=list)
     lifecycle_status: str = "draft"
     current_version_id: int | None = None
@@ -252,6 +263,9 @@ class UpdateDocAssetRequest(BaseModel):
     category: DocCategory | None = None
     project: str | None = Field(default=None, max_length=200)
     description: str | None = Field(default=None, max_length=2000)
+    manufacturer: str | None = Field(default=None, max_length=200)
+    mpn: str | None = Field(default=None, max_length=200)
+    revision: str | None = Field(default=None, max_length=100)
     tags: list[str] | None = Field(default=None, max_length=20)
 
 

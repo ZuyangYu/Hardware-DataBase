@@ -129,8 +129,16 @@ export default function WikiGraph({ graph, onSelect }: Props) {
               <g
                 key={node.slug}
                 opacity={dimmed ? 0.45 : 1}
-                className="cursor-pointer"
+                className="wiki-graph-node cursor-pointer focus-visible:outline-none"
+                role="button"
+                tabIndex={0}
+                aria-label={isDocs ? `查看文档 ${node.title}` : `查看词条 ${node.title}`}
                 onClick={() => onSelect(node.slug)}
+                onKeyDown={(event) => {
+                  if (event.key !== 'Enter' && event.key !== ' ') return;
+                  event.preventDefault();
+                  onSelect(node.slug);
+                }}
               >
                 <title>{isDocs ? `${node.title} · ${node.page_count ?? 0} 个词条` : node.title}</title>
                 <circle cx={point.x} cy={point.y} r={point.r} fill={fill} opacity={0.88} />

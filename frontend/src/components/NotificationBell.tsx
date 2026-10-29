@@ -4,7 +4,7 @@
  * 容器负责 30s 轮询与已读回执;视图为纯渲染,便于静态测试。
  * 通知只是触达面,权威审计仍在修订表/日志中心。
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type RefObject } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Bell } from 'lucide-react';
 
@@ -31,6 +31,7 @@ type ViewProps = {
   onToggle: () => void;
   onSelect: (item: AppNotification) => void;
   onMarkAll: () => void;
+  buttonRef?: RefObject<HTMLButtonElement>;
 };
 
 function formatTime(value: string): string {
@@ -47,13 +48,16 @@ export function NotificationBellView({
   onToggle,
   onSelect,
   onMarkAll,
+  buttonRef,
 }: ViewProps) {
   return (
     <div className="relative" data-notification-bell>
-      <button
-        type="button"
-        aria-label={`通知${unreadCount > 0 ? `（${unreadCount} 条未读）` : ''}`}
-        aria-expanded={open}
+        <button
+          ref={buttonRef}
+          type="button"
+          aria-label={`通知${unreadCount > 0 ? `（${unreadCount} 条未读）` : ''}`}
+          aria-expanded={open}
+          aria-controls="notification-panel"
         onClick={onToggle}
         className="relative flex size-[32px] items-center justify-center rounded-full text-[#464c5e] transition-colors hover:bg-[#f1f3f8]"
       >
@@ -69,6 +73,9 @@ export function NotificationBellView({
       </button>
       {open && (
         <div
+          id="notification-panel"
+          role="region"
+          aria-label="通知列表"
           data-notification-panel
           className="absolute right-0 top-[38px] z-50 w-[320px] overflow-hidden rounded-[12px] border border-[#e3e7f1] bg-white shadow-[0_12px_32px_rgba(24,24,26,0.12)]"
         >
@@ -86,9 +93,9 @@ export function NotificationBellView({
           </div>
           <div className="max-h-[360px] overflow-y-auto">
             {loading ? (
-              <p className="px-[12px] py-[16px] text-[12px] text-[#858b9c]">加载中…</p>
+              <p className="px-[12px] py-[16px] text-[12px] text-[#5b6478]">加载中…</p>
             ) : items.length === 0 ? (
-              <p className="px-[12px] py-[16px] text-[12px] text-[#858b9c]">暂无通知。</p>
+              <p className="px-[12px] py-[16px] text-[12px] text-[#5b6478]">暂无通知。</p>
             ) : (
               items.map((item) => (
                 <button
@@ -106,9 +113,9 @@ export function NotificationBellView({
                     <span className="min-w-0 truncate font-medium">{item.title}</span>
                   </span>
                   {item.body && (
-                    <span className="text-[12px] text-[#68728a] [word-break:break-word]">{item.body}</span>
+                    <span className="text-[12px] text-[#5b6478] [word-break:break-word]">{item.body}</span>
                   )}
-                  <span className="text-[11px] text-[#9aa1b3]">{formatTime(item.created_at)}</span>
+                  <span className="text-[11px] text-[#68728a]">{formatTime(item.created_at)}</span>
                 </button>
               ))
             )}
@@ -126,6 +133,7 @@ export default function NotificationBell() {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -144,8 +152,17 @@ export default function NotificationBell() {
 
   useEffect(() => {
     void load();
-    const timer = window.setInterval(() => void load(), 30_000);
-    return () => window.clearInterval(timer);
+    const timer = window.setInterval(() => {
+      if (!document.hidden) void load();
+    }, 30_000);
+    const onVisibilityChange = () => {
+      if (!document.hidden) void load();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
   }, [load]);
 
   useEffect(() => {
@@ -157,6 +174,18 @@ export default function NotificationBell() {
     };
     document.addEventListener('mousedown', onDocClick);
     return () => document.removeEventListener('mousedown', onDocClick);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      setOpen(false);
+      requestAnimationFrame(() => buttonRef.current?.focus());
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
   }, [open]);
 
   const markRead = useCallback(async (item: AppNotification) => {
@@ -192,6 +221,7 @@ export default function NotificationBell() {
         open={open}
         loading={loading}
         onToggle={() => setOpen((value) => !value)}
+        buttonRef={buttonRef}
         onMarkAll={() => void markAll()}
         onSelect={(item) => {
           void markRead(item);

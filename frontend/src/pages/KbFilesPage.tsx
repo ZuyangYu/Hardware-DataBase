@@ -248,11 +248,17 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
     if (!canWrite || !hasActiveTasks) {
       return undefined;
     }
-    const timer = window.setInterval(() => {
-      loadTasks(true);
-      loadFiles(true);
-    }, 3000);
-    return () => window.clearInterval(timer);
+    const poll = () => {
+      if (document.hidden) return;
+      void loadTasks(true);
+      void loadFiles(true);
+    };
+    const timer = window.setInterval(poll, 3000);
+    document.addEventListener('visibilitychange', poll);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', poll);
+    };
   }, [canWrite, hasActiveTasks, loadTasks, loadFiles]);
 
   const loadSpreadsheets = useCallback(async () => {
@@ -744,7 +750,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
           <div className="grid min-w-[180px] gap-[4px]">
             <span className="text-[11px] text-[#858b9c]">文件类型</span>
             <Select value={sourceGroup} onValueChange={setSourceGroup}>
-              <SelectTrigger className="h-[34px] w-full rounded-[10px] border-[#e3e7f1] bg-white text-[13px]">
+              <SelectTrigger aria-label="文件类型" className="h-[34px] w-full rounded-[10px] border-[#e3e7f1] bg-white text-[13px]">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -1026,6 +1032,7 @@ function FilesPanel({
       data={files}
       rowKey={(file) => file.id}
       size="compact"
+      rowAriaLabel={(file) => `查看文件 ${file.name}`}
       onRowClick={onViewChunks}
       emptyText="暂无文件"
     />
@@ -1086,7 +1093,7 @@ function SpreadsheetPanel({
             <div className="flex flex-wrap items-center justify-between gap-[10px]">
               <h3 className="text-[14px] font-semibold text-[#18181a]">工作表明细</h3>
               <Select value={selected?.file_id ?? ''} onValueChange={onSelectedIdChange}>
-                <SelectTrigger className="h-[32px] w-[260px] max-w-full rounded-[10px] border-[#e3e7f1] text-[12px]">
+                <SelectTrigger aria-label="选择工作簿文件" className="h-[32px] w-[260px] max-w-full rounded-[10px] border-[#e3e7f1] text-[12px]">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -1178,7 +1185,7 @@ function CircuitPanel({
             <div className="grid min-w-[260px] gap-[4px]">
               <span className="text-[11px] text-[#858b9c]">设计</span>
               <Select value={selectedDesignId} onValueChange={onSelectedDesignIdChange}>
-                <SelectTrigger className="h-[34px] w-full rounded-[10px] border-[#e3e7f1] text-[12px]">
+                <SelectTrigger aria-label="选择电路设计" className="h-[34px] w-full rounded-[10px] border-[#e3e7f1] text-[12px]">
                   <SelectValue placeholder="选择设计" />
                 </SelectTrigger>
                 <SelectContent>
@@ -1397,6 +1404,7 @@ export function ChatsPanel({
         data={items}
         rowKey={(row) => row.conversation_id}
         size="compact"
+        rowAriaLabel={(row) => `查看外部对话 ${row.title}`}
         onRowClick={(row) => onSelectedIdChange(row.conversation_id)}
         emptyText="当前知识库尚未上传外部对话记录"
       />
@@ -1516,7 +1524,7 @@ function SchematicPanel({
             <div className="grid min-w-[260px] gap-[4px]">
               <span className="text-[11px] text-[#858b9c]">设计</span>
               <Select value={selected?.design_id ?? ''} onValueChange={onSelectedDesignIdChange}>
-                <SelectTrigger className="h-[34px] w-full rounded-[10px] border-[#e3e7f1] text-[12px]">
+                <SelectTrigger aria-label="选择原理图设计" className="h-[34px] w-full rounded-[10px] border-[#e3e7f1] text-[12px]">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -1532,7 +1540,7 @@ function SchematicPanel({
                 value={selectedPageNumber == null ? '' : String(selectedPageNumber)}
                 onValueChange={(value) => onSelectedPageNumberChange(Number(value))}
               >
-                <SelectTrigger className="h-[34px] w-full rounded-[10px] border-[#e3e7f1] text-[12px]">
+                <SelectTrigger aria-label="选择页码" className="h-[34px] w-full rounded-[10px] border-[#e3e7f1] text-[12px]">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -1624,6 +1632,7 @@ function FilterBar({
       <h3 className="text-[14px] font-semibold text-[#18181a]">{title}</h3>
       <div className="flex min-w-[260px] max-w-full gap-[8px]">
         <Input
+          aria-label={`筛选${title}`}
           value={value}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={(event) => {

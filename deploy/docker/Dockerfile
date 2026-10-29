@@ -13,6 +13,7 @@
 # 国内/内网构建加速（构建机仍需能访问源）：
 #   --build-arg APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 #   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+#   --build-arg UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
 #   --build-arg HDB_INSTALL_EVAL=1        # 额外装 RAGAS 评估依赖组
 
 ARG PYTHON_IMAGE=python:3.12-slim-bookworm
@@ -21,6 +22,8 @@ FROM ${PYTHON_IMAGE}
 ARG UV_VERSION=0.12.5
 ARG APT_MIRROR=
 ARG PIP_INDEX_URL=
+ARG UV_INDEX_URL=
+ARG UV_DEFAULT_INDEX=
 ARG HDB_INSTALL_EVAL=0
 
 ENV PYTHONUNBUFFERED=1 \
@@ -31,7 +34,9 @@ ENV PYTHONUNBUFFERED=1 \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     TZ=Asia/Shanghai \
-    PATH=/app/.venv/bin:$PATH
+    PATH=/app/.venv/bin:$PATH \
+    UV_INDEX_URL=${UV_INDEX_URL} \
+    UV_DEFAULT_INDEX=${UV_DEFAULT_INDEX}
 
 # 系统依赖说明：
 #   fonts-droid-fallback -> PDF 导出嵌入中文字体，src/result_exports/renderers.py
@@ -77,7 +82,12 @@ RUN if [ "$HDB_INSTALL_EVAL" = "1" ]; then \
     fi
 
 # 应用运行期目录：storage 由卷挂载，config 挂载存放可写 .env。
-RUN mkdir -p /app/storage /app/config && chmod +x /app/deploy/docker/entrypoint.sh
+# 仓库内部分源码目录可能保留开发机的 0700 权限；镜像运行用户不是
+# 构建用户，必须显式保证 Python 源码和脚本可遍历/读取，否则会出现
+# 误导性的 ``ModuleNotFoundError``（例如 result_exports/store.py）。
+RUN mkdir -p /app/storage /app/config \
+    && chmod -R a+rX /app/src /app/scripts \
+    && chmod +x /app/deploy/docker/entrypoint.sh
 RUN groupadd --gid 10001 hdb && useradd --uid 10001 --gid hdb --home-dir /app/storage hdb \
     && chown -R hdb:hdb /app/storage /app/config
 USER hdb

@@ -46,6 +46,7 @@ const LIFECYCLE_TONE: Record<DocLifecycleStatus, string> = {
 
 const CATEGORY_LABEL: Record<DocCategory, string> = {
   design_doc: '设计文档',
+  datasheet: 'Datasheet',
   schematic: '原理图图纸',
   bom: 'BOM 清单',
   netlist: '网表',
@@ -106,6 +107,9 @@ type AssetForm = {
   category: DocCategory;
   project: string;
   description: string;
+  manufacturer: string;
+  mpn: string;
+  revision: string;
   tagsText: string;
 }
 
@@ -156,6 +160,8 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
   const [graphTypeFilter, setGraphTypeFilter] = useState<'' | WikiPageType>('');
   const [graphView, setGraphView] = useState<WikiGraphViewMode>('pages');
   const [wikiRefs, setWikiRefs] = useState<DocAssetWikiRefs | null>(null);
+  const [removeLinkTarget, setRemoveLinkTarget] = useState<number | null>(null);
+  const [removeLinkBusy, setRemoveLinkBusy] = useState(false);
 
   const load = useCallback(() => {
     if (!kbName) {
@@ -289,6 +295,9 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
           category: editForm.category,
           project: editForm.project,
           description: editForm.description,
+          manufacturer: editForm.manufacturer,
+          mpn: editForm.mpn,
+          revision: editForm.revision,
           tags: parseTags(editForm.tagsText),
         },
       );
@@ -342,13 +351,21 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
 
   async function removeLink(linkId: number) {
     if (!kbName || !detail) return;
-    if (!window.confirm('移除这条关联吗？移除后可在需要时重新建立。')) return;
+    setRemoveLinkTarget(linkId);
+  }
+
+  async function confirmRemoveLink() {
+    if (!kbName || !detail || removeLinkTarget == null) return;
+    setRemoveLinkBusy(true);
     try {
-      await api.delete<OkShape>(`/api/v1/kbs/${encodeURIComponent(kbName)}/doc-assets/${detail.id}/links/${linkId}`);
+      await api.delete<OkShape>(`/api/v1/kbs/${encodeURIComponent(kbName)}/doc-assets/${detail.id}/links/${removeLinkTarget}`);
       notify.success('关联已移除');
       await refreshDetail(detail.id);
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '移除关联失败');
+    } finally {
+      setRemoveLinkBusy(false);
+      setRemoveLinkTarget(null);
     }
   }
 
@@ -428,11 +445,12 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
       />
 
       <div className="mt-[20px] flex flex-wrap items-center gap-[12px]">
-        <div className="flex gap-[8px]">
+        <div className="flex gap-[8px]" role="group" aria-label="资产视图">
           {([['assets', '文档资产'], ['wiki', '知识 Wiki'], ['graph', '知识图谱']] as const).map(([key, label]) => (
             <button
               key={key}
               type="button"
+              aria-pressed={tab === key}
               onClick={() => switchTab(key)}
               className={`h-[34px] rounded-[8px] border px-[16px] text-[13px] transition-colors ${
                 tab === key
@@ -473,6 +491,7 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
               <button
                 key={key}
                 type="button"
+                aria-pressed={graphView === key}
                 onClick={() => setGraphView(key)}
                 className={`h-[30px] rounded-full border px-[12px] text-[12px] ${graphView === key ? 'border-[#2b7a57] bg-[#eef6ef] text-[#2b7a57]' : 'border-[#e3e7f1] bg-white text-[#5b6478] hover:border-[#9cabc8]'}`}
               >
@@ -482,6 +501,7 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
             <span className="mx-[2px] h-[18px] w-px bg-[#e8ebf2]" />
             <button
               type="button"
+              aria-pressed={graphTypeFilter === ''}
               disabled={graphView === 'documents'}
               onClick={() => setGraphTypeFilter('')}
               className={`h-[30px] rounded-full border px-[12px] text-[12px] disabled:opacity-40 ${graphTypeFilter === '' ? 'border-[#18181a] bg-[#18181a] text-white' : 'border-[#e3e7f1] bg-white text-[#5b6478] hover:border-[#9cabc8]'}`}
@@ -492,6 +512,7 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
               <button
                 key={t}
                 type="button"
+                aria-pressed={graphTypeFilter === t}
                 onClick={() => setGraphTypeFilter(t)}
                 className={`h-[30px] rounded-full border px-[12px] text-[12px] ${graphTypeFilter === t ? 'border-[#18181a] bg-[#18181a] text-white' : 'border-[#e3e7f1] bg-white text-[#5b6478] hover:border-[#9cabc8]'}`}
               >
@@ -519,6 +540,7 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
         <>
           <div className="mt-[16px] flex flex-wrap items-center gap-[8px]">
         <select
+          aria-label="资产类别"
           value={categoryFilter}
           onChange={(event) => setCategoryFilter(event.target.value)}
           className="h-[30px] rounded-[8px] border border-[#e3e7f1] bg-white px-[8px] text-[12px] text-[#18181a] outline-none focus:border-[#9cabc8]"
@@ -530,6 +552,7 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
         </select>
         <div className="relative ml-auto">
           <input
+            aria-label="搜索文档资产"
             value={searchInput}
             onChange={(event) => setSearchInput(event.target.value)}
             onKeyDown={(event) => {
@@ -554,6 +577,7 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
               rowKey={(row) => row.id}
               size="compact"
               emptyText="暂无文档资产;可从知识库文件建档,或手动新建。"
+              rowAriaLabel={(asset) => `打开文档资产 ${asset.title}`}
               onRowClick={(asset) => void openDetail(asset)}
             />
           )}
@@ -581,6 +605,9 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
                   </div>
                   <div className="mt-[6px] flex flex-wrap items-center gap-x-[14px] gap-y-[3px] text-[12px] text-[#9aa2b5]">
                     {detail.doc_no && <span>{detail.doc_no}</span>}
+                    {detail.manufacturer && <span>厂商 · {detail.manufacturer}</span>}
+                    {detail.mpn && <span>MPN · {detail.mpn}</span>}
+                    {detail.revision && <span>修订版 · {detail.revision}</span>}
                     {detail.project && <span>项目 · {detail.project}</span>}
                     <span>
                       {detail.effective_version_no ? `v${detail.effective_version_no} 生效` : '无生效版本'}
@@ -614,6 +641,9 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
                           category: detail.category,
                           project: detail.project,
                           description: detail.description,
+                          manufacturer: detail.manufacturer,
+                          mpn: detail.mpn,
+                          revision: detail.revision,
                           tagsText: visibleTags(detail.tags).join(' '),
                         });
                       }}
@@ -822,6 +852,9 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
                   <SelectCell value={editForm.category} onChange={(value) => setEditForm({ ...editForm, category: value as DocCategory })} options={Object.keys(CATEGORY_LABEL) as DocCategory[]} labelMap={CATEGORY_LABEL} />
                 </Field>
                 <Field label="编号"><Input value={editForm.doc_no} onChange={(event) => setEditForm({ ...editForm, doc_no: event.target.value })} /></Field>
+                <Field label="厂商"><Input value={editForm.manufacturer} onChange={(event) => setEditForm({ ...editForm, manufacturer: event.target.value })} /></Field>
+                <Field label="MPN"><Input value={editForm.mpn} onChange={(event) => setEditForm({ ...editForm, mpn: event.target.value })} /></Field>
+                <Field label="修订版"><Input value={editForm.revision} onChange={(event) => setEditForm({ ...editForm, revision: event.target.value })} /></Field>
                 <Field label="项目"><Input value={editForm.project} onChange={(event) => setEditForm({ ...editForm, project: event.target.value })} /></Field>
                 <Field label="标签(空格分隔)"><Input value={editForm.tagsText} onChange={(event) => setEditForm({ ...editForm, tagsText: event.target.value })} /></Field>
               </div>
@@ -910,6 +943,17 @@ export default function DocumentAssetsPage({ auth, onLogout, kbs }: Props) {
           )}
         </DialogContent>
       </Dialog>
+
+      <ConfirmDialog
+        open={removeLinkTarget !== null}
+        onOpenChange={(open) => { if (!open && !removeLinkBusy) setRemoveLinkTarget(null); }}
+        title="移除这条关联？"
+        description="移除后可以重新建立这条关系。"
+        confirmText="移除关联"
+        destructive
+        loading={removeLinkBusy}
+        onConfirm={() => void confirmRemoveLink()}
+      />
 
     </div>
   );

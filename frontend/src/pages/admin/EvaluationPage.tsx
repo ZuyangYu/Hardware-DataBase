@@ -294,11 +294,17 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
     const activeRunId = detail?.run_id;
     const isActive = detail != null && ACTIVE_STATUSES.has(detail.status);
     if (!activeRunId || !isActive) return undefined;
-    const timer = window.setInterval(() => {
+    const poll = () => {
+      if (document.hidden) return;
       void loadDetail(activeRunId, { silent: true });
       void loadRuns({ silent: true });
-    }, 2000);
-    return () => window.clearInterval(timer);
+    };
+    const timer = window.setInterval(poll, 3000);
+    document.addEventListener('visibilitychange', poll);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', poll);
+    };
   }, [detail?.run_id, detail?.status, loadDetail, loadRuns]);
 
   useEffect(() => {
@@ -839,6 +845,7 @@ export default function EvaluationPage({ auth, onLogout }: Props) {
             rowKey={(run) => run.run_id}
             size="compact"
             emptyText="尚无评估运行"
+            rowAriaLabel={(run) => `查看评估运行 ${run.run_id}`}
             onRowClick={(run) => {
               setSelectedRunId(run.run_id);
               setCompare(null);

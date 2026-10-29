@@ -150,6 +150,8 @@ API/worker 的 PG 运行路径仅校验；旧部署缺表时应先执行显式�
 ```bash
 APT_MIRROR=mirrors.tuna.tsinghua.edu.cn \
 PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple \
 NPM_REGISTRY=https://registry.npmmirror.com \
 HDB_INSTALL_EVAL=1 \
 docker compose -f deploy/docker/docker-compose.yml \
@@ -158,7 +160,7 @@ docker compose -f deploy/docker/docker-compose.yml \
 
 ### 指向已有 PostgreSQL（不启动 compose 内的 postgres）
 
-不启动 `postgres` 服务，改在 `config/.env` 里显式写 5 组后端与 DSN
+不启动 `postgres` 服务，改在 `config/.env` 里显式写控制面及各生产域后端与 DSN
 （模板里有注释示例），然后：
 
 ```bash

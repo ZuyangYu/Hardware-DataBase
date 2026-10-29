@@ -33,7 +33,7 @@ x-app-env: &app-env
   HDB_API_SPAWN_QUALITY_WORKER: "0"
   EVAL_EXECUTION_MODE: worker
 
-# 账本：5 组后端全部指向 compose 内的 PG（外部 PG 见 README「指向已有 PostgreSQL」）
+# 账本：控制面及生产域后端全部指向 compose 内的 PG（外部 PG 见 README「指向已有 PostgreSQL」）
 # 密码只在运行期需要：这里用空默认值，保证 `docker compose build` / `config` 不被阻塞。
 # 没设密码时 postgres 会拒绝初始化（官方镜像行为）、api 也会连接失败 —— 启动期即报错。
 x-pg-dsn: &pg-dsn "postgresql://hdb:${HDB_PG_PASSWORD:-}@postgres:5432/hdb"
@@ -47,6 +47,11 @@ x-pg-env: &pg-env
   RESOURCE_GOVERNOR_BACKEND: postgres
   RESOURCE_GOVERNOR_DATABASE_URL: *pg-dsn
   RESOURCE_GOVERNOR_SCOPE: deployment
+  # The control-plane chat tables reference users/departments. Keep the
+  # production authentication domain in the same PostgreSQL ledger rather
+  # than leaving the SQLite default, which makes employee session FKs fail.
+  AUTH_STORE_BACKEND: postgres
+  AUTH_STORE_DATABASE_URL: *pg-dsn
 
 x-app: &app
   image: ${HDB_APP_IMAGE:-hardware-database-app:latest}

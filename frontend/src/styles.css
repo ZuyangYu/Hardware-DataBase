@@ -6,23 +6,21 @@
   box-sizing: border-box;
 }
 
-/* 主题 token 照搬 frontend-enterprise。
-   第一个 :root 是暖色基础,第二个 :root(中性灰)覆盖成中性灰黑--后者是实时外观。
-   --primary/--ring/--chart-* 保持青绿 #0f766e(中性主题不覆盖),品牌 mark 也用青绿。 */
+/* 统一的中性灰主题 token。所有页面共享这一组语义变量。 */
 :root {
-  --background: #f7f5ef;
-  --foreground: #20201d;
+  --background: #f7f8fa;
+  --foreground: #111111;
   --surface: #ffffff;
   --surface-raised: #ffffff;
-  --surface-muted: #eeece4;
-  --surface-subtle: #fbfaf6;
-  --border: #ded7cc;
-  --border-strong: #cfc5b7;
-  --line: #e7dfd3;
-  --muted: #eeece4;
+  --surface-muted: #f3f4f6;
+  --surface-subtle: #fafafa;
+  --border: #e5e7eb;
+  --border-strong: #d4d4d8;
+  --line: #eceef1;
+  --muted: #f3f4f6;
   --muted-soft: #9a9b95;
-  --accent: #0f766e;
-  --accent-soft: #e1f1ed;
+  --accent: #111111;
+  --accent-soft: #f2f3f5;
   --accent-foreground: #ffffff;
   --danger: #dc2626;
   --warning: #b45309;
@@ -30,15 +28,15 @@
   --ink-soft: #343633;
   --copper: #a85d32;
   --olive: #6f7b42;
-  --shadow-float: 0 20px 54px rgba(37, 32, 24, 0.1);
-  --shadow-soft: 0 10px 30px rgba(37, 32, 24, 0.055);
-  --font-body: "Geist Variable", "Inter", "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
-  --font-display: "Geist Variable", "Inter", "IBM Plex Sans", "Noto Sans SC", "PingFang SC", system-ui, sans-serif;
+  --shadow-float: 0 18px 48px rgba(17, 17, 17, 0.1);
+  --shadow-soft: 0 8px 24px rgba(17, 17, 17, 0.045);
+  --font-body: "Geist Variable", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --font-display: var(--font-body);
   --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  --page-gradient-a: rgba(15, 118, 110, 0.055);
-  --page-gradient-top: #fbfaf6;
-  --page-gradient-bottom: #f3f0e8;
-  --panel-bg: rgba(249, 247, 241, 0.82);
+  --page-gradient-a: transparent;
+  --page-gradient-top: #f7f8fa;
+  --page-gradient-bottom: #f7f8fa;
+  --panel-bg: rgba(255, 255, 255, 0.94);
   --code-bg: #ffffff;
   --code-fg: #1f1f1f;
   --code-border: #e5e5e5;
@@ -60,60 +58,31 @@
   --thinking-focus: #2f3734;
   --thinking-flow-duration: 4.2s;
   --card: #ffffff;
-  --card-foreground: #20201d;
+  --card-foreground: #111111;
   --popover: #ffffff;
-  --popover-foreground: #20201d;
-  --primary: #0f766e;
+  --popover-foreground: #111111;
+  --primary: #111111;
   --primary-foreground: #ffffff;
-  --secondary: #eeece4;
-  --secondary-foreground: #20201d;
-  --muted-foreground: #5f655e;
+  --secondary: #f3f4f6;
+  --secondary-foreground: #111111;
+  --muted-foreground: #5b6478;
   --destructive: #dc2626;
-  --input: #ded7cc;
-  --ring: #0f766e;
-  --chart-1: #0f766e;
+  --input: #e5e7eb;
+  --ring: #111111;
+  --chart-1: #111111;
   --chart-2: #6f7b42;
   --chart-3: #a85d32;
   --chart-4: #138a55;
   --chart-5: #b45309;
   --radius: 0.625rem;
   --sidebar: #ffffff;
-  --sidebar-foreground: #858b9c;
+  --sidebar-foreground: #5b6478;
   --sidebar-primary: #18181a;
   --sidebar-primary-foreground: #ffffff;
   --sidebar-accent: #f6f6f6;
   --sidebar-accent-foreground: #18181a;
   --sidebar-border: #f4f4f4;
   --sidebar-ring: #18181a;
-}
-
-/* 中性灰主题对齐 —— 实时中性灰黑主题(覆盖上面的暖色) */
-:root {
-  --background: #f7f8fa;
-  --foreground: #111111;
-  --surface: #ffffff;
-  --surface-raised: #ffffff;
-  --surface-muted: #f3f4f6;
-  --surface-subtle: #fafafa;
-  --border: #e5e7eb;
-  --border-strong: #d4d4d8;
-  --line: #eceef1;
-  /* --muted 恢复浅色表面语义(与 --surface-muted 一致):此前第二 :root 把它覆盖成
-     中灰 #6b7280,导致 bg-muted 表头/卡片底变成灰底深字(实测约 3.9:1),不满足
-     WCAG AA 4.5:1。文字色由独立的 --muted-foreground 承担,不再互相覆盖。 */
-  --muted: #f3f4f6;
-  --accent: #111111;
-  --accent-soft: #f2f3f5;
-  --accent-foreground: #ffffff;
-  --shadow-float: 0 18px 48px rgba(17, 17, 17, 0.1);
-  --shadow-soft: 0 8px 24px rgba(17, 17, 17, 0.045);
-  --font-body: "Inter", "IBM Plex Sans", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
-  --font-display: var(--font-body);
-  --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  --page-gradient-a: transparent;
-  --page-gradient-top: #f7f8fa;
-  --page-gradient-bottom: #f7f8fa;
-  --panel-bg: rgba(255, 255, 255, 0.94);
 }
 
 /* Tailwind 4 主题桥:CSS var -> utility 类(bg-primary、text-muted-foreground…)
@@ -199,6 +168,21 @@ body {
   }
 }
 
+/* Legacy page classes still use these historical gray literals. Keep their
+   visual meaning, but route them through the accessible neutral ramp. */
+@layer utilities {
+  .text-\[\#858b9c\] { color: #5b6478 !important; }
+  .text-\[\#757f9c\] { color: #596174 !important; }
+  .text-\[\#9aa1b1\],
+  .text-\[\#9aa1b3\],
+  .text-\[\#a2a8b8\],
+  .text-\[\#a5adc0\],
+  .text-\[\#b6bdcf\] { color: #68728a !important; }
+  .text-\[\#b3b8c4\] { color: #6b7280 !important; }
+  .text-\[\#718099\],
+  .text-\[\#7b879d\] { color: #596174 !important; }
+}
+
 /* A3 统一键盘焦点:裸 input/select/textarea/button/a/summary 获得统一 focus ring。
    写在 @layer base,Tailwind utilities 层的 outline-none(共享 UI 组件)优先,
    因此 Input/Textarea/Select/Button 仍用自带的 ring,不叠加双环。
@@ -273,6 +257,12 @@ input[type='password']::-ms-clear {
 
 .app-icon-spin {
   animation: app-spin 1s linear infinite;
+}
+
+.wiki-graph-node:focus-visible circle {
+  stroke: var(--ring);
+  stroke-width: 2.5;
+  paint-order: stroke;
 }
 
 /* 流式输出时的"思考中"流光文字(trace-flow) */
@@ -414,11 +404,26 @@ input[type='password']::-ms-clear {
   }
 }
 
-/*
- * 登录页图谱动画不做 prefers-reduced-motion 降级:
- * 内网机器常被组策略强制开启"减少动态效果", 会导致登录页看起来像静态图,
- * 影响演示与观感。若将来需要无障碍降级, 改成"放慢/降低对比度"而不是完全静止。
- */
+/* Reduced-motion users should receive the same information without continuous motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.001ms !important;
+  }
+
+  .login-data-flow {
+    opacity: 0.35;
+  }
+
+  .login-graph-line,
+  .login-graph-node {
+    animation: none !important;
+  }
+}
 
 pre {
   max-width: 100%;

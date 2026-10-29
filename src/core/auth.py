@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import sqlite3
@@ -11,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import src.settings
+import src.external_settings as external_settings
 from src.pipelines.document_rag.schemas import RequestContext, kb_scope_key
 
 
@@ -18,6 +20,8 @@ PBKDF2_ITERATIONS = 260_000
 ROLE_SYSTEM_ADMIN = "system_admin"
 ROLE_EMPLOYEE = "employee"
 VALID_ROLES = {ROLE_SYSTEM_ADMIN, ROLE_EMPLOYEE}
+API_KEY_SCOPES = frozenset({"read", "write", "invoke"})
+API_KEY_ACCESS_MODES = frozenset({"selected_kbs", "all_current_accessible_kbs"})
 
 # M3: schema bootstrap + default-admin provisioning are process-level one-shot.
 # All AuthService instances share this guard so later instances skip both steps.
@@ -69,6 +73,89 @@ class KnowledgeBaseIdentity:
     kb_id: int
     kb_name: str
     department_id: int | None
+
+
+@dataclass(frozen=True)
+class ExternalKnowledgeBaseReference:
+    kb_ref: str
+    kb_id: int
+    kb_name: str
+    department_id: int | None
+    department_name: str | None = None
+
+
+@dataclass(frozen=True)
+class ExternalFileReference:
+    file_ref: str
+    kb_id: int
+    record_id: int
+
+
+@dataclass(frozen=True)
+class ExternalIngestionJob:
+    job_ref: str
+    kb_ref: str
+    kb_id: int
+    record_id: int
+    key_id: str
+
+
+@dataclass(frozen=True)
+class ExternalAssetReference:
+    asset_ref: str
+    kb_id: int
+    asset_id: int
+
+
+@dataclass(frozen=True)
+class ExternalSourceScope:
+    scope_ref: str
+    key_id: str
+    kb_ref: str
+    kb_id: int
+    department_id: int
+    sources: list[dict]
+    created_at: str
+    expires_at: str
+
+
+@dataclass(frozen=True)
+class ExternalEvidenceRecord:
+    evidence_id: str
+    key_id: str
+    scope_ref: str
+    kb_ref: str
+    kb_id: int
+    department_id: int
+    record_id: int
+    file_ref: str
+    file_name: str
+    content: str
+    content_hash: str
+    source_content_hash: str
+    locator: dict
+    score: float
+    backend: str
+    created_at: str
+    expires_at: str
+
+
+@dataclass(frozen=True)
+class EmployeeApiKeyPrincipal:
+    """The authenticated identity for an External request.
+
+    ``kb_ids`` is only the Key allowlist.  The caller must still resolve the
+    employee and current KB permission for every request; this object is never
+    a replacement for live authorization.
+    """
+
+    key_id: str
+    user_id: int
+    scopes: frozenset[str]
+    kb_access_mode: str
+    kb_ids: frozenset[int]
+    kb_refs: frozenset[str]
+    expires_at: str
 
 
 @dataclass
@@ -319,6 +406,129 @@ class AuthService:
             self._ensure_default_department(conn)
             self._ensure_column(conn, "knowledge_bases", "is_shared", "INTEGER NOT NULL DEFAULT 0")
             self._migrate_kb_scope_schema(conn)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS employee_api_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    public_key_id TEXT NOT NULL UNIQUE,
+                    key_digest TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    scopes_json TEXT NOT NULL,
+                    kb_access_mode TEXT NOT NULL DEFAULT 'selected_kbs',
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    revoked_at TEXT,
+                    last_used_at TEXT,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS employee_api_key_kbs (
+                    api_key_id INTEGER NOT NULL,
+                    kb_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(api_key_id, kb_id),
+                    FOREIGN KEY(api_key_id) REFERENCES employee_api_keys(id),
+                    FOREIGN KEY(kb_id) REFERENCES knowledge_bases(id)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS external_kb_refs (
+                    kb_ref TEXT PRIMARY KEY,
+                    kb_id INTEGER NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    retired_at TEXT,
+                    FOREIGN KEY(kb_id) REFERENCES knowledge_bases(id)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS external_file_refs (
+                    file_ref TEXT PRIMARY KEY,
+                    kb_id INTEGER NOT NULL,
+                    record_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    retired_at TEXT,
+                    UNIQUE(kb_id, record_id),
+                    FOREIGN KEY(kb_id) REFERENCES knowledge_bases(id)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS external_asset_refs (
+                    asset_ref TEXT PRIMARY KEY,
+                    kb_id INTEGER NOT NULL,
+                    asset_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    retired_at TEXT,
+                    UNIQUE(kb_id, asset_id)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS external_source_scopes (
+                    scope_ref TEXT PRIMARY KEY,
+                    key_id TEXT NOT NULL,
+                    kb_ref TEXT NOT NULL,
+                    kb_id INTEGER NOT NULL,
+                    department_id INTEGER NOT NULL,
+                    sources_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS external_evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    key_id TEXT NOT NULL,
+                    scope_ref TEXT NOT NULL DEFAULT '',
+                    kb_ref TEXT NOT NULL,
+                    kb_id INTEGER NOT NULL,
+                    department_id INTEGER NOT NULL,
+                    record_id INTEGER NOT NULL,
+                    file_ref TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    source_content_hash TEXT NOT NULL,
+                    locator_json TEXT NOT NULL DEFAULT '{}',
+                    score REAL NOT NULL DEFAULT 0,
+                    backend TEXT NOT NULL DEFAULT 'ragflow',
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS external_ingestion_jobs (
+                    job_ref TEXT PRIMARY KEY,
+                    kb_ref TEXT NOT NULL,
+                    kb_id INTEGER NOT NULL,
+                    record_id INTEGER NOT NULL,
+                    key_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(kb_id, record_id, key_id)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS external_upload_idempotency (
+                    key_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    kb_id INTEGER NOT NULL,
+                    request_hash TEXT NOT NULL,
+                    response_json TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(key_id, idempotency_key)
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_employee_api_keys_user_id "
+                "ON employee_api_keys(user_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_employee_api_key_kbs_kb_id "
+                "ON employee_api_key_kbs(kb_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_external_file_refs_record "
+                "ON external_file_refs(kb_id, record_id)"
+            )
 
     def _ensure_column(self, conn, table: str, column: str, ddl: str):
         columns = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -414,10 +624,23 @@ class AuthService:
                     """,
                     (username, hash_password(password), ROLE_SYSTEM_ADMIN, department_id, now, now),
                 )
-            except sqlite3.IntegrityError:
-                # API 与各 worker 同时首次启动时，另一进程可能刚插入了同名管理员；
-                # 以唯一约束为准。其它完整性错误照常抛出。
-                if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone() is None:
+            except Exception as exc:  # noqa: BLE001 - backend-specific integrity errors
+                # API 与各 worker 同时首次启动时，另一进程/容器可能刚插入了
+                # 同名管理员。SQLite 与 PostgreSQL 的异常类型不同，但两者都
+                # 使用唯一约束作为并发仲裁；其它完整性错误照常抛出。
+                is_unique_violation = isinstance(exc, sqlite3.IntegrityError)
+                if self._backend == "postgres":
+                    try:
+                        from psycopg.errors import UniqueViolation
+
+                        is_unique_violation = isinstance(exc, UniqueViolation)
+                    except ImportError:  # pragma: no cover - postgres backend has psycopg
+                        is_unique_violation = False
+                if not is_unique_violation:
+                    raise
+                if conn.execute(
+                    "SELECT 1 FROM users WHERE username = ?", (username,)
+                ).fetchone() is None:
                     raise
             admin_row = conn.execute(
                 "SELECT id FROM users WHERE username = ?", (username,)
@@ -1179,7 +1402,38 @@ class AuthService:
             kb = self._get_kb_row(conn, kb_name, department_id, kb_id)
             if kb is None:
                 return
-            conn.execute("DELETE FROM knowledge_bases WHERE id = ?", (kb["id"],))
+            internal_kb_id = int(kb["id"])
+            # External mappings are deliberately removed with the KB.  Keeping
+            # them (even retired) would either retain dangling FK rows or let a
+            # later KB reuse an old opaque reference.  The delete order honors
+            # the foreign keys on both SQLite and PostgreSQL.
+            conn.execute(
+                "DELETE FROM employee_api_key_kbs WHERE kb_id = ?", (internal_kb_id,)
+            )
+            conn.execute(
+                "DELETE FROM external_upload_idempotency WHERE kb_id = ?",
+                (internal_kb_id,),
+            )
+            conn.execute(
+                "DELETE FROM external_evidence WHERE kb_id = ?", (internal_kb_id,)
+            )
+            conn.execute(
+                "DELETE FROM external_source_scopes WHERE kb_id = ?",
+                (internal_kb_id,),
+            )
+            conn.execute(
+                "DELETE FROM external_ingestion_jobs WHERE kb_id = ?", (internal_kb_id,)
+            )
+            conn.execute(
+                "DELETE FROM external_file_refs WHERE kb_id = ?", (internal_kb_id,)
+            )
+            conn.execute(
+                "DELETE FROM external_asset_refs WHERE kb_id = ?", (internal_kb_id,)
+            )
+            conn.execute(
+                "DELETE FROM external_kb_refs WHERE kb_id = ?", (internal_kb_id,)
+            )
+            conn.execute("DELETE FROM knowledge_bases WHERE id = ?", (internal_kb_id,))
 
     def list_registered_knowledge_bases(self) -> list[str]:
         with closing(self._connect()) as conn:
@@ -1392,6 +1646,1088 @@ class AuthService:
             permissions[kb_scope_key(row["name"], row["department_id"])] = "admin"
         return permissions
 
+    def list_accessible_knowledge_base_identities(
+        self, user: AuthUser
+    ) -> list[KnowledgeBaseIdentity]:
+        """Return live employee KB identities without exposing them externally."""
+        if user.role != ROLE_EMPLOYEE or not user.is_active or user.department_id is None:
+            return []
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, name, department_id
+                FROM knowledge_bases
+                WHERE department_id = ?
+                  AND (is_shared = 1 OR owner_user_id IS NULL OR owner_user_id = ?)
+                ORDER BY name, id
+                """,
+                (user.department_id, user.id),
+            ).fetchall()
+        return [
+            KnowledgeBaseIdentity(
+                kb_id=int(row["id"]),
+                kb_name=str(row["name"]),
+                department_id=int(row["department_id"]) if row["department_id"] is not None else None,
+            )
+            for row in rows
+        ]
+
+    def list_all_knowledge_base_identities(self) -> list[KnowledgeBaseIdentity]:
+        """Return every registered KB for migration/backfill tooling."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT id, name, department_id FROM knowledge_bases ORDER BY department_id, name, id"
+            ).fetchall()
+        return [
+            KnowledgeBaseIdentity(
+                kb_id=int(row["id"]),
+                kb_name=str(row["name"]),
+                department_id=int(row["department_id"]) if row["department_id"] is not None else None,
+            )
+            for row in rows
+        ]
+
+    def ensure_external_kb_ref(self, kb_id: int) -> ExternalKnowledgeBaseReference:
+        """Create an opaque, never-reused KB reference on first observation."""
+        with closing(self._connect()) as conn:
+            kb = conn.execute(
+                """
+                SELECT kb.id, kb.name, kb.department_id, d.name AS department_name
+                FROM knowledge_bases kb
+                LEFT JOIN departments d ON d.id = kb.department_id
+                WHERE kb.id = ?
+                """,
+                (int(kb_id),),
+            ).fetchone()
+            if kb is None:
+                raise ValueError("知识库不存在")
+            existing = conn.execute(
+                """
+                SELECT kb_ref FROM external_kb_refs
+                WHERE kb_id = ?
+                """,
+                (int(kb_id),),
+            ).fetchone()
+            if existing is None:
+                # A URL-safe random token is opaque and non-enumerable; it
+                # never contains or encodes the internal integer KB id.
+                kb_ref = f"kbref_{secrets.token_urlsafe(18)}"
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO external_kb_refs
+                        (kb_ref, kb_id, created_at, retired_at)
+                    VALUES (?, ?, ?, NULL)
+                    """,
+                    (kb_ref, int(kb_id), utc_now()),
+                )
+                existing = conn.execute(
+                    "SELECT kb_ref FROM external_kb_refs WHERE kb_id = ?",
+                    (int(kb_id),),
+                ).fetchone()
+            return ExternalKnowledgeBaseReference(
+                kb_ref=str(existing["kb_ref"]),
+                kb_id=int(kb["id"]),
+                kb_name=str(kb["name"]),
+                department_id=int(kb["department_id"]) if kb["department_id"] is not None else None,
+                department_name=kb["department_name"],
+            )
+
+    def get_external_kb_ref(self, kb_ref: str) -> ExternalKnowledgeBaseReference | None:
+        if not kb_ref or len(str(kb_ref)) > 200:
+            return None
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT e.kb_ref, kb.id AS kb_id, kb.name AS kb_name,
+                       kb.department_id, d.name AS department_name
+                FROM external_kb_refs e
+                JOIN knowledge_bases kb ON kb.id = e.kb_id
+                LEFT JOIN departments d ON d.id = kb.department_id
+                WHERE e.kb_ref = ? AND e.retired_at IS NULL
+                """,
+                (str(kb_ref),),
+            ).fetchone()
+        if row is None:
+            return None
+        return ExternalKnowledgeBaseReference(
+            kb_ref=str(row["kb_ref"]),
+            kb_id=int(row["kb_id"]),
+            kb_name=str(row["kb_name"]),
+            department_id=int(row["department_id"]) if row["department_id"] is not None else None,
+            department_name=row["department_name"],
+        )
+
+    def ensure_external_file_ref(self, kb_id: int, record_id: int) -> ExternalFileReference:
+        """Create an opaque file reference for a scoped pipeline record."""
+        with closing(self._connect()) as conn:
+            kb = conn.execute("SELECT id FROM knowledge_bases WHERE id = ?", (int(kb_id),)).fetchone()
+            if kb is None:
+                raise ValueError("知识库不存在")
+            row = conn.execute(
+                """
+                SELECT file_ref FROM external_file_refs
+                WHERE kb_id = ? AND record_id = ? AND retired_at IS NULL
+                """,
+                (int(kb_id), int(record_id)),
+            ).fetchone()
+            if row is None:
+                file_ref = f"fileref_{secrets.token_urlsafe(18)}"
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO external_file_refs
+                        (file_ref, kb_id, record_id, created_at, retired_at)
+                    VALUES (?, ?, ?, ?, NULL)
+                    """,
+                    (file_ref, int(kb_id), int(record_id), utc_now()),
+                )
+                row = conn.execute(
+                    """
+                    SELECT file_ref FROM external_file_refs
+                    WHERE kb_id = ? AND record_id = ? AND retired_at IS NULL
+                    """,
+                    (int(kb_id), int(record_id)),
+                ).fetchone()
+            if row is None:
+                raise RuntimeError("无法建立外部文件引用")
+            return ExternalFileReference(
+                file_ref=str(row["file_ref"]), kb_id=int(kb_id), record_id=int(record_id)
+            )
+
+    def get_external_file_ref(self, file_ref: str) -> ExternalFileReference | None:
+        if not file_ref or len(str(file_ref)) > 200:
+            return None
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT file_ref, kb_id, record_id
+                FROM external_file_refs
+                WHERE file_ref = ? AND retired_at IS NULL
+                """,
+                (str(file_ref),),
+            ).fetchone()
+        if row is None:
+            return None
+        return ExternalFileReference(
+            file_ref=str(row["file_ref"]),
+            kb_id=int(row["kb_id"]),
+            record_id=int(row["record_id"]),
+        )
+
+    def ensure_external_asset_ref(
+        self, kb_id: int, asset_id: int
+    ) -> ExternalAssetReference:
+        with closing(self._connect()) as conn:
+            kb = conn.execute(
+                "SELECT id FROM knowledge_bases WHERE id = ?", (int(kb_id),)
+            ).fetchone()
+            if kb is None:
+                raise ValueError("知识库不存在")
+            row = conn.execute(
+                """
+                SELECT asset_ref FROM external_asset_refs
+                WHERE kb_id = ? AND asset_id = ? AND retired_at IS NULL
+                """,
+                (int(kb_id), int(asset_id)),
+            ).fetchone()
+            if row is None:
+                asset_ref = f"assetref_{secrets.token_urlsafe(18)}"
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO external_asset_refs
+                        (asset_ref, kb_id, asset_id, created_at, retired_at)
+                    VALUES (?, ?, ?, ?, NULL)
+                    """,
+                    (asset_ref, int(kb_id), int(asset_id), utc_now()),
+                )
+                row = conn.execute(
+                    """
+                    SELECT asset_ref FROM external_asset_refs
+                    WHERE kb_id = ? AND asset_id = ? AND retired_at IS NULL
+                    """,
+                    (int(kb_id), int(asset_id)),
+                ).fetchone()
+            if row is None:
+                raise RuntimeError("无法建立外部资产引用")
+            return ExternalAssetReference(
+                asset_ref=str(row["asset_ref"]),
+                kb_id=int(kb_id),
+                asset_id=int(asset_id),
+            )
+
+    def get_external_asset_ref(self, asset_ref: str) -> ExternalAssetReference | None:
+        if not asset_ref or len(str(asset_ref)) > 200:
+            return None
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT asset_ref, kb_id, asset_id
+                FROM external_asset_refs
+                WHERE asset_ref = ? AND retired_at IS NULL
+                """,
+                (str(asset_ref),),
+            ).fetchone()
+        if row is None:
+            return None
+        return ExternalAssetReference(
+            asset_ref=str(row["asset_ref"]),
+            kb_id=int(row["kb_id"]),
+            asset_id=int(row["asset_id"]),
+        )
+
+    def ensure_external_job_ref(
+        self, *, key_id: str, kb_ref: str, kb_id: int, record_id: int
+    ) -> ExternalIngestionJob:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT job_ref FROM external_ingestion_jobs
+                WHERE kb_id = ? AND record_id = ? AND key_id = ?
+                """,
+                (int(kb_id), int(record_id), str(key_id)),
+            ).fetchone()
+            if row is None:
+                job_ref = f"jobref_{secrets.token_urlsafe(18)}"
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO external_ingestion_jobs
+                        (job_ref, kb_ref, kb_id, record_id, key_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_ref,
+                        str(kb_ref),
+                        int(kb_id),
+                        int(record_id),
+                        str(key_id),
+                        utc_now(),
+                    ),
+                )
+                row = conn.execute(
+                    """
+                    SELECT job_ref FROM external_ingestion_jobs
+                    WHERE kb_id = ? AND record_id = ? AND key_id = ?
+                    """,
+                    (int(kb_id), int(record_id), str(key_id)),
+                ).fetchone()
+            if row is None:
+                raise RuntimeError("无法建立外部入库任务引用")
+            return ExternalIngestionJob(
+                job_ref=str(row["job_ref"]),
+                kb_ref=str(kb_ref),
+                kb_id=int(kb_id),
+                record_id=int(record_id),
+                key_id=str(key_id),
+            )
+
+    def get_external_job(self, job_ref: str, key_id: str) -> ExternalIngestionJob | None:
+        if not job_ref or len(str(job_ref)) > 200:
+            return None
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT job_ref, kb_ref, kb_id, record_id, key_id
+                FROM external_ingestion_jobs
+                WHERE job_ref = ? AND key_id = ?
+                """,
+                (str(job_ref), str(key_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        return ExternalIngestionJob(
+            job_ref=str(row["job_ref"]),
+            kb_ref=str(row["kb_ref"]),
+            kb_id=int(row["kb_id"]),
+            record_id=int(row["record_id"]),
+            key_id=str(row["key_id"]),
+        )
+
+    def claim_external_upload(
+        self,
+        *,
+        key_id: str,
+        idempotency_key: str,
+        request_hash: str,
+        kb_id: int,
+    ) -> tuple[str, str]:
+        """Claim an upload idempotency slot.
+
+        Returns ``("new", "")``, ``("replay", response_json)``,
+        ``("in_progress", "")`` or ``("conflict", "")``.
+        """
+        ttl_seconds = max(
+            1,
+            int(external_settings.HDB_EXTERNAL_UPLOAD_IDEMPOTENCY_TTL_SECONDS or 3600),
+        )
+        with closing(self._connect()) as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """
+                    SELECT request_hash, response_json, created_at
+                    FROM external_upload_idempotency
+                    WHERE key_id = ? AND idempotency_key = ?
+                    """,
+                    (str(key_id), str(idempotency_key)),
+                ).fetchone()
+                if row is not None:
+                    if str(row["request_hash"] or "") != str(request_hash):
+                        conn.rollback()
+                        return "conflict", ""
+                    response_json = str(row["response_json"] or "")
+                    if response_json:
+                        conn.rollback()
+                        return "replay", response_json
+                    try:
+                        age = (
+                            datetime.now(timezone.utc)
+                            - datetime.fromisoformat(str(row["created_at"]))
+                        ).total_seconds()
+                    except (ValueError, TypeError):
+                        age = ttl_seconds + 1
+                    if age <= ttl_seconds:
+                        conn.rollback()
+                        return "in_progress", ""
+                    conn.execute(
+                        """
+                        DELETE FROM external_upload_idempotency
+                        WHERE key_id = ? AND idempotency_key = ?
+                        """,
+                        (str(key_id), str(idempotency_key)),
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO external_upload_idempotency
+                        (key_id, idempotency_key, kb_id, request_hash,
+                         response_json, created_at)
+                    VALUES (?, ?, ?, ?, '', ?)
+                    """,
+                    (
+                        str(key_id),
+                        str(idempotency_key),
+                        int(kb_id),
+                        str(request_hash),
+                        utc_now(),
+                    ),
+                )
+                conn.commit()
+                return "new", ""
+            except Exception:
+                conn.rollback()
+                # A concurrent claimant may have won the unique insert race.
+                row = conn.execute(
+                    """
+                    SELECT request_hash, response_json
+                    FROM external_upload_idempotency
+                    WHERE key_id = ? AND idempotency_key = ?
+                    """,
+                    (str(key_id), str(idempotency_key)),
+                ).fetchone()
+                if row is not None:
+                    if str(row["request_hash"] or "") != str(request_hash):
+                        return "conflict", ""
+                    response_json = str(row["response_json"] or "")
+                    return ("replay", response_json) if response_json else ("in_progress", "")
+                raise
+
+    def finish_external_upload(
+        self,
+        *,
+        key_id: str,
+        idempotency_key: str,
+        response_json: str,
+    ) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                UPDATE external_upload_idempotency
+                SET response_json = ?
+                WHERE key_id = ? AND idempotency_key = ? AND response_json = ''
+                """,
+                (str(response_json), str(key_id), str(idempotency_key)),
+            )
+
+    def abort_external_upload(self, *, key_id: str, idempotency_key: str) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                DELETE FROM external_upload_idempotency
+                WHERE key_id = ? AND idempotency_key = ? AND response_json = ''
+                """,
+                (str(key_id), str(idempotency_key)),
+            )
+
+    def create_external_source_scope(
+        self,
+        *,
+        key_id: str,
+        kb_ref: str,
+        kb_id: int,
+        department_id: int,
+        sources: list[dict],
+        ttl_seconds: int | None = None,
+    ) -> ExternalSourceScope:
+        ttl = max(
+            60,
+            int(
+                ttl_seconds
+                if ttl_seconds is not None
+                else external_settings.HDB_EXTERNAL_SOURCE_SCOPE_TTL_SECONDS
+            ),
+        )
+        now = datetime.now(timezone.utc)
+        created_at = now.isoformat()
+        expires_at = (now + timedelta(seconds=ttl)).isoformat()
+        scope_ref = f"scoperef_{secrets.token_urlsafe(18)}"
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO external_source_scopes
+                    (scope_ref, key_id, kb_ref, kb_id, department_id,
+                     sources_json, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    scope_ref,
+                    str(key_id),
+                    str(kb_ref),
+                    int(kb_id),
+                    int(department_id),
+                    json.dumps(sources, ensure_ascii=False),
+                    created_at,
+                    expires_at,
+                ),
+            )
+        return ExternalSourceScope(
+            scope_ref=scope_ref,
+            key_id=str(key_id),
+            kb_ref=str(kb_ref),
+            kb_id=int(kb_id),
+            department_id=int(department_id),
+            sources=sources,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
+
+    def get_external_source_scope(
+        self, scope_ref: str, key_id: str
+    ) -> ExternalSourceScope | None:
+        if not scope_ref or len(str(scope_ref)) > 200:
+            return None
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT scope_ref, key_id, kb_ref, kb_id, department_id,
+                       sources_json, created_at, expires_at
+                FROM external_source_scopes
+                WHERE scope_ref = ? AND key_id = ?
+                """,
+                (str(scope_ref), str(key_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            if datetime.fromisoformat(str(row["expires_at"])) <= datetime.now(timezone.utc):
+                return None
+        except ValueError:
+            return None
+        try:
+            sources = json.loads(row["sources_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(sources, list) or not sources:
+            return None
+        return ExternalSourceScope(
+            scope_ref=str(row["scope_ref"]),
+            key_id=str(row["key_id"]),
+            kb_ref=str(row["kb_ref"]),
+            kb_id=int(row["kb_id"]),
+            department_id=int(row["department_id"]),
+            sources=sources,
+            created_at=str(row["created_at"]),
+            expires_at=str(row["expires_at"]),
+        )
+
+    def save_external_evidence(
+        self,
+        *,
+        key_id: str,
+        scope_ref: str,
+        kb_ref: str,
+        kb_id: int,
+        department_id: int,
+        record_id: int,
+        file_ref: str,
+        file_name: str,
+        content: str,
+        content_hash: str,
+        source_content_hash: str,
+        locator: dict,
+        score: float,
+        backend: str,
+        ttl_seconds: int | None = None,
+    ) -> str:
+        ttl = max(
+            60,
+            int(
+                ttl_seconds
+                if ttl_seconds is not None
+                else external_settings.HDB_EXTERNAL_EVIDENCE_TTL_SECONDS
+            ),
+        )
+        now = datetime.now(timezone.utc)
+        evidence_id = f"evidence_{secrets.token_urlsafe(18)}"
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO external_evidence
+                    (evidence_id, key_id, scope_ref, kb_ref, kb_id, department_id,
+                     record_id, file_ref, file_name, content, content_hash,
+                     source_content_hash, locator_json, score, backend,
+                     created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence_id,
+                    str(key_id),
+                    str(scope_ref),
+                    str(kb_ref),
+                    int(kb_id),
+                    int(department_id),
+                    int(record_id),
+                    str(file_ref),
+                    str(file_name),
+                    str(content),
+                    str(content_hash),
+                    str(source_content_hash),
+                    json.dumps(locator, ensure_ascii=False),
+                    float(score),
+                    str(backend),
+                    now.isoformat(),
+                    (now + timedelta(seconds=ttl)).isoformat(),
+                ),
+            )
+        return evidence_id
+
+    def get_external_evidence(
+        self, evidence_id: str, key_id: str
+    ) -> ExternalEvidenceRecord | None:
+        if not evidence_id or len(str(evidence_id)) > 200:
+            return None
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT evidence_id, key_id, scope_ref, kb_ref, kb_id,
+                       department_id, record_id, file_ref, file_name, content,
+                       content_hash, source_content_hash, locator_json, score,
+                       backend, created_at, expires_at
+                FROM external_evidence
+                WHERE evidence_id = ? AND key_id = ?
+                """,
+                (str(evidence_id), str(key_id)),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            if datetime.fromisoformat(str(row["expires_at"])) <= datetime.now(timezone.utc):
+                return None
+        except ValueError:
+            return None
+        try:
+            locator = json.loads(row["locator_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            locator = {}
+        return ExternalEvidenceRecord(
+            evidence_id=str(row["evidence_id"]),
+            key_id=str(row["key_id"]),
+            scope_ref=str(row["scope_ref"] or ""),
+            kb_ref=str(row["kb_ref"]),
+            kb_id=int(row["kb_id"]),
+            department_id=int(row["department_id"]),
+            record_id=int(row["record_id"]),
+            file_ref=str(row["file_ref"]),
+            file_name=str(row["file_name"]),
+            content=str(row["content"]),
+            content_hash=str(row["content_hash"]),
+            source_content_hash=str(row["source_content_hash"]),
+            locator=locator if isinstance(locator, dict) else {},
+            score=float(row["score"] or 0.0),
+            backend=str(row["backend"] or "ragflow"),
+            created_at=str(row["created_at"]),
+            expires_at=str(row["expires_at"]),
+        )
+
+    @staticmethod
+    def _api_key_digest(raw_key: str) -> str:
+        pepper = str(external_settings.HDB_API_KEY_PEPPER or "").strip()
+        if pepper:
+            return hmac.new(pepper.encode("utf-8"), raw_key.encode("utf-8"), hashlib.sha256).hexdigest()
+        return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _api_key_public_id(raw_key: str) -> str | None:
+        parts = str(raw_key or "").split("_", 2)
+        if len(parts) != 3 or parts[0] != "hdbk" or not parts[1] or not parts[2]:
+            return None
+        if len(parts[1]) != 24 or any(char not in "0123456789abcdef" for char in parts[1].lower()):
+            return None
+        return parts[1]
+
+    @staticmethod
+    def _normalize_api_key_scopes(scopes) -> frozenset[str]:
+        if not isinstance(scopes, (list, tuple, set, frozenset)):
+            raise ValueError("scopes 必须是非空数组")
+        normalized = frozenset(str(scope).strip().lower() for scope in scopes if str(scope).strip())
+        if not normalized or not normalized.issubset(API_KEY_SCOPES):
+            raise ValueError("scopes 仅支持 read、write、invoke")
+        return normalized
+
+    def create_employee_api_key(
+        self,
+        actor: AuthUser,
+        *,
+        name: str,
+        scopes,
+        kb_access_mode: str,
+        kb_refs: list[str] | None,
+        expires_in_days: int | None = None,
+        replacing_public_key_id: str | None = None,
+    ) -> dict:
+        if actor is None or actor.role != ROLE_EMPLOYEE or not actor.is_active:
+            raise PermissionError("只有启用的员工可以创建 API Key")
+        clean_name = str(name or "").strip()
+        if not clean_name or len(clean_name) > 120:
+            raise ValueError("Key 名称不能为空且不能超过 120 个字符")
+        normalized_scopes = self._normalize_api_key_scopes(scopes)
+        mode = str(kb_access_mode or "selected_kbs").strip()
+        if mode not in API_KEY_ACCESS_MODES:
+            raise ValueError("kb_access_mode 不受支持")
+        if mode == "all_current_accessible_kbs":
+            if kb_refs:
+                raise ValueError("all_current_accessible_kbs 不能提交 kb_refs")
+            if not bool(external_settings.HDB_EXTERNAL_ALL_KBS_MODE_ENABLED):
+                raise ValueError("all_current_accessible_kbs 未启用")
+            if str(getattr(src.settings, "OBS_ENVIRONMENT", "development")).strip().lower() in {
+                "prod",
+                "production",
+            }:
+                raise ValueError("生产环境不允许 all_current_accessible_kbs")
+            selected_refs: list[str] = []
+            selected_ids: list[int] = []
+        else:
+            selected_refs = list(dict.fromkeys(str(ref).strip() for ref in (kb_refs or []) if str(ref).strip()))
+            if not selected_refs:
+                raise ValueError("selected_kbs 必须至少选择一个 kb_ref")
+            with closing(self._connect()) as conn:
+                placeholders = ",".join("?" for _ in selected_refs)
+                rows = conn.execute(
+                    f"""
+                    SELECT e.kb_ref, e.kb_id, kb.name, kb.department_id
+                    FROM external_kb_refs e
+                    JOIN knowledge_bases kb ON kb.id = e.kb_id
+                    WHERE e.retired_at IS NULL AND e.kb_ref IN ({placeholders})
+                    """,
+                    selected_refs,
+                ).fetchall()
+            by_ref = {str(row["kb_ref"]): row for row in rows}
+            if len(by_ref) != len(selected_refs):
+                raise ValueError("存在未知或已停用的 kb_ref")
+            permissions = self.get_kb_permissions_for_user(actor)
+            selected_ids = []
+            for ref in selected_refs:
+                row = by_ref[ref]
+                if row["department_id"] != actor.department_id:
+                    raise PermissionError("Key 只能绑定员工当前部门的知识库")
+                permission = permissions.get(kb_scope_key(row["name"], row["department_id"]))
+                if permission not in {"read", "write", "admin"}:
+                    raise PermissionError("员工当前无权访问所选知识库")
+                selected_ids.append(int(row["kb_id"]))
+
+        min_ttl = int(external_settings.HDB_API_KEY_MIN_TTL_DAYS or 1)
+        max_ttl = min(int(external_settings.HDB_API_KEY_MAX_TTL_DAYS or 365), 365)
+        ttl = int(expires_in_days if expires_in_days is not None else external_settings.HDB_API_KEY_DEFAULT_TTL_DAYS)
+        if ttl < min_ttl or ttl > max_ttl:
+            raise ValueError(f"expires_in_days 必须在 {min_ttl} 到 {max_ttl} 天之间")
+
+        now = datetime.now(timezone.utc)
+        created_at = now.isoformat()
+        expires_at = (now + timedelta(days=ttl)).isoformat()
+        public_id = secrets.token_hex(12)
+        secret = secrets.token_urlsafe(32)
+        raw_key = f"hdbk_{public_id}_{secret}"
+        key_digest = self._api_key_digest(raw_key)
+        max_active = int(external_settings.HDB_API_KEY_MAX_ACTIVE_PER_USER or 10)
+
+        with closing(self._connect()) as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                active_query = """
+                    SELECT COUNT(*) AS count FROM employee_api_keys
+                    WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?
+                """
+                active_params: list[object] = [actor.id, created_at]
+                if replacing_public_key_id:
+                    active_query += " AND public_key_id != ?"
+                    active_params.append(str(replacing_public_key_id))
+                active = conn.execute(active_query, active_params).fetchone()
+                if int(active["count"] or 0) >= max_active:
+                    raise ValueError("KEY_LIMIT_REACHED")
+                inserted = conn.execute(
+                    """
+                    INSERT INTO employee_api_keys
+                        (public_key_id, key_digest, user_id, name, scopes_json,
+                         kb_access_mode, created_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING id
+                    """,
+                    (
+                        public_id,
+                        key_digest,
+                        actor.id,
+                        clean_name,
+                        json.dumps(sorted(normalized_scopes)),
+                        mode,
+                        created_at,
+                        expires_at,
+                    ),
+                ).fetchone()
+                if inserted is None:
+                    raise RuntimeError("无法创建 API Key")
+                key_row_id = int(inserted["id"])
+                for kb_id in selected_ids:
+                    conn.execute(
+                        """
+                        INSERT INTO employee_api_key_kbs (api_key_id, kb_id, created_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (key_row_id, kb_id, created_at),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        result = {
+            "key_id": public_id,
+            "name": clean_name,
+            "scopes": sorted(normalized_scopes),
+            "kb_access_mode": mode,
+            "kb_refs": selected_refs,
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "status": "active",
+            "masked_key": f"hdbk_{public_id}_••••",
+            "api_key": raw_key,
+        }
+        self._audit(
+            "create_employee_api_key",
+            actor=actor,
+            target_type="employee_api_key",
+            target_id=public_id,
+            metadata={
+                "public_key_id": public_id,
+                "scopes": sorted(normalized_scopes),
+                "kb_access_mode": mode,
+                "kb_refs": selected_refs,
+            },
+        )
+        return result
+
+    def _api_key_info(self, row, kb_refs: list[str]) -> dict:
+        revoked_at = row["revoked_at"]
+        expires_at = str(row["expires_at"] or "")
+        expired = False
+        try:
+            expired = datetime.fromisoformat(expires_at) <= datetime.now(timezone.utc)
+        except ValueError:
+            expired = True
+        status = "revoked" if revoked_at else ("expired" if expired else "active")
+        try:
+            scopes = sorted(set(json.loads(row["scopes_json"] or "[]")))
+        except (TypeError, json.JSONDecodeError):
+            scopes = []
+        return {
+            "key_id": str(row["public_key_id"]),
+            "name": str(row["name"]),
+            "scopes": scopes,
+            "kb_access_mode": str(row["kb_access_mode"]),
+            "kb_refs": kb_refs,
+            "created_at": str(row["created_at"]),
+            "expires_at": expires_at,
+            "revoked_at": revoked_at,
+            "last_used_at": row["last_used_at"],
+            "status": status,
+            "masked_key": f"hdbk_{row['public_key_id']}_••••",
+        }
+
+    def _api_key_kb_refs(self, conn, key_id: int) -> list[str]:
+        rows = conn.execute(
+            """
+            SELECT e.kb_ref
+            FROM employee_api_key_kbs k
+            JOIN external_kb_refs e ON e.kb_id = k.kb_id
+            WHERE k.api_key_id = ? AND e.retired_at IS NULL
+            ORDER BY e.kb_ref
+            """,
+            (key_id,),
+        ).fetchall()
+        return [str(row["kb_ref"]) for row in rows]
+
+    def list_employee_api_keys(self, actor: AuthUser) -> list[dict]:
+        if actor is None or actor.role != ROLE_EMPLOYEE or not actor.is_active:
+            raise PermissionError("只有启用的员工可以管理 API Key")
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM employee_api_keys WHERE user_id = ? ORDER BY id DESC",
+                (actor.id,),
+            ).fetchall()
+            return [self._api_key_info(row, self._api_key_kb_refs(conn, int(row["id"]))) for row in rows]
+
+    def get_employee_api_key(self, actor: AuthUser, public_key_id: str) -> dict | None:
+        if actor is None or actor.role != ROLE_EMPLOYEE or not actor.is_active:
+            raise PermissionError("只有启用的员工可以管理 API Key")
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM employee_api_keys WHERE user_id = ? AND public_key_id = ?",
+                (actor.id, str(public_key_id)),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._api_key_info(row, self._api_key_kb_refs(conn, int(row["id"])))
+
+    def revoke_employee_api_key(self, actor: AuthUser, public_key_id: str) -> bool:
+        if actor is None or actor.role != ROLE_EMPLOYEE or not actor.is_active:
+            raise PermissionError("只有启用的员工可以管理 API Key")
+        now = utc_now()
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT id FROM employee_api_keys WHERE user_id = ? AND public_key_id = ?",
+                (actor.id, str(public_key_id)),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                "UPDATE employee_api_keys SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?",
+                (now, int(row["id"])),
+            )
+        self._audit(
+            "revoke_employee_api_key",
+            actor=actor,
+            target_type="employee_api_key",
+            target_id=str(public_key_id),
+            metadata={"public_key_id": str(public_key_id)},
+        )
+        return True
+
+    def rotate_employee_api_key(
+        self,
+        actor: AuthUser,
+        public_key_id: str,
+        *,
+        expires_in_days: int | None = None,
+    ) -> dict | None:
+        existing = self.get_employee_api_key(actor, public_key_id)
+        if existing is None:
+            return None
+        if existing["status"] == "revoked":
+            raise ValueError("API Key 已撤销，不能轮换")
+        created = self.create_employee_api_key(
+            actor,
+            name=f"{existing['name']} (rotated)",
+            scopes=existing["scopes"],
+            kb_access_mode=existing["kb_access_mode"],
+            kb_refs=existing["kb_refs"],
+            expires_in_days=expires_in_days,
+            replacing_public_key_id=public_key_id,
+        )
+        if existing["status"] == "active":
+            self.revoke_employee_api_key(actor, public_key_id)
+        created["rotated_from"] = public_key_id
+        self._audit(
+            "rotate_employee_api_key",
+            actor=actor,
+            target_type="employee_api_key",
+            target_id=public_key_id,
+            metadata={
+                "rotated_from": public_key_id,
+                "new_key_id": created["key_id"],
+            },
+        )
+        return created
+
+    def narrow_employee_api_key_kbs(
+        self,
+        actor: AuthUser,
+        public_key_id: str,
+        kb_refs: list[str],
+    ) -> dict | None:
+        if actor is None or actor.role != ROLE_EMPLOYEE or not actor.is_active:
+            raise PermissionError("只有启用的员工可以管理 API Key")
+        existing = self.get_employee_api_key(actor, public_key_id)
+        if existing is None:
+            return None
+        if existing["status"] == "revoked":
+            raise ValueError("API Key 已撤销")
+        if existing["kb_access_mode"] != "selected_kbs":
+            raise ValueError("只有 selected_kbs 模式可以修改 allowlist")
+        selected_refs = list(
+            dict.fromkeys(str(ref).strip() for ref in kb_refs if str(ref).strip())
+        )
+        if not selected_refs:
+            raise ValueError("allowlist 不能为空")
+        current_refs = set(existing["kb_refs"])
+        if not set(selected_refs).issubset(current_refs):
+            raise ValueError("只能收窄 allowlist，不能扩大")
+        with closing(self._connect()) as conn:
+            placeholders = ",".join("?" for _ in selected_refs)
+            rows = conn.execute(
+                f"""
+                SELECT e.kb_ref, e.kb_id, kb.name, kb.department_id
+                FROM external_kb_refs e
+                JOIN knowledge_bases kb ON kb.id = e.kb_id
+                WHERE e.retired_at IS NULL AND e.kb_ref IN ({placeholders})
+                """,
+                selected_refs,
+            ).fetchall()
+            by_ref = {str(row["kb_ref"]): row for row in rows}
+            if len(by_ref) != len(selected_refs):
+                raise ValueError("存在未知或已停用的 kb_ref")
+            permissions = self.get_kb_permissions_for_user(actor)
+            selected_ids: list[int] = []
+            for ref in selected_refs:
+                row = by_ref[ref]
+                if row["department_id"] != actor.department_id:
+                    raise PermissionError("Key 只能绑定员工当前部门的知识库")
+                permission = permissions.get(kb_scope_key(row["name"], row["department_id"]))
+                if permission not in {"read", "write", "admin"}:
+                    raise PermissionError("员工当前无权访问所选知识库")
+                selected_ids.append(int(row["kb_id"]))
+            key_row = conn.execute(
+                "SELECT id FROM employee_api_keys WHERE user_id = ? AND public_key_id = ?",
+                (actor.id, str(public_key_id)),
+            ).fetchone()
+            if key_row is None:
+                return None
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "DELETE FROM employee_api_key_kbs WHERE api_key_id = ?",
+                    (int(key_row["id"]),),
+                )
+                for kb_id in selected_ids:
+                    conn.execute(
+                        """
+                        INSERT INTO employee_api_key_kbs (api_key_id, kb_id, created_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (int(key_row["id"]), kb_id, utc_now()),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        self._audit(
+            "narrow_employee_api_key_kbs",
+            actor=actor,
+            target_type="employee_api_key",
+            target_id=str(public_key_id),
+            metadata={"public_key_id": str(public_key_id), "kb_refs": selected_refs},
+        )
+        return self.get_employee_api_key(actor, public_key_id)
+
+    def resolve_employee_api_key(
+        self, raw_key: str | None
+    ) -> tuple[EmployeeApiKeyPrincipal | None, str]:
+        """Authenticate a key and return a stable failure code.
+
+        The caller decides how much of ``KEY_EXPIRED``/``KEY_REVOKED`` to
+        expose; ``authenticate_employee_api_key`` remains the boolean-ish
+        convenience wrapper used by older callers.
+        """
+        public_id = self._api_key_public_id(raw_key or "")
+        if public_id is None:
+            return None, "AUTH_INVALID"
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT k.*, u.role AS user_role, u.is_active AS user_is_active
+                FROM employee_api_keys k
+                JOIN users u ON u.id = k.user_id
+                WHERE k.public_key_id = ?
+                """,
+                (public_id,),
+            ).fetchone()
+            if row is None:
+                return None, "AUTH_INVALID"
+            expected = str(row["key_digest"] or "")
+            actual = self._api_key_digest(str(raw_key))
+            if not hmac.compare_digest(expected, actual):
+                return None, "AUTH_INVALID"
+            if row["user_role"] != ROLE_EMPLOYEE or not bool(row["user_is_active"]):
+                return None, "AUTH_INVALID"
+            if row["revoked_at"]:
+                return None, "KEY_REVOKED"
+            try:
+                if datetime.fromisoformat(str(row["expires_at"])) <= datetime.now(timezone.utc):
+                    return None, "KEY_EXPIRED"
+            except ValueError:
+                return None, "AUTH_INVALID"
+            mode = str(row["kb_access_mode"] or "")
+            if mode not in API_KEY_ACCESS_MODES:
+                return None, "AUTH_INVALID"
+            if mode == "all_current_accessible_kbs" and (
+                not bool(external_settings.HDB_EXTERNAL_ALL_KBS_MODE_ENABLED)
+                or str(getattr(src.settings, "OBS_ENVIRONMENT", "development"))
+                .strip()
+                .lower()
+                in {"prod", "production"}
+            ):
+                return None, "KEY_SCOPE_DENIED"
+            try:
+                scopes = frozenset(json.loads(row["scopes_json"] or "[]"))
+            except (TypeError, json.JSONDecodeError):
+                return None, "AUTH_INVALID"
+            if not scopes or not scopes.issubset(API_KEY_SCOPES):
+                return None, "AUTH_INVALID"
+            kb_rows = conn.execute(
+                """
+                SELECT k.kb_id, e.kb_ref
+                FROM employee_api_key_kbs k
+                JOIN external_kb_refs e ON e.kb_id = k.kb_id
+                WHERE k.api_key_id = ? AND e.retired_at IS NULL
+                """,
+                (int(row["id"]),),
+            ).fetchall()
+            last_used = row["last_used_at"]
+            should_update = True
+            if last_used:
+                try:
+                    should_update = (
+                        datetime.now(timezone.utc) - datetime.fromisoformat(str(last_used))
+                    ).total_seconds() >= 60
+                except ValueError:
+                    should_update = True
+            if should_update:
+                conn.execute(
+                    "UPDATE employee_api_keys SET last_used_at = ? WHERE id = ?",
+                    (utc_now(), int(row["id"])),
+                )
+            return (
+                EmployeeApiKeyPrincipal(
+                    key_id=public_id,
+                    user_id=int(row["user_id"]),
+                    scopes=frozenset(str(scope) for scope in scopes),
+                    kb_access_mode=mode,
+                    kb_ids=frozenset(int(item["kb_id"]) for item in kb_rows),
+                    kb_refs=frozenset(str(item["kb_ref"]) for item in kb_rows),
+                    expires_at=str(row["expires_at"]),
+                ),
+                "",
+            )
+
+    def authenticate_employee_api_key(self, raw_key: str | None) -> EmployeeApiKeyPrincipal | None:
+        principal, _failure_code = self.resolve_employee_api_key(raw_key)
+        return principal
+
     def get_user_by_username(self, username: str | None) -> AuthUser | None:
         if not username:
             return None
@@ -1479,7 +2815,7 @@ def anonymous_user_id(session_id: str) -> str:
     return f"anonymous-{digest}"
 
 
-def build_request_context(session_state) -> RequestContext:
+def build_request_context(session_state, auth_service: AuthService | None = None) -> RequestContext:
     session_id = ensure_session_id(session_state)
     username = session_state.get("username")
     department_id = session_state.get("department_id")
@@ -1488,7 +2824,7 @@ def build_request_context(session_state) -> RequestContext:
     if resource_department_id in (None, ""):
         resource_department_id = department_id
     if username:
-        auth_service = AuthService()
+        auth_service = auth_service or AuthService()
         user = auth_service.get_user_by_username(username)
         # 用 DB 里的实时角色/状态,而非 session_state 快照:降级或停用的账号
         # 不能凭旧会话继续以原角色操作。

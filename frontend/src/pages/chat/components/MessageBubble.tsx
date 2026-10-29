@@ -62,7 +62,7 @@ type Props = {
   showDiagnostics?: boolean;
   /** 为当前用户把一条已完成消息提交到明确的个人记忆授权确认流。 */
   onCreateMemory?: (messageIds: number[]) => void;
-  /** 把本轮问答主动提交为项目记忆提炼（结果先进入 Candidate）。 */
+  /** 把本轮问答主动提交为项目记忆提炼（结果先进入候选状态）。 */
   onCreateProjectMemory?: (messageIds: number[]) => void;
   /** 本轮问答的消息 id(提问在前、输出在后);个人记忆授权来源必须包含输出。 */
   memorySourceMessageIds?: number[];
@@ -803,7 +803,7 @@ function MessageBubble({
                     <button
                       type="button"
                       onClick={() => onCreateProjectMemory(memorySourceMessageIds)}
-                      title="把本轮问答提炼为项目记忆（先进入 Candidate 待审核）"
+                      title="把本轮问答提炼为项目记忆（先进入候选状态待审核）"
                       className="inline-flex items-center gap-[5px] border-0 bg-transparent p-0 text-[11px] text-[#858b9c] transition-colors hover:text-[#18181a] hover:underline"
                     >
                       <AppIcon name="database" size={13} />
