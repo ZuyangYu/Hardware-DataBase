@@ -49,6 +49,120 @@ def test_stream_wrapper_emits_deltas_and_records_answer(monkeypatch):
     assert record_agent.call_args.kwargs["mode"] == "deep"
 
 
+def test_stream_emits_real_compaction_and_context_manifest(monkeypatch):
+    from langchain_core.messages import HumanMessage
+
+    from src.agents import runner as runner_mod
+
+    class _State:
+        def __init__(self, values):
+            self.values = values
+
+    class _Checkpointer:
+        def get_tuple(self, config):
+            return None
+
+    messages = [HumanMessage(content=f"old-{index}") for index in range(8)]
+    messages += [HumanMessage(content=f"recent-{index}") for index in range(4)]
+    final_values = {
+        "messages": messages,
+        "_summarization_event": {
+            "cutoff_index": 8,
+            "summary_message": HumanMessage(content="压缩摘要"),
+            "file_path": "/conversation_history/t-compact.md",
+        },
+    }
+    state_calls = {"count": 0}
+
+    class _FakeAgent:
+        def get_state(self, config):
+            state_calls["count"] += 1
+            return _State({} if state_calls["count"] == 1 else final_values)
+
+        def stream(self, *args, **kwargs):
+            return iter(((AIMessage(content="回答"), {"langgraph_node": "model"}),))
+
+    class _Model:
+        profile = {"max_input_tokens": 32768}
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: _Model())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: _FakeAgent())
+    monkeypatch.setattr(runner_mod, "_create_checkpointer", lambda: _Checkpointer())
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    events = []
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    list(
+        runner.stream(
+            query="长对话压缩",
+            kb_name="kb_hw",
+            history=[],
+            thread_id="t-compact",
+            persist_thread=True,
+            event_callback=events.append,
+        )
+    )
+
+    compaction = [event for event in events if event["type"] == "context_compacted"]
+    assert len(compaction) == 1
+    payload = compaction[0]["payload"]
+    assert payload["cutoff_index"] == 8
+    assert payload["dropped_messages"] == 8
+    assert payload["retained_messages"] == 4
+    assert payload["summary_sha256"]
+    assert payload["window_id"].startswith("t-compact:")
+    assert payload["offload_path"].endswith("t-compact.md")
+    assert not any(event["type"] == "context_pressure" for event in events)
+
+    manifest = runner.get_last_retrieval_summary()["context_manifest"]
+    assert manifest["model_context_window"] == 32768
+    assert manifest["system_prompt_sha256"]
+    assert {item["kind"] for item in manifest["fragments"]} >= {"base_rules", "kb_scope", "evidence"}
+
+
+def test_stream_reports_pressure_without_fake_compaction(monkeypatch):
+    from src.agents import runner as runner_mod
+
+    class _State:
+        values = {"messages": [AIMessage(content="old")]}
+
+    class _FakeAgent:
+        def get_state(self, config):
+            return _State()
+
+        def stream(self, *args, **kwargs):
+            chunk = AIMessage(
+                content="回答",
+                usage_metadata={"input_tokens": 30000, "output_tokens": 10, "total_tokens": 30010},
+            )
+            return iter(((chunk, {"langgraph_node": "model"}),))
+
+    class _Model:
+        profile = {"max_input_tokens": 32768}
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: _Model())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: _FakeAgent())
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    events = []
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    list(
+        runner.stream(
+            query="接近窗口",
+            kb_name="kb_hw",
+            history=[],
+            thread_id="t-pressure",
+            event_callback=events.append,
+        )
+    )
+
+    pressure = [event for event in events if event["type"] == "context_pressure"]
+    assert len(pressure) == 1
+    assert pressure[0]["payload"]["window_tokens"] == 32768
+    assert not any(event["type"] == "context_compacted" for event in events)
+    assert runner.get_last_retrieval_summary()["context_manifest"]["estimated_input_tokens"] == 30000
+
+
 def test_stream_retracts_narration_without_tool_metadata(monkeypatch):
     """真实观测形态：工具调用信息不在流式 chunk 上，后续消息开始才知道前一段是叙述。
 
@@ -75,9 +189,11 @@ def test_stream_retracts_narration_without_tool_metadata(monkeypatch):
     )
 
     assert deltas == ["让我先检索电源方案。", "根据知识库证据，最终结论是 A。"]
-    assert [e for e in events if e["type"] == "narration"] == [
-        {"type": "narration", "payload": {"text": "让我先检索电源方案。"}}
-    ]
+    narration = [e for e in events if e["type"] == "narration"]
+    assert len(narration) == 1
+    assert narration[0]["payload"]["text"] == "让我先检索电源方案。"
+    assert narration[0]["payload"]["item_id"] == "answer"
+    assert narration[0]["payload"]["schema_version"] == 1
     assert runner_mod._current_run().answer == "根据知识库证据，最终结论是 A。"
 
 
@@ -476,3 +592,62 @@ def test_turn_preparation_stays_synchronous():
 
     assert not isgeneratorfunction(MultiSourceAgentRunner._prepare_turn)
     assert isgeneratorfunction(MultiSourceAgentRunner._stream_impl)
+
+
+def test_gapped_draft_is_retracted_and_closed_in_the_same_turn(monkeypatch):
+    from types import SimpleNamespace
+
+    from src.agents import runner as runner_mod
+
+    class _Checkpointer:
+        def get_tuple(self, config):
+            return None
+
+    class _Agent:
+        def __init__(self):
+            self.calls = []
+            self.streamed = []
+
+        def stream(self, payload, config=None, stream_mode="messages"):
+            self.calls.append(payload)
+            text = (
+                "过压门限数值未给出。"
+                if len(self.calls) == 1
+                else "补齐后的完整回答：门限以规格表为准。"
+            )
+            self.streamed.append(text)
+            yield AIMessage(content=text), {"langgraph_node": "model"}
+
+        def get_state(self, config):
+            return SimpleNamespace(values={})
+
+    agent = _Agent()
+    events: list[dict] = []
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: agent)
+    monkeypatch.setattr(runner_mod, "_create_checkpointer", lambda: _Checkpointer())
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    deltas = list(
+        runner.stream(
+            query="过压门限是多少？",
+            kb_name="kb_hw",
+            history=[],
+            thread_id="t-gap",
+            persist_thread=True,
+            event_callback=events.append,
+        )
+    )
+
+    assert deltas == ["过压门限数值未给出。", "补齐后的完整回答：门限以规格表为准。"]
+    assert len(agent.calls) == 2
+    continuation = agent.calls[1]["messages"][0]["content"]
+    assert "本轮回答仍存在证据缺口" in continuation
+    assert "过压门限数值未给出" in continuation
+    assert any(
+        event.get("type") == "narration"
+        and event.get("payload", {}).get("text") == "过压门限数值未给出。"
+        for event in events
+    )
+    assert runner_mod._current_run().answer == "补齐后的完整回答：门限以规格表为准。"

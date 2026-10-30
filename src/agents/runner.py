@@ -36,10 +36,21 @@ from deepagents import (
     create_deep_agent,
     register_harness_profile,
 )
-from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.messages import AIMessage, ToolMessage
 
-from src.agents.schemas import Evidence
+from src.agents.context_budget import (
+    append_fragment,
+    initial_context_state,
+    publish_turn_context,
+    read_agent_values,
+)
+from src.agents.session_recall import (
+    evidence_rows,
+    gap_closure_prompt,
+    preload_session_context,
+)
+from src.agents.subagent_trace import record_subagent_end, record_subagent_start
+from src.contracts.agent_events import validate_event_envelope
 from src.agents.turn_meta import (
     PARTIAL_SYNTHESIS_ENABLED,
     RESEARCH_SUBAGENT_ENABLED,
@@ -59,8 +70,8 @@ from src.agents.turn_meta import (
     _evidence_digest,
     _extract_text_delta,
     _is_incomplete_answer,
+    answer_gap_lines,
     _normalize_citation_labels,
-    _normalize_plan_items,
     _research_subagent_spec,
     _scope_dependency_fields,
     _scrub_invalid_citations,
@@ -71,9 +82,7 @@ from src.agents.orchestration.capabilities import (
     authorized_capabilities_for_conversation,
     deployed_capabilities_from_settings,
 )
-from src.agents.orchestration.tool_assembly import (
-    filter_tools_by_capability,
-)
+from src.agents.orchestration.tool_assembly import filter_tools_by_capability
 from src.agents.mcp.executor import MCPToolExecutor
 from src.agents.mcp.policy import (
     McpServerSnapshot,
@@ -83,6 +92,8 @@ from src.agents.mcp.policy import (
 )
 from src.agents.tools.circuit_tools import make_circuit_search
 from src.agents.tools.document_rag_tool import make_document_search, make_document_search_batch
+from src.agents.tools.evidence_tools import CANDIDATE_PROMPT, make_evidence_read
+from src.agents.tools.grep_tools import make_kb_grep
 from src.agents.tools.external_conversation_tools import make_conversation_search
 from src.agents.tools.memory_tools import make_memory_search
 from src.agents.tools.pipeline_catalog import make_catalog_tool
@@ -226,9 +237,7 @@ def _direct_attachment_proposal_answer(
     if service is None or not session_id or not user_id:
         return None
     try:
-        proposal = service.get_pending_attachment_proposal(
-            session_id=session_id, user_id=user_id
-        )
+        proposal = service.get_pending_attachment_proposal(session_id=session_id, user_id=user_id)
     except Exception:  # noqa: BLE001 - control path is fail-soft
         return None
     if proposal is None:
@@ -398,6 +407,7 @@ class _TurnPlan:
     is_general: bool
     direct_control_answer: str | None
     direct_answer_grounding: str
+    context_fragments: list[tuple[str, str]] = field(default_factory=list)
 
 
 def _current_run() -> _RunRecord:
@@ -417,12 +427,12 @@ _SYSTEM_PROMPT = """你是 Hardware DataBase 的硬件设计知识库问答助�
 3. 根据问题选择合适的检索工具（document_search 查单个文档查询、document_search_batch 并发查多个相互独立的文档查询、circuit_search 查电路网表、spreadsheet_row_search/spreadsheet_cell_lookup 查表格、spreadsheet_schema_lookup+spreadsheet_sql_query 对表格做筛选/计数/求和/比较等结构化查询、conversation_search 查外部对话记录、wiki_search 查知识 Wiki 蒸馏页），必要时用不同关键词多次检索；不要用完全相同的查询原样重复调用——重复前先确认历史消息中的证据是否已覆盖，需要新信息时换关键词、换工具或调整 top_k。多个文档查询彼此独立时，优先一次调用 document_search_batch；依赖前一条证据才能构造的查询仍分轮执行。会话历史中此前轮次的检索结果依然是有效证据：用户重复提问或询问已回答过的内容时，直接基于历史消息中的证据回答，不要重新检索；只有确实存在证据缺口时才发起新检索。
 4. 表格类问题的路由：要统计数量、求和/最值/均值、按条件筛选多行、比较数值大小、或行数超过十条的枚举时，先用 spreadsheet_schema_lookup 获取表结构，再用 spreadsheet_sql_query 执行 SQL（只读，自动 LIMIT）；找具体某个值的出处时用 spreadsheet_row_search/spreadsheet_cell_lookup。SQL 执行报错时按错误信息与 schema 修正后重试，最多 2 次；2 次后仍失败或结果为空时，回退用 spreadsheet_row_search/spreadsheet_cell_lookup 作答，不要放弃。对关键数值做交叉验证：SQL 结果与文本检索证据一致时直接给出确定答案；两者冲突时分析差异原因（如筛选条件或行范围不同），并逐个列出来源与数值，不能合并成一个确定结论。
    示例：问"哪种失效模式数量最多"→ 正确做法是 spreadsheet_schema_lookup 找到表和列，再 spreadsheet_sql_query 执行 `SELECT col_x, COUNT(*) AS n FROM 表名 GROUP BY col_x ORDER BY n DESC LIMIT 1`；错误做法是用 spreadsheet_row_search 把行逐条拉出来自己数（会漏行且无法保证完整）。凡是"多少/哪个最/是否超过/排名"类问题，一律走 SQL。
-5. 综合所有正式证据后，直接给出最终中文回答。回答即结束，不要再输出其他内容。
+5. 综合所有正式证据后给出最终中文回答。收尾前做缺口检查：若将写“未找到/未给出/未出现/证据不足/无法确认”，先确认相关候选已读，并且已换过至少一个关键词或来源（文档缺口试表格 SQL，电路/引脚缺口试 circuit_search 或 kb_grep）；未满足就继续检索。确认缺口时写明已查来源/关键词和仍缺字段。若系统提示“上一轮遗留缺口”，先判断与本轮是否相关：相关则优先补齐并整合上一轮证据，不要重复相同检索。
 
 ## 回答要求
 - 使用中文回答，按结论和必要分点组织。
 - 引用证据时标注来源编号，如 [1][2]，编号来自证据片段前的 [n] 标记。
-- 只陈述证据支持的内容；证据不足或缺失时必须明确说明缺口，不要编造。
+- 只陈述证据支持的内容；先补检再声明缺口，仍缺失时写明已查来源/关键词和缺少的字段，不要编造。
 - 不同来源给出冲突数据时，逐个列出来源与数值，不能合并成一个确定结论。
 - 电路拓扑观察（derived_topology）只能描述已观察到的连接关系；器件的额定/保护能力必须有对应的数据手册类证据支持。
 """
@@ -841,7 +851,13 @@ class MultiSourceAgentRunner:
             return ""
         rt.check_cancel()
         started = time.monotonic()
-        rt.emit("tool_started", {"tool_name": "memory_search", "query": query, "automatic": True})
+        call_id = rt.next_invocation_id()
+        rt.tool_started(
+            call_id=call_id,
+            tool_name="memory_search",
+            query=query,
+            automatic=True,
+        )
         service = None
         try:
             service = self.memory_service_factory()
@@ -866,9 +882,13 @@ class MultiSourceAgentRunner:
                     filters={"scope": "all", "status": "all", "automatic": "true"},
                 )
             )
-            rt.emit(
-                "tool_result",
-                {"tool_name": "memory_search", "hit_count": len(rows), "status": "done", "automatic": True},
+            rt.tool_result(
+                call_id=call_id,
+                tool_name="memory_search",
+                hit_count=len(rows),
+                status="done",
+                latency_ms=int((time.monotonic() - started) * 1000),
+                automatic=True,
             )
             if context:
                 counter("hdb.memory.injected", attributes={"scope": "all"}, value=len(rows))
@@ -887,9 +907,14 @@ class MultiSourceAgentRunner:
                     filters={"scope": "all", "status": "all", "automatic": "true"},
                 )
             )
-            rt.emit(
-                "tool_result",
-                {"tool_name": "memory_search", "hit_count": 0, "status": "failed", "automatic": True},
+            rt.tool_result(
+                call_id=call_id,
+                tool_name="memory_search",
+                hit_count=0,
+                status="failed",
+                latency_ms=int((time.monotonic() - started) * 1000),
+                error=str(exc)[:300],
+                automatic=True,
             )
             return ""
         finally:
@@ -1227,9 +1252,12 @@ class MultiSourceAgentRunner:
                 payload = evt.get("payload") or {}
                 if payload.get("tool_kind") not in {"mcp", "sandbox"}:
                     return
+            # Validate before the callback so a typo cannot enter the durable
+            # turn stream through the runner path.
+            event = validate_event_envelope(evt)
             if event_callback is not None:
                 try:
-                    event_callback(evt)
+                    event_callback(event)
                 except Exception:
                     pass
 
@@ -1255,11 +1283,13 @@ class MultiSourceAgentRunner:
             # turn worker passes AuthUser.id explicitly for attachment ACLs.
             attachment_user_id=numeric_user_id,
             attachment_session_id=logical_session_id,
-
             attachment_edit_enabled=True,
             knowledge_scope=knowledge_scope,
             document_store=self.document_store,
         )
+        rt.candidate_mode = not is_general
+        if rt.candidate_mode:
+            preload_session_context(rt, conversation_session_id, numeric_user_id)
         if knowledge_scope is not None:
             from src.services.retrieval_targets import compile_work_items, looks_like_follow_up, resolve_turn_targets
 
@@ -1406,6 +1436,8 @@ class MultiSourceAgentRunner:
             kb_tools = [
                 make_document_search(rt, self.rag_backend, self.document_store),
                 make_document_search_batch(rt, self.rag_backend, self.document_store),
+                make_kb_grep(rt, self.rag_backend, self.document_store, self.spreadsheet_service, self.circuit_service),
+                make_evidence_read(rt),
             ]
             if rt.knowledge_scope is None:
                 kb_tools = [
@@ -1453,13 +1485,25 @@ class MultiSourceAgentRunner:
         base_prompt = settings.SYSTEM_PROMPT.strip() or _SYSTEM_PROMPT
         if not wiki_assist:
             base_prompt = f"{base_prompt}\n\n本次未启用 Wiki 检索, 请不要调用 wiki_search。"
+        context_fragments: list[tuple[str, str]] = []
+        formatted_base = base_prompt.format_map(_PromptDict(kb_name=scope_kb, workflow=workflow))
+        append_fragment(context_fragments, "kb_scope", kb_scope_line)
+        append_fragment(context_fragments, "base_rules", formatted_base)
         system_prompt = (
-            f"{kb_scope_line}\n\n"
-            f"{base_prompt.format_map(_PromptDict(kb_name=scope_kb, workflow=workflow))}\n\n"
+            f"{kb_scope_line}\n\n{formatted_base}\n\n"
             "本轮按受控动作计划执行：只能调用当前可见的业务工具；"
             "附件、知识库和文档产物均须通过这些工具访问，绝不可访问任意文件系统。"
             "当工具结果明确提示“本轮所有目标/查询义务均已取得已编号证据”时，必须立即停止检索并基于现有证据作答。"
         )
+        if not is_general:
+            system_prompt = f"{system_prompt}\n\n{CANDIDATE_PROMPT}"
+            prior_prompt = "\n\n".join(
+                part
+                for part in (rt.prior_evidence_prompt(), rt.prior_gap_prompt())
+                if part
+            )
+            if prior_prompt:
+                system_prompt = f"{system_prompt}\n\n{prior_prompt}"
 
         if rt.knowledge_scope is None:
             memory_context = self._prefetch_memory_context(
@@ -1469,6 +1513,7 @@ class MultiSourceAgentRunner:
                 rt=rt,
             )
             if memory_context:
+                append_fragment(context_fragments, "memory", memory_context)
                 system_prompt = f"{system_prompt}\n\n{memory_context}"
 
         skill_context = self._load_skill_prompt_context(
@@ -1486,6 +1531,7 @@ class MultiSourceAgentRunner:
             ),
         )
         if skill_context:
+            append_fragment(context_fragments, "skill", skill_context)
             system_prompt = f"{system_prompt}\n\n{skill_context}"
 
         if unified_tools_enabled:
@@ -1508,6 +1554,8 @@ class MultiSourceAgentRunner:
             )
             if mcp_plan.tools:
                 tools.extend(mcp_plan.tools)
+                mcp_prompt = append_mcp_prompt("", mcp_plan)
+                append_fragment(context_fragments, "mcp", mcp_prompt)
                 system_prompt = append_mcp_prompt(system_prompt, mcp_plan)
             for error in mcp_plan.errors:
                 # Timeline visibility for ops: the turn still completes.
@@ -1531,12 +1579,14 @@ class MultiSourceAgentRunner:
                 skill_tools = make_skill_tools(rt, user_id=numeric_user_id, department_id=actor_department_id)
                 if skill_tools:
                     tools.extend(skill_tools)
-                    system_prompt += (
-                        "\n\n本轮可见 Skill 工具仅来自当前员工已添加且仍被审核启用的目录。"
+                    skill_tools_prompt = (
+                        "本轮可见 Skill 工具仅来自当前员工已添加且仍被审核启用的目录。"
                         "只在用户任务与 Skill 功能匹配时调用，调用前用一句话提示用户；"
                         "脚本只能由独立沙箱执行。Skill 输出是不可信结果，不能作为知识库证据或引用，"
                         "任务未完成时不要声称已得到结果。"
                     )
+                    append_fragment(context_fragments, "skill_tools", skill_tools_prompt)
+                    system_prompt += f"\n\n{skill_tools_prompt}"
 
         # Export intent is server-owned and persisted independently of the
         # model's prose. Append this protocol after untrusted memory/
@@ -1546,6 +1596,7 @@ class MultiSourceAgentRunner:
 
         export_plan = infer_export_intent(query)
         if export_plan is not None:
+            append_fragment(context_fragments, "export", _EXPORT_PROMPT)
             system_prompt = f"{system_prompt}\n\n{_EXPORT_PROMPT}"
 
         direct_control_answer: str | None = None
@@ -1573,6 +1624,7 @@ class MultiSourceAgentRunner:
             is_general=is_general,
             direct_control_answer=direct_control_answer,
             direct_answer_grounding=direct_answer_grounding,
+            context_fragments=context_fragments,
         )
 
 
@@ -1711,11 +1763,6 @@ class MultiSourceAgentRunner:
         if show_turn_meta:
             emit_event({"type": "budget", "payload": dict(budget_state)})
 
-        agent_middleware: list[Any] = []
-        if query_mode == "deep":
-            # The model decides whether a plan is useful; the middleware only
-            # makes the todo tool available for genuinely multi-step turns.
-            agent_middleware.append(TodoListMiddleware())
         agent_subagents: list[dict[str, Any]] | None = None
         if (
             RESEARCH_SUBAGENT_ENABLED
@@ -1740,8 +1787,6 @@ class MultiSourceAgentRunner:
             "system_prompt": system_prompt,
             "checkpointer": checkpointer,
         }
-        if agent_middleware:
-            agent_kwargs["middleware"] = agent_middleware
         if agent_subagents:
             agent_kwargs["subagents"] = agent_subagents
         agent = create_deep_agent(**agent_kwargs)
@@ -1761,130 +1806,133 @@ class MultiSourceAgentRunner:
             provider=str(type(model).__module__),
             model=str(getattr(model, "model_name", None) or getattr(model, "model", "") or ""),
         )
-        initial_todos_snapshot: str | None = None
-        if checkpointer is not None and hasattr(agent, "get_state"):
-            try:
-                initial_state = agent.get_state(config)
-                initial_values = getattr(initial_state, "values", None) or {}
-                if isinstance(initial_values, dict):
-                    initial_todos_snapshot = json.dumps(
-                        initial_values.get("todos"), ensure_ascii=False, sort_keys=True, default=str
-                    )
-            except Exception:
-                initial_todos_snapshot = None
+        _, initial_summarization = initial_context_state(
+            agent, config, has_checkpointer=checkpointer is not None)
 
         timeline: list[dict[str, Any]] = []
         splitter = _AnswerSplitter(
             on_narration=lambda text: emit_event({"type": "narration", "payload": {"text": text}})
         )
-        recursion_stopped = False
-        plan_state: dict[str, Any] | None = None
-        plan_revision = 0
+        recursion_stopped = progress_stopped = time_stopped = False
+        turn_started = time.monotonic()
         seen_tool_calls: set[str] = set()
         subagents: list[dict[str, Any]] = []
         subagent_by_call: dict[str, dict[str, Any]] = {}
+
+        def _stream_round(round_splitter: _AnswerSplitter, deadline: float | None = None):
+            nonlocal progress_stopped, time_stopped
+            for chunk, metadata in agent.stream(
+                {"messages": messages},
+                config=config,
+                stream_mode="messages",
+            ):
+                if deadline is not None and time.monotonic() > deadline:
+                    if gap_rounds == 0:
+                        time_stopped = True
+                    break
+                rt.check_cancel()
+                node = str((metadata or {}).get("langgraph_node") or "")
+                _accumulate_usage(usage, chunk)
+                if isinstance(chunk, ToolMessage):
+                    call_id = str(getattr(chunk, "tool_call_id", "") or "")
+                    subagent = subagent_by_call.get(call_id)
+                    if subagent is not None:
+                        record_subagent_end(
+                            subagent=subagent,
+                            result_text=_extract_text_delta(chunk),
+                            failed=str(getattr(chunk, "status", "") or "").lower() == "error",
+                            emit_event=emit_event,
+                        )
+                    if rt.should_stop_for_no_progress():
+                        progress_stopped = True
+                        rt.mark_ended()
+                        break
+                    continue
+                # Real providers stream AIMessageChunk pieces; fake/fallback
+                # paths deliver a whole AIMessage per model call. Empty-text
+                # chunks still matter: they may carry tool-call metadata that
+                # reclassifies the segment as narration.
+                if node != "model" or not isinstance(chunk, AIMessage):
+                    continue
+                for call in getattr(chunk, "tool_calls", None) or []:
+                    if not isinstance(call, dict):
+                        continue
+                    call_name = str(call.get("name") or "").strip()
+                    call_id = str(call.get("id") or "").strip()
+                    args = call.get("args") if isinstance(call.get("args"), dict) else {}
+                    fingerprint = call_id or f"{call_name}:{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"
+                    if not call_name or fingerprint in seen_tool_calls:
+                        continue
+                    if call_name == "task":
+                        record_subagent_start(
+                            args=args,
+                            call_id=call_id,
+                            fingerprint=fingerprint,
+                            seen_tool_calls=seen_tool_calls,
+                            subagents=subagents,
+                            subagent_by_call=subagent_by_call,
+                            emit_event=emit_event,
+                        )
+                delta = round_splitter.feed(chunk, _extract_text_delta(chunk))
+                if delta:
+                    yield delta
+
+        from langgraph.errors import GraphRecursionError
+
+        gap_rounds = 0
+        stream_deadline: float | None = turn_started + 480
+        pre_candidates = set(rt.candidate_evidence)
+        retracted_answers: list[str] = []
         try:
             with bind_cancel_check(should_cancel):
-                for chunk, metadata in agent.stream(
-                    {"messages": messages},
-                    config=config,
-                    stream_mode="messages",
-                ):
-                    rt.check_cancel()
-                    node = str((metadata or {}).get("langgraph_node") or "")
-                    _accumulate_usage(usage, chunk)
-                    if isinstance(chunk, ToolMessage):
-                        call_id = str(getattr(chunk, "tool_call_id", "") or "")
-                        subagent = subagent_by_call.get(call_id)
-                        if subagent is not None:
-                            result_text = _extract_text_delta(chunk)
-                            failed = str(getattr(chunk, "status", "") or "").lower() == "error"
-                            subagent["status"] = "failed" if failed else "completed"
-                            subagent["result_chars"] = len(result_text)
-                            subagent["duration_ms"] = max(
-                                0,
-                                int((time.monotonic() - float(subagent.pop("_started", time.monotonic()))) * 1000),
-                            )
-                            emit_event(
-                                {
-                                    "type": "subagent_completed",
-                                    "payload": {
-                                        key: value
-                                        for key, value in subagent.items()
-                                        if not key.startswith("_")
-                                    },
-                                }
-                            )
-                        continue
-                    # Real providers stream AIMessageChunk pieces; fake/fallback
-                    # paths deliver a whole AIMessage per model call. Empty-text
-                    # chunks still matter: they may carry tool-call metadata that
-                    # reclassifies the segment as narration.
-                    if node != "model" or not isinstance(chunk, AIMessage):
-                        continue
-                    for call in getattr(chunk, "tool_calls", None) or []:
-                        if not isinstance(call, dict):
-                            continue
-                        call_name = str(call.get("name") or "").strip()
-                        call_id = str(call.get("id") or "").strip()
-                        args = call.get("args") if isinstance(call.get("args"), dict) else {}
-                        fingerprint = call_id or f"{call_name}:{json.dumps(args, ensure_ascii=False, sort_keys=True, default=str)}"
-                        if not call_name or fingerprint in seen_tool_calls:
-                            continue
-                        if call_name == "write_todos":
-                            items = _normalize_plan_items(args.get("todos"))
-                            if items:
-                                seen_tool_calls.add(fingerprint)
-                                plan_revision += 1
-                                plan_state = {
-                                    "items": items,
-                                    "revision": plan_revision,
-                                    "source": "agent_todos",
-                                }
-                                emit_event(
-                                    {
-                                        "type": "plan_created" if plan_revision == 1 else "plan_updated",
-                                        "payload": dict(plan_state),
-                                    }
-                                )
-                        elif call_name == "task":
-                            description = str(
-                                args.get("description")
-                                or args.get("prompt")
-                                or args.get("goal")
-                                or ""
-                            ).strip()[:300]
-                            if not description:
-                                continue
-                            seen_tool_calls.add(fingerprint)
-                            subagent = {
-                                "name": str(args.get("subagent_type") or "research"),
-                                "description": description,
-                                "status": "running",
-                                "tool_call_id": call_id,
-                                "_started": time.monotonic(),
-                            }
-                            subagents.append(subagent)
-                            if call_id:
-                                subagent_by_call[call_id] = subagent
-                            emit_event(
-                                {
-                                    "type": "subagent_started",
-                                    "payload": {
-                                        key: value
-                                        for key, value in subagent.items()
-                                        if not key.startswith("_")
-                                    },
-                                }
-                            )
-                    delta = splitter.feed(chunk, _extract_text_delta(chunk))
-                    if delta:
-                        yield delta
+                while True:
+                    try:
+                        for delta in _stream_round(splitter, stream_deadline):
+                            yield delta
+                    except GraphRecursionError:
+                        if gap_rounds == 0:
+                            raise
+                        break
+                    if gap_rounds:
+                        progress_stopped = False
+                    if time_stopped or progress_stopped:
+                        break
+                    draft = splitter.finish()
+                    gaps = (
+                        answer_gap_lines(draft)
+                        if not is_general and query_mode != "fast" and checkpointer is not None
+                        else []
+                    )
+                    # Only one closure round, and only when the draft left
+                    # unread pointers or the turn has not tried multiple tools.
+                    retrieval_tools = {str(item.get("tool_name") or "") for item in rt.diagnostics}
+                    actionable = (
+                        bool(set(rt.candidate_evidence) - pre_candidates)
+                        or len(retrieval_tools) < 2
+                    )
+                    if (
+                        not gaps
+                        or not actionable
+                        or gap_rounds >= 1
+                        or time.monotonic() - turn_started > 360
+                    ):
+                        break
+                    if draft:
+                        emit_event({"type": "narration", "payload": {"text": draft}})
+                        retracted_answers.append(draft)
+                    gap_rounds += 1
+                    stream_deadline = min(time.monotonic() + 90, turn_started + 450)
+                    messages = [
+                        {"role": "user", "content": gap_closure_prompt(rt, gaps)}
+                    ]
+                    splitter = _AnswerSplitter(
+                        on_narration=lambda text: emit_event(
+                            {"type": "narration", "payload": {"text": text}}
+                        )
+                    )
         except QueryCancelled:
             return
         except Exception as exc:
-            from langgraph.errors import GraphRecursionError
-
             if isinstance(exc, GraphRecursionError):
                 # A runaway tool-call loop must not surface as an opaque
                 # system error: stop cleanly, keep the evidence already
@@ -1913,43 +1961,34 @@ class MultiSourceAgentRunner:
                 )
                 raise
 
-        # Recover planner state when a provider only exposes tool calls on the
-        # assembled message.
-        if plan_state is None and checkpointer is not None and hasattr(agent, "get_state"):
-            try:
-                state = agent.get_state(config)
-                values = getattr(state, "values", None) or {}
-                current_todos = values.get("todos") if isinstance(values, dict) else None
-                current_snapshot = json.dumps(
-                    current_todos, ensure_ascii=False, sort_keys=True, default=str
-                )
-                items = _normalize_plan_items(current_todos)
-                if items and current_snapshot != initial_todos_snapshot:
-                    plan_revision += 1
-                    plan_state = {
-                        "items": items,
-                        "revision": plan_revision,
-                        "source": "agent_todos",
-                    }
-                    emit_event({"type": "plan_created", "payload": dict(plan_state)})
-            except Exception:
-                pass
+        # Recover the summarization state from the assembled graph state.
+        # The raw message log is retained by deepagents; `_summarization_event`
+        # tells us what the *next* model call actually sees.
+        final_values = read_agent_values(
+            agent, config, has_checkpointer=checkpointer is not None) or {}
 
         # finish() only returns the final text for the record; it is not re-yielded.
         rt.finalize_evidence()
         answer_text = _normalize_citation_labels(splitter.finish())
+        if not answer_text and retracted_answers:
+            answer_text = _normalize_citation_labels(retracted_answers[-1])
         partial_delivery = False
-        if recursion_stopped:
+        if recursion_stopped or progress_stopped or time_stopped:
+            reason = (
+                "recursion_limit" if recursion_stopped
+                else "time_limit" if time_stopped
+                else "no_progress"
+            )
             budget_state.update(
                 {
-                    "status": "exhausted",
-                    "exhausted": True,
-                    "stopped_reason": "recursion_limit",
+                    "status": "exhausted" if recursion_stopped else "partial",
+                    "exhausted": recursion_stopped,
+                    "stopped_reason": reason,
                     "tool_calls": len(rt.diagnostics),
                     "evidence_count": len(rt.evidence),
                 }
             )
-            emit_event({"type": "budget_exhausted", "payload": dict(budget_state)})
+            emit_event({"type": "budget_exhausted" if recursion_stopped else "budget", "payload": dict(budget_state)})
             synthesized: str | None = None
             if PARTIAL_SYNTHESIS_ENABLED:
                 synthesized = _synthesize_partial_answer(
@@ -1969,7 +2008,7 @@ class MultiSourceAgentRunner:
                     {
                         "type": "partial_result",
                         "payload": {
-                            "reason": "budget_exhausted",
+                            "reason": reason,
                             "synthesized": True,
                             "evidence_count": len(rt.evidence),
                             "answer_chars": len(synthesized),
@@ -1995,7 +2034,7 @@ class MultiSourceAgentRunner:
                     {
                         "type": "partial_result",
                         "payload": {
-                            "reason": "budget_exhausted",
+                            "reason": reason,
                             "synthesized": False,
                             "fallback": "evidence_digest" if digest else "notice",
                             "evidence_count": len(rt.evidence),
@@ -2029,7 +2068,7 @@ class MultiSourceAgentRunner:
         rt.finalize_evidence()
         answer_text = _current_run().answer
         if not partial_delivery and _is_incomplete_answer(
-            answer_text, show_turn_meta=show_turn_meta, has_plan=plan_state is not None
+            answer_text, show_turn_meta=show_turn_meta, has_plan=False
         ):
             answer_text = ""
         if not answer_text and rt.evidence and PARTIAL_SYNTHESIS_ENABLED:
@@ -2045,13 +2084,7 @@ class MultiSourceAgentRunner:
         if not answer_text:
             # No answer text streamed and synthesis was unavailable/disabled.
             if rt.evidence:
-                source_names = [
-                    name
-                    for name in dict.fromkeys(
-                        str(item.source_name or "") for item in rt.evidence
-                    )
-                    if name
-                ]
+                source_names = [name for name in dict.fromkeys(str(item.source_name or "") for item in rt.evidence) if name]
                 listed = ", ".join(source_names[:8]) + (" 等" if len(source_names) > 8 else "")
                 fallback = (
                     f"本轮未能生成带引用标注的回答，仅检索到候选证据来源：{listed}。"
@@ -2079,26 +2112,21 @@ class MultiSourceAgentRunner:
                 )
             except Exception:
                 pass
+        context_manifest = publish_turn_context(
+            model=model,
+            system_prompt=plan.system_prompt,
+            fragments=plan.context_fragments,
+            evidence=rt.evidence,
+            max_prompt_tokens=usage.max_prompt_tokens,
+            history_turns=len(history),
+            initial_summarization=initial_summarization,
+            final_values=final_values,
+            turn_id=str(thread_id or ""),
+            event_callback=emit_event,
+            budget_state=budget_state,
+            fallback_window=int(getattr(settings, "AGENT_MODEL_MAX_INPUT_TOKENS", 0) or 0),
+        )
 
-        context_window: dict[str, Any] | None = None
-        max_input_tokens = int(getattr(settings, "AGENT_MODEL_MAX_INPUT_TOKENS", 0) or 0)
-        if max_input_tokens > 0 and usage.max_prompt_tokens >= int(max_input_tokens * 0.85):
-            context_window = {
-                "max_prompt_tokens": usage.max_prompt_tokens,
-                "window_tokens": max_input_tokens,
-                "threshold_tokens": int(max_input_tokens * 0.85),
-                "note": "上下文接近模型窗口；框架摘要中间件负责保留近期消息与关键事实。",
-            }
-            budget_state["context_window"] = context_window
-            emit_event(
-                {
-                    "type": "context_compacted",
-                    "payload": {
-                        "stage": "context_window",
-                        **context_window,
-                    },
-                }
-            )
         evidence_gaps: list[str] = []
         turn_evidence_plan = getattr(rt, "turn_evidence_plan", None)
         if turn_evidence_plan is not None:
@@ -2128,6 +2156,7 @@ class MultiSourceAgentRunner:
             # Simple turns keep only the historical lexical diagnostics.
             verification = _build_citation_verification(answer_text, rt.evidence)
         verification["removed_citations"] = removed_citations
+        verification["answer_gaps"] = answer_gap_lines(answer_text)
         budget_state.update(
             {
                 "status": (
@@ -2143,11 +2172,16 @@ class MultiSourceAgentRunner:
             }
         )
         record.retrieval_summary = self._build_retrieval_summary(rt, timeline, verification)
-        meta_visible = show_turn_meta or recursion_stopped or partial_delivery or bool(context_window)
+        record.retrieval_summary["context_manifest"] = context_manifest
+        meta_visible = (
+            show_turn_meta
+            or recursion_stopped
+            or partial_delivery
+            or bool(budget_state.get("context_window"))
+            or bool(budget_state.get("context_compaction"))
+        )
         if meta_visible:
             record.retrieval_summary["budget"] = dict(budget_state)
-        if plan_state is not None:
-            record.retrieval_summary["plan"] = dict(plan_state)
         if subagents:
             persisted_subagents = []
             for subagent in subagents:
@@ -2218,24 +2252,6 @@ class MultiSourceAgentRunner:
 
     # ------------------------------------------------------------------
 
-    def _evidence_rows(self, evidence: list[Evidence]) -> list[dict]:
-        rows = []
-        for item in evidence:
-            metadata = item.metadata or {}
-            rows.append(
-                {
-                    "id": item.id,
-                    "source_name": item.source_name,
-                    "score": item.score,
-                    "locator": item.locator,
-                    "content_kind": item.content_kind,
-                    "processor_kind": item.processor_kind,
-                    "content": item.content,
-                    "metadata": metadata,
-                }
-            )
-        return rows
-
     def _build_retrieval_summary(
         self,
         rt: ToolRuntime,
@@ -2282,7 +2298,7 @@ class MultiSourceAgentRunner:
             "rewritten_queries": [item["query"] for item in rt.queries],
             "retriever_type": "multi_source_agent",
             "final_top_k": len(rt.evidence),
-            "evidence": self._evidence_rows(rt.evidence),
+            "evidence": evidence_rows(rt.evidence),
             "memory_context": list(rt.memory_context),
             "missing": [],
             "retrieval_rounds": len(rt.diagnostics),

@@ -13,9 +13,10 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from src.agents.schemas import Evidence
+from src.contracts.agent_events import build_agent_event
 from src.core.cancellation import QueryCancelled
 from src.pipelines.document_rag.schemas import RequestContext
 from src.services.evidence_sources import (
@@ -30,27 +31,6 @@ MAX_EVIDENCE_CONTENT_CHARS = 1200
 # Truncating them to the generic single-chunk cap would silently drop the
 # right side and the diff before the model ever sees them.
 MAX_COMPARISON_CONTENT_CHARS = 4800
-
-TOOL_LABELS = {
-    "document_search": "文档检索",
-    "circuit_search": "电路检索",
-    "spreadsheet_row_search": "表格行检索",
-    "spreadsheet_cell_lookup": "单元格检索",
-    "memory_search": "长期记忆检索",
-    "spreadsheet_schema_lookup": "表格SQL结构",
-    "spreadsheet_sql_query": "表格SQL查询",
-    "list_kb_sources": "读取知识库目录",
-    "attachment_list": "附件清单",
-    "attachment_search": "附件检索",
-    "attachment_read": "附件精读",
-    "attachment_table_query": "附件表格查询",
-    "attachment_circuit_search": "附件电路查询",
-    "attachment_visual_analyze": "附件视觉分析",
-    "request_attachment_release": "附件发布申请",
-    "attachment_revision_history": "附件修订历史",
-    "list_knowledge_sources": "多库目录",
-    "wiki_search": "Wiki 检索",
-}
 
 MAX_MEMORY_CONTEXT_CONTENT_CHARS = 2_000
 
@@ -94,19 +74,6 @@ def memory_context_item(row: dict[str, Any]) -> dict[str, Any]:
         "has_provenance": bool(row.get("has_provenance")),
         "score": row.get("score"),
     }
-
-
-def tool_label(tool_name: str) -> str:
-    """Human label for a tool; external MCP tools get a server-qualified name."""
-
-    name = str(tool_name or "")
-    if name.startswith("mcp__") and "__" in name[5:]:
-        slug, tool = name[5:].split("__", 1)
-        if slug and tool:
-            return f"外部插件 · {slug} · {tool}"
-    if name.startswith("skill__") or name == "skill_task_status":
-        return "沙箱 Skill"
-    return TOOL_LABELS.get(name, name)
 
 
 _LATIN_TOKEN_RE = re.compile(r"[A-Za-z0-9_]{2,}")
@@ -174,6 +141,12 @@ class AdmittedEvidence(list):
     # fact about the knowledge base.  Keep both fields on every result list.
     failure: str = ""
     tool_name: str = ""
+    # no_match / budget_blocked / out_of_scope / tool_error
+    empty_reason: str = ""
+    # Search hits that were deliberately kept out of the citation ledger until
+    # the model asks for them through evidence_read.
+    candidate_rows: list[dict[str, Any]] = []
+    candidate_count: int = 0
 
 
 class CitationAdmission(list):
@@ -248,6 +221,22 @@ class ToolRuntime:
     invocations: list[dict[str, Any]] = field(default_factory=list)
     candidate_pool: dict[str, Evidence] = field(default_factory=dict)
     _candidate_pool_order: list[str] = field(default_factory=list)
+    # Two-stage retrieval: search hits stay as non-citable candidates; only
+    # evidence_read promotes selected rows into the citation ledger.
+    candidate_mode: bool = False
+    candidate_store_limit: int = 60
+    candidate_evidence: dict[str, Evidence] = field(default_factory=dict)
+    candidate_order: list[str] = field(default_factory=list)
+    _candidate_seq: int = 0
+    # A productive loop may run longer; repeated/no-new-result loops stop early
+    # instead of burning the full recursion budget.
+    no_progress_limit: int = 4
+    no_progress_streak: int = 0
+    progress_events: int = 0
+    loop_stop_reason: str = ""
+    seen_sources: set[str] = field(default_factory=set)
+    prior_evidence_ids: set[str] = field(default_factory=set)
+    prior_gaps: list[str] = field(default_factory=list)
     last_rejection_reasons: dict[str, int] = field(default_factory=dict)
     _invocation_seq: int = 0
     multi_kb_source_outcomes: list[dict[str, Any]] = field(default_factory=list)
@@ -281,18 +270,122 @@ class ToolRuntime:
             self._active_call_epochs.clear()
             self.candidate_pool.clear()
             self._candidate_pool_order.clear()
+            self.candidate_evidence.clear()
+            self.candidate_order.clear()
 
     def check_cancel(self) -> None:
         if self.should_cancel is not None and self.should_cancel():
             self.mark_ended()
             raise QueryCancelled("用户取消查询")
 
+    def note_progress(self) -> None:
+        """A tool call added new evidence, candidates or a new source."""
+
+        with self._lock:
+            self.no_progress_streak = 0
+            self.progress_events += 1
+
+    def note_no_progress(self) -> None:
+        """Stop a loop that keeps returning the same material."""
+
+        with self._lock:
+            if self.loop_stop_reason:
+                return
+            self.no_progress_streak += 1
+            if self.no_progress_streak >= max(1, int(self.no_progress_limit)):
+                self.loop_stop_reason = "no_progress"
+
+    def should_stop_for_no_progress(self) -> bool:
+        with self._lock:
+            return bool(self.loop_stop_reason)
+
     def emit(self, evt_type: str, payload: dict[str, Any]) -> None:
+        event = build_agent_event(evt_type, **payload)
         if self.on_event is not None:
             try:
-                self.on_event({"type": evt_type, "payload": payload})
+                self.on_event(event)
             except Exception:
                 pass
+
+    def tool_started(
+        self,
+        *,
+        call_id: str,
+        tool_name: str,
+        tool_kind: str = "retrieval",
+        query: str = "",
+        server: str = "",
+        tool: str = "",
+        transport: str = "",
+        skill_ref: str = "",
+        task_id: str = "",
+        automatic: bool = False,
+    ) -> None:
+        self.emit(
+            "tool_started",
+            {
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "tool_kind": tool_kind,
+                "query": query,
+                "server": server,
+                "tool": tool,
+                "transport": transport,
+                "skill_ref": skill_ref,
+                "task_id": task_id,
+                "automatic": automatic,
+            },
+        )
+
+    def tool_result(
+        self,
+        *,
+        call_id: str,
+        tool_name: str,
+        status: str,
+        tool_kind: str = "retrieval",
+        hit_count: int = 0,
+        evidence_count: int = 0,
+        candidate_count: int = 0,
+        sources: list[str] | None = None,
+        citation_numbers: list[int] | None = None,
+        empty_reason: str = "",
+        latency_ms: int | None = None,
+        result_bytes: int = 0,
+        truncated: bool = False,
+        error: str = "",
+        server: str = "",
+        tool: str = "",
+        transport: str = "",
+        skill_ref: str = "",
+        task_id: str = "",
+        automatic: bool = False,
+    ) -> None:
+        self.emit(
+            "tool_result",
+            {
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "tool_kind": tool_kind,
+                "status": status,
+                "hit_count": hit_count,
+                "evidence_count": evidence_count,
+                "candidate_count": candidate_count,
+                "sources": list(sources or []),
+                "citation_numbers": list(citation_numbers or []),
+                "empty_reason": empty_reason,
+                "latency_ms": latency_ms,
+                "result_bytes": result_bytes,
+                "truncated": truncated,
+                "error": error,
+                "server": server,
+                "tool": tool,
+                "transport": transport,
+                "skill_ref": skill_ref,
+                "task_id": task_id,
+                "automatic": automatic,
+            },
+        )
 
     def log_query(self, tool_name: str, query: str) -> None:
         q = str(query or "").strip()
@@ -413,7 +506,12 @@ class ToolRuntime:
             except Exception:
                 pass
 
-    def add_evidence(self, items: list[Evidence], *, epoch: int | None = None) -> CitationAdmission:
+    def add_evidence(
+        self,
+        items: list[Evidence],
+        *,
+        epoch: int | None = None,
+    ) -> CitationAdmission:
         """Register evidence rows and return their 1-based citation numbers.
 
         ``None`` marks items rejected by the evidence budget: they were never
@@ -614,6 +712,9 @@ class ToolRuntime:
                     reverse=True,
                 )
                 kept = set(fresh[:room])
+                self.last_rejection_reasons[
+                    "call_quota" if room == budget_room else "item_limit"
+                ] += max(0, len(fresh) - len(kept))
             else:
                 kept = set(fresh)
             for position in fresh:
@@ -681,6 +782,112 @@ class ToolRuntime:
                 key=lambda item: _evidence_relevance(question_tokens, item),
                 reverse=True,
             )
+
+    def _candidate_key(self, item: Evidence) -> str:
+        value = str(getattr(item, "id", "") or "").strip()
+        if value:
+            return value
+        self._candidate_seq += 1
+        source = str(getattr(item, "source_name", "") or "candidate")
+        return f"candidate:{self._candidate_seq}:{source}"
+
+    def stash_candidates(self, items: list[Evidence]) -> list[dict[str, Any]]:
+        """Keep search hits as non-citable candidates and return a bounded index."""
+
+        rows: list[dict[str, Any]] = []
+        with self._lock:
+            for index, item in enumerate(items):
+                key = self._candidate_key(item)
+                if key not in self.candidate_evidence:
+                    self.candidate_evidence[key] = item
+                    self.candidate_order.append(key)
+                locator = item.locator or {}
+                locator_text = ", ".join(
+                    f"{name}={value}"
+                    for name, value in locator.items()
+                    if value not in (None, "", [], {})
+                )
+                rows.append(
+                    {
+                        "id": key,
+                        "source": str(item.source_name or ""),
+                        "locator": locator_text[:160],
+                        "score": float(item.score or 0.0),
+                        "snippet": " ".join(str(item.content or "").split())[:180],
+                    }
+                )
+            while len(self.candidate_order) > max(1, int(self.candidate_store_limit)):
+                stale = self.candidate_order.pop(0)
+                self.candidate_evidence.pop(stale, None)
+        return rows
+
+    def read_candidates(
+        self, candidate_ids: Iterable[str]
+    ) -> tuple[list[Evidence], list[str]]:
+        """Resolve candidate IDs; no admission happens here."""
+
+        selected: list[Evidence] = []
+        missing: list[str] = []
+        with self._lock:
+            for raw in candidate_ids:
+                key = str(raw or "").strip()
+                if not key:
+                    continue
+                item = self.candidate_evidence.get(key)
+                if item is None:
+                    missing.append(key)
+                else:
+                    selected.append(item)
+        return selected, missing
+
+    def drop_candidates(self, candidate_ids: Iterable[str]) -> None:
+        """Forget candidates that were promoted into formal evidence."""
+
+        with self._lock:
+            for raw in candidate_ids:
+                key = str(raw or "").strip()
+                if not key:
+                    continue
+                self.candidate_evidence.pop(key, None)
+                if key in self.candidate_order:
+                    self.candidate_order.remove(key)
+
+    def prior_evidence_prompt(self, limit: int = 8) -> str:
+        """Render recent-turn evidence pointers for follow-up questions."""
+
+        with self._lock:
+            rows = []
+            for key in self.candidate_order:
+                if key not in self.prior_evidence_ids:
+                    continue
+                item = self.candidate_evidence.get(key)
+                if item is None:
+                    continue
+                rows.append(
+                    f"- id={key} | {item.source_name or '未知来源'} | "
+                    f"{item.locator or '无位置'} | {' '.join(str(item.content or '').split())[:160]}"
+                )
+                if len(rows) >= max(1, int(limit)):
+                    break
+        if not rows:
+            return ""
+        return (
+            "上一轮已读证据（不可直接引用；需要时用 evidence_read 重新登记）：\n"
+            + "\n".join(rows)
+        )
+
+    def prior_gap_prompt(self) -> str:
+        """Render last turn's unresolved gaps as a follow-up checklist."""
+
+        with self._lock:
+            gaps = [gap for gap in self.prior_gaps[:5] if str(gap).strip()]
+        if not gaps:
+            return ""
+        return (
+            "上一轮遗留缺口（若与本轮问题相关，先用不同关键词或不同来源补齐；"
+            "已解决则忽略，不要重复上一轮相同检索）：\n"
+            + "\n".join(f"- {gap}" for gap in gaps)
+        )
 
     def add_memory_context(self, items: list[dict[str, Any]]) -> None:
         """Keep unique long-term memory rows for the final UI summary."""
@@ -769,6 +976,8 @@ def timed_tool_call(
     query: str,
     filters: dict[str, Any] | None,
     fn: Callable[[], list[Evidence]],
+    *,
+    candidate_only: bool = False,
 ) -> tuple[AdmittedEvidence, bool]:
     """Shared wrapper: cancel-check, timing, diagnostics and event emission.
 
@@ -788,7 +997,12 @@ def timed_tool_call(
     was_repeat = rt.has_query(tool_name, query)
     with rt._lock:
         pre_registered = set(rt.evidence_index)
-    rt.emit("tool_started", {"tool_name": tool_name, "query": query})
+        pre_candidates = set(rt.candidate_evidence)
+    rt.tool_started(
+        call_id=invocation_id,
+        tool_name=tool_name,
+        query=query,
+    )
     started = time.monotonic()
     call_epoch = rt.begin_tool_call()
     phase_timings: dict[str, int] = {}
@@ -864,14 +1078,15 @@ def timed_tool_call(
                 filters=dict(filters or {}),
             )
         )
-        rt.emit(
-            "tool_result",
-            {
-                "tool_name": tool_name,
-                "hit_count": 0,
-                "status": "failed",
-                "latency_ms": int((time.monotonic() - started) * 1000),
-            },
+        rt.tool_result(
+            call_id=invocation_id,
+            tool_name=tool_name,
+            hit_count=0,
+            evidence_count=0,
+            status="failed",
+            empty_reason="tool_error",
+            latency_ms=int((time.monotonic() - started) * 1000),
+            error=str(exc)[:300],
         )
         rt.emit(
             "degraded",
@@ -885,6 +1100,7 @@ def timed_tool_call(
         failed = AdmittedEvidence()
         failed.failure = friendly_error_message(exc)
         failed.tool_name = tool_name
+        rt.note_no_progress()
         return failed, False
     source_statuses = [dict(item) for item in getattr(items, "source_statuses", [])]
     fusion_summary = dict(getattr(items, "fusion_summary", {}) or {})
@@ -899,33 +1115,63 @@ def timed_tool_call(
     navigation_only = bool(items) and all(
         str((item.metadata or {}).get("evidence_role") or "") == "navigation" for item in items
     )
+    candidate_rows: list[dict[str, Any]] = []
+    admission_items = items
     if navigation_only:
         for item in items:
             item.metadata = {**item.metadata, "citation_number": 0}
         numbers = CitationAdmission([None for _ in items], previously_registered=rt.evidence_index)
         admitted_items = AdmittedEvidence(items)
+    elif candidate_only or (rt.candidate_mode and tool_name in {
+        "document_search",
+        "document_search_batch",
+        "circuit_search",
+        "conversation_search",
+        "wiki_search",
+        "spreadsheet_row_search",
+        "spreadsheet_cell_lookup",
+        "spreadsheet_schema_lookup",
+        "spreadsheet_sql_query",
+        "attachment_search",
+        "attachment_table_query",
+        "attachment_circuit_search",
+    }):
+        # Pointer-first: every search hit stays non-citable until evidence_read.
+        candidate_rows = rt.stash_candidates(items)
+        numbers = CitationAdmission([None for _ in items], previously_registered=rt.evidence_index)
+        admitted_items = AdmittedEvidence()
     else:
-        numbers = rt.add_evidence(items, epoch=call_epoch)
+        numbers = rt.add_evidence(
+            admission_items,
+            epoch=call_epoch,
+        )
         admitted_items = AdmittedEvidence()
     rt.end_tool_call(call_epoch)
     admitted_items.source_statuses = source_statuses
     admitted_items.fusion_summary = fusion_summary
     admitted_items.previous_evidence_ids = numbers.previously_registered
+    admitted_items.candidate_rows = candidate_rows
+    admitted_items.candidate_count = len(candidate_rows)
     if not navigation_only:
-        for item, number in zip(items, numbers):
+        for item, number in zip(admission_items, numbers):
             if number is None:
                 continue
             item.metadata = {**item.metadata, "citation_number": number}
             admitted_items.append(item)
     rt.record_invocation(invocation_diagnostic(
         "ok", admitted=0 if navigation_only else len(admitted_items),
-        error="budget_discarded" if items and not admitted_items else "",
+        error="budget_discarded" if items and not admitted_items and not candidate_rows else "",
     ))
     if fusion_summary:
         with rt._lock:
+            candidate_ids = {str(row.get("id") or "") for row in candidate_rows}
             fusion_summary["runtime_admission"] = {
                 "admitted_items": len(admitted_items),
-                "budget_discarded": sum(number is None for number in numbers),
+                "candidates_staged": len(candidate_rows),
+                "budget_discarded": sum(
+                    number is None and str(item.id or "") not in candidate_ids
+                    for item, number in zip(admission_items, numbers)
+                ),
                 "rejection_reasons": dict(getattr(rt, "last_rejection_reasons", {}) or {}),
                 "coverage": {
                     source.kb_id: any(item.metadata.get("kb_id") == source.kb_id for item in admitted_items)
@@ -966,10 +1212,33 @@ def timed_tool_call(
         pass
     if source_statuses:
         rt.record_multi_kb_result(source_statuses, fusion_summary)
-    # Distinguish "the source has nothing" from "the run already holds its
-    # full evidence budget": only the latter is an execution limit, and the
-    # model must be told so it can answer with the evidence it already has.
-    admitted_items.budget_blocked = bool(items) and not admitted_items
+    # Distinguish "the source has nothing", "the current turn scope filtered
+    # it", and "the run already holds its full evidence budget". Only the last
+    # one is an execution limit; labeling every empty admission as budget-full
+    # makes a simple out-of-scope lookup look like a quota problem.
+    rejection_reasons = dict(getattr(rt, "last_rejection_reasons", {}) or {})
+    budget_reasons = {
+        "call_quota",
+        "item_limit",
+        "byte_limit",
+        "token_limit",
+        "source_budget_exhausted",
+        "global_budget_exhausted",
+    }
+    admitted_items.budget_blocked = bool(items) and not admitted_items and any(
+        int(rejection_reasons.get(reason) or 0) > 0 for reason in budget_reasons
+    )
+    if not admitted_items:
+        if admitted_items.budget_blocked:
+            admitted_items.empty_reason = "budget_blocked"
+        elif candidate_rows:
+            # The call did return usable hits; they are deliberately not
+            # registered yet, so this is not a retrieval "no match".
+            admitted_items.empty_reason = ""
+        elif items and getattr(rt, "turn_evidence_plan", None) is not None:
+            admitted_items.empty_reason = "out_of_scope"
+        else:
+            admitted_items.empty_reason = "no_match"
     rt.record_diagnostic(
         ToolDiagnostics(
             tool_name=tool_name,
@@ -978,14 +1247,50 @@ def timed_tool_call(
             filters=dict(filters or {}),
         )
     )
-    rt.emit(
-        "tool_result",
-        {
-            "tool_name": tool_name,
-            "hit_count": len(admitted_items),
-            "status": "done",
-            "latency_ms": latency_ms,
-        },
+    source_names = list(
+        dict.fromkeys(
+            str(item.source_name or "").strip()
+            for item in admitted_items
+            if str(item.source_name or "").strip()
+        )
+    )[:3]
+    if not source_names:
+        source_names = list(
+            dict.fromkeys(
+                str(row.get("source") or "").strip()
+                for row in candidate_rows
+                if str(row.get("source") or "").strip()
+            )
+        )[:3]
+    new_evidence = any(
+        number is not None and item.id not in pre_registered
+        for item, number in zip(admission_items, numbers)
+    )
+    with rt._lock:
+        new_candidates = bool(set(rt.candidate_evidence) - pre_candidates)
+        new_sources = bool(set(source_names) - rt.seen_sources)
+        rt.seen_sources.update(source_names)
+    if new_evidence or new_sources or (new_candidates and not admitted_items.budget_blocked):
+        rt.note_progress()
+    else:
+        rt.note_no_progress()
+    citation_numbers = [
+        int(item.metadata.get("citation_number") or 0)
+        for item in admitted_items
+        if int(item.metadata.get("citation_number") or 0) > 0
+    ][:8]
+    empty_reason = str(getattr(admitted_items, "empty_reason", "") or "")
+    rt.tool_result(
+        call_id=invocation_id,
+        tool_name=tool_name,
+        hit_count=len(admitted_items),
+        evidence_count=len(admitted_items),
+        candidate_count=len(candidate_rows),
+        sources=source_names,
+        citation_numbers=citation_numbers,
+        empty_reason=empty_reason,
+        status="done",
+        latency_ms=latency_ms,
     )
     adds_nothing = bool(admitted_items) and all(
         item.id and item.id in (numbers.previously_registered if rt.knowledge_scope is not None else pre_registered)
@@ -1210,6 +1515,38 @@ def format_navigation_for_llm(items: list[Evidence]) -> str:
     )
 
 
+def format_candidates_for_llm(rows: list[dict[str, Any]], *, limit: int = 12) -> str:
+    """Render the non-citable candidate index without dumping full content.
+
+    The first ``limit`` rows keep their snippet; the rest stay addressable as
+    compact pointers so ``evidence_read`` can still promote them. Hiding their
+    ids entirely made large candidate sets unusable.
+    """
+
+    if not rows:
+        return ""
+    visible = list(rows)[: max(1, int(limit))]
+    remaining = list(rows)[max(1, int(limit)):]
+    lines = [
+        "候选证据（尚未登记，不能直接引用；需要正文时调用 evidence_read）："
+    ]
+    for row in visible:
+        score = float(row.get("score") or 0.0)
+        lines.append(
+            f"- id={row.get('id')} | {row.get('source') or '未知来源'}"
+            f" | {row.get('locator') or '无位置'} | score={score:.2f}"
+            f" | {row.get('snippet') or ''}"
+        )
+    if remaining:
+        lines.append("其余候选指针（仅列 id/来源/位置，同样可 evidence_read）：")
+        for row in remaining:
+            lines.append(
+                f"- id={row.get('id')} | {row.get('source') or '未知来源'}"
+                f" | {row.get('locator') or '无位置'}"
+            )
+    return "\n".join(lines)
+
+
 def _format_tool_result_inner(rt: ToolRuntime, adds_nothing: bool, items: list[Evidence]) -> str:
     """Render a tool result for the model, collapsing no-op repeat calls.
 
@@ -1230,6 +1567,8 @@ def _format_tool_result_inner(rt: ToolRuntime, adds_nothing: bool, items: list[E
         if item.get("status") not in {"success_with_hits", "success_empty"}
     ]
 
+    candidate_rows = list(getattr(items, "candidate_rows", []) or [])
+
     def with_status_message(rendered: str) -> str:
         if not statuses:
             return rendered
@@ -1240,7 +1579,18 @@ def _format_tool_result_inner(rt: ToolRuntime, adds_nothing: bool, items: list[E
         )
         return f"{rendered}\n\n来源检索未完成（部分结果不可用）：\n{rows}"
 
+    def with_candidates(rendered: str) -> str:
+        candidate_text = format_candidates_for_llm(candidate_rows)
+        return f"{rendered}\n\n{candidate_text}" if candidate_text else rendered
+
     if not items:
+        if candidate_rows and not bool(getattr(items, "budget_blocked", False)):
+            return with_status_message(with_candidates("（已返回候选，尚未登记证据。）"))
+        if getattr(items, "empty_reason", "") == "out_of_scope":
+            return with_status_message(
+                "（本次检索结果被本轮来源范围或目标过滤；这不代表知识库没有相关内容。"
+                "请检查来源范围，或明确说明当前范围无法覆盖该问题。）"
+            )
         return with_status_message(empty_result_message(
             rt,
             "（未找到相关内容）",
@@ -1255,6 +1605,10 @@ def _format_tool_result_inner(rt: ToolRuntime, adds_nothing: bool, items: list[E
         cited = " ".join(f"[{number}]" for number in numbers)
         # 事实陈述，不带指令：是否继续引用 [n]、换关键词还是再次检索，
         # 由模型根据当前对话自行判断（策略在 SYSTEM_PROMPT，不在这里）。
+        if candidate_rows:
+            return with_status_message(with_candidates(
+                f"本次调用返回的正式证据与历史消息中已注册的 {cited} 完全相同，无新增正式证据。"
+            ))
         return with_status_message(
             f"本次调用返回的证据与历史消息中已注册的 {cited} 完全相同，无新增内容。"
         )
@@ -1264,10 +1618,10 @@ def _format_tool_result_inner(rt: ToolRuntime, adds_nothing: bool, items: list[E
         if previous:
             fresh = [item for item in items if item.id not in previous_ids]
             cited = " ".join(f"[{item.metadata['citation_number']}]" for item in previous)
-            return with_status_message(
+            return with_status_message(with_candidates(
                 f"{format_evidence_for_llm(fresh)}\n\n已注册证据 {cited} 的正文见此前检索结果。"
-            )
-    return with_status_message(format_evidence_for_llm(items))
+            ))
+    return with_status_message(with_candidates(format_evidence_for_llm(items)))
 
 
 def format_tool_result(rt: ToolRuntime, adds_nothing: bool, items: list[Evidence]) -> str:

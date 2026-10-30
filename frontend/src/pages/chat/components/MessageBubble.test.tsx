@@ -14,29 +14,31 @@ describe('complex turn meta panels', () => {
     created_at: '2026-10-26T00:00:00Z',
   };
 
-  it('renders the agent plan with progress', () => {
+  it('does not render a plan panel', () => {
     const html = renderToStaticMarkup(
       <MessageBubble
-        msg={{ ...baseMessage, content: '' }}
+        msg={{
+          ...baseMessage,
+          content: '',
+          plan: {
+            revision: 1,
+            items: [
+              { content: '读取上一代 BOM', status: 'completed' },
+              { content: '检索知识库约束', status: 'in_progress' },
+              { content: '输出推荐表', status: 'pending' },
+            ],
+          },
+        }}
         streaming
         streamingText="候选 BOM [1]"
-        plan={{
-          revision: 1,
-          items: [
-            { content: '读取上一代 BOM', status: 'completed' },
-            { content: '检索知识库约束', status: 'in_progress' },
-            { content: '输出推荐表', status: 'pending' },
-          ],
-        }}
       />,
     );
-    expect(html).toContain('执行计划');
-    expect(html).toContain('1/3');
-    expect(html).toContain('读取上一代 BOM');
-    expect(html).toContain('进行中');
+    expect(html).not.toContain('执行计划');
+    expect(html).not.toContain('读取上一代 BOM');
+    expect(html).not.toContain('进行中');
   });
 
-  it('renders the budget-exhausted partial result with continue actions', () => {
+  it('does not render a budget-exhausted card', () => {
     const html = renderToStaticMarkup(
       <MessageBubble
         msg={{
@@ -52,18 +54,16 @@ describe('complex turn meta panels', () => {
             context_compressed: { evidence_count: 41, compressed_bytes: 20480 },
           },
         }}
-        onContinue={() => undefined}
-        onNarrowScope={() => undefined}
       />,
     );
-    expect(html).toContain('本轮执行预算已用完');
-    expect(html).toContain('41 次工具调用');
-    expect(html).toContain('继续完成');
-    expect(html).toContain('缩小范围');
-    expect(html).toContain('20 KB');
+    expect(html).not.toContain('本轮执行预算已用完');
+    expect(html).not.toContain('41 次工具调用');
+    expect(html).not.toContain('继续完成');
+    expect(html).not.toContain('缩小范围');
+    expect(html).not.toContain('20 KB');
   });
 
-  it('renders a partial delivery that did not exhaust the loop budget', () => {
+  it('does not render a partial-delivery card', () => {
     const html = renderToStaticMarkup(
       <MessageBubble
         msg={{
@@ -76,15 +76,15 @@ describe('complex turn meta panels', () => {
             evidence_count: 20,
           },
         }}
-        onContinue={() => undefined}
       />,
     );
-    expect(html).toContain('本轮为部分交付');
-    expect(html).toContain('已基于已有证据生成本轮可交付的部分结果');
-    expect(html).toContain('继续完成');
+    expect(html).not.toContain('本轮为部分交付');
+    expect(html).not.toContain('已基于已有证据生成本轮可交付的部分结果');
+    expect(html).not.toContain('继续完成');
+    expect(html).not.toContain('缩小范围');
   });
 
-  it('renders a context-window notice without treating it as a budget failure', () => {
+  it('does not render automatic context-window notices as cards', () => {
     const html = renderToStaticMarkup(
       <MessageBubble
         msg={{
@@ -101,12 +101,82 @@ describe('complex turn meta panels', () => {
         }}
       />,
     );
-    expect(html).toContain('上下文预算');
-    expect(html).toContain('58000 tokens');
+    expect(html).not.toContain('接近上下文窗口');
+    expect(html).not.toContain('上下文预算');
     expect(html).not.toContain('本轮执行预算已用完');
+    expect(html).not.toContain('继续完成');
   });
 
-  it('renders verification checks and gaps, including model checks', () => {
+  it('renders tool results as one flat chronological process', () => {
+    const html = renderToStaticMarkup(
+      <MessageBubble
+        msg={{ ...baseMessage, content: '' }}
+        streaming
+        streamingText="回答"
+        traceSteps={[
+          {
+            key: 'inv-1',
+            kind: 'tool',
+            call_id: 'inv-1',
+            label: '文档检索',
+            status: 'done',
+            detail: '3 条命中 · 9ms',
+            input: '电源方案',
+            sources: ['设计说明.docx', 'BOM.xlsx'],
+            evidence_count: 3,
+            candidate_count: 2,
+          },
+          {
+            key: 'inv-2',
+            kind: 'tool',
+            call_id: 'inv-2',
+            label: '电路检索',
+            status: 'done',
+            detail: '0 条命中',
+            input: 'PMU',
+            sources: [],
+            empty_reason: 'no_match',
+          },
+        ]}
+      />,
+    );
+    expect(html).toContain('处理过程');
+    expect(html).toContain('文档检索');
+    expect(html).toContain('设计说明.docx');
+    expect(html).toContain('3 条证据');
+    expect(html).toContain('2 条候选');
+    expect(html).toContain('无结果：知识库未命中');
+  });
+
+  it('does not render automatic compaction as a message card', () => {
+    const html = renderToStaticMarkup(
+      <MessageBubble
+        msg={{
+          ...baseMessage,
+          budget: {
+            status: 'ok',
+            exhausted: false,
+            context_compaction: {
+              stage: 'summarization',
+              trigger: 'auto',
+              cutoff_index: 18,
+              dropped_messages: 18,
+              retained_messages: 6,
+              before_tokens: 30000,
+              after_tokens: 9000,
+              summary_chars: 1200,
+              window_id: 'turn-1:abcdef',
+            },
+          },
+        }}
+      />,
+    );
+    expect(html).not.toContain('上下文已压缩');
+    expect(html).not.toContain('上下文预算');
+    expect(html).not.toContain('继续完成');
+  });
+
+  it('does not render a verification panel', () => {
     const html = renderToStaticMarkup(
       <MessageBubble
         msg={{
@@ -129,11 +199,10 @@ describe('complex turn meta panels', () => {
         }}
       />,
     );
-    expect(html).toContain('系统校验');
-    expect(html).toContain('部分完成');
-    expect(html).toContain('五类覆盖');
-    expect(html).toContain('模型');
-    expect(html).toContain('缺少车规密封连接器型号');
+    expect(html).not.toContain('系统校验');
+    expect(html).not.toContain('部分完成');
+    expect(html).not.toContain('五类覆盖');
+    expect(html).not.toContain('缺少车规密封连接器型号');
   });
 
   it('renders a read-only research subtask without raw context', () => {

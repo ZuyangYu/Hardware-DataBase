@@ -91,6 +91,7 @@
    GET /turns/{id}/events?after=<seq>（SSE）
      ├─ 进程内队列（同进程 worker）或 Redis Stream（跨进程）或 DB 轮询（兜底 0.4s）
      └─ 事件：delta / narration / stage / tool_started / tool_result / degraded / done / error
+        （payload 经 src/contracts/agent_events.py 校验；工具事件带 call_id）
 6. 落账
    query_traces + retrieved_evidence（审计中心可查、带 OTel trace 链接）
 ```

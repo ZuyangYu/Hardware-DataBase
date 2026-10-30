@@ -664,7 +664,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             _delta_first_at.clear()
         event = _append_owned_event("delta", {"text": text})
         if event is not None:
-            _publish_turn_event(turn_id, event.seq, "delta", {"text": text})
+            _publish_turn_event(turn_id, event.seq, "delta", event.payload)
 
     def emit(event_type: str, payload: dict) -> None:
         conv.touch_turn_worker(turn_id, worker_id, fencing_token=ownership_token)
@@ -689,7 +689,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         event = _append_owned_event(event_type, payload)
         if event is None:
             return
-        _publish_turn_event(turn_id, event.seq, event_type, payload)
+        _publish_turn_event(turn_id, event.seq, event_type, event.payload)
 
     def emit_stage(key: str, label: str, status: str = "running", detail: str = "", **extra: Any) -> None:
         now = time.monotonic()

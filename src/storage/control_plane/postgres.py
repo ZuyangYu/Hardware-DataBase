@@ -29,6 +29,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
+from src.contracts.agent_events import validate_agent_event
 from src.core.conversation import (
     GENERAL_CHAT_KB_NAME,
     ChatMessage,
@@ -228,6 +229,7 @@ class PostgresExecutionStore:
     def _append_event_locked(
         conn, turn_id: str, event_type: str, payload: dict
     ) -> ChatTurnEvent:
+        payload = validate_agent_event(event_type, payload)
         row = conn.execute(
             """
             WITH bump AS (
@@ -1752,6 +1754,7 @@ class PostgresExecutionStore:
         attempt_id: str = "",
         fencing_token: int | None = None,
     ) -> ChatTurnEvent:
+        payload = validate_agent_event(event_type, payload)
         if fencing_token is None:
             with self._tx() as conn:
                 return self._append_event_locked(conn, str(turn_id), event_type, payload)

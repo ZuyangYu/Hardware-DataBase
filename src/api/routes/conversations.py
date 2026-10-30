@@ -119,7 +119,7 @@ def _trace_steps_from_events(events) -> list[dict]:
     stage / tool_started / tool_result 三类事件驱动实时执行轨迹；刷新页面后
     用同一规则从 chat_turn_events 重建，避免轨迹只在当次流式会话里可见。
     """
-    from src.agents.tools.runtime import tool_label
+    from src.contracts.agent_events import tool_label
 
     steps: list[dict] = []
     active: dict[str, int] = {}
@@ -132,33 +132,57 @@ def _trace_steps_from_events(events) -> list[dict]:
             name = str(payload.get("tool_name") or "").strip()
             if not name:
                 continue
-            active[name] = len(steps)
+            call_id = str(getattr(event, "call_id", "") or payload.get("call_id") or "").strip()
+            # Events written before the typed protocol have no call_id.  Keep
+            # their history readable with a deterministic key, but new events
+            # always correlate through call_id.
+            key = call_id or f"{name}#{len(steps) + 1}"
+            active[call_id or name] = len(steps)
             steps.append(
                 {
-                    "key": f"{name}#{len(steps) + 1}",
-                    "label": tool_label(name),
+                    "key": key,
+                    "kind": "tool",
+                    "call_id": call_id,
+                    "label": str(payload.get("label") or tool_label(name)),
                     "status": "running",
-                    "detail": str(payload.get("query") or ""),
+                    "detail": str(payload.get("detail") or payload.get("query") or ""),
+                    "input": str(payload.get("query") or ""),
                 }
             )
         elif event_type == "tool_result":
             name = str(payload.get("tool_name") or "").strip()
             if not name:
                 continue
-            hits = int(payload.get("hit_count") or 0)
-            latency = payload.get("latency_ms")
-            detail = f"{hits} 条命中"
-            if isinstance(latency, (int, float)):
-                detail += f" · {int(latency)}ms"
+            call_id = str(getattr(event, "call_id", "") or payload.get("call_id") or "").strip()
+            index = active.get(call_id or name)
+            detail = str(payload.get("detail") or "")
+            if not detail:
+                hits = int(payload.get("hit_count") or 0)
+                latency = payload.get("latency_ms")
+                detail = f"{hits} 条命中"
+                if isinstance(latency, (int, float)):
+                    detail += f" · {int(latency)}ms"
+            status = str(payload.get("status") or "done")
             step = {
-                "key": f"{name}#{len(steps) + 1}",
-                "label": tool_label(name),
-                "status": "error" if payload.get("status") == "failed" else "done",
+                "key": call_id or f"{name}#{len(steps) + 1}",
+                "kind": "tool",
+                "call_id": call_id,
+                "label": str(payload.get("label") or tool_label(name)),
+                "status": "error" if status in {"failed", "rejected", "timeout", "cancelled"} else "done",
                 "detail": detail,
+                "sources": list(payload.get("sources") or [])[:5],
+                "evidence_count": int(payload.get("evidence_count") or 0),
+                "candidate_count": int(payload.get("candidate_count") or 0),
+                "citation_numbers": list(payload.get("citation_numbers") or [])[:8],
+                "empty_reason": str(payload.get("empty_reason") or ""),
             }
-            index = active.get(name)
-            if index is not None and 0 <= index < len(steps) and steps[index]["key"].startswith(f"{name}#"):
-                steps[index] = {**steps[index], **step, "key": steps[index]["key"]}
+            if index is not None and 0 <= index < len(steps):
+                steps[index] = {
+                    **steps[index],
+                    **step,
+                    "key": steps[index]["key"],
+                    "input": steps[index].get("input") or "",
+                }
             else:
                 steps.append(step)
         elif event_type == "stage":
@@ -167,6 +191,7 @@ def _trace_steps_from_events(events) -> list[dict]:
                 continue
             step = {
                 "key": key,
+                "kind": "stage",
                 "label": str(payload.get("label") or key),
                 "status": str(payload.get("status") or "done"),
                 "detail": str(payload.get("detail") or ""),

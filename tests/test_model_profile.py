@@ -48,6 +48,14 @@ class ModelProfileTests(unittest.TestCase):
         self.assertIsInstance(model.profile, dict)
         self.assertEqual(model.profile["max_input_tokens"], 65536)
 
+    def test_known_model_caps_stale_global_window(self):
+        app_settings.AGENT_MODEL_MAX_INPUT_TOKENS = 65536
+
+        model = create_chat_model(provider="custom", model="qwen2.5:32b")
+
+        self.assertIsInstance(model.profile, dict)
+        self.assertEqual(model.profile["max_input_tokens"], 32768)
+
     def test_apply_model_profile_respects_existing_declaration(self):
         class _Model:
             profile: dict | None = {"max_input_tokens": 400000, "max_output_tokens": 64000}

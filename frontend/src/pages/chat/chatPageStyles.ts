@@ -22,7 +22,7 @@ export const CHAT_HEADER_TITLE_META_CLASS =
 export const CHAT_HEADER_ACTIONS_CLASS = 'flex shrink-0 items-center gap-[6px]';
 
 export const CHAT_MESSAGES_CLASS =
-  'min-h-0 flex-1 overflow-y-auto px-[28px] pt-[28px] pb-[78px]';
+  'min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-[28px] pt-[28px] pb-[78px]';
 export const CHAT_MESSAGE_STACK_CLASS = 'mx-auto flex w-full max-w-[860px] flex-col gap-[24px]';
 
 export const CHAT_MESSAGE_ITEM_CLASS = 'flex min-w-0 flex-col';
@@ -76,7 +76,7 @@ export const CHAT_MARKDOWN_CLASS = cn(
   '[&_blockquote]:my-[10px] [&_blockquote]:border-l-[3px] [&_blockquote]:border-[#dfe5f2] [&_blockquote]:pl-[12px] [&_blockquote]:text-[#5b6273]',
   '[&_hr]:my-[12px] [&_hr]:border-0 [&_hr]:border-t [&_hr]:border-[#e3e7f1]',
   '[&_strong]:font-semibold',
-  '[&_code]:rounded-[5px] [&_code]:bg-[#f1f2f5] [&_code]:px-[5px] [&_code]:py-[1px] [&_code]:font-mono [&_code]:text-[12.5px]',
+  '[&_code]:font-mono [&_code]:text-[12.5px] [&_code]:text-[#3f4658]',
   '[&_.code-block-vscode]:my-[10px]',
 );
 export const CHAT_MD_TABLE_SCROLL_CLASS = 'my-[10px] max-w-full overflow-x-auto';

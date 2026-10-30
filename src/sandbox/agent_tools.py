@@ -152,8 +152,14 @@ def make_skill_tools(rt: Any, *, user_id: int | None, department_id: Any) -> lis
                     ), actor_id=principal,
                 )
                 admitted_task_id = task.task_id
-                rt.emit("tool_started", {"tool_kind": "sandbox", "tool_name": name,
-                                          "skill_ref": current.skill_ref, "task_id": task.task_id})
+                call_id = rt.next_invocation_id()
+                rt.tool_started(
+                    call_id=call_id,
+                    tool_kind="sandbox",
+                    tool_name=name,
+                    skill_ref=current.skill_ref,
+                    task_id=task.task_id,
+                )
                 # The normal worker owns dispatch/collection and their fencing
                 # leases. Do not race it with a second in-process dispatcher.
                 deadline = time.monotonic() + 60
@@ -164,9 +170,14 @@ def make_skill_tools(rt: Any, *, user_id: int | None, department_id: Any) -> lis
                         break
                     time.sleep(0.5)
                 answer = status(task.task_id)
-                rt.emit("tool_result", {"tool_kind": "sandbox", "tool_name": name,
-                                         "skill_ref": current.skill_ref, "task_id": task.task_id,
-                                         "status": store.require(task.task_id).status})
+                rt.tool_result(
+                    call_id=call_id,
+                    tool_kind="sandbox",
+                    tool_name=name,
+                    skill_ref=current.skill_ref,
+                    task_id=task.task_id,
+                    status=store.require(task.task_id).status,
+                )
                 return answer
             except QueryCancelled:
                 if admitted_task_id:

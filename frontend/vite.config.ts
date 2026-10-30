@@ -20,6 +20,10 @@ export default defineConfig({
     // 端口与 scripts/hdb.sh 的 FRONT_PORT 保持一致(5176)。
     host: '0.0.0.0',
     port: 5176,
+    // A stale proxy/browser cache is indistinguishable from an old checkout
+    // and has already caused wrong-version debugging. Dev modules are never
+    // safe to cache across edits.
+    headers: { 'Cache-Control': 'no-store' },
     allowedHosts: ['.trycloudflare.com'],
     proxy: {
       '/api': {

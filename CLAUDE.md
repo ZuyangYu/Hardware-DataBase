@@ -218,6 +218,9 @@ no hand-written nodes). It is **OpenAI-agents-style ReAct**, not a bounded
 Plan-and-Execute graph: the model decides which retrieval tools to call, in what
 order, and how many hops, inside the tool-calling loop. Every tool call emits
 `tool_started` / `tool_result` events that drive the frontend's live trace.
+Event payloads are validated by `src/contracts/agent_events.py`; tool events
+carry a stable `call_id` (from `ToolRuntime.next_invocation_id()`), so live
+streams and history replay pair calls without tool-name heuristics.
 
 Multi-hop retrieval is **agentic by design** (the 2026-08 bounded-graph with the
 deterministic gap-ledger forced re-retrieval was removed in `9db28ca`). Guardrails
@@ -241,6 +244,8 @@ tool; they share one per-request `ToolRuntime` (`runtime.py`) that scopes
 `kb_name` / `ctx` / cancellation / event callback so concurrent sessions never
 leak state. Registered in `runner.py`:
 - `document_search` (`make_document_search`) - `RAGBackend.retrieve` (RAGFlow).
+- `kb_grep` (`make_kb_grep`) - pointer-only exact/regex search across parsed docs, spreadsheet rows and circuit evidence backed by the persistent SQLite FTS5 pointer index; returns ids/locators without registering evidence.
+- `evidence_read` (`make_evidence_read`) - promotes selected non-citable search candidates into the formal evidence ledger; broad hits stay out of the evidence budget until read.
 - `circuit_search` (`make_circuit_search`) - `CircuitIndexService.query` -> structured circuit `Evidence`.
 - `spreadsheet_row_search` / `spreadsheet_cell_lookup` (`make_spreadsheet_tools`) - SQL over the per-KB spreadsheet index.
 - `conversation_search` (`make_conversation_search`) - external conversation records.
