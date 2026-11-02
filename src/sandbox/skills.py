@@ -667,7 +667,9 @@ class SkillCatalog:
             or bundle.bundle_digest.lower().removeprefix("sha256:") != digest
             or bundle.profile_ref != profile or bundle.network_policy_ref
             or bundle.catalog_source != "curated"
-            or not set(bundle.required_capabilities).issubset({"sandbox.execute", "sandbox.write_artifact"})
+            or not set(bundle.required_capabilities).issubset(
+                {"sandbox.execute", "sandbox.write_artifact", "sandbox.internal_data"}
+            )
             or "sandbox.execute" not in bundle.required_capabilities
         ):
             raise SkillStateConflict("Skill execution requires an enabled fixed no-network bundle")
@@ -749,7 +751,9 @@ class SkillCatalog:
             not bundle.enabled or bundle.bundle_digest.lower().removeprefix("sha256:") != item.execution_bundle_digest
             or bundle.profile_ref != item.execution_profile_ref or bundle.network_policy_ref
             or bundle.catalog_source != "curated"
-            or not set(bundle.required_capabilities).issubset({"sandbox.execute", "sandbox.write_artifact"})
+            or not set(bundle.required_capabilities).issubset(
+                {"sandbox.execute", "sandbox.write_artifact", "sandbox.internal_data"}
+            )
         ):
             raise SkillStateConflict("Skill execution bundle has changed or been revoked")
         return bundle

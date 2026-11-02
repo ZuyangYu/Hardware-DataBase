@@ -45,11 +45,23 @@ def package(wheel_sha256: str) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("SKILL.md", "# 输出版本报告\n给定 label，生成含 six 版本的文本报告。\n")
+        archive.writestr("steps/build_report.py", (
+            "import json\n"
+            "def build(label, version):\n"
+            "    return {\"label\": label, \"six\": version}\n"
+        ))
         archive.writestr("entrypoint.py", (
             "import json\nimport six\nfrom pathlib import Path\n"
+            "from steps.build_report import build\n"
             "params = json.loads(Path('/work/in/parameters.json').read_text())\n"
+            "payload = build(params['label'], six.__version__)\n"
+            "Path('/work/out/spec.json').write_text(json.dumps(payload, ensure_ascii=False))\n"
             "Path('/work/out/report.txt').write_text("
-            "f\"{params['label']} | six={six.__version__}\\n\")\n"
+            "f\"{payload['label']} | six={payload['six']}\\n\")\n"
+            "Path('/work/out/result.json').write_text(json.dumps({\n"
+            "    'runtime_contract_version': 'v1', 'result_status': 'completed',\n"
+            "    'artifact_ids': [], 'issues': [], 'required_inputs': [], 'required_tools': [],\n"
+            "}, ensure_ascii=False))\n"
         ))
         archive.writestr("requirements.lock", f"six==1.17.0 --hash=sha256:{wheel_sha256}\n")
     return buffer.getvalue()
@@ -134,10 +146,13 @@ def main() -> int:
                     break
                 time.sleep(0.5)
             assert task["status"] == "succeeded", task
+            assert task["result_status"] == "completed", task
             items = assert_response(client.get(f"/api/v1/sandbox/tasks/{task_id}/artifacts",
                                                headers=employee_auth), 200)["items"]
-            assert len(items) == 1 and items[0]["state"] == "committed", items
-            artifact_id = items[0]["artifact_id"]
+            by_name = {item["filename"]: item for item in items}
+            assert {"report.txt", "spec.json", "result.json"} <= set(by_name), items
+            assert all(item["state"] == "committed" for item in items), items
+            artifact_id = by_name["report.txt"]["artifact_id"]
             assert client.get(f"/api/v1/sandbox/artifacts/{artifact_id}", headers=outsider_auth).status_code in {403, 404}
             result = client.get(f"/api/v1/sandbox/artifacts/{artifact_id}", headers=employee_auth)
             assert result.status_code == 200 and result.content == b"sample | six=1.17.0\n", result.text[:100]
@@ -147,11 +162,20 @@ def main() -> int:
             events = []
             rt = SimpleNamespace(check_cancel=lambda: None, emit=lambda kind, payload: events.append((kind, payload)))
             tools = make_skill_tools(rt, user_id=int(employee["id"]), department_id=primary)
-            skill_tool = next(tool for tool in tools if tool.name.startswith("skill__"))
-            agent_result = json.loads(skill_tool.invoke({"parameters_json": '{"label":"agent"}'}))
+            skill_tool = next(tool for tool in tools if tool.name == "skill_invoke")
+            agent_result = json.loads(skill_tool.invoke({"skill_ref": skill_ref, "parameters": {"label": "agent"}}))
+            assert agent_result.get("task_id"), agent_result
+            status_tool = next(tool for tool in tools if tool.name == "skill_task_status")
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                agent_result = json.loads(status_tool.invoke({"task_id": agent_result["task_id"]}))
+                if agent_result.get("status") in {"succeeded", "failed", "cancelled", "rejected"}:
+                    break
+                time.sleep(0.5)
             assert agent_result["status"] == "succeeded", agent_result
-            assert agent_result["artifacts"][0]["untrusted_preview"] == "agent | six=1.17.0\n"
-            assert [kind for kind, _ in events] == ["tool_started", "tool_result"]
+            report = next(item for item in agent_result["artifacts"] if item["filename"] == "report.txt")
+            assert report["untrusted_preview"] == "agent | six=1.17.0\n"
+            assert [kind for kind, _ in events] == ["tool_started", "stage", "tool_result"]
             assert_response(client.delete(skill_path + "/subscribe", headers=employee_auth), 200)
             assert all(tool.name != skill_tool.name for tool in make_skill_tools(
                 rt, user_id=int(employee["id"]), department_id=primary))

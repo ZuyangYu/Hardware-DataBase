@@ -73,12 +73,12 @@ uv run python deploy/sandbox-runner/skill_api_smoke.py # 需要管理员账号�
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | GET | `/health` | 健康检查 |
-| POST | `/tasks` | 提交固定 bundle（校验 bundle digest/profile/参数 schema） |
+| POST | `/tasks` | 入队固定 bundle 并立即返回 202（校验 digest/profile/参数 schema/输入 Artifact 清单） |
 | POST | `/skill-build` | HDB 管理员上传源包后调用；使用固定模板构建（锁定依赖时可按批准的 HTTPS 源联网），返回镜像 ID、源码 digest 和 bundle 引用 |
 | POST | `/generated-bundles/{ref}/purge` | 删除已撤销 Skill 的生成 bundle 目录与固定镜像；仅接受 `bundle/skill-*`，仍有未完成任务时返回 409 |
-| GET | `/tasks/{id}` | 观察状态/执行身份/产物清单 |
+| GET | `/tasks/{id}` | 观察状态/执行身份/产物清单/Runtime Contract 结果与步骤事件 |
 | POST | `/tasks/{id}/cancel` | 请求取消；容器与工作区清理确认后终结为 cancelled |
-| POST | `/tasks/{id}/collect` | 返回内联产物清单（base64 + sha256 + execution_id） |
+| POST | `/tasks/{id}/collect` | 返回内联产物清单（base64 + sha256 + execution_id）与业务结果 |
 | POST | `/reconcile[/{id}]` | 清理孤儿容器 |
 | POST | `/services` | Gateway 独立身份；必须匹配 Runner 的 deployment/profile/镜像 ID 目录 |
 | GET | `/services/{ref}` | 逐次复核运行实例的镜像、挂载和隔离参数 |
@@ -88,6 +88,13 @@ uv run python deploy/sandbox-runner/skill_api_smoke.py # 需要管理员账号�
 
 - 任务状态持久化在 `state/runner.db`；启动及 `POST /v1/reconcile` 对账孤儿；
   重启后已丢失执行身份的任务标为 `unknown`，不会猜测成功。
+- 输出 payload 暂存在 `state/artifact-payloads/`，`collect` 时按需内联；
+  账本不长期保存完整 `content_base64`，默认保留
+  `SANDBOX_RUNNER_PAYLOAD_RETENTION_SECONDS=3600` 秒后由启动清理。
+- 运行期 worker 池默认 2 个并发、队列上限 32；可用
+  `SANDBOX_RUNNER_MAX_WORKERS` / `SANDBOX_RUNNER_MAX_QUEUE` 调整。
+- Skill stdout 仅作为诊断日志消费，默认最多保留 64 KiB；事件必须写入独立的
+  `/work/events/events.jsonl`，可用 `SANDBOX_RUNNER_MAX_STDOUT_BYTES` 调整保留上限。
 - 幂等键在账本中唯一且与参数/调用身份的请求指纹绑定；旧账本自动加列，
   缺少指纹的历史请求无法作为新提交重放，需走观察/对账。
 - 镜像 ID 分别固定在 `bundles/*/bundle.json` 与 `service-profiles.json`；
@@ -95,8 +102,9 @@ uv run python deploy/sandbox-runner/skill_api_smoke.py # 需要管理员账号�
   环境及唯一内网；以实际 OCI 容器 ID 生成稳定服务身份，Gateway 调用时复核实例。
 - 日志：`storage/logs/sandbox-runner.log`；镜像：`hdb-sandbox-bundle:1.0`。
 - 新增 bundle：把固定代码放到 `bundles/<name>/`（`entrypoint.py` + `bundle.json`，
-  含 `entrypoint_path`、输入 schema 与 digest 算法），重建镜像，并在 HDB 侧以
-  `sha256(entrypoint.py)` 注册新 digest。
+  含 `entrypoint_path`、输入 schema 与 digest 算法），重建镜像，并在 HDB 侧注册新 digest。
+  带 `source_digest` 的生成 bundle 使用“全部源码文件 + 依赖锁 + 运行时 Profile”的规范化
+  manifest digest；旧 bundle 继续按 `sha256(entrypoint.py)` 兼容复核。
 - 管理员可在 HDB 的 Skill 页面上传 ZIP（根目录 `SKILL.md` 与 `entrypoint.py`；可附带 UTF-8 文本 Python 辅助文件）。
   HDB 私有目录持久保存原始 ZIP 并记录 SHA-256。Runner 从已核验的 `bundle/report` 基础镜像
   用固定模板构建；不接受 Dockerfile、运行时动态安装或由调用方指定镜像。无依赖时构建也无网络；
@@ -107,9 +115,13 @@ uv run python deploy/sandbox-runner/skill_api_smoke.py # 需要管理员账号�
   构建后生成固定 image ID 与源码校验标签；管理员下载源包并审核 bundle/Skill、标记测试和启用。
   自动生成的 bundle 清单保存在 Runner 的 `state/skill-bundles/`（可配置
   `SANDBOX_RUNNER_SKILL_BUNDLE_ROOT`，应作为持久卷备份），不写回版本库的固定 bundle 目录。
-  执行时脚本读取 `/work/in/parameters.json`，写入 `/work/out`；容器与任务 workspace 回收，源包与镜像保留。
-  构建失败保留 HDB 草稿和源包，管理员可重试；启用后版本变更须重新上传和审核。
-  Agent 对话仅加载员工已添加且仍被授权的 Skill 工具；调用时显示任务事件，Broker 校验后的
-  小型文本产物预览返回 Agent，长任务返回任务 ID 并可使用状态工具查询。插件仍沿用 MCP 订阅与写同意。
+  执行时脚本读取 `/work/in/parameters.json` 与只读的 `/work/in/assets/<artifact-id>/<filename>`，
+  写入 `/work/out` 和 `/work/events/events.jsonl`；容器与任务 workspace 回收，源包与镜像保留。
+  执行型 Skill 必须在 `/work/out/result.json` 声明 Runtime Contract v1 结果；Runner 会校验并
+  将结果、步骤事件和产物清单一起返回 HDB。构建失败保留 HDB 草稿和源包，管理员可重试；
+  启用后版本变更须重新上传和审核。
+  Agent 对话仅加载员工已添加且仍被授权的 Skill 工具；调用参数为结构化对象，长任务只返回
+  任务 ID，随后通过 `skill_task_status` 读取结果/步骤/问题，通过 `skill_artifact_list/read/
+  preview/query` 按需读取产物。插件仍沿用 MCP 订阅与写同意。
 - **生产替换项**：升级到 L2/L3 运行时、外部产物扫描器（替换
   `scanner://builtin/basic-v1`）、工作负载身份（mTLS/短时令牌）与真实混沌/重启测试。

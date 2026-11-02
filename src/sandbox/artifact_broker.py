@@ -527,7 +527,77 @@ class ArtifactBroker:
             raise ArtifactStateConflict("only committed input artifacts may be task inputs")
         if manifest.state not in {"committed", "consumed"}:
             raise ArtifactStateConflict("input artifact is not committed")
+        expires = str(manifest.expires_at or "").strip()
+        if expires:
+            try:
+                deadline = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ArtifactStateConflict("input artifact expiry is invalid") from exc
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            if deadline <= _now():
+                raise ArtifactStateConflict("input artifact has expired")
         return manifest
+
+    def promote_output(
+        self,
+        artifact_id: str,
+        *,
+        principal_id: str | int,
+        department_id: str | int,
+        expires_at: str = "",
+    ) -> ArtifactManifest:
+        """Copy a committed output into a new input with explicit lineage.
+
+        Outputs are never re-labelled in place: a new opaque input Artifact
+        keeps the original digest, task and artifact IDs in its metadata.
+        """
+
+        manifest = self.require(artifact_id)
+        self._authorize(
+            manifest,
+            principal_id=principal_id,
+            department_id=department_id,
+            allow_department=False,
+        )
+        if manifest.role != "output":
+            raise ArtifactStateConflict("only output artifacts can be promoted")
+        if manifest.state not in {"committed", "consumed"}:
+            raise ArtifactStateConflict("output artifact is not committed")
+        content = self.read(
+            artifact_id,
+            principal_id=principal_id,
+            department_id=department_id,
+        )
+        staged = self.stage_input(
+            task_id=manifest.task_id,
+            owner_id=manifest.owner_id,
+            department_id=manifest.department_id,
+            filename=manifest.filename,
+            content=content,
+            sha256=manifest.sha256,
+            execution_id=manifest.execution_id,
+            media_type=manifest.media_type,
+            expires_at=expires_at,
+            metadata={
+                "source_artifact_id": manifest.artifact_id,
+                "source_task_id": manifest.task_id,
+                "source_sha256": manifest.sha256,
+                "promoted": True,
+            },
+        )
+        self.scan(
+            staged.artifact_id,
+            principal_id=principal_id,
+            department_id=department_id,
+            task_id=manifest.task_id,
+        )
+        return self.commit(
+            staged.artifact_id,
+            principal_id=principal_id,
+            department_id=department_id,
+            task_id=manifest.task_id,
+        )
 
     def _remove_uncommitted_payload(self, manifest: ArtifactManifest) -> None:
         """Remove a payload only when no durable row owns the same artifact ID."""

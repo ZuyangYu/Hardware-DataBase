@@ -158,14 +158,29 @@ def basic_artifact_scanner(content: bytes, manifest: Any) -> tuple[bool, str]:
     max_bytes = max(1, int(getattr(settings, "SANDBOX_MAX_OUTPUT_BYTES", 50 * 1024 * 1024)))
     if len(content) > max_bytes:
         return False, "size"
-    if b"\x00" in content:
-        return False, "binary"
-    if extension in {"txt", "json", "csv", "md", "kicad_sch", "kicad_pcb", "kicad_pro"}:
+    text_extensions = {"txt", "json", "csv", "md", "svg", "kicad_sch", "kicad_pcb", "kicad_pro"}
+    if extension in text_extensions:
+        if b"\x00" in content:
+            return False, "binary"
         try:
             content.decode("utf-8")
         except UnicodeDecodeError:
             return False, "encoding"
-    return True, ""
+        return True, ""
+    # Binary formats use a structural signature and, for OOXML, the same
+    # archive checks as ZIP.  This is not an antivirus engine, but it prevents
+    # a renamed arbitrary binary from passing the dev-l1 text policy.
+    if extension == "png":
+        return (True, "") if content.startswith(b"\x89PNG\r\n\x1a\n") else (False, "signature")
+    if extension == "pdf":
+        return (True, "") if content.startswith(b"%PDF-") else (False, "signature")
+    if extension in {"xlsx", "docx"}:
+        try:
+            inspect_archive(content)
+        except ArtifactRejected as exc:
+            return False, exc.reason
+        return True, ""
+    return False, "extension"
 
 
 def inspect_archive(

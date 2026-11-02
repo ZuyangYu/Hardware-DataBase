@@ -364,7 +364,7 @@ def test_runner_idempotency_binds_payload_and_supports_pending_retry(runner, mon
         "input_schema": {},
     })
 
-    def execute(task, bundle, params):
+    def execute(task, bundle, params, inputs=None):
         module._update_task(task["task_id"], status="succeeded", observed_state="succeeded", execution_id="exec-reviewed")
 
     monkeypatch.setattr(module, "_execute_task", execute)
@@ -375,10 +375,10 @@ def test_runner_idempotency_binds_payload_and_supports_pending_retry(runner, mon
     }
     with TestClient(module.app) as client:
         first = client.post("/v1/tasks", json=payload, headers=headers)
-        assert first.status_code == 200
+        assert first.status_code == 202
         task_id = first.json()["task_id"]
         replay = client.post("/v1/tasks", json=payload, headers=headers)
-        assert replay.status_code == 200 and replay.json()["task_id"] == task_id
+        assert replay.status_code == 202 and replay.json()["task_id"] == task_id
         different = client.post("/v1/tasks", json={**payload, "parameters": {"rows": 2}}, headers=headers)
         assert different.status_code == 409
         changed_id = client.post("/v1/tasks", json={**payload, "task_id": task_id, "parameters": {"rows": 2}}, headers={
@@ -386,6 +386,10 @@ def test_runner_idempotency_binds_payload_and_supports_pending_retry(runner, mon
         })
         assert changed_id.status_code == 409
         assert module._get_task(task_id)["request_fingerprint"]
+        for _ in range(100):
+            if module._get_task(task_id)["status"] == "succeeded":
+                break
+            threading.Event().wait(0.01)
         assert module._get_task(task_id)["status"] == "succeeded"
 
 

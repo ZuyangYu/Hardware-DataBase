@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from typing import Any
 
 import src.settings as settings
@@ -275,6 +276,42 @@ class MCPToolExecutor:
         if arguments:
             return f"args={len(arguments)}"[:200]
         return ""
+
+    def _persist_read_artifact(
+        self, binding: McpToolBinding, raw: Any
+    ) -> dict[str, Any] | None:
+        """Persist a validated read-tool artifact for an in-turn Skill bridge."""
+
+        if self.rt is None or self.user_id is None:
+            return None
+        payload = extract_artifact_payload(raw)
+        if payload is None:
+            return None
+        try:
+            artifact = self.artifact_store.save(
+                user_id=int(self.user_id),
+                proposal_id=f"result-{uuid.uuid4().hex}",
+                filename=payload.get("filename"),
+                content_base64=payload.get("content_base64"),
+                content_bytes=payload.get("content_bytes"),
+                sha256=payload.get("sha256"),
+                media_type=payload.get("media_type"),
+            )
+        except (McpArtifactRejected, ValueError, TypeError):
+            record_mcp_artifact_rejected(reason="bridge")
+            return None
+        record = artifact.to_dict()
+        record.update(
+            {
+                "server": binding.server.slug,
+                "tool": binding.tool_name,
+                "source_user_id": str(self.user_id),
+            }
+        )
+        recorder = getattr(self.rt, "record_mcp_artifact", None)
+        if callable(recorder):
+            recorder(record)
+        return record
 
     def _audit_write_proposal(
         self, binding: McpToolBinding, proposal: McpWriteProposal
@@ -573,6 +610,7 @@ class MCPToolExecutor:
         slug = binding.server.slug
         tool_name = binding.tool_name
         status, failure, result_text, truncated, result_bytes = "ok", "", "", False, 0
+        artifact_record: dict[str, Any] | None = None
 
         with observe.tool(
             f"mcp.{slug}.{tool_name}",
@@ -589,7 +627,25 @@ class MCPToolExecutor:
                         self.runtime, binding.raw_tool, arguments, timeout=call_timeout
                     )
                 rt.check_cancel()
-                result_text, truncated, result_bytes = _truncate_result(stringify_result(raw))
+                artifact_record = self._persist_read_artifact(binding, raw)
+                if artifact_record is not None:
+                    result_text, truncated, result_bytes = _truncate_result(
+                        json.dumps(
+                            {
+                                "artifact_ref": artifact_record["artifact_ref"],
+                                "filename": artifact_record["filename"],
+                                "sha256": artifact_record["sha256"],
+                                "bytes": artifact_record["bytes"],
+                                "media_type": artifact_record["media_type"],
+                                "server": artifact_record["server"],
+                                "tool": artifact_record["tool"],
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                    )
+                else:
+                    result_text, truncated, result_bytes = _truncate_result(stringify_result(raw))
             except QueryCancelled:
                 # Turn cancelled: late results must not enter any record.
                 raise
@@ -614,6 +670,7 @@ class MCPToolExecutor:
             result_text=result_text,
             truncated=truncated,
             result_bytes=result_bytes,
+            artifact=artifact_record,
         )
 
     # ------------------------------------------------------------------
@@ -651,6 +708,7 @@ class MCPToolExecutor:
         result_text: str = "",
         truncated: bool = False,
         result_bytes: int = 0,
+        artifact: dict[str, Any] | None = None,
     ) -> str:
         rt = self.rt
         if rt is None:  # pragma: no cover - worker path does not emit turn events
@@ -674,6 +732,8 @@ class MCPToolExecutor:
                 "latency_ms": latency_ms,
                 "result_bytes": result_bytes,
                 "truncated": truncated,
+                "artifact_ref": str((artifact or {}).get("artifact_ref") or ""),
+                "artifact_sha256": str((artifact or {}).get("sha256") or ""),
             }
         )
         rt.tool_result(
@@ -702,7 +762,15 @@ class MCPToolExecutor:
                     "tool": binding.tool_name,
                 },
             )
-        self._audit_call(binding, status, failure, latency_ms, result_bytes, truncated)
+        self._audit_call(
+            binding,
+            status,
+            failure,
+            latency_ms,
+            result_bytes,
+            truncated,
+            artifact=artifact,
+        )
         rt.check_cancel()
         if status == "ok":
             return result_text
@@ -716,6 +784,7 @@ class MCPToolExecutor:
         latency_ms: int,
         result_bytes: int,
         truncated: bool,
+        artifact: dict[str, Any] | None = None,
     ) -> None:
         try:
             from src.core.app_logs import AppLogService
@@ -735,6 +804,8 @@ class MCPToolExecutor:
                     "latency_ms": latency_ms,
                     "result_bytes": result_bytes,
                     "truncated": truncated,
+                    "artifact_ref": str((artifact or {}).get("artifact_ref") or ""),
+                    "artifact_sha256": str((artifact or {}).get("sha256") or ""),
                     "username": self.username,
                 },
             )

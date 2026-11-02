@@ -45,6 +45,7 @@ class SqliteExecutionStore:
         client_request_id: str | None = None,
         query_mode: str = "fast",
         source_scope: str = "auto",
+        disabled_skill_refs: list[str] | None = None,
         knowledge_scope=None,
     ) -> ChatTurn:
         return self._conv.create_turn(
@@ -54,6 +55,7 @@ class SqliteExecutionStore:
             client_request_id=client_request_id,
             query_mode=query_mode,
             source_scope=source_scope,
+            disabled_skill_refs=disabled_skill_refs,
             knowledge_scope=knowledge_scope,
         )
 

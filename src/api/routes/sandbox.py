@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import difflib
 import hashlib
 import re
-from typing import Any
+import sqlite3
+from datetime import datetime, timezone
+from typing import Any, Mapping
 
 import src.settings as settings
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -23,6 +26,7 @@ from src.api.schemas import (
     SandboxCapabilityGrantRequest,
     SandboxCapabilityGrantResponse,
     SandboxTaskCreateRequest,
+    SandboxTaskInputBindRequest,
     SandboxBundleListResponse,
     SandboxBundleRegisterRequest,
     SandboxBundleResponse,
@@ -45,6 +49,8 @@ from src.api.schemas import (
     SandboxSkillBuildRequest,
     SandboxSkillPipSourceRequest,
     SandboxSkillExecutionBindingRequest,
+    SandboxSkillSigningKeyRequest,
+    SandboxSkillSigningKeyResponse,
     SandboxSkillRunRequest,
     SandboxSkillResponse,
     SandboxTaskEventsResponse,
@@ -98,6 +104,14 @@ from src.sandbox.skills import (
 from src.sandbox.skill_packages import (
     SkillPackageError, SkillPackageStore, validate_skill_package, validate_text_skill_package,
 )
+from src.sandbox.provenance import (
+    SkillProvenanceError,
+    SkillProvenanceStore,
+    build_sbom,
+    manifest_digest,
+    validate_source_declaration,
+    verify_signature,
+)
 from src.sandbox.schema import SchemaValidationError, normalize_schema
 from src.sandbox.pip_sources import SkillPipSourceStore, SkillPipSourceError
 from src.sandbox.task_store import (
@@ -110,6 +124,11 @@ from src.sandbox.task_store import (
 
 
 router = APIRouter(prefix="/sandbox", tags=["sandbox"])
+
+_DIFF_TEXT_SUFFIXES = (".txt", ".md", ".csv", ".json", ".svg", ".yaml", ".yml")
+_MAX_DIFF_BYTES = 512 * 1024
+_MAX_DIFF_LINES = 2_000
+_MAX_TASK_LINEAGE = 8
 
 
 def _safe_error(value: Any) -> str:
@@ -319,27 +338,52 @@ def upload_skill_package(
     client: SandboxServiceClient | None = Depends(get_sandbox_service_client),
 ):
     storage_ref = ""
+    provenance_record: dict[str, Any] | None = None
+    sbom: dict[str, Any] | None = None
     try:
         raw = base64.b64decode(body.package_base64, validate=True)
         package = validate_skill_package(raw)
+        provenance_record, sbom = _package_provenance(
+            package=package, skill_ref=body.skill_ref, version=body.version,
+            source_kind=body.source_kind, source_ref=body.source_ref,
+            source_commit=body.source_commit, signing_key_id=body.signing_key_id,
+            signature=body.signature_base64, provided_sbom=body.sbom, catalog=catalog,
+        )
         storage_ref = packages.save(body.skill_ref, package, raw)
         skill = catalog.register(
             skill_ref=body.skill_ref, version=body.version,
-            content=package.skill_markdown, source_ref=body.source_ref,
+            content=package.skill_markdown,
+            source_ref=str(provenance_record["source_ref"] if provenance_record else body.source_ref),
             catalog_source=body.catalog_source, department_id=body.department_id,
-            actor=actor.username, metadata=body.metadata,
+            actor=actor.username, metadata={
+                **dict(body.metadata or {}), **dict(package.metadata),
+                **_source_manifest_metadata(package),
+            },
             package_storage_ref=storage_ref, package_archive_digest=package.archive_digest,
             package_files=package.files, package_review_flags=package.review_flags,
             package_build_state="uploaded",
         )
-    except (ValueError, binascii.Error, SkillPackageError, SkillCatalogError) as exc:
+        _skill_provenance_store(catalog).put(
+            skill_ref=skill.skill_ref, package_digest=package.archive_digest,
+            version=skill.version, record=provenance_record, sbom=sbom or {},
+        )
+        _record_skill_review(
+            catalog, skill_ref=skill.skill_ref, package_digest=package.archive_digest,
+            action="source_uploaded", decision="pending", actor=actor,
+            metadata={"signature_status": provenance_record["signature"]["status"],
+                      "sbom_status": provenance_record["sbom"]["status"]},
+        )
+    except (ValueError, binascii.Error, SkillPackageError, SkillCatalogError, SkillProvenanceError) as exc:
         if storage_ref:
             packages.delete(storage_ref)
         _audit(actor, action="sandbox.skill_package_upload", task_id=body.skill_ref,
                target_type="sandbox_skill", success=False, error=str(exc))
         raise HTTPException(status_code=400, detail="Skill package is invalid") from exc
     _audit(actor, action="sandbox.skill_package_upload", task_id=skill.skill_ref,
-           target_type="sandbox_skill", metadata={"archive_digest": package.archive_digest})
+           target_type="sandbox_skill", metadata={"archive_digest": package.archive_digest,
+                                                   "source_kind": provenance_record["source_kind"] if provenance_record else "",
+                                                   "signature_status": provenance_record["signature"]["status"] if provenance_record else "",
+                                                   "sbom_status": provenance_record["sbom"]["status"] if provenance_record else ""})
     # Build is system-managed: upload leaves a durable draft even if the
     # Runner is unavailable; the administrator may retry the same build.
     return build_skill_package(
@@ -365,20 +409,37 @@ def upload_text_skill_package(
 ):
     """Register a reviewable text draft from SKILL.md and bundled Markdown."""
     storage_ref = ""
+    provenance_record: dict[str, Any] | None = None
+    sbom: dict[str, Any] | None = None
     try:
         raw = base64.b64decode(body.package_base64, validate=True)
         package = validate_text_skill_package(raw)
+        provenance_record, sbom = _package_provenance(
+            package=package, skill_ref=package.skill_ref, version=package.version,
+            source_kind="direct_upload", source_ref="", source_commit="", catalog=catalog,
+        )
         storage_ref = packages.save(package.skill_ref, package, raw)
         skill = catalog.register(
             skill_ref=package.skill_ref, version=package.version,
             content=package.content, department_id=body.department_id,
             actor=actor.username,
-            metadata={"skill_name": package.skill_ref.removeprefix("skill/"),
+            metadata={**dict(package.metadata), **_source_manifest_metadata(package),
+                      "skill_name": package.skill_ref.removeprefix("skill/"),
                       "summary": package.description[:500]},
             text_storage_ref=storage_ref, text_archive_digest=package.archive_digest,
             text_files=package.files,
         )
-    except (ValueError, binascii.Error, SkillPackageError, SkillCatalogError) as exc:
+        _skill_provenance_store(catalog).put(
+            skill_ref=skill.skill_ref, package_digest=package.archive_digest,
+            version=skill.version, record=provenance_record, sbom=sbom or {},
+        )
+        _record_skill_review(
+            catalog, skill_ref=skill.skill_ref, package_digest=package.archive_digest,
+            action="source_uploaded", decision="pending", actor=actor,
+            metadata={"signature_status": provenance_record["signature"]["status"],
+                      "sbom_status": provenance_record["sbom"]["status"]},
+        )
+    except (ValueError, binascii.Error, SkillPackageError, SkillCatalogError, SkillProvenanceError) as exc:
         if storage_ref:
             packages.delete(storage_ref)
         _audit(actor, action="sandbox.text_skill_package_upload", target_type="sandbox_skill",
@@ -386,8 +447,9 @@ def upload_text_skill_package(
         raise HTTPException(status_code=400, detail="text Skill package is invalid or conflicts with an enabled Skill") from exc
     _audit(actor, action="sandbox.text_skill_package_upload", task_id=skill.skill_ref,
            target_type="sandbox_skill", metadata={"archive_digest": package.archive_digest,
-                                                   "file_count": len(package.files)})
-    return SandboxSkillResponse(skill=skill.to_dict())
+                                                   "file_count": len(package.files),
+                                                   "sbom_status": provenance_record["sbom"]["status"] if provenance_record else ""})
+    return SandboxSkillResponse(skill=_skill_provenance_payload(skill, catalog))
 
 
 def _personal_skill_view(skill) -> dict[str, Any]:
@@ -424,20 +486,35 @@ def upload_personal_text_skill(
         raise HTTPException(status_code=409, detail="personal Skill name already exists")
     storage_ref = ""
     try:
+        provenance_record, sbom = _package_provenance(
+            package=package, skill_ref=skill_ref, version=package.version,
+            source_kind="direct_upload", source_ref="", source_commit="", catalog=catalog,
+        )
         storage_ref = packages.save(skill_ref, package, raw)
         skill = catalog.register(
             skill_ref=skill_ref, version=package.version, content=package.content,
             catalog_source="employee", owner_id=user.id, department_id=user.department_id,
-            actor=user.username, metadata={"skill_name": package.skill_ref.removeprefix("skill/"),
-                                          "summary": package.description[:500]},
+            actor=user.username, metadata={**dict(package.metadata), **_source_manifest_metadata(package),
+                                           "skill_name": package.skill_ref.removeprefix("skill/"),
+                                           "summary": package.description[:500]},
             text_storage_ref=storage_ref, text_archive_digest=package.archive_digest,
             text_files=package.files, allow_overwrite=False,
+        )
+        _skill_provenance_store(catalog).put(
+            skill_ref=skill.skill_ref, package_digest=package.archive_digest,
+            version=skill.version, record=provenance_record, sbom=sbom,
+        )
+        _record_skill_review(
+            catalog, skill_ref=skill.skill_ref, package_digest=package.archive_digest,
+            action="source_uploaded", decision="pending", actor=user,
+            metadata={"signature_status": provenance_record["signature"]["status"],
+                      "sbom_status": provenance_record["sbom"]["status"]},
         )
     except SkillStateConflict as exc:
         if storage_ref:
             packages.delete(storage_ref)
         raise HTTPException(status_code=409, detail="personal Skill name already exists") from exc
-    except (SkillCatalogError, SkillPackageError) as exc:
+    except (SkillCatalogError, SkillPackageError, SkillProvenanceError) as exc:
         if storage_ref:
             packages.delete(storage_ref)
         _audit(user, action="sandbox.personal_skill_upload", task_id=skill_ref,
@@ -474,23 +551,40 @@ def upload_personal_executable_skill(
         raise HTTPException(status_code=409, detail="personal Skill name already exists")
     storage_ref = ""
     try:
+        provenance_record, sbom = _package_provenance(
+            package=package, skill_ref=skill_ref, version=body.version,
+            source_kind="direct_upload", source_ref="", source_commit="", catalog=catalog,
+        )
         storage_ref = packages.save(skill_ref, package, raw)
-        summary = next((line.lstrip("# ").strip() for line in package.skill_markdown.splitlines() if line.strip()), "")
+        summary = str(package.metadata.get("summary") or "") or next(
+            (line.lstrip("# ").strip() for line in package.skill_markdown.splitlines() if line.strip()), ""
+        )
         skill = catalog.register(
             skill_ref=skill_ref, version=body.version, content=package.skill_markdown,
             catalog_source="employee", owner_id=user.id, department_id=user.department_id,
-            actor=user.username, metadata={"skill_name": body.skill_name, "summary": summary[:500],
-                                          "submitted_input_schema": input_schema,
-                                          "submitted_output_schema": output_schema},
+            actor=user.username, metadata={**dict(package.metadata), **_source_manifest_metadata(package),
+                                           "skill_name": body.skill_name, "summary": summary[:500],
+                                           "submitted_input_schema": input_schema,
+                                           "submitted_output_schema": output_schema},
             package_storage_ref=storage_ref, package_archive_digest=package.archive_digest,
             package_files=package.files, package_review_flags=package.review_flags,
             package_build_state="uploaded", allow_overwrite=False,
+        )
+        _skill_provenance_store(catalog).put(
+            skill_ref=skill.skill_ref, package_digest=package.archive_digest,
+            version=skill.version, record=provenance_record, sbom=sbom,
+        )
+        _record_skill_review(
+            catalog, skill_ref=skill.skill_ref, package_digest=package.archive_digest,
+            action="source_uploaded", decision="pending", actor=user,
+            metadata={"signature_status": provenance_record["signature"]["status"],
+                      "sbom_status": provenance_record["sbom"]["status"]},
         )
     except SkillStateConflict as exc:
         if storage_ref:
             packages.delete(storage_ref)
         raise HTTPException(status_code=409, detail="personal Skill name already exists") from exc
-    except (SkillCatalogError, SkillPackageError) as exc:
+    except (SkillCatalogError, SkillPackageError, SkillProvenanceError) as exc:
         if storage_ref:
             packages.delete(storage_ref)
         _audit(user, action="sandbox.personal_skill_package_upload", task_id=skill_ref,
@@ -545,13 +639,17 @@ def approve_personal_skill_source(
             raise SkillStateConflict("Skill source changed before review")
         skill = skills.approve_source_for_build(skill_ref, archive_digest=package.archive_digest,
                                                 actor=actor.username)
-    except (SkillCatalogError, SkillPackageError) as exc:
+        _set_provenance_review(
+            skills, skill, actor=actor, state="source_reviewed", decision="approved",
+            action="source_review", metadata={"archive_digest": package.archive_digest},
+        )
+    except (SkillCatalogError, SkillPackageError, SkillProvenanceError) as exc:
         _audit(actor, action="sandbox.skill_source_approve", task_id=skill_ref,
                target_type="sandbox_skill", success=False, error=str(exc))
         raise HTTPException(status_code=409, detail="employee Skill source is not eligible for build") from exc
     _audit(actor, action="sandbox.skill_source_approve", task_id=skill_ref,
            target_type="sandbox_skill", metadata={"archive_digest": skill.package_archive_digest})
-    return SandboxSkillResponse(skill=skill.to_dict())
+    return SandboxSkillResponse(skill=_skill_provenance_payload(skill, skills))
 
 
 @router.post("/skills/{skill_ref:path}/build", response_model=SandboxSkillResponse)
@@ -575,6 +673,7 @@ def build_skill_package(
         package = validate_skill_package(packages.read(skill.package_storage_ref))
         if package.archive_digest != skill.package_archive_digest:
             raise SkillStateConflict("Skill package digest changed")
+        _enforce_source_runtime_gate(catalog, skill, body.profile_ref)
         if not client:
             raise SandboxClientConfigurationError("Runner client is not configured")
         dependency_index_url = pip_sources.get() if package.requirements_declared else ""
@@ -602,27 +701,37 @@ def build_skill_package(
         image_digest = str(result.get("image_digest") or "")
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
             raise SkillStateConflict("Runner did not return a fixed image identity")
+        sbom_ref, signature_ref, source_provenance = _bundle_provenance_refs(
+            skills, skill, package.archive_digest,
+        )
         bundle = catalog.register(
             bundle_ref=str(result.get("bundle_ref") or ""),
             bundle_digest=str(result.get("bundle_digest") or ""),
             profile_ref=body.profile_ref, required_capabilities=body.required_capabilities,
             input_schema=body.input_schema, output_schema=body.output_schema,
+            sbom_ref=sbom_ref, signature_ref=signature_ref,
             runtime_policy_ref=runtime_policy_ref,
             runtime_policy_digest=runtime_policy_digest,
             actor=actor.username, metadata={"skill_ref": skill.skill_ref, "package_digest": package.archive_digest,
-                                            "image_digest": image_digest},
+                                             "image_digest": image_digest,
+                                             "source_provenance": source_provenance},
         )
         skill = skills.mark_package_built(skill.skill_ref, archive_digest=package.archive_digest, actor=actor.username)
         skill = skills.bind_execution(skill.skill_ref, bundle_ref=bundle.bundle_ref,
                                       bundle_digest=bundle.bundle_digest, profile_ref=bundle.profile_ref,
                                       actor=actor.username, require_enabled=False)
-    except (SkillCatalogError, SkillPackageError, SkillPipSourceError, BundleCatalogError, SandboxProtocolError) as exc:
+        _set_provenance_review(
+            skills, skill, actor=actor, state="built", decision="build_completed",
+            action="bundle_build", metadata={"bundle_ref": bundle.bundle_ref, "bundle_digest": bundle.bundle_digest},
+        )
+    except (SkillCatalogError, SkillPackageError, SkillPipSourceError, BundleCatalogError,
+            SandboxProtocolError, SkillProvenanceError) as exc:
         _audit(actor, action="sandbox.skill_package_build", task_id=skill_ref,
                target_type="sandbox_skill", success=False, error=str(exc))
         raise HTTPException(status_code=409, detail="Skill package build failed; uploaded source is retained for retry") from exc
     _audit(actor, action="sandbox.skill_package_build", task_id=skill_ref,
            target_type="sandbox_skill", metadata={"bundle_ref": skill.execution_bundle_ref})
-    return SandboxSkillResponse(skill=skill.to_dict())
+    return SandboxSkillResponse(skill=_skill_provenance_payload(skill, skills))
 
 
 @router.get("/skill-dependencies")
@@ -655,7 +764,320 @@ def list_skills(
     _actor: AuthUser = Depends(require_system_admin),
     catalog: SkillCatalog = Depends(get_skill_catalog),
 ):
-    return SandboxSkillListResponse(items=[item.to_dict() for item in catalog.list(include_revoked=True)])
+    return SandboxSkillListResponse(
+        items=[_skill_provenance_payload(item, catalog, include_reviews=True) for item in catalog.list(include_revoked=True)]
+    )
+
+
+def _key_view(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "key_id": str(value.get("key_id") or ""),
+        "algorithm": str(value.get("algorithm") or ""),
+        "fingerprint": str(value.get("fingerprint") or ""),
+        "state": str(value.get("state") or ""),
+        "created_by": str(value.get("created_by") or ""),
+        "created_at": str(value.get("created_at") or ""),
+        "revoked_by": str(value.get("revoked_by") or ""),
+        "revoked_at": str(value.get("revoked_at") or ""),
+    }
+
+
+@router.post("/skill-signing-keys", response_model=SandboxSkillSigningKeyResponse)
+def register_skill_signing_key(
+    body: SandboxSkillSigningKeyRequest,
+    actor: AuthUser = Depends(require_system_admin),
+    catalog: SkillCatalog = Depends(get_skill_catalog),
+):
+    try:
+        key = _skill_provenance_store(catalog).register_key(
+            key_id=body.key_id, public_key=body.public_key, actor=actor.username,
+        )
+    except SkillProvenanceError as exc:
+        _audit(actor, action="sandbox.skill_signing_key_register", target_type="sandbox_signing_key",
+               target_id=body.key_id, success=False, error=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)[:300]) from exc
+    _audit(actor, action="sandbox.skill_signing_key_register", target_type="sandbox_signing_key",
+           target_id=body.key_id, metadata={"fingerprint": key.get("fingerprint", "")})
+    return SandboxSkillSigningKeyResponse(key=_key_view(key))
+
+
+@router.get("/skill-signing-keys")
+def list_skill_signing_keys(
+    _actor: AuthUser = Depends(require_system_admin),
+    catalog: SkillCatalog = Depends(get_skill_catalog),
+):
+    return {"items": [_key_view(item) for item in _skill_provenance_store(catalog).list_keys(include_revoked=True)]}
+
+
+@router.post("/skill-signing-keys/{key_id}/revoke", response_model=SandboxSkillSigningKeyResponse)
+def revoke_skill_signing_key(
+    key_id: str,
+    actor: AuthUser = Depends(require_system_admin),
+    catalog: SkillCatalog = Depends(get_skill_catalog),
+):
+    try:
+        key = _skill_provenance_store(catalog).revoke_key(key_id, actor=actor.username)
+    except SkillProvenanceError as exc:
+        _audit(actor, action="sandbox.skill_signing_key_revoke", target_type="sandbox_signing_key",
+               target_id=key_id, success=False, error=str(exc))
+        raise HTTPException(status_code=409, detail=str(exc)[:300]) from exc
+    _audit(actor, action="sandbox.skill_signing_key_revoke", target_type="sandbox_signing_key",
+           target_id=key_id)
+    return SandboxSkillSigningKeyResponse(key=_key_view(key))
+
+
+def _source_manifest_metadata(package: Any) -> dict[str, Any]:
+    items = [dict(item) for item in (getattr(package, "source_manifest", ()) or ())][:64]
+    if not items:
+        return {}
+    digest = manifest_digest(getattr(package, "source_manifest", ()))
+    return {
+        "source_manifest": items,
+        "source_manifest_digest": digest,
+        "source_manifest_truncated": len(getattr(package, "source_manifest", ()) or ()) > len(items),
+    }
+
+
+def _skill_provenance_store(catalog: Any) -> SkillProvenanceStore:
+    return SkillProvenanceStore(str(getattr(catalog, "db_path", settings.SANDBOX_TASK_DB_PATH)))
+
+
+def _skill_provenance_payload(skill: Any, catalog: Any, *, include_reviews: bool = False) -> dict[str, Any]:
+    payload = skill.to_dict()
+    package_digest = str(skill.package_archive_digest or skill.text_archive_digest or "")
+    if package_digest:
+        store = _skill_provenance_store(catalog)
+        item = store.get(skill.skill_ref, package_digest)
+        if item is not None:
+            payload["provenance"] = item.to_dict()
+            if include_reviews:
+                payload["review_records"] = store.reviews(skill.skill_ref, package_digest)
+    return payload
+
+
+def _package_provenance(
+    *,
+    package: Any,
+    skill_ref: str,
+    version: str,
+    source_kind: str,
+    source_ref: str,
+    source_commit: str,
+    signing_key_id: str = "",
+    signature: str = "",
+    provided_sbom: Mapping[str, Any] | None = None,
+    catalog: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    declaration = validate_source_declaration(
+        source_kind=source_kind, source_ref=source_ref, source_commit=source_commit,
+    )
+    store = _skill_provenance_store(catalog)
+    trusted_key = store.get_key(signing_key_id, active_only=True) if signing_key_id else None
+    signature_record = verify_signature(
+        package_digest=package.archive_digest,
+        source_ref=declaration["source_ref"],
+        source_commit=declaration["source_commit"],
+        signing_key_id=signing_key_id,
+        signature=signature,
+        trusted_public_key=str(trusted_key.get("public_key") or "") if trusted_key else None,
+    )
+    sbom, sbom_summary = build_sbom(
+        package_digest=package.archive_digest,
+        source_manifest=package.source_manifest,
+        dependencies=getattr(package, "dependencies", ()),
+        provided=provided_sbom,
+    )
+    record = {
+        "schema_version": "hdb-skill-provenance-v1",
+        "source_kind": declaration["source_kind"],
+        "source_ref": declaration["source_ref"],
+        "source_ref_status": "declared_not_fetched" if declaration["source_ref"] else "not_provided",
+        "source_commit": declaration["source_commit"],
+        "package_digest": package.archive_digest,
+        "source_manifest_digest": manifest_digest(package.source_manifest),
+        "source_manifest_count": len(package.source_manifest),
+        "signature": signature_record,
+        "sbom": {
+            **sbom_summary,
+            "ref": f"hdb://skill-sbom/{package.archive_digest}",
+        },
+        "review": {
+            "state": "pending",
+            "decision": "not_reviewed",
+            "reviewed_by": "",
+            "reviewed_at": "",
+        },
+        # Unattested or model-generated source remains on the lowest reviewed
+        # runtime profile.  This is a gate, not a claim that the source is safe.
+        "runtime_gate": {
+            "minimum_profile": "profile/dev-l1",
+            "reason": (
+                "model_generated" if declaration["source_kind"] == "model_generated"
+                else "signature_verified" if signature_record["status"] == "verified"
+                else "source_not_attested"
+            ),
+        },
+        "skill_ref": skill_ref,
+        "version": version,
+    }
+    return record, sbom
+
+
+def _record_skill_review(
+    catalog: Any,
+    *,
+    skill_ref: str,
+    package_digest: str,
+    action: str,
+    decision: str,
+    actor: AuthUser,
+    reason: str = "",
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    if not package_digest:
+        return
+    try:
+        _skill_provenance_store(catalog).record_review(
+            skill_ref=skill_ref, package_digest=package_digest, action=action,
+            decision=decision, actor_id=actor.id, actor_name=actor.username,
+            reason=reason, metadata=metadata,
+        )
+    except (SkillProvenanceError, OSError, sqlite3.Error):
+        # The immutable audit event below is the minimum fallback.  A review
+        # action must not turn a successfully persisted Skill state into a
+        # 500 merely because the optional projection is unavailable.
+        pass
+
+
+def _set_provenance_review(
+    catalog: Any,
+    skill: Any,
+    *,
+    actor: AuthUser,
+    state: str,
+    decision: str,
+    action: str,
+    reason: str = "",
+    metadata: Mapping[str, Any] | None = None,
+) -> None:
+    package_digest = str(skill.package_archive_digest or skill.text_archive_digest or "")
+    if not package_digest:
+        return
+    try:
+        store = _skill_provenance_store(catalog)
+        item = store.get(skill.skill_ref, package_digest)
+        if item is not None:
+            record = dict(item.record)
+            record["review"] = {
+                "state": state,
+                "decision": decision,
+                "reviewed_by": actor.username,
+                "reviewed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            store.put(
+                skill_ref=skill.skill_ref, package_digest=package_digest,
+                version=skill.version, record=record, sbom=item.sbom,
+            )
+        _record_skill_review(
+            catalog, skill_ref=skill.skill_ref, package_digest=package_digest,
+            action=action, decision=decision, actor=actor, reason=reason, metadata=metadata,
+        )
+    except (SkillProvenanceError, OSError, sqlite3.Error):
+        pass
+
+
+def _enforce_source_runtime_gate(catalog: Any, skill: Any, profile_ref: str) -> None:
+    """Keep unverified and model-generated source on the restricted profile."""
+
+    if str(profile_ref) == "profile/dev-l1":
+        return
+    package_digest = str(skill.package_archive_digest or "")
+    item = _skill_provenance_store(catalog).get(skill.skill_ref, package_digest) if package_digest else None
+    record = dict(item.record) if item is not None else {}
+    signature = dict(record.get("signature") or {})
+    if signature.get("status") != "verified":
+        raise SkillStateConflict("unverified Skill source is restricted to profile/dev-l1")
+    if str(record.get("source_kind") or "") == "model_generated":
+        raise SkillStateConflict("model-generated Skill source is restricted to profile/dev-l1")
+
+
+def _bundle_provenance_refs(catalog: Any, skill: Any, package_digest: str) -> tuple[str, str, dict[str, Any]]:
+    item = _skill_provenance_store(catalog).get(skill.skill_ref, package_digest)
+    if item is None:
+        return "", "", {}
+    record = dict(item.record)
+    sbom = dict(record.get("sbom") or {})
+    signature = dict(record.get("signature") or {})
+    signature_ref = ""
+    if signature.get("status") == "verified" and signature.get("signature_digest"):
+        signature_ref = f"hdb://skill-signature/{signature['signature_digest']}"
+    return str(sbom.get("ref") or ""), signature_ref, record
+
+
+def _skill_directory_metadata(skill: Any) -> dict[str, Any]:
+    """Return only review metadata intended for the employee catalog."""
+    source = dict(getattr(skill, "metadata", {}) or {})
+    result: dict[str, Any] = {}
+    for key in ("skill_name", "summary", "risk", "declared_version"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            result[key] = value.strip()[:500]
+    for key in ("intent_examples", "input_kinds", "output_kinds", "interaction_modes", "side_effects"):
+        value = source.get(key)
+        if isinstance(value, (list, tuple)):
+            result[key] = [str(item).strip()[:160] for item in value if str(item).strip()][:32]
+    return result
+
+
+def _skill_runtime_view(bundle: Any | None) -> dict[str, Any] | None:
+    if bundle is None:
+        return None
+    from src.sandbox.runtime_contract import RUNTIME_CONTRACT_VERSION
+
+    return {
+        "profile_ref": str(bundle.profile_ref or ""),
+        "contract_version": RUNTIME_CONTRACT_VERSION,
+        "runtime_policy_ref": str(bundle.runtime_policy_ref or ""),
+        "runtime_policy_digest": str(bundle.runtime_policy_digest or ""),
+        "required_capabilities": list(bundle.required_capabilities),
+        "network_policy_ref": str(bundle.network_policy_ref or ""),
+        "bundle_digest": str(bundle.bundle_digest or ""),
+        "sbom_ref": str(bundle.sbom_ref or ""),
+        "signature_ref": str(bundle.signature_ref or ""),
+    }
+
+
+@router.get("/skills/{skill_ref:path}/provenance")
+def get_skill_provenance(
+    skill_ref: str,
+    actor: AuthUser = Depends(require_system_admin),
+    catalog: SkillCatalog = Depends(get_skill_catalog),
+):
+    try:
+        skill = catalog.require(skill_ref)
+        package_digest = str(skill.package_archive_digest or skill.text_archive_digest or "")
+        item = _skill_provenance_store(catalog).get(skill.skill_ref, package_digest) if package_digest else None
+        if item is None:
+            raise SkillProvenanceError("Skill provenance is unavailable")
+    except (SkillNotFound, SkillProvenanceError) as exc:
+        raise HTTPException(status_code=404, detail="Skill provenance is unavailable") from exc
+    _audit(actor, action="sandbox.skill_provenance_read", task_id=skill_ref,
+           target_type="sandbox_skill", metadata={"package_digest": package_digest})
+    return {
+        "provenance": item.to_dict(),
+        "sbom": dict(item.sbom),
+        "reviews": _skill_provenance_store(catalog).reviews(skill_ref, package_digest),
+    }
+
+
+@router.get("/skills/{skill_ref:path}/sbom")
+def get_skill_sbom(
+    skill_ref: str,
+    actor: AuthUser = Depends(require_system_admin),
+    catalog: SkillCatalog = Depends(get_skill_catalog),
+):
+    payload = get_skill_provenance(skill_ref, actor=actor, catalog=catalog)
+    return {"sbom": payload["sbom"], "package_digest": payload["provenance"]["package_digest"]}
 
 
 @router.get("/skills/{skill_ref:path}/source")
@@ -701,9 +1123,11 @@ def available_skills(
                 continue
             if not skills._principal_allowed(skill, user.id, user.department_id or ""):
                 continue
+            metadata = _skill_directory_metadata(skill)
             items.append({
                 "skill_ref": skill.skill_ref, "version": skill.version, "bundle_ref": "",
-                "input_schema": {}, "subscribed": skills.is_subscribed(skill.skill_ref, user.id),
+                "input_schema": {}, "output_schema": {}, "runtime": None,
+                "metadata": metadata, "subscribed": skills.is_subscribed(skill.skill_ref, user.id),
                 "description": skills.content(skill.skill_ref)[:2000], "kind": "text",
                 "is_owner": skill.owner_id == str(user.id) and skill.catalog_source == "employee",
                 "share_scope": skill.share_scope if skill.catalog_source == "employee" else "",
@@ -721,14 +1145,20 @@ def available_skills(
             continue
         if not set(bundle.required_capabilities).issubset(effective):
             continue
+        metadata = _skill_directory_metadata(skill)
         items.append({
             "skill_ref": skill.skill_ref,
             "version": skill.version,
             "bundle_ref": bundle.bundle_ref,
             "input_schema": dict(bundle.input_schema),
+            "output_schema": dict(bundle.output_schema),
+            "runtime": _skill_runtime_view(bundle),
+            "metadata": metadata,
             "subscribed": skills.is_subscribed(skill.skill_ref, user.id),
             "description": skills.content(skill.skill_ref)[:2000],
             "kind": "executable",
+            "is_owner": skill.owner_id == str(user.id) and skill.catalog_source == "employee",
+            "share_scope": skill.share_scope if skill.catalog_source == "employee" else "",
         })
     return {"items": items}
 
@@ -775,8 +1205,12 @@ def _skill_state_action(
             skill = catalog.revoke(skill_ref, actor=actor.username)
     except (SkillCatalogError, SkillNotFound, SkillStateConflict) as exc:
         raise HTTPException(status_code=409, detail=str(exc)[:300]) from exc
+    _set_provenance_review(
+        catalog, skill, actor=actor, state=state, decision=state,
+        action=f"skill_{state}",
+    )
     _audit(actor, action=f"sandbox.skill_{state}", task_id=skill_ref, target_type="sandbox_skill")
-    return SandboxSkillResponse(skill=skill.to_dict())
+    return SandboxSkillResponse(skill=_skill_provenance_payload(skill, catalog))
 
 
 @router.post("/skills/{skill_ref:path}/review", response_model=SandboxSkillResponse)
@@ -912,6 +1346,30 @@ def run_skill(
         f"{skill.skill_ref}:{skill.version}:{skill.content_digest}".encode("utf-8")
     ).hexdigest()[:20]
     required = set(bundle.required_capabilities)
+    input_ids = tuple(dict.fromkeys(str(item).strip() for item in body.input_artifact_ids if str(item).strip()))
+    if input_ids:
+        if "sandbox.internal_data" not in required:
+            raise HTTPException(status_code=403, detail="Skill bundle is not approved to read input artifacts")
+        required.add("sandbox.internal_data")
+        for artifact_id in input_ids:
+            try:
+                broker.authorize_input(
+                    artifact_id, principal_id=str(user.id), department_id=str(user.department_id),
+                )
+            except (ArtifactAccessDenied, ArtifactNotFound) as exc:
+                # Do not disclose whether another department's artifact exists.
+                raise HTTPException(status_code=404, detail="input artifact is not available") from exc
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=409, detail="input artifact is not committed") from exc
+    if body.resume_from and body.resume_from not in input_ids:
+        raise HTTPException(status_code=400, detail="resume_from must reference a bound input artifact")
+    if body.parent_task_id:
+        try:
+            parent = store.require(body.parent_task_id)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=404, detail="parent task not found") from exc
+        if parent.owner_id != str(user.id) or parent.department_id != str(user.department_id):
+            raise HTTPException(status_code=403, detail="parent task is not available")
     if not required.issubset(_context_capabilities(user, auth, authorization)) or user.department_id in (None, ""):
         raise HTTPException(status_code=403, detail="Skill bundle capabilities are not authorized")
     try:
@@ -929,8 +1387,13 @@ def run_skill(
                 user_id=user.id, department_id=user.department_id,
                 capabilities=required, policy_snapshot_hash=bundle.policy_snapshot_hash,
             ),
-            required_capabilities=tuple(required), parameters=body.parameters,
+            required_capabilities=tuple(sorted(required)), parameters=body.parameters,
+            input_artifact_ids=input_ids,
             skill_ref=skill.skill_ref, skill_content_digest=skill.content_digest,
+            skill_version=skill.version,
+            runtime_contract_version="v1",
+            parent_task_id=body.parent_task_id,
+            resume_from=body.resume_from,
         )
         task = SandboxExecutionAdapter(store=store, catalog=catalog, broker=broker).admit(
             spec, actor_id=str(user.id),
@@ -1477,6 +1940,70 @@ def _artifact_error(exc: Exception) -> None:
     raise HTTPException(status_code=400, detail="artifact request rejected") from exc
 
 
+def _require_artifact_access(manifest: Any, user: AuthUser) -> None:
+    if user.role == ROLE_SYSTEM_ADMIN:
+        return
+    if (
+        str(manifest.owner_id) != str(user.id)
+        or str(manifest.department_id) != str(user.department_id or "")
+    ):
+        # Never disclose whether another department's artifact exists.
+        raise HTTPException(status_code=404, detail="artifact not found")
+
+
+def _artifact_diff_payload(
+    current: Any,
+    previous: Any,
+    *,
+    user: AuthUser,
+    broker: ArtifactBroker,
+) -> dict[str, Any]:
+    filename = str(current.filename or "")
+    if not filename.lower().endswith(_DIFF_TEXT_SUFFIXES):
+        raise HTTPException(status_code=415, detail="artifact type does not support text diff")
+    if int(current.size or 0) > _MAX_DIFF_BYTES or int(previous.size or 0) > _MAX_DIFF_BYTES:
+        raise HTTPException(status_code=413, detail="artifact is too large for an inline diff")
+    department = str(current.department_id if user.role == ROLE_SYSTEM_ADMIN else user.department_id or "")
+    current_content = broker.read(
+        current.artifact_id,
+        principal_id=str(user.id),
+        department_id=department,
+        task_id=current.task_id if user.role == ROLE_SYSTEM_ADMIN else None,
+    ).decode("utf-8", errors="replace")
+    previous_content = broker.read(
+        previous.artifact_id,
+        principal_id=str(user.id),
+        department_id=str(previous.department_id if user.role == ROLE_SYSTEM_ADMIN else department),
+        task_id=previous.task_id if user.role == ROLE_SYSTEM_ADMIN else None,
+    ).decode("utf-8", errors="replace")
+    lines = list(
+        difflib.unified_diff(
+            previous_content.splitlines(),
+            current_content.splitlines(),
+            fromfile=f"{previous.artifact_id}/{previous.filename}",
+            tofile=f"{current.artifact_id}/{current.filename}",
+            lineterm="",
+            n=3,
+        )
+    )
+    added = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in lines if line.startswith("-") and not line.startswith("---"))
+    truncated = len(lines) > _MAX_DIFF_LINES
+    return {
+        "artifact_id": current.artifact_id,
+        "base_artifact_id": previous.artifact_id,
+        "filename": current.filename,
+        "base_filename": previous.filename,
+        "sha256": current.sha256,
+        "base_sha256": previous.sha256,
+        "changed": bool(lines),
+        "added_lines": added,
+        "removed_lines": removed,
+        "truncated": truncated,
+        "diff": "\n".join(lines[:_MAX_DIFF_LINES]),
+    }
+
+
 def _decode_artifact_body(encoded: str) -> bytes:
     try:
         return base64.b64decode(encoded, validate=True)
@@ -1553,6 +2080,37 @@ def stage_artifact(
         metadata={"sha256": manifest.sha256, "role": manifest.role},
     )
     return SandboxArtifactResponse(artifact=manifest.to_dict())
+
+
+@router.post("/artifacts/{artifact_id}/promote", response_model=SandboxArtifactResponse)
+def promote_artifact(
+    artifact_id: str,
+    user: AuthUser = Depends(require_employee),
+    broker: ArtifactBroker = Depends(get_sandbox_artifact_broker),
+):
+    """Explicitly copy an output into a new input Artifact with lineage."""
+
+    try:
+        manifest = broker.require(artifact_id)
+        if user.role != ROLE_SYSTEM_ADMIN and (
+            manifest.owner_id != str(user.id) or manifest.department_id != str(user.department_id or "")
+        ):
+            raise ArtifactAccessDenied()
+        promoted = broker.promote_output(
+            artifact_id,
+            principal_id=str(user.id),
+            department_id=str(user.department_id or ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _artifact_error(exc)
+    _audit(
+        user,
+        action="sandbox.artifact_promote",
+        task_id=artifact_id,
+        target_type="sandbox_artifact",
+        metadata={"promoted_artifact_id": promoted.artifact_id},
+    )
+    return SandboxArtifactResponse(artifact=promoted.to_dict())
 
 
 @router.get("/tasks/{task_id}/artifacts", response_model=SandboxArtifactListResponse)
@@ -1661,6 +2219,157 @@ def read_artifact(
         media_type=manifest.media_type,
         headers={"Content-Disposition": f'attachment; filename="{manifest.filename}"'},
     )
+
+
+@router.get("/artifacts/{artifact_id}/diff/{base_artifact_id}")
+def diff_artifacts(
+    artifact_id: str,
+    base_artifact_id: str,
+    user: AuthUser = Depends(current_user),
+    broker: ArtifactBroker = Depends(get_sandbox_artifact_broker),
+):
+    """Compare two committed text artifacts in the caller's scope."""
+
+    try:
+        current = broker.require(artifact_id)
+        previous = broker.require(base_artifact_id)
+        _require_artifact_access(current, user)
+        _require_artifact_access(previous, user)
+        payload = _artifact_diff_payload(current, previous, user=user, broker=broker)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _artifact_error(exc)
+    _audit(
+        user,
+        action="sandbox.artifact_diff",
+        task_id=artifact_id,
+        target_type="sandbox_artifact",
+        metadata={
+            "base_artifact_id": base_artifact_id,
+            "changed": payload["changed"],
+            "added_lines": payload["added_lines"],
+            "removed_lines": payload["removed_lines"],
+        },
+    )
+    return payload
+
+
+@router.get("/tasks/{task_id}/artifacts/{artifact_id}/diff-parent")
+def diff_artifact_with_parent(
+    task_id: str,
+    artifact_id: str,
+    user: AuthUser = Depends(current_user),
+    store: SandboxTaskStore = Depends(get_sandbox_task_store),
+    broker: ArtifactBroker = Depends(get_sandbox_artifact_broker),
+):
+    """Compare an output with the same-named output from its parent task."""
+
+    task = _task_for_artifact(task_id, user, store)
+    if not task.parent_task_id:
+        raise HTTPException(status_code=404, detail="parent task not found")
+    parent = _task_for_artifact(task.parent_task_id, user, store)
+    try:
+        current = broker.require(artifact_id)
+        if current.task_id != task.task_id:
+            raise HTTPException(status_code=404, detail="artifact not found")
+        _require_artifact_access(current, user)
+        candidates = [
+            item
+            for item in broker.list_for_task(parent.task_id, states={"committed", "consumed"})
+            if item.role == "output" and item.filename == current.filename
+        ]
+        if not candidates:
+            raise HTTPException(status_code=404, detail="parent artifact not found")
+        previous = max(candidates, key=lambda item: str(item.created_at or ""))
+        payload = _artifact_diff_payload(current, previous, user=user, broker=broker)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _artifact_error(exc)
+    _audit(
+        user,
+        action="sandbox.artifact_diff_parent",
+        task_id=task_id,
+        target_type="sandbox_artifact",
+        metadata={"artifact_id": artifact_id, "base_artifact_id": previous.artifact_id},
+    )
+    return {**payload, "task_id": task.task_id, "base_task_id": parent.task_id}
+
+
+@router.get("/tasks/{task_id}/lineage")
+def task_lineage(
+    task_id: str,
+    user: AuthUser = Depends(current_user),
+    store: SandboxTaskStore = Depends(get_sandbox_task_store),
+):
+    """Return the bounded parent-task chain for a Skill run."""
+
+    task = _task_for_artifact(task_id, user, store)
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    current = task
+    while current is not None and len(items) < _MAX_TASK_LINEAGE and current.task_id not in seen:
+        seen.add(current.task_id)
+        items.append({
+            "task_id": current.task_id,
+            "parent_task_id": current.parent_task_id,
+            "skill_ref": current.skill_ref,
+            "skill_version": current.skill_version,
+            "status": current.status,
+            "result_status": current.result_status,
+            "created_at": current.created_at,
+        })
+        if not current.parent_task_id:
+            break
+        try:
+            current = _task_for_artifact(current.parent_task_id, user, store)
+        except HTTPException:
+            break
+    return {"items": items}
+
+
+@router.post("/tasks/{task_id}/inputs", response_model=SandboxTaskResponse)
+def bind_task_inputs(
+    task_id: str,
+    body: SandboxTaskInputBindRequest,
+    user: AuthUser = Depends(require_employee),
+    store: SandboxTaskStore = Depends(get_sandbox_task_store),
+    broker: ArtifactBroker = Depends(get_sandbox_artifact_broker),
+):
+    """Bind user attachments to an admitted task before it is dispatched."""
+
+    task = _task_for_artifact(task_id, user, store)
+    if "sandbox.internal_data" not in task.required_capabilities:
+        raise HTTPException(status_code=403, detail="task is not approved to read input artifacts")
+    for artifact_id in body.artifact_ids:
+        try:
+            broker.authorize_input(
+                artifact_id,
+                principal_id=str(user.id),
+                department_id=str(task.department_id),
+            )
+        except (ArtifactAccessDenied, ArtifactNotFound) as exc:
+            raise HTTPException(status_code=404, detail="input artifact is not available") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=409, detail="input artifact is not committed") from exc
+    try:
+        updated = store.bind_inputs(
+            task.task_id,
+            tuple(body.artifact_ids),
+            expected_revision=body.expected_revision if body.expected_revision >= 0 else None,
+            actor_id=str(user.id),
+        )
+    except Exception as exc:  # noqa: BLE001
+        _raise_store_error(exc)
+    _audit(
+        user,
+        action="sandbox.task_bind_inputs",
+        task_id=task.task_id,
+        target_type="sandbox_task",
+        metadata={"artifact_count": len(body.artifact_ids)},
+    )
+    return SandboxTaskResponse(task=updated.to_dict())
 
 
 @router.post("/tasks/{task_id}/submit", response_model=SandboxTaskResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -1825,10 +2534,8 @@ def create_task(
                 success=False,
                 error="input_artifact_denied",
             )
-            if isinstance(exc, ArtifactAccessDenied):
-                raise HTTPException(status_code=403, detail="input artifact access denied") from exc
-            if isinstance(exc, ArtifactNotFound):
-                raise HTTPException(status_code=404, detail="input artifact not found") from exc
+            if isinstance(exc, (ArtifactAccessDenied, ArtifactNotFound)):
+                raise HTTPException(status_code=404, detail="input artifact is not available") from exc
             raise HTTPException(status_code=409, detail="input artifact is not committed") from exc
     spec = SandboxTaskSpec(
         idempotency_key=body.idempotency_key,
@@ -1924,7 +2631,11 @@ def task_events(
     try:
         task = store.require(task_id)
         _require_task_visibility(task, user)
-        events = store.events(task_id)
+        events = [{**item, "kind": "task"} for item in store.events(task_id)]
+        events.extend(
+            {**item, "kind": "runtime"} for item in store.runtime_events(task_id)
+        )
+        events.sort(key=lambda item: str(item.get("created_at") or ""))
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001

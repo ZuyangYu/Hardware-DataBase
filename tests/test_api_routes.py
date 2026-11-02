@@ -424,6 +424,27 @@ class ApiRoutesTests(unittest.TestCase):
         self.assertEqual([message["content"] for message in messages], ["问", "第一段第二段"])
         self.assertEqual(messages[1]["footer"], "footer")
 
+    def test_create_turn_accepts_temporary_skill_suppression(self):
+        t = self._token("user1")
+        session = self.client.post(
+            "/api/v1/conversations",
+            json={"kb_name": "shared", "title": "临时停用"},
+            headers=self._auth(t),
+        ).json()
+        created = self.client.post(
+            f"/api/v1/conversations/{session['id']}/turns",
+            json={
+                "query": "先不要用报告 Skill",
+                "client_request_id": "skill-suppression-key",
+                "disabled_skill_refs": ["skill/report", "skill/report", "skill/summary"],
+            },
+            headers=self._auth(t),
+        )
+        self.assertEqual(created.status_code, 201, created.text)
+        turn = ConversationService(self.db_path).get_turn(self.user.id, created.json()["turn"]["id"])
+        self.assertIsNotNone(turn)
+        self.assertEqual(turn.disabled_skill_refs, ["skill/report", "skill/summary"])
+
     def test_turns_include_terminal_and_messages_project_document_cards(self):
         from src.core.conversation import ConversationService
 
@@ -762,3 +783,14 @@ class TurnWikiAssistFlagTests(unittest.TestCase):
         fetched = self.conv.get_turn(self.user.id, turn_on.id)
         self.assertIsNotNone(fetched)
         self.assertTrue(fetched.wiki_assist)
+
+    def test_disabled_skill_refs_are_deduplicated_and_persisted(self) -> None:
+        turn = self.conv.create_turn(
+            self.user.id, self.session.id, "本轮先不用报告 Skill",
+            disabled_skill_refs=["skill/report", "skill/report", "skill/summary"],
+        )
+        self.assertEqual(turn.disabled_skill_refs, ["skill/report", "skill/summary"])
+        fetched = self.conv.get_turn(self.user.id, turn.id)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.disabled_skill_refs, ["skill/report", "skill/summary"])
+        self.assertIn("hdb.skill_disabled_refs", fetched.trace_context)

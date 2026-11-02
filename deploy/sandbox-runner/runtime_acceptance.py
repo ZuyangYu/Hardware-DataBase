@@ -42,6 +42,20 @@ def _request(path: str, payload: dict | None = None) -> dict:
         return json.load(response)
 
 
+def _get(path: str) -> dict:
+    request = urllib.request.Request(
+        f"{BASE}{path}",
+        method="GET",
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "X-Audience": "sandbox-runner",
+            "X-Request-ID": f"req-{uuid.uuid4().hex}",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=90) as response:
+        return json.load(response)
+
+
 def _submit(task_id: str, result: dict, failures: list[str]) -> None:
     source = (ROOT / "bundles/slow/entrypoint.py").read_bytes()
     try:
@@ -86,14 +100,24 @@ def _run_case(*, cancel: bool) -> None:
     assert "no-new-privileges" in host["SecurityOpt"]
     assert host["PidsLimit"] == 128 and host["Memory"] == 256 * 1024 * 1024
     assert host["NanoCpus"] == 1_000_000_000
-    assert {mount["Destination"] for mount in container["Mounts"]} == {"/work/in", "/work/out"}
+    assert {mount["Destination"] for mount in container["Mounts"]} == {
+        "/work/in", "/work/out", "/work/events",
+    }
     assert all(mount["Type"] == "bind" for mount in container["Mounts"])
 
     if cancel:
         cancelled = _request(f"/v1/tasks/{task_id}/cancel")
         assert cancelled["status"] in {"cancel_requested", "cancelled"}, cancelled["status"]
-    worker.join(timeout=90)
+    worker.join(timeout=10)
     assert not worker.is_alive() and not failures, failures
+    deadline = time.monotonic() + 30
+    terminal = {"succeeded", "failed", "cancelled", "timed_out", "unknown"}
+    while time.monotonic() < deadline:
+        observation = _get(f"/v1/tasks/{task_id}")["observation"]
+        if observation["status"] in terminal:
+            result.update(observation)
+            break
+        time.sleep(0.2)
     assert result["status"] == ("cancelled" if cancel else "timed_out"), result["status"]
     assert not _inspect(name), "container survived cancellation/timeout"
     assert not (Path(os.getenv("SANDBOX_RUNNER_WORKSPACE_ROOT", "/tmp/hdb-sandbox-runner")) / task_id).exists()

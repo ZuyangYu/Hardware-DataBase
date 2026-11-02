@@ -68,6 +68,15 @@ def _timestamp(value: Any) -> Any:
 
 
 def _turn_from_row(row: dict) -> ChatTurn:
+    trace_context = {
+        str(key): str(value)
+        for key, value in (_json_value(row.get("trace_context_json"), {}) or {}).items()
+        if value
+    }
+    raw_disabled = _json_value(trace_context.get("hdb.skill_disabled_refs"), [])
+    if isinstance(raw_disabled, str):
+        raw_disabled = _json_value(raw_disabled, [])
+    disabled_skill_refs = [str(item) for item in raw_disabled if str(item)] if isinstance(raw_disabled, list) else []
     return ChatTurn(
         id=str(row["id"]),
         session_id=int(row["session_id"]),
@@ -87,11 +96,7 @@ def _turn_from_row(row: dict) -> ChatTurn:
         summary=_json_value(row.get("summary_json"), {}),
         footer=str(row.get("footer") or ""),
         metrics=_json_value(row.get("metrics_json"), {}),
-        trace_context={
-            str(key): str(value)
-            for key, value in (_json_value(row.get("trace_context_json"), {}) or {}).items()
-            if value
-        },
+        trace_context=trace_context,
         error_message=str(row.get("error_message") or ""),
         worker_id=str(row.get("worker_id") or ""),
         worker_heartbeat_at=_timestamp(row.get("worker_heartbeat_at")),
@@ -108,6 +113,7 @@ def _turn_from_row(row: dict) -> ChatTurn:
         knowledge_scope=_json_value(row.get("knowledge_scope_json"), {}) or None,
         knowledge_selection_hash=str(row.get("knowledge_selection_hash") or ""),
         knowledge_request_fingerprint=str(row.get("knowledge_request_fingerprint") or ""),
+        disabled_skill_refs=disabled_skill_refs,
         turn_sequence=int(row.get("turn_sequence") or 0),
     )
 
@@ -313,6 +319,7 @@ class PostgresExecutionStore:
         wiki_assist: bool = False,
         attachment_ids: list[str] | None = None,
         source_scope: str = "auto",
+        disabled_skill_refs: list[str] | None = None,
         *,
         knowledge_scope=None,
     ) -> ChatTurn:
@@ -326,6 +333,15 @@ class PostgresExecutionStore:
             for item in (attachment_ids or [])
             if str(item or "").strip()
         ]
+        disabled_skill_refs = list(dict.fromkeys(
+            str(item or "").strip() for item in (disabled_skill_refs or [])
+            if str(item or "").strip()
+        ))[:32]
+        persisted_trace_context = dict(trace_context or {})
+        if disabled_skill_refs:
+            persisted_trace_context["hdb.skill_disabled_refs"] = json.dumps(
+                disabled_skill_refs, ensure_ascii=False, separators=(",", ":")
+            )
         session = self.get_session(user_id, session_id)
         if session is None:
             raise PermissionError("chat session does not belong to current user")
@@ -390,7 +406,7 @@ class PostgresExecutionStore:
             )
 
             scope = turn_scope_payload(knowledge_scope, user_id=user_id, anchor_kb_id=session_row["kb_id"], stored_hash=session_row["knowledge_selection_hash"])
-            fingerprint = request_fingerprint(scope=scope, query=query, source_scope=effective_scope, attachment_ids=attachment_ids, query_mode=query_mode, wiki_assist=wiki_assist)
+            fingerprint = request_fingerprint(scope=scope, query=query, source_scope=effective_scope, attachment_ids=attachment_ids, query_mode=query_mode, wiki_assist=wiki_assist, disabled_skill_refs=disabled_skill_refs)
             if request_id:
                 existing = conn.execute(
                     "SELECT * FROM chat_turns WHERE session_id = %s AND client_request_id = %s",
@@ -452,7 +468,7 @@ class PostgresExecutionStore:
                     initial_status,
                     request_id,
                     int(turn_sequence),
-                    Jsonb(trace_context or {}),
+                    Jsonb(persisted_trace_context),
                     Jsonb(export_plan_payload),
                     effective_scope,
                     Jsonb(required_ids),

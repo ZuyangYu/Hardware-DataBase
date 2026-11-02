@@ -40,6 +40,7 @@ import type {
 } from '@/api/types';
 import { notify } from '@/components/ui/app-toast';
 import { createClientRequestId } from '@/api/clientRequestId';
+import { readDisabledSkillRefs } from '@/lib/skillPreferences';
 import { shouldCancelServerTurn, type ChatStreamDetachReason } from './chatTaskLifecycle';
 
 const GENERAL_CHAT_KB_NAME = '__general__';
@@ -88,6 +89,63 @@ function requestUuid(): string {
   return createClientRequestId();
 }
 
+export type SkillInputRequest = {
+  task_id: string;
+  skill_ref: string;
+  required_inputs: string[];
+  checkpoint_artifact_id: string;
+};
+
+function normalizeSkillInputRequest(raw: Partial<SkillInputRequest>): SkillInputRequest | null {
+  const taskId = String(raw.task_id ?? '').trim();
+  if (!taskId) return null;
+  return {
+    task_id: taskId,
+    skill_ref: String(raw.skill_ref ?? '').trim(),
+    required_inputs: Array.isArray(raw.required_inputs)
+      ? raw.required_inputs
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        .map((item) => item.trim())
+        .slice(0, 16)
+      : [],
+    checkpoint_artifact_id: String(raw.checkpoint_artifact_id ?? '').trim(),
+  };
+}
+
+export function skillInputRequestFromEvent(
+  previous: SkillInputRequest[],
+  raw: Partial<SkillInputRequest> | undefined,
+): SkillInputRequest[] {
+  if (!raw) return previous;
+  const normalized = normalizeSkillInputRequest(raw);
+  if (!normalized) return previous;
+  const index = previous.findIndex((item) => item.task_id === normalized.task_id);
+  if (index < 0) return [...previous, normalized];
+  return previous.map((item, itemIndex) => (itemIndex === index ? normalized : item));
+}
+
+/** Compatibility helper for unit fixtures; production uses typed AgentEvent data. */
+export function skillInputRequestFromSseEvent(
+  previous: SkillInputRequest[],
+  eventType: string,
+  data: string,
+): SkillInputRequest[] {
+  if (eventType !== 'stage') return previous;
+  try {
+    const parsed = JSON.parse(data) as { skill_request?: Partial<SkillInputRequest> };
+    return skillInputRequestFromEvent(previous, parsed.skill_request);
+  } catch {
+    return previous;
+  }
+}
+
+export function dismissSkillInputRequest(
+  previous: SkillInputRequest[],
+  taskId: string,
+): SkillInputRequest[] {
+  return previous.filter((item) => item.task_id !== taskId);
+}
+
 /**
  * Build the persistent-turn request. Chat attachments and the knowledge scope
  * are separate optional fields; the user query is never decorated with them.
@@ -117,6 +175,8 @@ export function buildTurnRequest(
       sources: knowledgeScope.sources.map((source) => ({ ...source })),
     };
   }
+  const disabledSkillRefs = readDisabledSkillRefs();
+  if (disabledSkillRefs.length > 0) request.disabled_skill_refs = disabledSkillRefs;
   return request;
 }
 
@@ -206,6 +266,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const [traceSteps, setTraceSteps] = useState<QueryTraceStep[]>([]);
   const [degradedNotes, setDegradedNotes] = useState<Array<{ stage: string; reason: string }>>([]);
   const [mcpWriteCards, setMcpWriteCards] = useState<McpWriteProposalCard[]>([]);
+  const [skillInputRequests, setSkillInputRequests] = useState<SkillInputRequest[]>([]);
   const [evidenceByMessageId, setEvidenceByMessageId] = useState<Record<number, EvidenceItem[]>>({});
   const [memorySummary, setMemorySummary] = useState<SessionMemorySummary | null>(null);
   const [sessionConsents, setSessionConsents] = useState<MemoryConsentView[] | null>(null);
@@ -701,6 +762,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       setTraceSteps(createInitialTrace(turn.kb_name === GENERAL_CHAT_KB_NAME));
       setDegradedNotes([]);
       setLiveSubagents([]);
+      setSkillInputRequests([]);
       let accumulated = '';
       try {
         await api.post(`/api/v1/turns/${turn.id}/start`);
@@ -727,6 +789,9 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
                 status: event.status,
                 detail: event.detail,
               });
+              if (event.skill_request) {
+                setSkillInputRequests((previous) => skillInputRequestFromEvent(previous, event.skill_request));
+              }
               break;
             case 'tool_started':
             case 'tool_result':
@@ -744,6 +809,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
               break;
             case 'done': {
               if (!ownsStream(turn.id, turn.session_id)) break;
+              setSkillInputRequests([]);
               const answer = event.answer || accumulated;
               const summary = event.summary ?? {};
               setMessages((prev) => [
@@ -780,6 +846,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
             }
             case 'error':
               if (!ownsStream(turn.id, turn.session_id)) break;
+              setSkillInputRequests([]);
               finishTrace('error', event.message || '查询失败');
               break;
             default:
@@ -952,6 +1019,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     setTraceSteps(createInitialTrace(scopeKbName === GENERAL_CHAT_KB_NAME));
     setDegradedNotes([]);
     setLiveSubagents([]);
+    setSkillInputRequests([]);
 
     let sessionId = mustStartNewSession ? null : activeSessionId;
     // 乐观更新:点发送立即上屏,不等建会话/建 turn 的两个往返(否则"思考中"
@@ -1061,6 +1129,9 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
               status: event.status,
               detail: event.detail,
             });
+            if (event.skill_request) {
+              setSkillInputRequests((previous) => skillInputRequestFromEvent(previous, event.skill_request));
+            }
             break;
           case 'tool_started':
           case 'tool_result':
@@ -1078,11 +1149,13 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
             break;
           case 'done':
             finalPayload = event;
+            setSkillInputRequests([]);
             finishTrace('done', '已完成输出');
             setTraceByMessageId((prev) => ({ ...prev, [created.turn.assistant_message_id]: traceRef.current }));
             break;
           case 'error':
             errorMessage = event.message || '查询失败';
+            setSkillInputRequests([]);
             finishTrace('error', errorMessage);
             break;
           default:
@@ -1229,6 +1302,10 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     }));
   }, [mcpWriteCards.length]);
 
+  const dismissSkillInput = useCallback((taskId: string) => {
+    setSkillInputRequests((previous) => dismissSkillInputRequest(previous, taskId));
+  }, []);
+
   return {
     kbName,
     // 会话
@@ -1263,6 +1340,8 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     degradedNotes,
     liveSubagents,
     mcpWriteCards,
+    skillInputRequests,
+    dismissSkillInput,
     updateMcpWriteCard,
     refreshMcpWriteCards,
     turnQueueNotice,

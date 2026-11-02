@@ -13,8 +13,9 @@ import os
 import re
 import secrets
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Mapping
 
 import yaml
 
@@ -59,6 +60,24 @@ def validate_requirements_lock(data: bytes) -> int:
     return len(lines)
 
 
+def _dependency_manifest(data: bytes) -> tuple[Mapping[str, Any], ...]:
+    """Return dependency identities without treating a lock file as proof of supply-chain trust."""
+
+    if not data.strip():
+        return ()
+    lines = [line.strip() for line in data.decode("utf-8").splitlines() if line.strip()]
+    result: list[Mapping[str, Any]] = []
+    for line in lines:
+        requirement, *hash_parts = line.split()
+        name, version = requirement.split("==", 1)
+        result.append({
+            "name": name,
+            "version": version,
+            "hashes": [part.removeprefix("--hash=sha256:").lower() for part in hash_parts],
+        })
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class SkillPackage:
     archive_digest: str
@@ -66,6 +85,9 @@ class SkillPackage:
     entrypoint: bytes
     files: tuple[str, ...]
     review_flags: tuple[str, ...]
+    source_manifest: tuple[Mapping[str, Any], ...] = ()
+    dependencies: tuple[Mapping[str, Any], ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
     requirements_declared: bool = False
 
 
@@ -77,11 +99,117 @@ class TextSkillPackage:
     description: str
     content: str
     files: tuple[str, ...]
+    source_manifest: tuple[Mapping[str, Any], ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SKILL_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _FRONTMATTER_RE = re.compile(r"\A---\n(.{1,4096}?)\n---(?:\n|\Z)", re.DOTALL)
+
+
+def _read_frontmatter(markdown: str, *, required: bool = False) -> tuple[str, str, dict[str, Any]]:
+    """Read the bounded YAML header used by both Skill package types.
+
+    Executable packages may keep the older Markdown-only form, so their
+    frontmatter is optional.  When present, only the review metadata below is
+    copied into the catalog; arbitrary YAML is never treated as runtime
+    configuration.
+    """
+    normalized = str(markdown or "").replace("\r\n", "\n").replace("\r", "\n")
+    match = _FRONTMATTER_RE.match(normalized)
+    if not match:
+        if required:
+            raise SkillPackageError("SKILL.md must start with YAML name and description")
+        return "", "", {}
+    try:
+        document = yaml.safe_load(match.group(1))
+    except yaml.YAMLError as exc:
+        raise SkillPackageError("SKILL.md frontmatter is invalid YAML") from exc
+    if not isinstance(document, Mapping):
+        raise SkillPackageError("SKILL.md frontmatter must be a mapping")
+    raw_name = document.get("name", "")
+    raw_description = document.get("description", "")
+    if required and (not isinstance(raw_name, str) or not isinstance(raw_description, str)):
+        raise SkillPackageError("SKILL.md must start with YAML name and description")
+    name = raw_name.strip() if isinstance(raw_name, str) else ""
+    description = raw_description.strip() if isinstance(raw_description, str) else ""
+    if name and (len(name) > 64 or not _SKILL_NAME_RE.fullmatch(name)):
+        raise SkillPackageError("SKILL.md name must use lowercase letters, digits and hyphens")
+    if required and not name:
+        raise SkillPackageError("SKILL.md must start with YAML name and description")
+    if description and len(description) > 1024:
+        raise SkillPackageError("SKILL.md description must be 1-1024 characters")
+    if required and not 1 <= len(description) <= 1024:
+        raise SkillPackageError("SKILL.md description must be 1-1024 characters")
+    declared = document.get("metadata") or {}
+    if not isinstance(declared, Mapping):
+        raise SkillPackageError("SKILL.md metadata must be a mapping")
+    return name, description, dict(declared)
+
+
+def _source_manifest(files: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
+    """Generate a deterministic source manifest for review and SBOM display."""
+
+    entries: list[Mapping[str, Any]] = []
+    for name in sorted(files):
+        content = files[name]
+        data = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        entries.append({
+            "path": name,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size": len(data),
+        })
+    return tuple(entries)
+
+
+def _bounded_metadata_list(value: Any, field_name: str) -> list[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) > 32:
+        raise SkillPackageError(f"SKILL.md metadata.{field_name} must be a bounded list")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not 1 <= len(item.strip()) <= 160:
+            raise SkillPackageError(f"SKILL.md metadata.{field_name} contains an invalid value")
+        result.append(item.strip())
+    return result
+
+
+def _review_metadata(name: str, description: str, declared: Mapping[str, Any]) -> dict[str, Any]:
+    """Project frontmatter into the public, non-executable Skill directory."""
+    result: dict[str, Any] = {}
+    if name:
+        result["skill_name"] = name
+    if description:
+        result["summary"] = description[:500]
+
+    aliases = {
+        "intent_examples": ("intent_examples",),
+        "input_kinds": ("input_kinds", "input_types"),
+        "output_kinds": ("output_kinds", "output_types", "outputs"),
+        "interaction_modes": ("interaction_modes",),
+        "side_effects": ("side_effects",),
+    }
+    for canonical, keys in aliases.items():
+        for key in keys:
+            if key in declared:
+                values = _bounded_metadata_list(declared.get(key), canonical)
+                if values is not None:
+                    result[canonical] = values
+                break
+
+    if "risk" in declared:
+        risk = declared.get("risk")
+        if not isinstance(risk, str) or not 1 <= len(risk.strip()) <= 32:
+            raise SkillPackageError("SKILL.md metadata.risk must be a short text value")
+        result["risk"] = risk.strip().lower()
+    if "version" in declared:
+        version = declared.get("version")
+        if not isinstance(version, str) or not _SKILL_VERSION_RE.fullmatch(version) or ".." in version:
+            raise SkillPackageError("SKILL.md metadata.version is invalid")
+        result["declared_version"] = version
+    return result
 
 
 def validate_text_skill_package(data: bytes) -> TextSkillPackage:
@@ -137,22 +265,9 @@ def validate_text_skill_package(data: bytes) -> TextSkillPackage:
     frontmatter = _FRONTMATTER_RE.match(markdown)
     if not frontmatter:
         raise SkillPackageError("SKILL.md must start with YAML name and description")
-    try:
-        metadata = yaml.safe_load(frontmatter.group(1))
-    except yaml.YAMLError as exc:
-        raise SkillPackageError("SKILL.md frontmatter is invalid YAML") from exc
-    if not isinstance(metadata, dict):
-        raise SkillPackageError("SKILL.md frontmatter must be a mapping")
-    name, description = metadata.get("name"), metadata.get("description")
-    if not isinstance(name, str) or len(name) > 64 or not _SKILL_NAME_RE.fullmatch(name):
-        raise SkillPackageError("SKILL.md name must use lowercase letters, digits and hyphens")
+    name, description, declared = _read_frontmatter(markdown, required=True)
     if prefix and prefix[:-1] != name:
         raise SkillPackageError("Skill folder name must match SKILL.md name")
-    if not isinstance(description, str) or not 1 <= len(description.strip()) <= 1024:
-        raise SkillPackageError("SKILL.md description must be 1-1024 characters")
-    declared = metadata.get("metadata") or {}
-    if not isinstance(declared, dict):
-        raise SkillPackageError("SKILL.md metadata must be a mapping")
     version = declared.get("version", "1.0.0")
     if not isinstance(version, str) or not _SKILL_VERSION_RE.fullmatch(version) or ".." in version:
         raise SkillPackageError("SKILL.md metadata.version is invalid")
@@ -167,6 +282,10 @@ def validate_text_skill_package(data: bytes) -> TextSkillPackage:
         archive_digest=hashlib.sha256(raw).hexdigest(), skill_ref=f"skill/{name}",
         version=version, description=description.strip(), content=combined,
         files=tuple(sorted(name.removeprefix(prefix) for name in files)),
+        source_manifest=_source_manifest({
+            name.removeprefix(prefix): content for name, content in files.items()
+        }),
+        metadata=_review_metadata(name, description, declared),
     )
 
 
@@ -239,6 +358,8 @@ def validate_skill_package(data: bytes) -> SkillPackage:
     entrypoint = contents["entrypoint.py"]
     if b"\x00" in entrypoint:
         raise SkillPackageError("entrypoint.py contains a NUL byte")
+    name, description, declared = _read_frontmatter(markdown)
+    metadata = _review_metadata(name, description, declared)
     flags = list(review_flags(markdown))
     for name, content in contents.items():
         if name.endswith(".py"):
@@ -249,6 +370,9 @@ def validate_skill_package(data: bytes) -> SkillPackage:
         entrypoint=entrypoint,
         files=tuple(sorted(names)),
         review_flags=tuple(sorted(set(flags))),
+        source_manifest=_source_manifest(contents),
+        dependencies=_dependency_manifest(contents.get("requirements.lock", b"")),
+        metadata=metadata,
         requirements_declared=dependency_count > 0,
     )
 

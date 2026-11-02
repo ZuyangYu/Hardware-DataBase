@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import re
 import threading
 import uuid
 from contextlib import closing
@@ -29,6 +30,10 @@ from .models import (
     canonical_json,
 )
 from .policy import validate_task_spec
+from .migrations.v1_task_runtime import migrate_runtime_events
+from .runtime_contract import RuntimeContractError, parse_skill_result, validate_skill_event
+
+_ARTIFACT_ID_RE = re.compile(r"^art-[a-f0-9]{16,64}$")
 
 
 class SandboxTaskStoreError(RuntimeError):
@@ -73,12 +78,24 @@ CREATE TABLE IF NOT EXISTS sandbox_tasks (
     policy_snapshot_hash TEXT NOT NULL,
     skill_ref TEXT NOT NULL DEFAULT '',
     skill_content_digest TEXT NOT NULL DEFAULT '',
+    skill_version TEXT NOT NULL DEFAULT '',
+    runtime_contract_version TEXT NOT NULL DEFAULT 'v1',
+    parent_task_id TEXT NOT NULL DEFAULT '',
+    resume_from TEXT NOT NULL DEFAULT '',
     capability_snapshot_hash TEXT NOT NULL DEFAULT '',
     network_policy_ref TEXT NOT NULL DEFAULT '',
     required_capabilities_json TEXT NOT NULL DEFAULT '[]',
     input_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
     parameters_json TEXT NOT NULL DEFAULT '{}',
     output_manifest_json TEXT NOT NULL DEFAULT '{}',
+    result_status TEXT NOT NULL DEFAULT '',
+    skill_result_json TEXT NOT NULL DEFAULT '{}',
+    latest_step_id TEXT NOT NULL DEFAULT '',
+    latest_step_status TEXT NOT NULL DEFAULT '',
+    latest_progress REAL NOT NULL DEFAULT -1,
+    latest_event_seq INTEGER NOT NULL DEFAULT 0,
+    latest_event_attempt INTEGER NOT NULL DEFAULT 0,
+    latest_checkpoint_artifact_id TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'admitted',
     desired_state TEXT NOT NULL DEFAULT 'running',
     observed_state TEXT NOT NULL DEFAULT '',
@@ -106,6 +123,30 @@ CREATE INDEX IF NOT EXISTS idx_sandbox_task_lease
     ON sandbox_tasks(status, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_sandbox_task_scope
     ON sandbox_tasks(owner_id, department_id, created_at);
+
+CREATE TABLE IF NOT EXISTS sandbox_task_runtime_events (
+    runtime_event_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    fencing_token INTEGER NOT NULL DEFAULT 0,
+    skill_content_digest TEXT NOT NULL DEFAULT '',
+    runtime_contract_version TEXT NOT NULL DEFAULT 'v1',
+    seq INTEGER NOT NULL,
+    step_id TEXT NOT NULL DEFAULT '',
+    event_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT '',
+    progress REAL,
+    message TEXT NOT NULL DEFAULT '',
+    artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    heartbeat INTEGER NOT NULL DEFAULT 0,
+    emitted_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES sandbox_tasks(task_id) ON DELETE CASCADE,
+    UNIQUE(task_id, attempt, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_sandbox_task_runtime_events_task
+    ON sandbox_task_runtime_events(task_id, attempt, seq);
 
 CREATE TABLE IF NOT EXISTS sandbox_task_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -302,10 +343,27 @@ class SandboxTaskStore:
                 "capability_snapshot_hash": "TEXT NOT NULL DEFAULT ''",
                 "skill_ref": "TEXT NOT NULL DEFAULT ''",
                 "skill_content_digest": "TEXT NOT NULL DEFAULT ''",
+                "skill_version": "TEXT NOT NULL DEFAULT ''",
+                "runtime_contract_version": "TEXT NOT NULL DEFAULT 'v1'",
+                "parent_task_id": "TEXT NOT NULL DEFAULT ''",
+                "resume_from": "TEXT NOT NULL DEFAULT ''",
+                "result_status": "TEXT NOT NULL DEFAULT ''",
+                "skill_result_json": "TEXT NOT NULL DEFAULT '{}'",
+                "latest_step_id": "TEXT NOT NULL DEFAULT ''",
+                "latest_step_status": "TEXT NOT NULL DEFAULT ''",
+                "latest_progress": "REAL NOT NULL DEFAULT -1",
+                "latest_event_seq": "INTEGER NOT NULL DEFAULT 0",
+                "latest_event_attempt": "INTEGER NOT NULL DEFAULT 0",
+                "latest_checkpoint_artifact_id": "TEXT NOT NULL DEFAULT ''",
             }
             for column, ddl in migrations.items():
                 if column not in columns:
                     conn.execute(f"ALTER TABLE sandbox_tasks ADD COLUMN {column} {ddl}")
+            event_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(sandbox_task_runtime_events)")
+            }
+            migrate_runtime_events(conn, event_columns)
 
     @staticmethod
     def _row_to_task(row: sqlite3.Row) -> SandboxTask:
@@ -327,6 +385,10 @@ class SandboxTaskStore:
             policy_snapshot_hash=str(get("policy_snapshot_hash")),
             skill_ref=str(get("skill_ref")),
             skill_content_digest=str(get("skill_content_digest")),
+            skill_version=str(get("skill_version")),
+            runtime_contract_version=str(get("runtime_contract_version", "v1")),
+            parent_task_id=str(get("parent_task_id")),
+            resume_from=str(get("resume_from")),
             capability_snapshot_hash=str(get("capability_snapshot_hash")),
             network_policy_ref=str(get("network_policy_ref")),
             required_capabilities=tuple(_load_json(get("required_capabilities_json", "[]"), [])),
@@ -334,6 +396,17 @@ class SandboxTaskStore:
             parameters=dict(_load_json(get("parameters_json", "{}"), {}) or {}),
             output_manifest=dict(_load_json(get("output_manifest_json", "{}"), {}) or {}),
             status=str(get("status", "admitted")),
+            result_status=str(get("result_status")),
+            skill_result=dict(_load_json(get("skill_result_json", "{}"), {}) or {}),
+            latest_step_id=str(get("latest_step_id")),
+            latest_step_status=str(get("latest_step_status")),
+            latest_progress=(
+                None if float(get("latest_progress", -1) or -1) < 0
+                else float(get("latest_progress", -1))
+            ),
+            latest_event_seq=int(get("latest_event_seq", 0) or 0),
+            latest_event_attempt=int(get("latest_event_attempt", 0) or 0),
+            latest_checkpoint_artifact_id=str(get("latest_checkpoint_artifact_id")),
             desired_state=str(get("desired_state", "running")),
             observed_state=str(get("observed_state")),
             cleanup_state=str(get("cleanup_state", "pending")),
@@ -427,13 +500,17 @@ class SandboxTaskStore:
                         task_id, idempotency_key, request_fingerprint, owner_id, department_id,
                         kind, bundle_ref, bundle_digest, profile_ref, policy_snapshot_hash,
                         capability_snapshot_hash, skill_ref, skill_content_digest,
+                        skill_version, runtime_contract_version, parent_task_id, resume_from,
                         network_policy_ref, required_capabilities_json, input_artifact_ids_json,
-                        parameters_json, output_manifest_json, status, desired_state,
+                        parameters_json, output_manifest_json, result_status, skill_result_json,
+                        latest_step_id, latest_step_status, latest_progress, latest_event_seq,
+                        latest_event_attempt, latest_checkpoint_artifact_id, status, desired_state,
                         observed_state, cleanup_state, execution_id, backend_ref, lease_owner,
                         lease_expires_at, fencing_token, attempt, deadline_at, error_code,
                         error_message, revision, created_at, updated_at, started_at, finished_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', 'admitted',
-                              'running', '', 'pending', '', '', '', '', 0, 0, ?, '', '', 0, ?, ?, '', '')
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                              ?, '{}', '', '{}', '', '', -1, 0, 0, '', 'admitted', 'running',
+                              '', 'pending', '', '', '', '', 0, 0, ?, '', '', 0, ?, ?, '', '')
                     """,
                     (
                         task_id,
@@ -449,6 +526,10 @@ class SandboxTaskStore:
                         normalized.capability_snapshot_hash,
                         normalized.skill_ref,
                         normalized.skill_content_digest,
+                        normalized.skill_version,
+                        normalized.runtime_contract_version,
+                        normalized.parent_task_id,
+                        normalized.resume_from,
                         normalized.network_policy_ref,
                         _json(list(normalized.required_capabilities), []),
                         _json(list(normalized.input_artifact_ids), []),
@@ -494,6 +575,91 @@ class SandboxTaskStore:
 
     submit = create
 
+    def bind_inputs(
+        self,
+        task_id: str,
+        artifact_ids: tuple[str, ...],
+        *,
+        expected_revision: int | None = None,
+        actor_id: str = "",
+    ) -> SandboxTask:
+        """Atomically bind committed inputs before a task is dispatched.
+
+        The task fingerprint is re-derived because input references are part of
+        the request identity; replaying the original idempotency key with a
+        different input set must never silently reuse the old task.
+        """
+
+        values = tuple(str(item).strip() for item in artifact_ids)
+        if len(set(values)) != len(values) or any(not _ARTIFACT_ID_RE.fullmatch(item) for item in values):
+            raise ValueError("input artifacts must be unique opaque IDs")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._select(conn, task_id)
+                if row is None:
+                    raise TaskNotFound(f"sandbox task not found: {task_id}")
+                current = self._row_to_task(row)
+                if expected_revision is not None and current.revision != int(expected_revision):
+                    raise TaskConflict("task revision changed")
+                if current.status not in {"admitted", "queued"} or current.execution_id:
+                    raise InvalidTransition("inputs can only be bound before execution starts")
+                spec = SandboxTaskSpec(
+                    idempotency_key=current.idempotency_key,
+                    owner_id=current.owner_id,
+                    department_id=current.department_id,
+                    bundle_ref=current.bundle_ref,
+                    bundle_digest=current.bundle_digest,
+                    profile_ref=current.profile_ref,
+                    policy_snapshot_hash=current.policy_snapshot_hash,
+                    capability_snapshot_hash=current.capability_snapshot_hash,
+                    kind=current.kind,
+                    network_policy_ref=current.network_policy_ref,
+                    required_capabilities=current.required_capabilities,
+                    input_artifact_ids=values,
+                    parameters=current.parameters,
+                    deadline_at=current.deadline_at,
+                    skill_ref=current.skill_ref,
+                    skill_content_digest=current.skill_content_digest,
+                    skill_version=current.skill_version,
+                    runtime_contract_version=current.runtime_contract_version,
+                    parent_task_id=current.parent_task_id,
+                    resume_from=current.resume_from,
+                )
+                if "sandbox.internal_data" not in current.required_capabilities and values:
+                    raise InvalidTransition("task capability snapshot does not allow input artifacts")
+                fingerprint = spec.fingerprint()
+                now = _utc_now().isoformat()
+                revision = current.revision + 1
+                conn.execute(
+                    "UPDATE sandbox_tasks SET input_artifact_ids_json = ?, request_fingerprint = ?, "
+                    "revision = ?, updated_at = ? WHERE task_id = ? AND revision = ?",
+                    (
+                        _json(list(values), []),
+                        fingerprint,
+                        revision,
+                        now,
+                        current.task_id,
+                        current.revision,
+                    ),
+                )
+                self._event(
+                    conn,
+                    task_id=current.task_id,
+                    action="sandbox.task_bind_inputs",
+                    from_status=current.status,
+                    to_status=current.status,
+                    actor_id=actor_id or current.owner_id,
+                    revision=revision,
+                    metadata={"input_artifact_ids": list(values)},
+                )
+                updated = self._select(conn, task_id)
+                conn.execute("COMMIT")
+                return self._row_to_task(updated) if updated else current
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
     def enqueue(self, task_id: str, *, expected_revision: int | None = None, actor_id: str = "") -> SandboxTask:
         return self.transition(
             task_id,
@@ -517,6 +683,31 @@ class SandboxTaskStore:
         revision: int = 0,
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
+        event_metadata = _safe_metadata(metadata)
+        lineage = conn.execute(
+            "SELECT bundle_digest, skill_content_digest, runtime_contract_version "
+            "FROM sandbox_tasks WHERE task_id = ?",
+            (str(task_id),),
+        ).fetchone()
+        if lineage is not None:
+            event_metadata.setdefault("bundle_digest", str(lineage["bundle_digest"] or ""))
+            event_metadata.setdefault(
+                "skill_content_digest", str(lineage["skill_content_digest"] or "")
+            )
+            event_metadata.setdefault(
+                "runtime_contract_version",
+                str(lineage["runtime_contract_version"] or "v1"),
+            )
+        try:
+            from src.observability.context import current_trace_identity
+
+            trace_identity = current_trace_identity()
+            if trace_identity.trace_id:
+                event_metadata.setdefault("trace_id", trace_identity.trace_id)
+            if trace_identity.span_id:
+                event_metadata.setdefault("span_id", trace_identity.span_id)
+        except Exception:
+            pass
         conn.execute(
             """
             INSERT INTO sandbox_task_events(
@@ -533,7 +724,7 @@ class SandboxTaskStore:
                 str(lease_owner or "")[:128],
                 int(fencing_token or 0),
                 int(revision or 0),
-                _json(_safe_metadata(metadata), {}),
+                _json(event_metadata, {}),
                 _iso(),
             ),
         )
@@ -572,6 +763,290 @@ class SandboxTaskStore:
                 )
             result.append(item)
         return result
+
+    def append_runtime_event(
+        self,
+        task_id: str,
+        value: Mapping[str, Any],
+        *,
+        lease_owner: str | None = None,
+        fencing_token: int | None = None,
+        require_lease: bool = False,
+        actor_id: str = "",
+    ) -> SandboxTask:
+        """Validate and durably append one Skill runtime event.
+
+        Runtime events are separate from task lifecycle transitions so a Skill
+        can report step progress without widening the task state machine.  The
+        task's latest step projection is updated in the same transaction.
+        """
+
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._select(conn, task_id)
+                if row is None:
+                    raise TaskNotFound(f"sandbox task not found: {task_id}")
+                current = self._row_to_task(row)
+                if require_lease:
+                    self._assert_lease(current, lease_owner, fencing_token)
+                event = validate_skill_event(
+                    value,
+                    task_id=current.task_id,
+                    attempt=current.attempt,
+                )
+                if current.latest_event_attempt > event.attempt:
+                    raise RuntimeContractError("runtime event attempt is older than the task projection")
+                now = _utc_now().isoformat()
+                artifact_ids = list(event.artifact_ids)
+                metadata = _safe_metadata(event.metadata)
+                # event_id is only required to be unique inside one task's
+                # event stream.  Namespace the physical primary key so two
+                # tasks may legitimately reuse evt-1, evt-2, ...
+                storage_event_id = f"{current.task_id}:{event.attempt}:{event.event_id}"
+                existing = conn.execute(
+                    "SELECT * FROM sandbox_task_runtime_events "
+                    "WHERE task_id = ? AND attempt = ? AND seq = ?",
+                    (current.task_id, event.attempt, event.seq),
+                ).fetchone()
+                if existing is not None:
+                    # Polling an observation may replay the same snapshot.  A
+                    # byte-identical event is idempotent; a different payload
+                    # for the same (attempt, seq) is a contract conflict.
+                    same = (
+                        str(existing["runtime_event_id"]) == storage_event_id
+                        and str(existing["step_id"]) == event.step_id
+                        and str(existing["event_type"]) == event.event
+                        and str(existing["status"]) == event.status
+                        and existing["progress"] == event.progress
+                        and str(existing["message"]) == event.message
+                        and _load_json(existing["artifact_ids_json"], []) == artifact_ids
+                        and _load_json(existing["metadata_json"], {}) == metadata
+                    )
+                    if same:
+                        conn.execute("COMMIT")
+                        return current
+                    raise RuntimeContractError("runtime event sequence conflicts with a stored event")
+                max_row = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM sandbox_task_runtime_events "
+                    "WHERE task_id = ? AND attempt = ?",
+                    (current.task_id, event.attempt),
+                ).fetchone()
+                if event.seq <= int(max_row["max_seq"] or 0):
+                    raise RuntimeContractError("event sequence must be strictly increasing")
+                checkpoint = ""
+                if event.event == "checkpoint_created" and artifact_ids:
+                    checkpoint = artifact_ids[0]
+                latest_progress = -1 if event.progress is None else event.progress
+                revision = current.revision + 1
+                conn.execute(
+                    """
+                    INSERT INTO sandbox_task_runtime_events(
+                        runtime_event_id, task_id, attempt, fencing_token,
+                        skill_content_digest, runtime_contract_version, seq, step_id, event_type,
+                        status, progress, message, artifact_ids_json, metadata_json,
+                        heartbeat, emitted_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        storage_event_id,
+                        current.task_id,
+                        event.attempt,
+                        current.fencing_token,
+                        current.skill_content_digest,
+                        current.runtime_contract_version,
+                        event.seq,
+                        event.step_id,
+                        event.event,
+                        event.status,
+                        event.progress,
+                        event.message,
+                        _json(artifact_ids, []),
+                        _json(metadata, {}),
+                        1 if event.heartbeat else 0,
+                        event.emitted_at,
+                        now,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE sandbox_tasks
+                    SET latest_step_id = ?, latest_step_status = ?,
+                        latest_progress = CASE WHEN ? >= 0 THEN ? ELSE latest_progress END,
+                        latest_event_seq = ?, latest_event_attempt = ?,
+                        latest_checkpoint_artifact_id = CASE
+                            WHEN ? <> '' THEN ? ELSE latest_checkpoint_artifact_id END,
+                        revision = ?, updated_at = ?
+                    WHERE task_id = ? AND revision = ?
+                    """,
+                    (
+                        event.step_id,
+                        event.status or event.event,
+                        latest_progress,
+                        latest_progress,
+                        event.seq,
+                        event.attempt,
+                        checkpoint,
+                        checkpoint,
+                        revision,
+                        now,
+                        current.task_id,
+                        current.revision,
+                    ),
+                )
+                self._event(
+                    conn,
+                    task_id=current.task_id,
+                    action=f"skill.{event.event}",
+                    from_status=current.status,
+                    to_status=current.status,
+                    actor_id=actor_id or lease_owner or current.owner_id,
+                    lease_owner=str(lease_owner or current.lease_owner),
+                    fencing_token=int(fencing_token if fencing_token is not None else current.fencing_token),
+                    revision=revision,
+                    metadata={
+                        "runtime_event_id": event.event_id,
+                        "seq": event.seq,
+                        "attempt": event.attempt,
+                        "step_id": event.step_id,
+                        "status": event.status,
+                        "progress": event.progress,
+                        "artifact_ids": list(event.artifact_ids),
+                        "heartbeat": event.heartbeat,
+                    },
+                )
+                updated = self._select(conn, task_id)
+                conn.execute("COMMIT")
+                if updated is None:  # pragma: no cover - defensive
+                    raise SandboxTaskStoreError("task disappeared after runtime event")
+                return self._row_to_task(updated)
+            except sqlite3.IntegrityError as exc:
+                conn.execute("ROLLBACK")
+                raise RuntimeContractError("runtime event sequence or event_id already exists") from exc
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+    def runtime_events(self, task_id: str, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Return validated Skill events in ascending sequence order."""
+
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM sandbox_task_runtime_events "
+                "WHERE task_id = ? ORDER BY attempt ASC, seq ASC LIMIT ?",
+                (str(task_id), max(1, min(int(limit), 1000))),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            task_id = str(row["task_id"])
+            attempt = int(row["attempt"] or 0)
+            prefix = f"{task_id}:{attempt}:"
+            stored_event_id = str(row["runtime_event_id"])
+            result.append(
+                {
+                    "event_id": stored_event_id.removeprefix(prefix),
+                    "task_id": task_id,
+                    "attempt": int(row["attempt"] or 0),
+                    "fencing_token": int(row["fencing_token"] or 0)
+                    if "fencing_token" in row.keys()
+                    else 0,
+                    "skill_content_digest": str(row["skill_content_digest"] or "")
+                    if "skill_content_digest" in row.keys()
+                    else "",
+                    "runtime_contract_version": str(row["runtime_contract_version"] or "v1")
+                    if "runtime_contract_version" in row.keys()
+                    else "v1",
+                    "seq": int(row["seq"] or 0),
+                    "step_id": str(row["step_id"]),
+                    "event": str(row["event_type"]),
+                    "status": str(row["status"]),
+                    "progress": row["progress"],
+                    "message": str(row["message"]),
+                    "artifact_ids": _load_json(row["artifact_ids_json"], []),
+                    "metadata": _load_json(row["metadata_json"], {}),
+                    "heartbeat": bool(row["heartbeat"]),
+                    "emitted_at": str(row["emitted_at"]),
+                    "created_at": str(row["created_at"]),
+                }
+            )
+        return result
+
+    def record_result(
+        self,
+        task_id: str,
+        value: Mapping[str, Any],
+        *,
+        lease_owner: str | None = None,
+        fencing_token: int | None = None,
+        require_lease: bool = False,
+        actor_id: str = "",
+    ) -> SandboxTask:
+        """Persist a Skill business result independently of task execution state."""
+
+        result = parse_skill_result(value)
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._select(conn, task_id)
+                if row is None:
+                    raise TaskNotFound(f"sandbox task not found: {task_id}")
+                current = self._row_to_task(row)
+                if require_lease:
+                    self._assert_lease(current, lease_owner, fencing_token)
+                serialized = result.to_dict()
+                if current.result_status == result.result_status and dict(current.skill_result) == serialized:
+                    conn.execute("COMMIT")
+                    return current
+                now = _utc_now().isoformat()
+                revision = current.revision + 1
+                checkpoint = result.checkpoint_artifact_id
+                conn.execute(
+                    """
+                    UPDATE sandbox_tasks
+                    SET result_status = ?, skill_result_json = ?,
+                        latest_checkpoint_artifact_id = CASE WHEN ? <> '' THEN ? ELSE latest_checkpoint_artifact_id END,
+                        revision = ?, updated_at = ?
+                    WHERE task_id = ? AND revision = ?
+                    """,
+                    (
+                        result.result_status,
+                        _json(serialized, {}),
+                        checkpoint,
+                        checkpoint,
+                        revision,
+                        now,
+                        current.task_id,
+                        current.revision,
+                    ),
+                )
+                self._event(
+                    conn,
+                    task_id=current.task_id,
+                    action="skill.result",
+                    from_status=current.status,
+                    to_status=current.status,
+                    actor_id=actor_id or lease_owner or current.owner_id,
+                    lease_owner=str(lease_owner or current.lease_owner),
+                    fencing_token=int(fencing_token if fencing_token is not None else current.fencing_token),
+                    revision=revision,
+                    metadata={
+                        "result_status": result.result_status,
+                        "error_code": result.error_code,
+                        "issue_count": len(result.issues),
+                        "artifact_ids": list(result.artifact_ids),
+                        "required_inputs": list(result.required_inputs),
+                        "required_tools": list(result.required_tools),
+                        "checkpoint_artifact_id": checkpoint,
+                    },
+                )
+                updated = self._select(conn, task_id)
+                conn.execute("COMMIT")
+                if updated is None:  # pragma: no cover - defensive
+                    raise SandboxTaskStoreError("task disappeared after result")
+                return self._row_to_task(updated)
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def transition(
         self,
@@ -622,7 +1097,11 @@ class SandboxTaskStore:
                     raise InvalidTransition(f"cannot transition {current.status} -> {target}")
                 if target == "succeeded":
                     manifest = _safe_manifest(output_manifest or current.output_manifest or {})
-                    if not manifest or not _manifest_committed(manifest):
+                    empty_interaction = not manifest.get("items") and current.result_status in {
+                        "needs_user_input",
+                        "needs_tool",
+                    }
+                    if not empty_interaction and (not manifest or not _manifest_committed(manifest)):
                         raise TaskConflict("task cannot succeed before committed output artifacts are recorded")
                     output_manifest = manifest
                 now = _utc_now()
@@ -665,6 +1144,16 @@ class SandboxTaskStore:
                 )
                 if int(cursor.rowcount or 0) != 1:
                     raise TaskConflict("task revision changed")
+                transition_metadata = dict(metadata or {})
+                if output_manifest is not None:
+                    transition_metadata.setdefault(
+                        "artifact_digests",
+                        [
+                            str(item.get("sha256") or "")
+                            for item in (_safe_manifest(output_manifest).get("items") or [])
+                            if isinstance(item, Mapping) and item.get("sha256")
+                        ][:64],
+                    )
                 self._event(
                     conn,
                     task_id=str(task_id),
@@ -675,7 +1164,7 @@ class SandboxTaskStore:
                     lease_owner=str(lease_owner or current.lease_owner),
                     fencing_token=int(fencing_token if fencing_token is not None else current.fencing_token),
                     revision=current.revision + 1,
-                    metadata=metadata,
+                    metadata=transition_metadata,
                 )
                 updated = self._select(conn, task_id)
                 conn.execute("COMMIT")
@@ -1081,6 +1570,7 @@ class SandboxTaskStore:
         error_code: str = "runner_failed",
         error_message: str = "",
         expected_revision: int | None = None,
+        output_manifest: Mapping[str, Any] | None = None,
     ) -> SandboxTask:
         return self.transition(
             task_id,
@@ -1095,6 +1585,7 @@ class SandboxTaskStore:
             error_message=error_message,
             observed_state="failed",
             cleanup_state="complete",
+            output_manifest=output_manifest,
         )
 
     def mark_unknown(
@@ -1163,7 +1654,12 @@ class SandboxTaskStore:
             if task.status == target:
                 return task
             raise InvalidTransition(f"task is not awaiting reconciliation: {task.status}")
-        if target == "succeeded" and not _manifest_committed(_safe_manifest(output_manifest or task.output_manifest or {})):
+        manifest = _safe_manifest(output_manifest or task.output_manifest or {})
+        if (
+            target == "succeeded"
+            and not _manifest_committed(manifest)
+            and task.result_status not in {"needs_user_input", "needs_tool"}
+        ):
             raise TaskConflict("reconciliation cannot mark success without committed artifacts")
         metadata = dict(proof or {})
         metadata["execution_id_present"] = bool(execution_id or task.execution_id)

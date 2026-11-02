@@ -965,19 +965,43 @@ _SANDBOX_TASK_STATUSES = frozenset(
 _SANDBOX_OPERATIONS = frozenset({"submit", "observe", "cancel", "collect", "reconcile", "dispatch"})
 _SANDBOX_OUTCOMES = frozenset({"ok", "failed", "unknown", "disabled", "denied"})
 _SANDBOX_ARTIFACT_STATES = frozenset({"staged", "scanning", "committed", "rejected", "deleted"})
+_SANDBOX_RESULT_STATUSES = frozenset(
+    {"completed", "needs_user_input", "needs_tool", "validation_failed", "failed", "unknown"}
+)
+_SANDBOX_SKILL_KINDS = frozenset({"executable", "generic"})
 
 
-def record_sandbox_task(*, operation: str, status: str, duration_s: float = 0.0) -> None:
+def record_sandbox_task(
+    *,
+    operation: str,
+    status: str,
+    duration_s: float = 0.0,
+    result_status: str = "",
+    skill_kind: str = "",
+) -> None:
     """Record Sandbox lifecycle activity without task/user/tenant labels."""
 
     op = str(operation or "").strip().lower()
     outcome = str(status or "").strip().lower()
+    attributes = {
+        "operation": op if op in _SANDBOX_OPERATIONS else "other",
+        "outcome": outcome if outcome in _SANDBOX_OUTCOMES else "failed",
+    }
+    if result_status:
+        attributes["result_status"] = (
+            str(result_status).strip().lower()
+            if str(result_status).strip().lower() in _SANDBOX_RESULT_STATUSES
+            else "unknown"
+        )
+    if skill_kind:
+        attributes["skill_kind"] = (
+            str(skill_kind).strip().lower()
+            if str(skill_kind).strip().lower() in _SANDBOX_SKILL_KINDS
+            else "generic"
+        )
     counter(
         "hdb.sandbox.task_count",
-        attributes={
-            "operation": op if op in _SANDBOX_OPERATIONS else "other",
-            "outcome": outcome if outcome in _SANDBOX_OUTCOMES else "failed",
-        },
+        attributes=attributes,
         description="Sandbox control-plane task operations",
     )
     if duration_s:

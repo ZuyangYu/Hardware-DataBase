@@ -77,6 +77,10 @@ class SandboxTaskSpec:
     deadline_at: str = ""
     skill_ref: str = ""
     skill_content_digest: str = ""
+    skill_version: str = ""
+    runtime_contract_version: str = "v1"
+    parent_task_id: str = ""
+    resume_from: str = ""
 
     def fingerprint(self) -> str:
         """Return a stable request identity without exposing parameter values."""
@@ -97,6 +101,10 @@ class SandboxTaskSpec:
             "deadline_at": self.deadline_at,
             "skill_ref": self.skill_ref,
             "skill_content_digest": self.skill_content_digest,
+            "skill_version": self.skill_version,
+            "runtime_contract_version": self.runtime_contract_version,
+            "parent_task_id": self.parent_task_id,
+            "resume_from": self.resume_from,
         }
         return sha256_text(canonical_json(payload))
 
@@ -139,6 +147,18 @@ class SandboxTask:
     finished_at: str = ""
     skill_ref: str = ""
     skill_content_digest: str = ""
+    skill_version: str = ""
+    runtime_contract_version: str = "v1"
+    parent_task_id: str = ""
+    resume_from: str = ""
+    result_status: str = ""
+    skill_result: Mapping[str, Any] = field(default_factory=dict)
+    latest_step_id: str = ""
+    latest_step_status: str = ""
+    latest_progress: float | None = None
+    latest_event_seq: int = 0
+    latest_event_attempt: int = 0
+    latest_checkpoint_artifact_id: str = ""
 
     @property
     def is_terminal(self) -> bool:
@@ -178,7 +198,19 @@ class SandboxTask:
             "output_manifest": dict(self.output_manifest),
             "parameters_digest": self.parameters_digest,
             "skill_ref": self.skill_ref,
+            "skill_version": self.skill_version,
             "status": self.status,
+            "result_status": self.result_status,
+            "skill_result": dict(self.skill_result),
+            "runtime_contract_version": self.runtime_contract_version,
+            "parent_task_id": self.parent_task_id,
+            "resume_from": self.resume_from,
+            "latest_step_id": self.latest_step_id,
+            "latest_step_status": self.latest_step_status,
+            "latest_progress": self.latest_progress,
+            "latest_event_seq": self.latest_event_seq,
+            "latest_event_attempt": self.latest_event_attempt,
+            "latest_checkpoint_artifact_id": self.latest_checkpoint_artifact_id,
             "desired_state": self.desired_state,
             "observed_state": self.observed_state,
             "cleanup_state": self.cleanup_state,

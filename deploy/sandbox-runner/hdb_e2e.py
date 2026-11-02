@@ -19,6 +19,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 import src.settings as settings
 from src.agents.mcp.gateway import GatewayRegistry
@@ -107,7 +108,12 @@ def main() -> int:
     check("task admitted", task.status == "admitted", task.status)
     task = adapter.submit(task.task_id)
     check("task submitted to the real runner", task.status == "running" and bool(task.execution_id), task.status)
-    task = adapter.observe(task.task_id)
+    deadline = time.monotonic() + 120
+    while task.status in {"running", "queued"} and time.monotonic() < deadline:
+        task = adapter.observe(task.task_id)
+        if task.status in {"collecting", "succeeded", "failed", "cancelled", "timed_out", "reconcile_required"}:
+            break
+        time.sleep(0.2)
     check("observation reaches collecting", task.status == "collecting", task.status)
     result = adapter.collect(task.task_id)
     items = (result.get("output_manifest") or {}).get("items") or []

@@ -45,15 +45,48 @@ def test_skill_package_rejects_paths_build_recipes_and_dependencies():
     assert locked.requirements_declared
 
 
+def test_executable_skill_frontmatter_exposes_review_metadata():
+    package = validate_skill_package(
+        archive(
+            {
+                "SKILL.md": (
+                    "---\n"
+                    "name: block-diagram\n"
+                    "description: Render a hardware block diagram.\n"
+                    "metadata:\n"
+                    "  intent_examples: [生成硬件框图, 根据接口表绘图]\n"
+                    "  input_kinds: [csv, xlsx]\n"
+                    "  output_kinds: [svg, json]\n"
+                    "  interaction_modes: [self_contained]\n"
+                    "  side_effects: []\n"
+                    "  risk: low\n"
+                    "---\n"
+                    "# Block diagram\n"
+                ),
+                "entrypoint.py": "print('ok')\n",
+            }
+        )
+    )
+
+    assert package.metadata["skill_name"] == "block-diagram"
+    assert package.metadata["summary"] == "Render a hardware block diagram."
+    assert package.metadata["intent_examples"] == ["生成硬件框图", "根据接口表绘图"]
+    assert package.metadata["input_kinds"] == ["csv", "xlsx"]
+    assert package.metadata["risk"] == "low"
+
+
 def test_text_skill_zip_imports_multiple_markdown_files_without_execution():
     raw = archive({
-        "bom-guide/SKILL.md": "---\nname: bom-guide\ndescription: Check BOM consistency.\nmetadata:\n  version: 1.2.0\n---\n# BOM\nSee references/checks.md\n",
+        "bom-guide/SKILL.md": "---\nname: bom-guide\ndescription: Check BOM consistency.\nmetadata:\n  version: 1.2.0\n  intent_examples: [审查 BOM]\n  input_kinds: [xlsx]\n  output_kinds: [review.md]\n  risk: low\n---\n# BOM\nSee references/checks.md\n",
         "bom-guide/references/checks.md": "Flag duplicate designators and missing voltage ratings.\n",
         "bom-guide/LICENSE.txt": "MIT\n",
     })
     package = validate_text_skill_package(raw)
     assert package.skill_ref == "skill/bom-guide" and package.version == "1.2.0"
     assert package.files == ("LICENSE.txt", "SKILL.md", "references/checks.md")
+    assert package.metadata["intent_examples"] == ["审查 BOM"]
+    assert package.metadata["input_kinds"] == ["xlsx"]
+    assert package.metadata["output_kinds"] == ["review.md"]
     assert "Flag duplicate designators" in package.content
     assert "### 随附资料：references/checks.md" in package.content
     assert validate_text_skill_package(archive({
@@ -218,6 +251,10 @@ def test_upload_build_review_subscription_and_persistent_source(tmp_path, monkey
     assert response.skill["package_build_state"] == "built"
     assert packages.read(skill.package_storage_ref) == raw
     assert skill.package_archive_digest == hashlib.sha256(raw).hexdigest()
+    assert {item["path"] for item in skill.metadata["source_manifest"]} == {
+        "SKILL.md", "entrypoint.py", "lib/helper.py", "requirements.lock",
+    }
+    assert skill.metadata["source_manifest_digest"]
     assert skill.execution_bundle_digest == hashlib.sha256(package.entrypoint).hexdigest()
     assert bundles.require(skill.execution_bundle_ref).metadata["image_digest"] == "sha256:" + "f" * 64
     with pytest.raises(SkillCatalogError):
@@ -313,6 +350,9 @@ def test_admin_uploads_and_downloads_reviewable_text_folder(tmp_path, monkeypatc
         assert item["text_archive_digest"] == hashlib.sha256(raw).hexdigest()
         assert item["text_files"] == ["SKILL.md", "references/notes.md"]
         assert item["metadata"]["summary"] == "Check BOM"
+        assert {row["path"] for row in item["metadata"]["source_manifest"]} == {
+            "SKILL.md", "references/notes.md",
+        }
         downloaded = client.get("/sandbox/skills/skill%2Fbom-guide/source")
         assert downloaded.status_code == 200 and downloaded.content == raw
         for action in ("review", "tested", "enable"):

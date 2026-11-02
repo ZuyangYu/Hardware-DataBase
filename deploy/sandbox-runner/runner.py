@@ -40,6 +40,7 @@ import threading
 import time
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -82,8 +83,54 @@ SERVICE_PROFILES_FILE = os.getenv(
 TASK_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_RUNNER_TASK_TIMEOUT_SECONDS", "120"))
 MAX_OUTPUT_BYTES = int(os.getenv("SANDBOX_RUNNER_MAX_OUTPUT_BYTES", str(4 * 1024 * 1024)))
 MAX_PARAMETER_BYTES = int(os.getenv("SANDBOX_RUNNER_MAX_PARAMETER_BYTES", "65536"))
+MAX_INPUT_BYTES = int(os.getenv("SANDBOX_RUNNER_MAX_INPUT_BYTES", str(32 * 1024 * 1024)))
+MAX_INPUT_ARTIFACTS = int(os.getenv("SANDBOX_RUNNER_MAX_INPUT_ARTIFACTS", "16"))
+MAX_EVENT_BYTES = int(os.getenv("SANDBOX_RUNNER_MAX_EVENT_BYTES", str(1024 * 1024)))
+MAX_EVENTS = int(os.getenv("SANDBOX_RUNNER_MAX_EVENTS", "500"))
+MAX_RESULT_BYTES = int(os.getenv("SANDBOX_RUNNER_MAX_RESULT_BYTES", str(256 * 1024)))
+MAX_STDOUT_BYTES = max(0, int(os.getenv("SANDBOX_RUNNER_MAX_STDOUT_BYTES", str(64 * 1024))))
+MAX_WORKERS = max(1, min(int(os.getenv("SANDBOX_RUNNER_MAX_WORKERS", "2")), 16))
+MAX_QUEUE = max(MAX_WORKERS, min(int(os.getenv("SANDBOX_RUNNER_MAX_QUEUE", "32")), 256))
+PAYLOAD_RETENTION_SECONDS = max(
+    60, int(os.getenv("SANDBOX_RUNNER_PAYLOAD_RETENTION_SECONDS", "3600"))
+)
 CONTAINER_LABEL = os.getenv("SANDBOX_RUNNER_CONTAINER_LABEL", "hdb.sandbox.runner=1")
 SERVICE_NETWORK = os.getenv("SANDBOX_RUNNER_SERVICE_NETWORK", "hdb-sandbox-internal")
+
+_RUNTIME_CONTRACT_VERSION = "v1"
+_RESULT_STATUSES = {
+    "completed",
+    "needs_user_input",
+    "needs_tool",
+    "validation_failed",
+    "failed",
+}
+_EVENT_TYPES = {
+    "step_started",
+    "step_progress",
+    "step_completed",
+    "step_failed",
+    "checkpoint_created",
+    "validation_issue",
+    "needs_user_input",
+    "needs_tool",
+    "heartbeat",
+}
+_OUTPUT_EXTENSIONS = {
+    "txt",
+    "json",
+    "csv",
+    "md",
+    "svg",
+    "png",
+    "pdf",
+    "xlsx",
+    "docx",
+    "kicad_sch",
+    "kicad_pcb",
+    "kicad_pro",
+    "zip",
+}
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
@@ -100,14 +147,23 @@ _MEDIA_TYPES = {
     "json": "application/json",
     "csv": "text/csv",
     "md": "text/markdown",
+    "svg": "image/svg+xml",
+    "png": "image/png",
+    "pdf": "application/pdf",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "kicad_sch": "application/x-kicad-schematic",
     "kicad_pcb": "application/x-kicad-pcb",
+    "kicad_pro": "application/x-kicad-project",
+    "zip": "application/zip",
 }
 
 _lock = threading.Lock()
 _build_lock = threading.Lock()
 _processes: dict[str, subprocess.Popen[bytes]] = {}
 _active_executions: set[str] = set()
+_executor: ThreadPoolExecutor | None = None
+_executor_lock = threading.Lock()
 
 
 def _now() -> str:
@@ -116,6 +172,303 @@ def _now() -> str:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _source_digest(
+    files: Any,
+    *,
+    entrypoint_digest: str,
+    dependency_index_digest: str,
+    profile_digest: str,
+) -> str:
+    """Canonical identity over every source file, dependency lock and profile."""
+
+    normalized = sorted(
+        (
+            {"path": str(item.get("path") or ""), "sha256": str(item.get("sha256") or "").lower()}
+            for item in (files or [])
+            if isinstance(item, Mapping)
+        ),
+        key=lambda item: item["path"],
+    )
+    payload = {
+        "source_manifest": normalized,
+        "entrypoint_digest": entrypoint_digest,
+        "dependency_index_digest": dependency_index_digest,
+        "profile_digest": profile_digest,
+    }
+    return _sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _executor_pool() -> ThreadPoolExecutor:
+    """Lazily create the bounded execution pool (never during import)."""
+
+    global _executor
+    with _executor_lock:
+        if _executor is None:
+            _executor = ThreadPoolExecutor(
+                max_workers=MAX_WORKERS, thread_name_prefix="hdb-sandbox-task"
+            )
+        return _executor
+
+
+def _shutdown_executor() -> None:
+    global _executor
+    with _executor_lock:
+        executor, _executor = _executor, None
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=False)
+
+
+def _safe_relative_output_name(relative: str) -> str:
+    """Flatten a reviewed relative output path into one broker-safe basename."""
+
+    parts = [part for part in str(relative or "").replace("\\", "/").split("/") if part]
+    if not parts or any(part in {".", ".."} for part in parts):
+        raise _safe_error("artifact_path_invalid", "output path is invalid", status=502)
+    for part in parts:
+        if not re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9._\u4e00-\u9fff-]{0,119}", part):
+            raise _safe_error("artifact_path_invalid", "output path contains an unsafe segment", status=502)
+    extension = parts[-1].rsplit(".", 1)[-1].lower() if "." in parts[-1] else ""
+    if extension not in _OUTPUT_EXTENSIONS:
+        raise _safe_error("artifact_extension_denied", "output file type is not allowed", status=502)
+    stem = "__".join(parts)
+    if len(stem) > 120:
+        stem = f"{stem[:100]}-{_sha256(relative.encode('utf-8'))[:8]}.{extension}" if extension else stem[:120]
+    return stem
+
+
+def _decode_input_artifacts(body: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Validate inline input artifacts forwarded by HDB for this task.
+
+    The reference deployment keeps its containers offline and lets the trusted
+    Runner host stage the bytes.  Production can replace this with a one-time
+    Broker pull without changing the container contract.
+    """
+
+    raw_ids = body.get("input_artifact_ids") or []
+    raw_items = body.get("input_artifacts") or []
+    if not isinstance(raw_ids, (list, tuple)) or len(raw_ids) > MAX_INPUT_ARTIFACTS:
+        raise _safe_error("invalid_input", "input_artifact_ids must be a bounded array")
+    if not isinstance(raw_items, (list, tuple)) or len(raw_items) != len(raw_ids):
+        raise _safe_error("invalid_input", "every input artifact requires exactly one transfer item")
+    ids = [_require_ref(item, "input_artifact_id") for item in raw_ids]
+    if len(set(ids)) != len(ids):
+        raise _safe_error("invalid_input", "input artifact IDs must be unique")
+    total = 0
+    decoded: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw, expected_id in zip(raw_items, ids):
+        if not isinstance(raw, Mapping):
+            raise _safe_error("invalid_input", "input artifact item must be an object")
+        artifact_id = str(raw.get("artifact_id") or "").strip()
+        if artifact_id != expected_id or not _ARTIFACT_ID_RE.fullmatch(artifact_id):
+            raise _safe_error("invalid_input", "input artifact identity does not match its reference")
+        if artifact_id in seen:
+            raise _safe_error("invalid_input", "duplicate input artifact")
+        seen.add(artifact_id)
+        filename = str(raw.get("filename") or "").strip()
+        if (
+            not filename
+            or filename in {".", ".."}
+            or "/" in filename
+            or "\\" in filename
+            or not re.fullmatch(r"[A-Za-z0-9\u4e00-\u9fff][A-Za-z0-9._\u4e00-\u9fff-]{0,119}", filename)
+        ):
+            raise _safe_error("invalid_input", "input artifact filename is invalid")
+        encoded = raw.get("content_base64")
+        if not isinstance(encoded, str) or len(encoded) > (MAX_INPUT_BYTES * 4 // 3) + 8:
+            raise _safe_error("input_too_large", "input artifact payload is too large")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise _safe_error("invalid_input", "input artifact payload is not base64") from exc
+        digest = str(raw.get("sha256") or "").strip().lower().removeprefix("sha256:")
+        if not _DIGEST_RE.fullmatch(digest) or _sha256(content) != digest:
+            raise _safe_error("input_digest_mismatch", "input artifact digest does not match its content")
+        total += len(content)
+        if total > MAX_INPUT_BYTES:
+            raise _safe_error("input_too_large", "input artifact set exceeds the cap")
+        decoded.append(
+            {
+                "artifact_id": artifact_id,
+                "filename": filename,
+                "sha256": digest,
+                "size": len(content),
+                "content": content,
+            }
+        )
+    return decoded, [
+        {"artifact_id": item["artifact_id"], "sha256": item["sha256"], "size": item["size"]}
+        for item in decoded
+    ]
+
+
+def _resolve_result_artifacts(
+    result: Mapping[str, Any], manifest: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Resolve Skill-declared relative output paths into Runner Artifact IDs.
+
+    A Skill cannot know the opaque IDs before collection.  It may therefore
+    declare ``artifact_paths`` and ``checkpoint_path`` using output-relative
+    paths; the Runner resolves them after collection and only the resolved
+    opaque IDs leave the Runner.
+    """
+
+    resolved = dict(result)
+    by_path = {
+        str(item.get("relative_path") or ""): str(item.get("artifact_id"))
+        for item in (manifest.get("items") or [])
+        if isinstance(item, Mapping) and item.get("relative_path") and item.get("artifact_id")
+    }
+    raw_paths = resolved.get("artifact_paths") or []
+    if raw_paths not in (None, ""):
+        if not isinstance(raw_paths, (list, tuple)) or len(raw_paths) > 64:
+            raise _safe_error("runtime_result_invalid", "artifact_paths must be a bounded array", status=502)
+        ids: list[str] = []
+        for path in raw_paths:
+            key = str(path or "")
+            if key not in by_path:
+                raise _safe_error("runtime_result_invalid", "artifact_path is not a collected output", status=502)
+            ids.append(by_path[key])
+        resolved["artifact_ids"] = ids
+    checkpoint_path = str(resolved.get("checkpoint_path") or "").strip()
+    if checkpoint_path:
+        if checkpoint_path not in by_path:
+            raise _safe_error("runtime_result_invalid", "checkpoint_path is not a collected output", status=502)
+        resolved["checkpoint_artifact_id"] = by_path[checkpoint_path]
+    return resolved
+
+
+def _read_runtime_result(workspace: str) -> dict[str, Any]:
+    path = os.path.join(workspace, "out", "result.json")
+    if not os.path.isfile(path) or os.path.islink(path):
+        return {}
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_RESULT_BYTES + 1)
+    except OSError as exc:
+        raise _safe_error("runtime_result_invalid", "result.json is not readable", status=502) from exc
+    if len(raw) > MAX_RESULT_BYTES:
+        raise _safe_error("runtime_result_invalid", "result.json exceeds the size limit", status=502)
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError) as exc:
+        raise _safe_error("runtime_result_invalid", "result.json is not valid JSON", status=502) from exc
+    if not isinstance(value, Mapping):
+        raise _safe_error("runtime_result_invalid", "result.json must be an object", status=502)
+    version = str(value.get("runtime_contract_version") or "")
+    if version != _RUNTIME_CONTRACT_VERSION:
+        raise _safe_error("runtime_result_invalid", "unsupported runtime contract version", status=502)
+    if str(value.get("result_status") or "") not in _RESULT_STATUSES:
+        raise _safe_error("runtime_result_invalid", "result_status is invalid", status=502)
+    return dict(value)
+
+
+def _sync_runtime_events(task_id: str, workspace: str, attempt: int) -> None:
+    """Best-effort live projection while the Skill process is still running."""
+
+    path = os.path.join(workspace, "events", "events.jsonl")
+    if not os.path.isfile(path) or os.path.islink(path):
+        return
+    try:
+        if os.path.getsize(path) > MAX_EVENT_BYTES:
+            return
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_EVENT_BYTES)
+    except OSError:
+        return
+    events: list[dict[str, Any]] = []
+    previous = 0
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            break  # the last line may still be partially written
+        if not isinstance(event, Mapping):
+            break
+        raw_attempt = event.get("attempt", -1)
+        try:
+            parsed_attempt = int(raw_attempt)
+        except (TypeError, ValueError):
+            break
+        if (
+            str(event.get("runtime_contract_version") or "") != _RUNTIME_CONTRACT_VERSION
+            or str(event.get("task_id") or "") != task_id
+            or parsed_attempt != attempt
+            or str(event.get("event") or "") not in _EVENT_TYPES
+        ):
+            break
+        seq = event.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq <= previous:
+            break
+        previous = seq
+        events.append(dict(event))
+        if len(events) >= MAX_EVENTS:
+            break
+    if events:
+        _update_task(task_id, events_json=json.dumps(events, ensure_ascii=False, sort_keys=True))
+
+
+def _read_runtime_events(workspace: str, *, task_id: str, attempt: int) -> list[dict[str, Any]]:
+    path = os.path.join(workspace, "events", "events.jsonl")
+    if not os.path.isfile(path) or os.path.islink(path):
+        return []
+    try:
+        size = os.path.getsize(path)
+        if size > MAX_EVENT_BYTES:
+            raise _safe_error("runtime_event_invalid", "event stream exceeds the size limit", status=502)
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_EVENT_BYTES + 1)
+    except OSError as exc:
+        raise _safe_error("runtime_event_invalid", "event stream is not readable", status=502) from exc
+    lines = [line for line in raw.decode("utf-8", errors="strict").splitlines() if line.strip()]
+    if len(lines) > MAX_EVENTS:
+        raise _safe_error("runtime_event_invalid", "event stream exceeds the event count limit", status=502)
+    events: list[dict[str, Any]] = []
+    previous = 0
+    seen_ids: set[str] = set()
+    for line in lines:
+        if len(line.encode("utf-8")) > 4096:
+            raise _safe_error("runtime_event_invalid", "one runtime event is too large", status=502)
+        try:
+            event = json.loads(line)
+        except ValueError as exc:
+            raise _safe_error("runtime_event_invalid", "runtime event is not valid JSON", status=502) from exc
+        if not isinstance(event, Mapping):
+            raise _safe_error("runtime_event_invalid", "runtime event must be an object", status=502)
+        if str(event.get("runtime_contract_version") or "") != _RUNTIME_CONTRACT_VERSION:
+            raise _safe_error("runtime_event_invalid", "runtime event contract version is invalid", status=502)
+        try:
+            parsed_attempt = int(event.get("attempt", -1))
+        except (TypeError, ValueError) as exc:
+            raise _safe_error("runtime_event_invalid", "runtime event attempt is invalid", status=502) from exc
+        if str(event.get("task_id") or "") != task_id or parsed_attempt != attempt:
+            raise _safe_error("runtime_event_invalid", "runtime event is not bound to this task", status=502)
+        seq = event.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq <= previous:
+            raise _safe_error("runtime_event_invalid", "runtime event sequence is not strictly increasing", status=502)
+        previous = seq
+        event_id = str(event.get("event_id") or "").strip()
+        if not event_id or event_id in seen_ids or len(event_id) > 128:
+            raise _safe_error("runtime_event_invalid", "runtime event identity is invalid", status=502)
+        seen_ids.add(event_id)
+        if str(event.get("event") or "") not in _EVENT_TYPES:
+            raise _safe_error("runtime_event_invalid", "runtime event type is invalid", status=502)
+        if not str(event.get("step_id") or "").strip():
+            raise _safe_error("runtime_event_invalid", "runtime event step_id is required", status=502)
+        progress = event.get("progress")
+        if progress is not None and (
+            isinstance(progress, bool) or not isinstance(progress, (int, float)) or not 0 <= float(progress) <= 1
+        ):
+            raise _safe_error("runtime_event_invalid", "runtime event progress is invalid", status=502)
+        events.append(dict(event))
+    return events
 
 
 def _safe_error(code: str, message: str, *, retryable: bool = False, status: int = 400) -> HTTPException:
@@ -258,19 +611,40 @@ def _load_bundle(bundle_ref: str) -> dict[str, Any]:
     digest = _sha256(entrypoint)
     if str(manifest.get("bundle_ref") or "") != bundle_ref:
         raise _safe_error("bundle_invalid", "bundle manifest reference mismatch", status=500)
+    source_digest = str(manifest.get("source_digest") or "").strip().lower()
+    reviewed_digest = source_digest or digest
+    if not _DIGEST_RE.fullmatch(reviewed_digest):
+        raise _safe_error("bundle_invalid", "bundle source digest is invalid", status=500)
     if str(manifest.get("entrypoint_digest") or "") != digest:
         raise _safe_error("digest_mismatch", "reviewed bundle source has changed", status=503)
+    if source_digest:
+        files = list(manifest.get("source_manifest") or [])
+        if not files or any(
+            not isinstance(item, Mapping)
+            or not _DIGEST_RE.fullmatch(str(item.get("sha256") or ""))
+            or not str(item.get("path") or "")
+            for item in files
+        ):
+            raise _safe_error("bundle_invalid", "bundle source manifest is invalid", status=500)
+        expected = _source_digest(
+            files,
+            entrypoint_digest=digest,
+            dependency_index_digest=str(manifest.get("dependency_index_digest") or ""),
+            profile_digest=str(manifest.get("profile_digest") or ""),
+        )
+        if expected != source_digest:
+            raise _safe_error("digest_mismatch", "reviewed bundle source manifest changed", status=503)
     if str(manifest.get("profile_digest") or "") != _profile_digest():
         raise _safe_error("profile_mismatch", "reviewed runtime policy has changed", status=503)
     entrypoint_path = str(manifest.get("entrypoint_path") or "")
     if entrypoint_path != f"/opt/bundle/{directory}/entrypoint.py":
         raise _safe_error("bundle_invalid", "bundle entrypoint path is not reviewed", status=500)
     image_digest = _reviewed_digest(manifest.get("image_digest"), "bundle image_digest")
-    _inspect_image(image_digest, {f"org.hdb.bundle.{directory}.sha256": digest})
+    _inspect_image(image_digest, {f"org.hdb.bundle.{directory}.sha256": reviewed_digest})
     return {
         "bundle_ref": bundle_ref,
         "profile_ref": str(manifest.get("profile_ref") or ""),
-        "digest": digest,
+        "digest": reviewed_digest,
         "input_schema": dict(manifest.get("input_schema") or {}),
         "entrypoint_path": entrypoint_path,
         "image_digest": image_digest,
@@ -398,8 +772,19 @@ def _build_skill_bundle(body: Mapping[str, Any]) -> dict[str, Any]:
     raw = base64.b64decode(str(body.get("package_base64") or ""), validate=True)
     files, _ = _validate_skill_archive(raw, package_digest)
     dependency_index = _skill_dependency_index(body.get("dependency_index_url"), files.get("requirements.lock", b""))
-    source_digest = _sha256(dependency_index.encode("utf-8")) if dependency_index else ""
-    bundle_ref = _skill_bundle_ref(skill_ref, package_digest, source_digest)
+    dependency_index_digest = _sha256(dependency_index.encode("utf-8")) if dependency_index else ""
+    entrypoint_digest = _sha256(files["entrypoint.py"])
+    profile_digest = _profile_digest()
+    source_manifest = [
+        {"path": name, "sha256": _sha256(content)} for name, content in sorted(files.items())
+    ]
+    source_digest = _source_digest(
+        source_manifest,
+        entrypoint_digest=entrypoint_digest,
+        dependency_index_digest=dependency_index_digest,
+        profile_digest=profile_digest,
+    )
+    bundle_ref = _skill_bundle_ref(skill_ref, package_digest, dependency_index_digest)
     directory = _SAFE_NAME_RE.sub("_", bundle_ref.rsplit("/", 1)[-1])[:64]
     root = os.path.abspath(GENERATED_BUNDLE_ROOT)
     os.makedirs(root, mode=0o700, exist_ok=True)
@@ -408,12 +793,12 @@ def _build_skill_bundle(body: Mapping[str, Any]) -> dict[str, Any]:
         raise _safe_error("invalid_reference", "Skill bundle path is invalid")
     if os.path.exists(bundle_dir):
         bundle = _load_bundle(bundle_ref)
-        if bundle["digest"] != _sha256(files["entrypoint.py"]):
+        if bundle["digest"] != source_digest:
             raise _safe_error("bundle_conflict", "Existing Skill bundle has different source", status=409)
         with open(os.path.join(bundle_dir, "bundle.json"), encoding="utf-8") as handle:
             existing = json.load(handle)
         if (existing.get("package_digest") != package_digest
-                or existing.get("dependency_index_digest", "") != source_digest
+                or existing.get("dependency_index_digest", "") != dependency_index_digest
                 or existing.get("input_schema") != dict(body.get("input_schema") or {})
                 or existing.get("capabilities") != list(body.get("required_capabilities") or ["sandbox.execute"])):
             raise _safe_error("bundle_conflict", "Existing Skill bundle has different package identity", status=409)
@@ -431,7 +816,6 @@ def _build_skill_bundle(body: Mapping[str, Any]) -> dict[str, Any]:
             with open(target, "wb") as handle:
                 handle.write(content)
             os.chmod(target, 0o600)
-        entrypoint_digest = _sha256(files["entrypoint.py"])
         image_root = f"/opt/bundle/{directory}"
         copy_lines = []
         for name in sorted(files):
@@ -459,7 +843,7 @@ def _build_skill_bundle(body: Mapping[str, Any]) -> dict[str, Any]:
             )
         dockerfile = (
             install_stage + f"FROM {base_tag}\n"
-            f"LABEL org.hdb.bundle.{directory}.sha256=\"{entrypoint_digest}\"\n"
+            f"LABEL org.hdb.bundle.{directory}.sha256=\"{source_digest}\"\n"
             + dependency_copy
             + "\n".join(copy_lines)
             + "\nUSER 65534:65534\nWORKDIR /work\nENTRYPOINT [\"/usr/local/bin/python3\"]\n"
@@ -494,13 +878,15 @@ def _build_skill_bundle(body: Mapping[str, Any]) -> dict[str, Any]:
         manifest = {
             "bundle_ref": bundle_ref,
             "profile_ref": profile_ref,
-            "profile_digest": _profile_digest(),
+            "profile_digest": profile_digest,
             "image_digest": built_image,
             "entrypoint_digest": entrypoint_digest,
+            "source_digest": source_digest,
+            "source_manifest": source_manifest,
             "package_digest": package_digest,
-            "dependency_index_digest": source_digest,
+            "dependency_index_digest": dependency_index_digest,
             "description": f"Administrator-built Skill bundle: {skill_ref}",
-            "digest_algorithm": "sha256(entrypoint.py)",
+            "digest_algorithm": "sha256(source-manifest+dependency-lock+profile)",
             "input_schema": dict(body.get("input_schema") or {}),
             "outputs": ["output artifacts"],
             "capabilities": list(body.get("required_capabilities") or ["sandbox.execute"]),
@@ -517,7 +903,7 @@ def _build_skill_bundle(body: Mapping[str, Any]) -> dict[str, Any]:
             os.rename(staged, bundle_dir)
         finally:
             shutil.rmtree(staged, ignore_errors=True)
-        return {"bundle_ref": bundle_ref, "bundle_digest": entrypoint_digest,
+        return {"bundle_ref": bundle_ref, "bundle_digest": source_digest,
                 "image_digest": built_image, "profile_ref": profile_ref,
                 "package_digest": package_digest}
     finally:
@@ -592,10 +978,15 @@ def _init_db() -> None:
                 request_fingerprint TEXT NOT NULL DEFAULT '',
                 kind TEXT NOT NULL DEFAULT 'task',
                 execution_id TEXT NOT NULL DEFAULT '',
+                attempt INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'queued',
                 observed_state TEXT NOT NULL DEFAULT '',
                 cleanup_state TEXT NOT NULL DEFAULT 'pending',
                 manifest_json TEXT NOT NULL DEFAULT '',
+                parameters_json TEXT NOT NULL DEFAULT '{}',
+                input_manifest_json TEXT NOT NULL DEFAULT '[]',
+                result_json TEXT NOT NULL DEFAULT '',
+                events_json TEXT NOT NULL DEFAULT '[]',
                 error_code TEXT NOT NULL DEFAULT '',
                 container_name TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -604,8 +995,17 @@ def _init_db() -> None:
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(runner_tasks)")}
-        if "request_fingerprint" not in columns:
-            conn.execute("ALTER TABLE runner_tasks ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''")
+        migrations = {
+            "request_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "attempt": "INTEGER NOT NULL DEFAULT 1",
+            "parameters_json": "TEXT NOT NULL DEFAULT '{}'",
+            "input_manifest_json": "TEXT NOT NULL DEFAULT '[]'",
+            "result_json": "TEXT NOT NULL DEFAULT ''",
+            "events_json": "TEXT NOT NULL DEFAULT '[]'",
+        }
+        for column, ddl in migrations.items():
+            if column not in columns:
+                conn.execute(f"ALTER TABLE runner_tasks ADD COLUMN {column} {ddl}")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_runner_tasks_idem_unique "
             "ON runner_tasks(idempotency_key) WHERE idempotency_key <> ''"
@@ -622,10 +1022,15 @@ def _row_to_task(row: sqlite3.Row) -> dict[str, Any]:
         "request_fingerprint": str(row["request_fingerprint"]),
         "kind": str(row["kind"]),
         "execution_id": str(row["execution_id"]),
+        "attempt": int(row["attempt"] or 1) if "attempt" in row.keys() else 1,
         "status": str(row["status"]),
         "observed_state": str(row["observed_state"]),
         "cleanup_state": str(row["cleanup_state"]),
         "manifest": json.loads(row["manifest_json"]) if row["manifest_json"] else {},
+        "parameters": json.loads(row["parameters_json"]) if "parameters_json" in row.keys() and row["parameters_json"] else {},
+        "input_manifest": json.loads(row["input_manifest_json"]) if "input_manifest_json" in row.keys() and row["input_manifest_json"] else [],
+        "result": json.loads(row["result_json"]) if "result_json" in row.keys() and row["result_json"] else {},
+        "events": json.loads(row["events_json"]) if "events_json" in row.keys() and row["events_json"] else [],
         "error_code": str(row["error_code"]),
         "container_name": str(row["container_name"]),
         "created_at": str(row["created_at"]),
@@ -646,9 +1051,10 @@ def _insert_task(**values: Any) -> None:
             """
             INSERT INTO runner_tasks (
                 task_id, idempotency_key, bundle_ref, bundle_digest, profile_ref, request_fingerprint, kind,
-                execution_id, status, observed_state, cleanup_state, container_name,
+                execution_id, attempt, status, observed_state, cleanup_state, container_name,
+                parameters_json, input_manifest_json, result_json, events_json,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 values["task_id"],
@@ -659,10 +1065,15 @@ def _insert_task(**values: Any) -> None:
                 values.get("request_fingerprint", ""),
                 values.get("kind", "task"),
                 values.get("execution_id", ""),
+                int(values.get("attempt", 1)),
                 values.get("status", "queued"),
                 values.get("observed_state", ""),
                 values.get("cleanup_state", "pending"),
                 values.get("container_name", ""),
+                json.dumps(values.get("parameters", {}), ensure_ascii=False, sort_keys=True),
+                json.dumps(values.get("input_manifest", []), ensure_ascii=False, sort_keys=True),
+                json.dumps(values.get("result", {}), ensure_ascii=False, sort_keys=True),
+                json.dumps(values.get("events", []), ensure_ascii=False, sort_keys=True),
                 now,
                 now,
             ),
@@ -788,6 +1199,8 @@ def _observation(task: Mapping[str, Any]) -> dict[str, Any]:
         "status": task.get("status", ""),
         "cleanup_state": task.get("cleanup_state", ""),
         "output_manifest": task.get("manifest", {}),
+        "result": task.get("result", {}),
+        "runtime_events": task.get("events", []),
         "error_code": task.get("error_code", ""),
     }
 
@@ -809,7 +1222,13 @@ def _container_user() -> str:
 
 
 def _run_container(
-    task_id: str, workspace: str, entrypoint_path: str, image_digest: str, *, timeout: float
+    task_id: str,
+    workspace: str,
+    entrypoint_path: str,
+    image_digest: str,
+    *,
+    timeout: float,
+    attempt: int = 1,
 ) -> tuple[int, bytes]:
     """Run the fixed bundle image; fixed argv, no shell, no caller-controlled flags."""
 
@@ -841,86 +1260,203 @@ def _run_container(
         "1",
         "--tmpfs",
         "/tmp:rw,noexec,nosuid,size=16m",
+        # Fixed, non-sensitive execution identity for the Runtime Contract
+        # event envelope.  Callers cannot supply arbitrary environment values.
+        "--env",
+        f"HDB_TASK_ID={task_id}",
+        "--env",
+        f"HDB_ATTEMPT={int(attempt)}",
         "-v",
         f"{workspace}/in:/work/in:ro",
         "-v",
         f"{workspace}/out:/work/out:rw",
+        "-v",
+        f"{workspace}/events:/work/events:rw",
         image_digest,
         entrypoint_path,
     ]
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     with _lock:
         _processes[task_id] = proc
+
+    # ``communicate()`` buffers the complete stream in memory.  A Skill is
+    # untrusted and its stdout is only diagnostic data, so consume it on a
+    # bounded reader thread while the supervisor waits for the process.  This
+    # keeps a chatty process from filling the OS pipe (and avoids turning logs
+    # into an unbounded Runner memory allocation).  The fallback preserves the
+    # small fake-process interface used by unit tests and older integrations.
+    stream = getattr(proc, "stdout", None)
+    if stream is None or not callable(getattr(proc, "wait", None)):
+        try:
+            stdout, _ = proc.communicate(timeout=timeout)
+            return proc.returncode or 0, (stdout or b"")[:MAX_STDOUT_BYTES]
+        finally:
+            with _lock:
+                _processes.pop(task_id, None)
+
+    stdout_buffer = bytearray()
+
+    def _drain_stdout() -> None:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                return
+            if len(stdout_buffer) < MAX_STDOUT_BYTES:
+                remaining = MAX_STDOUT_BYTES - len(stdout_buffer)
+                stdout_buffer.extend(chunk[:remaining])
+
+    reader = threading.Thread(
+        target=_drain_stdout,
+        name=f"hdb-sandbox-stdout-{task_id[-12:]}",
+        daemon=True,
+    )
+    reader.start()
+
+    def _wait_after_stop(wait_timeout: float) -> int:
+        try:
+            return int(proc.wait(timeout=wait_timeout) or 0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return int(proc.wait(timeout=5) or 0)
+
     try:
         deadline = time.monotonic() + timeout
         while True:
             try:
-                stdout, _ = proc.communicate(timeout=max(0.01, min(0.5, deadline - time.monotonic())))
-                return proc.returncode or 0, stdout or b""
+                returncode = int(
+                    proc.wait(timeout=max(0.01, min(0.5, deadline - time.monotonic())))
+                    or 0
+                )
+                reader.join(timeout=5)
+                return returncode, bytes(stdout_buffer)
             except subprocess.TimeoutExpired:
+                _sync_runtime_events(task_id, workspace, attempt)
                 current = _get_task(task_id)
                 if current is not None and current["status"] == "cancel_requested":
                     subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, timeout=30)
-                    try:
-                        stdout, _ = proc.communicate(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        stdout, _ = proc.communicate(timeout=5)
-                    return proc.returncode or 0, stdout or b""
+                    returncode = _wait_after_stop(5)
+                    reader.join(timeout=5)
+                    return returncode, bytes(stdout_buffer)
                 if time.monotonic() < deadline:
                     continue
                 subprocess.run(["docker", "kill", container_name], capture_output=True, timeout=30)
-                try:
-                    proc.communicate(timeout=10)
-                except subprocess.TimeoutExpired:  # pragma: no cover - docker kill is authoritative
-                    proc.kill()
-                    proc.communicate(timeout=5)
+                _wait_after_stop(10)
+                reader.join(timeout=5)
                 raise
     finally:
         with _lock:
             _processes.pop(task_id, None)
 
 
-def _collect_outputs(workspace: str, execution_id: str) -> dict[str, Any]:
+def _payload_root() -> str:
+    root = os.path.join(STATE_DIR, "artifact-payloads")
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    return root
+
+
+def _store_payload(task_id: str, artifact_id: str, content: bytes) -> str:
+    directory = os.path.join(_payload_root(), task_id)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    target = os.path.join(directory, artifact_id)
+    with open(target, "xb") as handle:
+        handle.write(content)
+    os.chmod(target, 0o600)
+    return f"{task_id}/{artifact_id}"
+
+
+def _payload_bytes(payload_ref: str) -> bytes:
+    root = os.path.abspath(_payload_root())
+    candidate = os.path.abspath(os.path.join(root, str(payload_ref or "")))
+    if not candidate.startswith(root + os.sep) or not os.path.isfile(candidate):
+        raise _safe_error("artifact_payload_missing", "artifact payload is no longer retained", status=410)
+    with open(candidate, "rb") as handle:
+        return handle.read()
+
+
+def _cleanup_old_payloads() -> None:
+    root = _payload_root()
+    cutoff = time.time() - PAYLOAD_RETENTION_SECONDS
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        try:
+            if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def _collect_outputs(workspace: str, execution_id: str, task_id: str) -> dict[str, Any]:
+    """Recursively collect a bounded output tree without following symlinks."""
+
     out_dir = os.path.join(workspace, "out")
     items: list[dict[str, Any]] = []
     total = 0
+    if os.path.islink(out_dir):
+        raise _safe_error("artifact_path_invalid", "output directory is a symlink", status=502)
     if os.path.isdir(out_dir):
-        for name in sorted(os.listdir(out_dir)):
-            path = os.path.join(out_dir, name)
-            if not os.path.isfile(path) or os.path.islink(path):
-                continue
-            safe_name = _SAFE_NAME_RE.sub("_", os.path.basename(name))[:120] or "output.bin"
-            with open(path, "rb") as handle:
-                data = handle.read(MAX_OUTPUT_BYTES + 1)
-            if len(data) > MAX_OUTPUT_BYTES:
-                raise _safe_error("artifact_too_large", f"output {safe_name} exceeds the cap")
-            total += len(data)
-            if total > MAX_OUTPUT_BYTES:
-                raise _safe_error("artifact_too_large", "output set exceeds the cap")
-            extension = safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""
-            items.append(
-                {
-                    "artifact_id": f"art-{uuid.uuid4().hex[:32]}",
-                    "filename": safe_name,
-                    "media_type": _MEDIA_TYPES.get(extension, "application/octet-stream"),
-                    "size": len(data),
-                    "sha256": _sha256(data),
-                    "role": "output",
-                    "execution_id": execution_id,
-                    "content_base64": base64.b64encode(data).decode("ascii"),
-                }
-            )
-    if not items:
-        raise _safe_error("artifact_missing", "bundle produced no output artifact", status=502)
+        for current, directories, files in os.walk(out_dir, topdown=True, followlinks=False):
+            for name in directories:
+                if os.path.islink(os.path.join(current, name)):
+                    raise _safe_error("artifact_path_invalid", "output tree contains a symlink", status=502)
+            directories[:] = sorted(directories)
+            for name in sorted(files):
+                path = os.path.join(current, name)
+                if os.path.islink(path):
+                    raise _safe_error("artifact_path_invalid", "output tree contains a symlink", status=502)
+                if not os.path.isfile(path):
+                    continue
+                relative = os.path.relpath(path, out_dir).replace(os.sep, "/")
+                safe_name = _safe_relative_output_name(relative)
+                with open(path, "rb") as handle:
+                    data = handle.read(MAX_OUTPUT_BYTES + 1)
+                if len(data) > MAX_OUTPUT_BYTES:
+                    raise _safe_error("artifact_too_large", f"output {safe_name} exceeds the cap")
+                total += len(data)
+                if total > MAX_OUTPUT_BYTES:
+                    raise _safe_error("artifact_too_large", "output set exceeds the cap")
+                extension = safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""
+                artifact_id = f"art-{uuid.uuid4().hex[:32]}"
+                payload_ref = _store_payload(task_id, artifact_id, data)
+                items.append(
+                    {
+                        "artifact_id": artifact_id,
+                        "filename": safe_name,
+                        "relative_path": relative[:240],
+                        "media_type": _MEDIA_TYPES.get(extension, "application/octet-stream"),
+                        "size": len(data),
+                        "sha256": _sha256(data),
+                        "role": "output",
+                        "execution_id": execution_id,
+                        "payload_ref": payload_ref,
+                    }
+                )
+                if len(items) > 256:
+                    raise _safe_error("artifact_too_many", "output set exceeds the file count cap", status=502)
     return {"items": items}
 
 
+def _write_input_assets(workspace: str, input_artifacts: list[dict[str, Any]]) -> None:
+    assets = os.path.join(workspace, "in", "assets")
+    os.makedirs(assets, mode=0o700, exist_ok=True)
+    for item in input_artifacts:
+        directory = os.path.join(assets, item["artifact_id"])
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        target = os.path.join(directory, item["filename"])
+        with open(target, "xb") as handle:
+            handle.write(item["content"])
+        os.chmod(target, 0o400)
+
+
 def _execute_task(
-    task: dict[str, Any], bundle: Mapping[str, Any], parameters: Mapping[str, Any]
+    task: dict[str, Any],
+    bundle: Mapping[str, Any],
+    parameters: Mapping[str, Any],
+    input_artifacts: list[dict[str, Any]] | None = None,
 ) -> None:
     task_id = task["task_id"]
-    execution_id = f"exec-{uuid.uuid4().hex[:24]}"
+    execution_id = str(task.get("execution_id") or f"exec-{uuid.uuid4().hex[:24]}")
+    attempt = int(task.get("attempt") or 1)
+    inputs = list(input_artifacts or [])
     workspace = os.path.join(WORKSPACE_ROOT, task_id)
     with _lock:
         _active_executions.add(task_id)
@@ -932,18 +1468,25 @@ def _execute_task(
         with _lock:
             _active_executions.discard(task_id)
         return
+    manifest: dict[str, Any] = {"items": []}
+    result: dict[str, Any] = {}
+    events: list[dict[str, Any]] = []
+    runtime_error = ""
     try:
         shutil.rmtree(workspace, ignore_errors=True)
         os.makedirs(os.path.join(workspace, "in"), mode=0o700, exist_ok=True)
         os.makedirs(os.path.join(workspace, "out"), mode=0o777, exist_ok=True)
+        os.makedirs(os.path.join(workspace, "events"), mode=0o777, exist_ok=True)
         with open(os.path.join(workspace, "in", "parameters.json"), "w", encoding="utf-8") as handle:
             json.dump(dict(parameters), handle, ensure_ascii=False, sort_keys=True)
+        _write_input_assets(workspace, inputs)
         if _finalize_cancellation(task_id):
             return
+        returncode = 0
         try:
             returncode, _stdout = _run_container(
                 task_id, workspace, bundle["entrypoint_path"], bundle["image_digest"],
-                timeout=float(TASK_TIMEOUT_SECONDS),
+                timeout=float(TASK_TIMEOUT_SECONDS), attempt=attempt,
             )
         except subprocess.TimeoutExpired:
             if _finalize_cancellation(task_id):
@@ -960,25 +1503,55 @@ def _execute_task(
             return
         if _finalize_cancellation(task_id):
             return
+        # Preserve whatever the Skill wrote even for a non-zero exit: a
+        # validation report is often the most valuable output of a failure.
+        try:
+            manifest = _collect_outputs(workspace, execution_id, task_id)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, Mapping) else {}
+            runtime_error = str((detail.get("error") or {}).get("code") or "artifact_invalid")[:64]
+        try:
+            events = _read_runtime_events(workspace, task_id=task_id, attempt=attempt)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, Mapping) else {}
+            runtime_error = runtime_error or str(
+                (detail.get("error") or {}).get("code") or "runtime_event_invalid"
+            )[:64]
+        try:
+            result = _read_runtime_result(workspace)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, Mapping) else {}
+            runtime_error = runtime_error or str(
+                (detail.get("error") or {}).get("code") or "runtime_result_invalid"
+            )[:64]
+        if result and not runtime_error:
+            try:
+                result = _resolve_result_artifacts(result, manifest)
+            except HTTPException as exc:
+                detail = exc.detail if isinstance(exc.detail, Mapping) else {}
+                runtime_error = str((detail.get("error") or {}).get("code") or "runtime_result_invalid")[:64]
+        is_skill_bundle = str(bundle.get("bundle_ref") or "").startswith("bundle/skill-")
+        result_status = str(result.get("result_status") or "")
         if returncode != 0:
-            if not _update_task(
-                task_id,
-                expected_statuses=("running",),
-                status="failed",
-                observed_state="failed",
-                cleanup_state="complete",
-                error_code="bundle_failed",
-            ):
-                _finalize_cancellation(task_id)
-            return
-        manifest = _collect_outputs(workspace, execution_id)
+            status, error_code = "failed", "bundle_failed"
+        elif runtime_error:
+            status, error_code = "failed", runtime_error
+        elif is_skill_bundle and not result:
+            status, error_code = "failed", "runtime_result_missing"
+        elif not manifest.get("items") and result_status not in {"needs_user_input", "needs_tool"}:
+            status, error_code = "failed", "artifact_missing"
+        else:
+            status, error_code = "succeeded", ""
         if not _update_task(
             task_id,
             expected_statuses=("running",),
-            status="succeeded",
-            observed_state="succeeded",
+            status=status,
+            observed_state=status,
             cleanup_state="complete",
+            error_code=error_code,
             manifest_json=json.dumps(manifest, ensure_ascii=False),
+            result_json=json.dumps(result, ensure_ascii=False, sort_keys=True) if result else "",
+            events_json=json.dumps(events, ensure_ascii=False, sort_keys=True),
         ):
             _finalize_cancellation(task_id)
     except HTTPException as exc:
@@ -991,6 +1564,9 @@ def _execute_task(
             observed_state="failed",
             cleanup_state="complete",
             error_code=code[:64],
+            manifest_json=json.dumps(manifest, ensure_ascii=False),
+            result_json=json.dumps(result, ensure_ascii=False, sort_keys=True) if result else "",
+            events_json=json.dumps(events, ensure_ascii=False, sort_keys=True),
         ):
             _finalize_cancellation(task_id)
     except Exception:  # noqa: BLE001 - bounded error code only
@@ -1001,6 +1577,9 @@ def _execute_task(
             observed_state="failed",
             cleanup_state="complete",
             error_code="execution_error",
+            manifest_json=json.dumps(manifest, ensure_ascii=False),
+            result_json=json.dumps(result, ensure_ascii=False, sort_keys=True) if result else "",
+            events_json=json.dumps(events, ensure_ascii=False, sort_keys=True),
         ):
             _finalize_cancellation(task_id)
     finally:
@@ -1225,6 +1804,12 @@ def _envelope(request: Request) -> dict[str, str]:
 def _startup() -> None:
     _init_db()
     _reconcile_tasks()
+    _cleanup_old_payloads()
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    _shutdown_executor()
 
 
 @app.get("/v1/health")
@@ -1233,7 +1818,7 @@ def health(authorization: str = Header(default=""), x_audience: str = Header(def
     return {"status": "up", "service": "sandbox-runner", "time": _now()}
 
 
-@app.post("/v1/tasks")
+@app.post("/v1/tasks", status_code=202)
 async def submit_task(
     request: Request,
     authorization: str = Header(default=""),
@@ -1255,8 +1840,17 @@ async def submit_task(
     network_policy = str(body.get("network_policy_ref") or "")
     if network_policy not in {"", "none"}:
         raise _safe_error("network_denied", "this deployment only allows network_policy_ref=none")
-    if body.get("input_artifact_ids"):
-        raise _safe_error("input_artifacts_unsupported", "this reference bundle takes parameters only")
+    runtime_contract_version = str(body.get("runtime_contract_version") or _RUNTIME_CONTRACT_VERSION)
+    if runtime_contract_version != _RUNTIME_CONTRACT_VERSION:
+        raise _safe_error("runtime_contract_unsupported", "unsupported runtime contract version")
+    parent_task_id = str(body.get("parent_task_id") or "").strip()
+    resume_from = str(body.get("resume_from") or "").strip()
+    for field_name, value in (("parent_task_id", parent_task_id), ("resume_from", resume_from)):
+        if value and not _REF_RE.fullmatch(value):
+            raise _safe_error("invalid_reference", f"{field_name} is not a bounded reference")
+    attempt = body.get("attempt", 1)
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or not 1 <= attempt <= 1000:
+        raise _safe_error("invalid_attempt", "attempt must be a bounded positive integer")
 
     bundle = _load_bundle(bundle_ref)
     if bundle["digest"] != bundle_digest:
@@ -1267,6 +1861,7 @@ async def submit_task(
         raise _safe_error("invalid_parameters", "parameters must be an object")
     parameters = dict(body.get("parameters") or {})
     _validate_parameters(parameters, bundle["input_schema"])
+    input_artifacts, input_manifest = _decode_input_artifacts(body)
     if idempotency_key:
         idempotency_key = _require_ref(idempotency_key, "idempotency_key")
     fingerprint = _sha256(json.dumps({
@@ -1276,6 +1871,10 @@ async def submit_task(
         "kind": kind,
         "network_policy_ref": network_policy or "none",
         "parameters": parameters,
+        "input_artifacts": input_manifest,
+        "runtime_contract_version": runtime_contract_version,
+        "parent_task_id": parent_task_id,
+        "resume_from": resume_from,
         "actor_id": request.headers.get("X-Actor-ID") or "",
         "department_id": request.headers.get("X-Department-ID") or "",
         "policy_snapshot_hash": request.headers.get("X-Policy-Snapshot-Hash") or "",
@@ -1286,6 +1885,7 @@ async def submit_task(
     auto_id = requested_id in {"", "pending"}
     if not auto_id:
         requested_id = _require_task_id(requested_id)
+    execution_id = f"exec-{uuid.uuid4().hex[:24]}"
 
     with _lock:
         if idempotency_key:
@@ -1311,6 +1911,14 @@ async def submit_task(
             if existing_task["request_fingerprint"] != fingerprint or existing_task["idempotency_key"] != idempotency_key:
                 raise _safe_error("idempotency_conflict", "task_id is bound to another request", status=409)
             return {"task_id": existing_task["task_id"], **_observation(existing_task)}
+        with closing(_connect()) as conn:
+            queued = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM runner_tasks WHERE status IN ('queued', 'running')"
+                ).fetchone()[0]
+            )
+        if queued >= MAX_QUEUE:
+            raise _safe_error("queue_full", "Runner execution queue is full", retryable=True, status=429)
         _insert_task(
             task_id=requested_id,
             idempotency_key=idempotency_key,
@@ -1319,15 +1927,17 @@ async def submit_task(
             profile_ref=profile_ref,
             request_fingerprint=fingerprint,
             kind=kind,
+            execution_id=execution_id,
+            attempt=attempt,
+            parameters=parameters,
+            input_manifest=input_manifest,
         )
-    task = _get_task(requested_id)
-    assert task is not None
-    # A blocking OCI launch on the ASGI event loop would prevent cancel and
-    # observe requests from being served until the task has already timed out.
-    await asyncio.to_thread(_execute_task, task, bundle, parameters)
-    finished = _get_task(requested_id)
-    assert finished is not None
-    return {"task_id": finished["task_id"], **_observation(finished)}
+        task = _get_task(requested_id)
+        assert task is not None
+        # Admission is durable before any OCI work starts.  The bounded worker
+        # pool owns execution, so this endpoint never blocks cancel/observe.
+        _executor_pool().submit(_execute_task, task, bundle, parameters, input_artifacts)
+    return {"task_id": requested_id, **_observation(task)}
 
 
 @app.post("/v1/skill-build")
@@ -1452,6 +2062,21 @@ def cancel_task(
     return {"task_id": task["task_id"], **_observation(updated)}
 
 
+def _inline_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve retained Runner payload files into an inline collection result."""
+
+    result: dict[str, Any] = {"items": []}
+    for raw in manifest.get("items") or []:
+        if not isinstance(raw, Mapping):
+            continue
+        item = dict(raw)
+        payload_ref = str(item.pop("payload_ref", "") or "")
+        if payload_ref:
+            item["content_base64"] = base64.b64encode(_payload_bytes(payload_ref)).decode("ascii")
+        result["items"].append(item)
+    return result
+
+
 @app.post("/v1/tasks/{task_id}/collect")
 def collect_task(
     task_id: str,
@@ -1462,14 +2087,17 @@ def collect_task(
     task = _get_task(_require_task_id(task_id))
     if task is None:
         raise _safe_error("task_unknown", "task is not known to the runner", status=404)
-    if task["status"] != "succeeded" or not task["manifest"]:
+    if task["status"] not in {"succeeded", "failed"}:
         raise _safe_error("collect_unavailable", "task has no collectable output", status=409)
-    return {
-        "task_id": task["task_id"],
-        "status": task["status"],
-        "execution_id": task["execution_id"],
-        "output_manifest": task["manifest"],
-    }
+    manifest = task["manifest"] or {}
+    if not manifest.get("items") and str((task.get("result") or {}).get("result_status") or "") not in {
+        "needs_user_input",
+        "needs_tool",
+    }:
+        raise _safe_error("collect_unavailable", "task has no collectable output", status=409)
+    observation = _observation(task)
+    observation["output_manifest"] = _inline_manifest(manifest)
+    return observation
 
 
 @app.post("/v1/reconcile")

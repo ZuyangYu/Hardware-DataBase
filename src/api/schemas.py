@@ -455,6 +455,9 @@ class CreateTurnRequest(BaseModel):
     query_mode: Literal["fast", "deep"] = "deep"
     # Wiki 辅助开关(每轮): False 时不注册 wiki_search 工具。
     wiki_assist: bool = False
+    # Temporary Skill suppression for this turn. Subscription and permission
+    # remain unchanged; the server only omits these refs from the Skill catalog.
+    disabled_skill_refs: list[str] = Field(default_factory=list, max_length=32)
     # Chat attachments (design §5.1): session-scoped references; the server
     # re-verifies ownership and parse state before persisting the turn.
     attachment_ids: list[str] = Field(default_factory=list, max_length=20)
@@ -1276,6 +1279,13 @@ class SandboxTaskCreateRequest(BaseModel):
     deadline_at: str = Field(default="", max_length=80)
 
 
+class SandboxTaskInputBindRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_ids: list[str] = Field(min_length=1, max_length=16)
+    expected_revision: int = Field(default=-1, ge=-1)
+
+
 class SandboxCancelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1427,6 +1437,11 @@ class SandboxSkillPackageUploadRequest(BaseModel):
     version: str = Field(min_length=1, max_length=64)
     department_id: str = Field(min_length=1, max_length=128)
     source_ref: str = Field(default="", max_length=512)
+    source_kind: Literal["direct_upload", "git", "registry", "model_generated", "internal"] = "direct_upload"
+    source_commit: str = Field(default="", max_length=128)
+    signing_key_id: str = Field(default="", max_length=128)
+    signature_base64: str = Field(default="", max_length=512)
+    sbom: dict[str, Any] = Field(default_factory=dict)
     catalog_source: str = Field(default="curated", max_length=50)
     package_base64: str = Field(min_length=1, max_length=12_000_000)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -1483,6 +1498,19 @@ class SandboxSkillBuildRequest(BaseModel):
     )
 
 
+class SandboxSkillSigningKeyRequest(BaseModel):
+    """Administrator-owned Ed25519 trust anchor; uploaders cannot self-register it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_id: str = Field(min_length=1, max_length=128)
+    public_key: str = Field(min_length=43, max_length=256)
+
+
+class SandboxSkillSigningKeyResponse(BaseModel):
+    key: dict[str, Any]
+
+
 class SandboxSkillPipSourceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1504,6 +1532,9 @@ class SandboxSkillRunRequest(BaseModel):
 
     idempotency_key: str = Field(min_length=1, max_length=100)
     parameters: dict[str, Any] = Field(default_factory=dict)
+    input_artifact_ids: list[str] = Field(default_factory=list, max_length=16)
+    parent_task_id: str = Field(default="", max_length=128)
+    resume_from: str = Field(default="", max_length=128)
 
 
 class SandboxSkillResponse(BaseModel):

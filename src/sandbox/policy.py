@@ -10,6 +10,7 @@ from typing import Any
 import src.settings as settings
 
 from .models import SandboxTaskSpec
+from .runtime_contract import RUNTIME_CONTRACT_VERSION
 
 
 class SandboxPolicyError(ValueError):
@@ -155,6 +156,18 @@ def validate_task_spec(spec: SandboxTaskSpec) -> SandboxTaskSpec:
     skill_digest = str(spec.skill_content_digest or "").lower().removeprefix("sha256:")
     if bool(skill_ref) != bool(skill_digest) or (skill_digest and not re.fullmatch(r"[0-9a-f]{64}", skill_digest)):
         raise SandboxPolicyError("Skill task must bind a reviewed Skill reference and digest")
+    skill_version = str(getattr(spec, "skill_version", "") or "").strip()
+    if skill_version and not _REF_RE.fullmatch(skill_version):
+        raise SandboxPolicyError("skill_version must be a bounded reference")
+    runtime_contract_version = str(getattr(spec, "runtime_contract_version", RUNTIME_CONTRACT_VERSION) or RUNTIME_CONTRACT_VERSION)
+    if runtime_contract_version != RUNTIME_CONTRACT_VERSION:
+        raise SandboxPolicyError("unsupported runtime_contract_version")
+    parent_task_id = str(getattr(spec, "parent_task_id", "") or "").strip()
+    resume_from = str(getattr(spec, "resume_from", "") or "").strip()
+    if parent_task_id and not _REF_RE.fullmatch(parent_task_id):
+        raise SandboxPolicyError("parent_task_id must be a bounded reference")
+    if resume_from and not _REF_RE.fullmatch(resume_from):
+        raise SandboxPolicyError("resume_from must be a bounded reference")
     owner_id = _check_ref(spec.owner_id, "owner_id")
     department_id = _check_ref(spec.department_id, "department_id")
     bundle_ref = _check_ref(spec.bundle_ref, "bundle_ref")
@@ -189,6 +202,10 @@ def validate_task_spec(spec: SandboxTaskSpec) -> SandboxTaskSpec:
     for artifact_id in artifact_ids:
         if not _ARTIFACT_ID_RE.fullmatch(artifact_id):
             raise SandboxPolicyError("input_artifact_ids must be opaque IDs")
+    if artifact_ids and "sandbox.internal_data" not in capabilities:
+        raise SandboxPolicyError("input artifacts require the sandbox.internal_data capability")
+    if resume_from and resume_from not in artifact_ids:
+        raise SandboxPolicyError("resume_from must reference a bound input artifact")
 
     _check_parameters(spec.parameters)
     try:
@@ -205,6 +222,10 @@ def validate_task_spec(spec: SandboxTaskSpec) -> SandboxTaskSpec:
         idempotency_key=idempotency_key,
         skill_ref=skill_ref,
         skill_content_digest=skill_digest,
+        skill_version=skill_version,
+        runtime_contract_version=runtime_contract_version,
+        parent_task_id=parent_task_id,
+        resume_from=resume_from,
         owner_id=owner_id,
         department_id=department_id,
         bundle_ref=bundle_ref,

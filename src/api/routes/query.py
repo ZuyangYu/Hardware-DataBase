@@ -76,6 +76,20 @@ _DELTA_FLUSH_SECONDS = 0.12
 _SHORT_TERM_HISTORY_LIMIT = 5
 
 
+def _normalize_disabled_skill_refs(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return []
+    result: list[str] = []
+    for raw in value:
+        ref = str(raw or "").strip()
+        if not ref or len(ref) > 256 or ref in result:
+            continue
+        result.append(ref)
+        if len(result) >= 32:
+            break
+    return result
+
+
 
 
 
@@ -346,6 +360,19 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     turn = conv.claim_turn(user.id, turn_id, worker_id)
     if turn is None:
         return
+    disabled_skill_refs = _normalize_disabled_skill_refs(
+        getattr(turn, "disabled_skill_refs", None)
+    )
+    if not disabled_skill_refs:
+        raw_disabled = (getattr(turn, "trace_context", {}) or {}).get("hdb.skill_disabled_refs")
+        try:
+            disabled_skill_refs = _normalize_disabled_skill_refs(json.loads(raw_disabled or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            disabled_skill_refs = []
+    if disabled_skill_refs:
+        metadata = getattr(ctx, "metadata", None)
+        if isinstance(metadata, dict):
+            metadata["disabled_skill_refs"] = disabled_skill_refs
     update_context(execution_attempt_id=str(getattr(turn, "attempt_id", "") or ""))
     # Execution ownership: a positive token means serialized mode and enables
     # stale-owner rejection for every later authoritative write of this turn.
@@ -1165,17 +1192,23 @@ def create_turn(
                 },
             )
     trace_context = inject_trace_context()
+    disabled_skill_refs = _normalize_disabled_skill_refs(body.disabled_skill_refs)
+    if disabled_skill_refs:
+        trace_context["hdb.skill_disabled_refs"] = json.dumps(
+            disabled_skill_refs, ensure_ascii=False, separators=(",", ":")
+        )
     try:
         turn = conv.create_turn(
-        user.id,
-        session_id,
-        body.query,
-        body.client_request_id,
-        query_mode,
-        trace_context=trace_context,
-        wiki_assist=body.wiki_assist,
-        attachment_ids=[ref.attachment_id for ref in attachment_refs],
+            user.id,
+            session_id,
+            body.query,
+            body.client_request_id,
+            query_mode,
+            trace_context=trace_context,
+            wiki_assist=body.wiki_assist,
+            attachment_ids=[ref.attachment_id for ref in attachment_refs],
             source_scope=effective_scope,
+            disabled_skill_refs=disabled_skill_refs,
             **({"knowledge_scope": knowledge_scope} if knowledge_scope is not None else {}),
         )
     except (KnowledgeScopeChanged, IdempotencyConflict) as exc:

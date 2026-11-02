@@ -56,4 +56,8 @@ METRIC_LABEL_KEYS = {
     # Context governance: bounded enums only (auto/manual/overflow, ok/failed).
     "trigger",
     "outcome",
+    # Sandbox result dimensions are closed enums; task IDs and digests remain
+    # on durable events/traces rather than becoming metric labels.
+    "result_status",
+    "skill_kind",
 }

@@ -5,6 +5,19 @@ import { describe, expect, it } from 'vitest';
 import type { McpCatalogItem, McpListFlags } from '../api/types';
 import { ExtensionsView } from './ExtensionsPage';
 
+const stored = new Map<string, string>();
+Object.defineProperty(globalThis, 'localStorage', {
+  configurable: true,
+  value: {
+    getItem: (key: string) => stored.get(key) ?? null,
+    setItem: (key: string, value: string) => { stored.set(key, value); },
+    removeItem: (key: string) => { stored.delete(key); },
+    clear: () => { stored.clear(); },
+    key: (index: number) => [...stored.keys()][index] ?? null,
+    get length() { return stored.size; },
+  },
+});
+
 const flags: McpListFlags = {
   enabled: true,
   write_enabled: true,
@@ -110,6 +123,121 @@ describe('ExtensionsView', () => {
     expect(markup).not.toContain('下载 pending.txt');
   });
 
+  it('renders task version, validation issues and committed artifact versions', () => {
+    const markup = view({
+      skills: [{ skill_ref: 'skill/report', version: 'v1', bundle_ref: 'bundle/report',
+        input_schema: {}, subscribed: true, kind: 'executable' }],
+      skillTask: {
+        task_id: 'task-1', status: 'succeeded', result_status: 'validation_failed',
+        skill_ref: 'skill/report', skill_version: '1.2.0', latest_step_id: 'validate',
+        latest_progress: 0.75,
+        skill_result: { issues: [{ code: 'missing_interface', message: '缺少接口表' }] },
+      },
+      skillArtifacts: [{
+        artifact_id: 'art-1', filename: 'report.json', state: 'committed',
+        size: 128, sha256: 'a'.repeat(64),
+      }],
+      onToggleSkill: () => undefined,
+      onDownloadSkillArtifact: () => undefined,
+    });
+    expect(markup).toContain('data-skill-task-result');
+    expect(markup).toContain('validation_failed');
+    expect(markup).toContain('skill/report');
+    expect(markup).toContain('v1.2.0');
+    expect(markup).toContain('data-skill-validation-report');
+    expect(markup).toContain('missing_interface');
+    expect(markup).toContain('缺少接口表');
+    expect(markup).toContain('版本 aaaaaaaaaaaa');
+    expect(markup).toContain('下载 report.json');
+  });
+
+  it('shows parent-task lineage and artifact diff controls', () => {
+    const markup = view({
+      skills: [{ skill_ref: 'skill/report', version: 'v1', bundle_ref: 'bundle/report',
+        input_schema: {}, subscribed: true, kind: 'executable' }],
+      skillTask: {
+        task_id: 'task-child', status: 'succeeded', parent_task_id: 'task-parent',
+        skill_ref: 'skill/report', skill_version: '2.0.0',
+      },
+      skillArtifacts: [{
+        artifact_id: 'art-current', filename: 'result.json', state: 'committed', sha256: 'b'.repeat(64),
+        metadata: { source_artifact_id: 'art-previous' },
+      }],
+      skillLineage: [
+        { task_id: 'task-child', parent_task_id: 'task-parent', skill_ref: 'skill/report',
+          skill_version: '2.0.0', status: 'succeeded', result_status: 'completed', created_at: '2026-10-30' },
+        { task_id: 'task-parent', parent_task_id: '', skill_ref: 'skill/report',
+          skill_version: '1.0.0', status: 'succeeded', result_status: 'completed', created_at: '2026-10-29' },
+      ],
+      artifactDiffs: { 'art-current': {
+        artifact_id: 'art-current', base_artifact_id: 'art-previous', filename: 'result.json',
+        base_filename: 'result.json', changed: true, added_lines: 1, removed_lines: 1,
+        truncated: false, diff: '-old\n+new',
+      } },
+      onDiffSkillArtifact: () => undefined,
+      onRefreshSkillLineage: () => undefined,
+    });
+    expect(markup).toContain('data-skill-lineage');
+    expect(markup).toContain('task-parent');
+    expect(markup).toContain('v2.0.0');
+    expect(markup).toContain('对比上一版本');
+    expect(markup).toContain('data-skill-artifact-diff="art-current"');
+    expect(markup).toContain('+1 / -1');
+    expect(markup).toContain('+new');
+  });
+
+  it('separates persistent subscription from per-turn temporary suppression', () => {
+    localStorage.setItem('hdb.skill.disabled_refs', JSON.stringify(['skill/report']));
+    try {
+      const markup = view({
+        skills: [{
+          skill_ref: 'skill/report', version: 'v1', bundle_ref: 'bundle/report',
+          input_schema: {}, subscribed: true, kind: 'executable',
+        }],
+        onToggleSkill: () => undefined,
+      });
+      expect(markup).toContain('移出我的工具');
+      expect(markup).toContain('data-skill-temporary-disable="skill/report"');
+      expect(markup).toContain('恢复使用');
+      expect(markup).toContain('data-skill-temporary-notice');
+      expect(markup).toContain('订阅权限不受影响');
+      expect(markup).toContain('全部恢复');
+    } finally {
+      localStorage.removeItem('hdb.skill.disabled_refs');
+    }
+  });
+
+  it('shows reviewed Skill intent metadata and the actual runtime contract', () => {
+    const markup = view({
+      skills: [{
+        skill_ref: 'skill/block-diagram', version: '2.1.0', bundle_ref: 'bundle/block-diagram',
+        input_schema: {}, subscribed: false, kind: 'executable',
+        metadata: {
+          summary: '根据接口表生成硬件框图。',
+          intent_examples: ['生成硬件框图', '根据接口表绘图'],
+          input_kinds: ['csv', 'xlsx'], output_kinds: ['svg', 'json'],
+          interaction_modes: ['self_contained'], side_effects: [], risk: 'low',
+        },
+        runtime: {
+          profile_ref: 'profile/dev-l1', contract_version: 'v1', runtime_policy_ref: 'profile/dev-l1',
+          runtime_policy_digest: 'a'.repeat(64), required_capabilities: ['sandbox.execute'],
+          network_policy_ref: '', bundle_digest: 'b'.repeat(64), sbom_ref: '', signature_ref: '',
+        },
+      }],
+      onToggleSkill: () => undefined,
+    });
+    expect(markup).toContain('data-skill-metadata');
+    expect(markup).toContain('生成硬件框图');
+    expect(markup).toContain('csv');
+    expect(markup).toContain('svg');
+    expect(markup).toContain('低风险');
+    expect(markup).toContain('data-skill-runtime');
+    expect(markup).toContain('profile/dev-l1');
+    expect(markup).toContain('SBOM');
+    expect(markup).toContain('管理员发布');
+    expect(markup).toContain('v1');
+  });
+
   it('lets an employee add a scoped text Skill without offering execution controls', () => {
     const markup = view({ skills: [{ skill_ref: 'skill/bom-review', version: 'v1',
       bundle_ref: '', input_schema: {}, kind: 'text', description: '---\nname: bom-review\ndescription: 核对位号\n---\n# BOM 人工复核清单\n请检查冲突。' }],
@@ -118,7 +246,7 @@ describe('ExtensionsView', () => {
     expect(markup).toContain('BOM 人工复核清单');
     expect(markup).toContain('核对位号');
     expect(markup).toContain('文本参考');
-    expect(markup).toContain('添加 Skill');
+    expect(markup).toContain('添加到我的工具');
     expect(markup).not.toContain('测试 Skill');
     expect(markup).not.toContain('在沙箱中运行');
     expect(markup).not.toContain('JSON 参数');

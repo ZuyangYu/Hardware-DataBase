@@ -87,10 +87,18 @@ describe('SkillsPanelView', () => {
         execution_bundle_ref: 'bundle/skill-export',
         bundle_invocation_available: false,
         package_archive_digest: 'b'.repeat(64),
-        package_files: ['SKILL.md', 'entrypoint.py'],
-        package_review_flags: ['execution_markers_present'],
-        package_build_state: 'built',
-      }, {
+         package_files: ['SKILL.md', 'entrypoint.py'],
+         package_review_flags: ['execution_markers_present'],
+         package_build_state: 'built',
+         provenance: {
+           source_kind: 'git', source_ref: 'https://git.example/report.git', source_commit: 'a'.repeat(40),
+           signature: { status: 'verified', key_id: 'release-key' },
+           sbom: { status: 'generated_not_attested', digest: 'e'.repeat(64) },
+           review: { state: 'built', reviewed_by: 'admin' },
+           runtime_gate: { minimum_profile: 'profile/dev-l1', reason: 'signature_verified' },
+         },
+         review_records: [{ action: 'source_uploaded', decision: 'pending', actor_name: 'admin', created_at: '2026-10-30' }],
+       }, {
         skill_ref: 'skill/other', version: '1.0.0', department_id: '13',
         approval_state: 'enabled', execution_bundle_ref: '',
         bundle_invocation_available: false, package_archive_digest: 'd'.repeat(64),
@@ -111,6 +119,10 @@ describe('SkillsPanelView', () => {
     expect(markup).toContain('data-skill-source-review="skill/export"');
     expect(markup).toContain('data-skill-build-review="bundle/skill-export"');
     expect(markup).toContain('源包 SHA-256');
+    expect(markup).toContain('已用已登记公钥验签');
+    expect(markup).toContain('HDB 生成文件清单');
+    expect(markup).toContain('release-key');
+    expect(markup).toContain('审核事件');
     expect(markup).toContain('文本规则提示');
     expect(markup).not.toContain('data-skill-source-review="skill/other"');
     expect(markup).toContain('审核构建镜像');

@@ -593,6 +593,8 @@ export interface CreateTurnRequest {
   source_scope?: 'auto' | 'attachment_only' | 'knowledge_base_only' | 'attachment_and_knowledge_base';
   /** Wiki 辅助开关: true 时注册 wiki_search 检索知识 Wiki 蒸馏页。 */
   wiki_assist?: boolean;
+  /** 本轮临时隐藏的 Skill；不改变持久订阅或权限。 */
+  disabled_skill_refs?: string[];
   knowledge_scope?: KnowledgeSelectionInput | null;
 }
 

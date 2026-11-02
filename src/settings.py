@@ -441,6 +441,9 @@ SANDBOX_TASK_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_TASK_TIMEOUT_SECONDS", "30
 SANDBOX_TASK_LEASE_SECONDS = int(os.getenv("SANDBOX_TASK_LEASE_SECONDS", "60"))
 SANDBOX_MAX_OUTPUT_BYTES = int(os.getenv("SANDBOX_MAX_OUTPUT_BYTES", str(50 * 1024 * 1024)))
 SANDBOX_MAX_INPUT_BYTES = int(os.getenv("SANDBOX_MAX_INPUT_BYTES", str(50 * 1024 * 1024)))
+SANDBOX_RUNNER_MAX_INLINE_INPUT_BYTES = int(
+    os.getenv("SANDBOX_RUNNER_MAX_INLINE_INPUT_BYTES", str(32 * 1024 * 1024))
+)
 SANDBOX_ALLOW_DYNAMIC_INSTALL = _env_bool("SANDBOX_ALLOW_DYNAMIC_INSTALL", False)
 SANDBOX_AUTHORIZED_CAPABILITIES = _env_csv("SANDBOX_AUTHORIZED_CAPABILITIES")
 # Enabling execution without an operator-recorded runtime attestation is never
@@ -465,7 +468,7 @@ SANDBOX_SKILL_STORAGE_DIR = _resolve_storage_path(
 )
 SANDBOX_SKILL_PIP_ALLOWED_HOSTS = os.getenv("SANDBOX_SKILL_PIP_ALLOWED_HOSTS", "pypi.org")
 SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS = os.getenv(
-    "SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS", "json,csv,txt,zip,kicad_sch,kicad_pcb,kicad_pro"
+    "SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS", "json,csv,txt,md,zip,svg,png,pdf,xlsx,docx,kicad_sch,kicad_pcb,kicad_pro"
 )
 # Text Skills are a separate, prompt-data-only catalog.  They have no runtime
 # capability, so the catalog is on by default; nothing reaches a conversation
@@ -956,6 +959,7 @@ DEFAULT_VALUES = {
     "SANDBOX_TASK_LEASE_SECONDS": "60",
     "SANDBOX_MAX_OUTPUT_BYTES": str(50 * 1024 * 1024),
     "SANDBOX_MAX_INPUT_BYTES": str(50 * 1024 * 1024),
+    "SANDBOX_RUNNER_MAX_INLINE_INPUT_BYTES": str(32 * 1024 * 1024),
     "SKILLS_ENABLED": "true",
     # Deployment-only sandbox identity/endpoints are intentionally excluded
     # from the ordinary config API; these defaults document the closed state.
@@ -1169,7 +1173,8 @@ def _reload_settings():
     global SANDBOX_DEFAULT_NETWORK
     global SANDBOX_MAX_CONCURRENT, SANDBOX_TASK_TIMEOUT_SECONDS, SANDBOX_TASK_LEASE_SECONDS
     global SANDBOX_MAX_CONCURRENT_PER_USER, SANDBOX_MAX_CONCURRENT_PER_DEPARTMENT
-    global SANDBOX_MAX_OUTPUT_BYTES, SANDBOX_MAX_INPUT_BYTES, SANDBOX_ALLOW_DYNAMIC_INSTALL
+    global SANDBOX_MAX_OUTPUT_BYTES, SANDBOX_MAX_INPUT_BYTES, SANDBOX_RUNNER_MAX_INLINE_INPUT_BYTES
+    global SANDBOX_ALLOW_DYNAMIC_INSTALL
     global SANDBOX_AUTHORIZED_CAPABILITIES
     global SANDBOX_REQUIRE_RUNTIME_ATTESTATION, SANDBOX_RUNTIME_ATTESTATION_REF
     global SANDBOX_RUNTIME_PROFILE_DIGEST, SANDBOX_ARTIFACT_SCANNER_REF
@@ -1433,6 +1438,9 @@ def _reload_settings():
     SANDBOX_TASK_LEASE_SECONDS = int(os.getenv("SANDBOX_TASK_LEASE_SECONDS", "60"))
     SANDBOX_MAX_OUTPUT_BYTES = int(os.getenv("SANDBOX_MAX_OUTPUT_BYTES", str(50 * 1024 * 1024)))
     SANDBOX_MAX_INPUT_BYTES = int(os.getenv("SANDBOX_MAX_INPUT_BYTES", str(50 * 1024 * 1024)))
+    SANDBOX_RUNNER_MAX_INLINE_INPUT_BYTES = int(
+        os.getenv("SANDBOX_RUNNER_MAX_INLINE_INPUT_BYTES", str(32 * 1024 * 1024))
+    )
     SANDBOX_ALLOW_DYNAMIC_INSTALL = _env_bool("SANDBOX_ALLOW_DYNAMIC_INSTALL", False)
     SANDBOX_AUTHORIZED_CAPABILITIES = _env_csv("SANDBOX_AUTHORIZED_CAPABILITIES")
     SANDBOX_REQUIRE_RUNTIME_ATTESTATION = _env_bool("SANDBOX_REQUIRE_RUNTIME_ATTESTATION", True)
@@ -1453,7 +1461,7 @@ def _reload_settings():
     SANDBOX_SKILL_PIP_ALLOWED_HOSTS = os.getenv("SANDBOX_SKILL_PIP_ALLOWED_HOSTS", "pypi.org")
     SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS = os.getenv(
         "SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS",
-        "json,csv,txt,zip,kicad_sch,kicad_pcb,kicad_pro",
+        "json,csv,txt,md,zip,svg,png,pdf,xlsx,docx,kicad_sch,kicad_pcb,kicad_pro",
     )
     SKILLS_ENABLED = _env_bool("SKILLS_ENABLED", True)
     MULTI_KB_CHAT_ENABLED = _env_bool("MULTI_KB_CHAT_ENABLED", False)
@@ -1854,6 +1862,7 @@ _INT_SETTING_KEYS = frozenset({
     "SANDBOX_TASK_LEASE_SECONDS",
     "SANDBOX_MAX_OUTPUT_BYTES",
     "SANDBOX_MAX_INPUT_BYTES",
+    "SANDBOX_RUNNER_MAX_INLINE_INPUT_BYTES",
     "RETRIEVAL_EXECUTOR_MAX_WORKERS",
     "MULTI_KB_MAX_SOURCES",
     "MULTI_KB_PER_SOURCE_TOP_K",
@@ -1950,6 +1959,7 @@ def validate_settings_values(settings_dict: dict) -> None:
                 "SANDBOX_TASK_LEASE_SECONDS",
                 "SANDBOX_MAX_OUTPUT_BYTES",
                 "SANDBOX_MAX_INPUT_BYTES",
+                "SANDBOX_RUNNER_MAX_INLINE_INPUT_BYTES",
                 "MULTI_KB_MAX_SOURCES",
                 "MULTI_KB_PER_SOURCE_TOP_K",
                 "MULTI_KB_PER_RECORD_CANDIDATES",

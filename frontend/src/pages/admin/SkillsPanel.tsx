@@ -26,7 +26,28 @@ type Skill = {
   text_archive_digest?: string;
   text_files?: string[];
   review_flags?: string[];
-  metadata?: { summary?: string; skill_name?: string; submitted_input_schema?: Record<string, unknown>; submitted_output_schema?: Record<string, unknown> };
+  source_ref?: string;
+  metadata?: {
+    summary?: string;
+    skill_name?: string;
+    submitted_input_schema?: Record<string, unknown>;
+    submitted_output_schema?: Record<string, unknown>;
+    source_manifest?: Array<{ path: string; sha256: string; size: number }>;
+    source_manifest_digest?: string;
+    source_manifest_truncated?: boolean;
+  };
+  provenance?: {
+    source_kind?: string;
+    source_ref?: string;
+    source_ref_status?: string;
+    source_commit?: string;
+    source_manifest_digest?: string;
+    signature?: { status?: string; algorithm?: string; key_id?: string; key_fingerprint?: string };
+    sbom?: { status?: string; format?: string; digest?: string; ref?: string; component_count?: number; dependency_count?: number };
+    review?: { state?: string; decision?: string; reviewed_by?: string; reviewed_at?: string };
+    runtime_gate?: { minimum_profile?: string; reason?: string };
+  };
+  review_records?: Array<{ action?: string; decision?: string; actor_name?: string; created_at?: string }>;
 };
 type Bundle = {
   bundle_ref: string;
@@ -37,6 +58,8 @@ type Bundle = {
   network_policy_ref: string;
   required_capabilities: string[];
   metadata?: { image_digest?: string };
+  sbom_ref?: string;
+  signature_ref?: string;
 };
 
 export type SkillsPanelViewProps = {
@@ -139,6 +162,48 @@ function approvalVariant(state: string): 'default' | 'secondary' | 'destructive'
   return 'outline';
 }
 
+function SourceManifestDetails({ metadata, provenance, reviewRecords }: {
+  metadata?: Skill['metadata'];
+  provenance?: Skill['provenance'];
+  reviewRecords?: Skill['review_records'];
+}) {
+  const items = metadata?.source_manifest ?? [];
+  if (!items.length && !provenance) return null;
+  return (
+    <details className="mt-[10px] text-[12px] text-[#697084]" data-skill-source-manifest>
+      <summary className="cursor-pointer font-medium text-[#596174]">查看来源、签名与 SBOM</summary>
+      {provenance && (
+        <div className="mt-[8px] grid gap-[5px] rounded-[8px] bg-[#f8f9fb] p-[10px]">
+          <div>来源类型：{provenance.source_kind || '未声明'}</div>
+          {provenance.source_ref && <div className="break-all">来源引用：{provenance.source_ref} · {provenance.source_ref_status === 'declared_not_fetched' ? '已声明，未由 HDB 在线抓取' : '未提供'}</div>}
+          {provenance.source_commit && <div className="break-all">来源提交：<span className="font-mono">{provenance.source_commit}</span></div>}
+          <div>签名：{provenance.signature?.status === 'verified' ? '已用已登记公钥验签' : '未提供或未验签（不是安全结论）'}{provenance.signature?.key_id ? ` · ${provenance.signature.key_id}` : ''}</div>
+          <div>SBOM：{provenance.sbom?.status === 'provided_validated_not_attested' ? '外部清单已校验（未构成第三方证明）' : 'HDB 生成文件清单（未构成第三方证明）'} · {provenance.sbom?.digest || '未计算'}</div>
+          <div>审核链：{provenance.review?.state || 'pending'}{provenance.review?.reviewed_by ? ` · ${provenance.review.reviewed_by}` : ''}</div>
+          {provenance.runtime_gate?.minimum_profile && <div>运行门禁：最低 {provenance.runtime_gate.minimum_profile} · {provenance.runtime_gate.reason || 'source policy'}</div>}
+        </div>
+      )}
+      {reviewRecords?.length ? (
+        <div className="mt-[8px] grid gap-[4px] rounded-[8px] border border-[#e8ebf2] p-[10px]">
+          <div className="font-medium text-[#596174]">审核事件</div>
+          {reviewRecords.map((item, index) => (
+            <div key={`${item.action}-${item.created_at}-${index}`} className="break-all">{item.action || 'review'} · {item.decision || '—'} · {item.actor_name || '—'} · {item.created_at || '—'}</div>
+          ))}
+        </div>
+      ) : null}
+      <div className="mt-[8px] break-all">
+        清单摘要：{metadata?.source_manifest_digest || provenance?.source_manifest_digest || '未计算'}
+        {metadata?.source_manifest_truncated ? '（仅展示前 64 个文件）' : ''}
+      </div>
+      {items.length > 0 && <div className="mt-[6px] grid max-h-[240px] gap-[4px] overflow-auto rounded-[8px] bg-[#f8f9fb] p-[10px] font-mono text-[11px]">
+        {items.map((item) => (
+          <div key={item.path} className="break-all">{item.path} · {item.size} B · {item.sha256.slice(0, 16)}…</div>
+        ))}
+      </div>}
+    </details>
+  );
+}
+
 function SkillBundleCard({ bundle, busy, onBundleState }: {
   bundle: Bundle;
   busy: boolean;
@@ -171,7 +236,9 @@ function SkillBundleCard({ bundle, busy, onBundleState }: {
           <div>目录来源：{bundle.catalog_source === 'curated' ? '已审核模板' : bundle.catalog_source}</div>
           <div>网络策略：{bundle.network_policy_ref || '未附加策略引用'}</div>
           <div>所需能力：{bundle.required_capabilities.join('、') || '无'}</div>
-          <div className="break-all"><span className="font-medium">Bundle SHA-256：</span>{bundle.bundle_digest}</div>
+           <div className="break-all"><span className="font-medium">Bundle SHA-256：</span>{bundle.bundle_digest}</div>
+           <div>SBOM 引用：{bundle.sbom_ref || '未提供'}</div>
+           <div>签名引用：{bundle.signature_ref || '未验签'}</div>
           {bundle.metadata?.image_digest && (
             <div className="break-all"><span className="font-medium">镜像 ID：</span>{bundle.metadata.image_digest}</div>
           )}
@@ -377,8 +444,9 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
                 )}
                 <details className="mt-[10px] text-[12px] text-[#697084]">
                   <summary className="cursor-pointer font-medium text-[#596174]">查看文件清单与源包 SHA-256</summary>
-                  <div className="mt-[8px] break-all">文件：{selectedSkill.package_files?.join('、') || '未返回文件清单'}<br />源包 SHA-256：{selectedSkill.package_archive_digest}</div>
+                  <div className="mt-[8px] break-all">文件：{selectedSkill.package_files?.join('、') || '未返回文件清单'}<br />源包 SHA-256：{selectedSkill.package_archive_digest}{selectedSkill.source_ref ? <><br />来源：{selectedSkill.source_ref}</> : null}</div>
                 </details>
+                <SourceManifestDetails metadata={selectedSkill.metadata} provenance={selectedSkill.provenance} reviewRecords={selectedSkill.review_records} />
                 {selectedSkill.catalog_source === 'employee' && (
                   <details className="mt-[10px] text-[12px] text-[#697084]">
                     <summary className="cursor-pointer font-medium text-[#596174]">查看员工提交的参数 Schema</summary>
@@ -405,8 +473,9 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
                 )}
                 <details className="mt-[10px] text-[12px] text-[#697084]">
                   <summary className="cursor-pointer font-medium text-[#596174]">查看文件清单与 SHA-256</summary>
-                  <div className="mt-[8px] break-all">文件：{selectedSkill.text_files?.join('、') || '未返回文件清单'}<br />ZIP SHA-256：{selectedSkill.text_archive_digest}</div>
+                  <div className="mt-[8px] break-all">文件：{selectedSkill.text_files?.join('、') || '未返回文件清单'}<br />ZIP SHA-256：{selectedSkill.text_archive_digest}{selectedSkill.source_ref ? <><br />来源：{selectedSkill.source_ref}</> : null}</div>
                 </details>
+                <SourceManifestDetails metadata={selectedSkill.metadata} provenance={selectedSkill.provenance} reviewRecords={selectedSkill.review_records} />
               </div>
             )}
 

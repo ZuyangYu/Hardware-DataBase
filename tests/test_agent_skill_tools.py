@@ -7,6 +7,7 @@ from langchain_core.messages import AIMessage
 import src.settings as settings
 from src.agents import runner as runner_mod
 from src.pipelines.document_rag.schemas import RequestContext
+from src.sandbox.agent_tools import _emit_task_stage
 from src.sandbox.catalog import SandboxCatalog
 from src.sandbox.skills import SkillCatalog
 
@@ -16,6 +17,25 @@ class _Backend:
 
     def retrieve(self, *args, **kwargs):
         return []
+
+
+def test_needs_user_input_stage_emits_a_bounded_input_request():
+    events = []
+    _emit_task_stage(
+        type("RT", (), {"emit": lambda self, kind, payload: events.append((kind, payload))})(),
+        {
+            "task_id": "task-1", "skill_ref": "skill/report", "status": "succeeded",
+            "result_status": "needs_user_input",
+            "latest_checkpoint_artifact_id": "art-checkpoint",
+            "skill_result": {"required_inputs": ["电源电压", "目标器件"]},
+        },
+    )
+    assert events[0][0] == "stage"
+    assert events[0][1]["skill_request"] == {
+        "task_id": "task-1", "skill_ref": "skill/report",
+        "required_inputs": ["电源电压", "目标器件"],
+        "checkpoint_artifact_id": "art-checkpoint",
+    }
 
 
 def test_subscribed_skill_is_model_tool_but_disabled_mcp_is_not(tmp_path, monkeypatch):
@@ -66,13 +86,38 @@ def test_subscribed_skill_is_model_tool_but_disabled_mcp_is_not(tmp_path, monkey
         return {str(getattr(tool, "name", "") or getattr(tool, "__name__", "")): tool
                 for tool in captured["tools"]}
 
-    assert not any(name.startswith("skill__") for name in turn())
+    assert "skill_invoke" not in turn()
     skills.subscribe("skill/agent-report", principal_id=42, department_id=7)
+    skills.register(
+        skill_ref="skill/agent-report-two",
+        version="v1",
+        content="Second report generator",
+        department_id="7",
+    )
+    skills.bind_execution(
+        "skill/agent-report-two",
+        bundle_ref=bundle.bundle_ref,
+        bundle_digest=bundle.bundle_digest,
+        profile_ref=bundle.profile_ref,
+    )
+    skills.review("skill/agent-report-two")
+    skills.mark_tested("skill/agent-report-two")
+    skills.enable("skill/agent-report-two")
+    skills.subscribe("skill/agent-report-two", principal_id=42, department_id=7)
     tools = turn()
     assert "skill_task_status" in tools
+    assert "skill_invoke" in tools
+    assert not any(name.startswith("skill__") for name in tools)
+    assert "skill/agent-report-two" in tools["skill_invoke"].description
     assert not any(name.startswith("mcp__") for name in tools)
-    invoke = next(tool for name, tool in tools.items() if name.startswith("skill__"))
-    assert "skill_request_rejected" in invoke.invoke({"parameters_json": "not-json"})
+    # Executable Skill tools are available even when the unified/MCP surface
+    # is disabled; they have their own authorization path.
+    monkeypatch.setattr(settings, "CONVERSATION_UNIFIED_TOOLS_ENABLED", False)
+    assert "skill_invoke" in turn()
+    monkeypatch.setattr(settings, "CONVERSATION_UNIFIED_TOOLS_ENABLED", True)
+    invoke = tools["skill_invoke"]
+    assert "skill_request_rejected" in invoke.invoke({"skill_ref": "skill/agent-report", "parameters": {}})
     skills.unsubscribe("skill/agent-report", principal_id=42)
-    assert not any(name.startswith("skill__") for name in turn())
-    assert "skill_not_subscribed" in invoke.invoke({"parameters_json": '{"title":"report"}'})
+    skills.unsubscribe("skill/agent-report-two", principal_id=42)
+    assert "skill_invoke" not in turn()
+    assert "skill_not_subscribed" in invoke.invoke({"skill_ref": "skill/agent-report", "parameters": {"title": "report"}})

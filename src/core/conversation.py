@@ -93,6 +93,7 @@ class ChatTurn:
     knowledge_scope: dict | None = None
     knowledge_selection_hash: str = ""
     knowledge_request_fingerprint: str = ""
+    disabled_skill_refs: list[str] = field(default_factory=list)
 
 
 # A turn waits here while its required chat attachments are still parsing.
@@ -1050,6 +1051,7 @@ class ConversationService:
         wiki_assist: bool = False,
         attachment_ids: list[str] | None = None,
         source_scope: str = "auto",
+        disabled_skill_refs: list[str] | None = None,
         *,
         knowledge_scope=None,
     ) -> ChatTurn:
@@ -1068,6 +1070,10 @@ class ConversationService:
         request_id = (client_request_id or "").strip()[:128] or None
         query_mode = query_mode if query_mode in {"fast", "deep"} else "fast"
         attachment_ids = [str(item or "").strip() for item in (attachment_ids or []) if str(item or "").strip()]
+        disabled_skill_refs = list(dict.fromkeys(
+            str(item or "").strip() for item in (disabled_skill_refs or [])
+            if str(item or "").strip()
+        ))[:32]
         session = self.get_session(user_id, session_id)
         if session is None:
             raise PermissionError("chat session does not belong to current user")
@@ -1119,6 +1125,11 @@ class ConversationService:
             ensure_ascii=False,
             sort_keys=True,
         )
+        persisted_trace_context = dict(trace_context or {})
+        if disabled_skill_refs:
+            persisted_trace_context["hdb.skill_disabled_refs"] = json.dumps(
+                disabled_skill_refs, ensure_ascii=False, separators=(",", ":")
+            )
         now = utc_now()
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -1137,7 +1148,7 @@ class ConversationService:
                 )
 
                 scope = turn_scope_payload(knowledge_scope, user_id=user_id, anchor_kb_id=session_row["kb_id"], stored_hash=session_row["knowledge_selection_hash"])
-                fingerprint = request_fingerprint(scope=scope, query=query, source_scope=effective_scope, attachment_ids=attachment_ids, query_mode=query_mode, wiki_assist=wiki_assist)
+                fingerprint = request_fingerprint(scope=scope, query=query, source_scope=effective_scope, attachment_ids=attachment_ids, query_mode=query_mode, wiki_assist=wiki_assist, disabled_skill_refs=disabled_skill_refs)
                 if request_id:
                     existing = conn.execute(
                         "SELECT * FROM chat_turns WHERE session_id = ? AND client_request_id = ?",
@@ -1221,7 +1232,7 @@ class ConversationService:
                         initial_status,
                         request_id,
                         turn_sequence,
-                        json.dumps(trace_context or {}, ensure_ascii=False),
+                        json.dumps(persisted_trace_context, ensure_ascii=False),
                         now,
                         export_plan_json,
                         effective_scope,
@@ -3014,6 +3025,11 @@ def row_to_turn(row) -> ChatTurn:
     if not isinstance(trace_context, dict):
         trace_context = {}
     try:
+        raw_disabled = json.loads(str(trace_context.get("hdb.skill_disabled_refs") or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raw_disabled = []
+    disabled_skill_refs = [str(item) for item in raw_disabled if str(item)] if isinstance(raw_disabled, list) else []
+    try:
         raw_export_plan = (
             json.loads(row["export_plan_json"] or "{}")
             if "export_plan_json" in row.keys() else {}
@@ -3062,6 +3078,7 @@ def row_to_turn(row) -> ChatTurn:
         knowledge_scope=json.loads(row["knowledge_scope_json"] or "{}") or None if "knowledge_scope_json" in row.keys() else None,
         knowledge_selection_hash=row["knowledge_selection_hash"] if "knowledge_selection_hash" in row.keys() else "",
         knowledge_request_fingerprint=row["knowledge_request_fingerprint"] if "knowledge_request_fingerprint" in row.keys() else "",
+        disabled_skill_refs=disabled_skill_refs,
         turn_sequence=(
             int(row["turn_sequence"])
             if "turn_sequence" in row.keys() and row["turn_sequence"] is not None

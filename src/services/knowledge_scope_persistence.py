@@ -58,7 +58,7 @@ def turn_scope_payload(scope, *, user_id: int, anchor_kb_id: int | None, stored_
     return parsed.model_dump(mode="json")
 
 
-def request_fingerprint(*, scope: dict, query: str, source_scope: str, attachment_ids: list[str], query_mode: str, wiki_assist: bool) -> str:
+def request_fingerprint(*, scope: dict, query: str, source_scope: str, attachment_ids: list[str], query_mode: str, wiki_assist: bool, disabled_skill_refs: list[str] | None = None) -> str:
     if not scope:
         return ""
     payload = {
@@ -66,6 +66,7 @@ def request_fingerprint(*, scope: dict, query: str, source_scope: str, attachmen
         "knowledge_selection_hash": scope["selection_hash"],
         "source_scope": source_scope, "attachment_ids": sorted(set(attachment_ids)),
         "query_mode": query_mode, "wiki_assist": bool(wiki_assist),
+        "disabled_skill_refs": sorted(set(str(item) for item in (disabled_skill_refs or ()) if str(item))),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
 

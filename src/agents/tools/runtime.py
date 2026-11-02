@@ -247,6 +247,11 @@ class ToolRuntime:
     # external calls must not change retrieval rounds, the evidence set or the
     # grounding footer.
     mcp_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    # Read-only MCP results that contain a validated artifact are registered
+    # here for the same turn.  Skill tools may bridge only one of these opaque
+    # references into the Sandbox Artifact Broker; model-supplied filesystem
+    # paths or arbitrary artifact refs are never accepted.
+    mcp_artifacts: list[dict[str, Any]] = field(default_factory=list)
     mcp_call_count: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
     # P0-007: per-call epochs make late evidence registration impossible once
@@ -883,6 +888,38 @@ class ToolRuntime:
     def record_mcp_diagnostic(self, diagnostic: dict[str, Any]) -> None:
         with self._lock:
             self.mcp_diagnostics.append(dict(diagnostic))
+
+    def record_mcp_artifact(self, artifact: dict[str, Any]) -> None:
+        """Register one bounded, validated MCP artifact for this turn."""
+
+        if not isinstance(artifact, dict):
+            return
+        ref = str(artifact.get("artifact_ref") or "").strip()
+        if not ref:
+            return
+        safe = {
+            "artifact_ref": ref[:512],
+            "filename": str(artifact.get("filename") or "")[:120],
+            "sha256": str(artifact.get("sha256") or "")[:64],
+            "bytes": max(0, min(int(artifact.get("bytes") or 0), 2**63 - 1)),
+            "media_type": str(artifact.get("media_type") or "")[:120],
+            "server": str(artifact.get("server") or "")[:128],
+            "tool": str(artifact.get("tool") or "")[:128],
+            "source_user_id": str(artifact.get("source_user_id") or "")[:128],
+        }
+        with self._lock:
+            if any(item.get("artifact_ref") == ref for item in self.mcp_artifacts):
+                return
+            self.mcp_artifacts.append(safe)
+            del self.mcp_artifacts[:-32]
+
+    def get_mcp_artifact(self, artifact_ref: str) -> dict[str, Any] | None:
+        ref = str(artifact_ref or "").strip()
+        with self._lock:
+            for item in self.mcp_artifacts:
+                if item.get("artifact_ref") == ref:
+                    return dict(item)
+        return None
 
     def next_invocation_id(self) -> str:
         with self._lock:

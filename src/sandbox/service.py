@@ -16,6 +16,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+import src.settings as settings
+
 from .artifact_broker import (
     ArtifactBroker,
     ArtifactBrokerError,
@@ -26,6 +28,7 @@ from .client import SandboxServiceClient
 from .models import SandboxTask, SandboxTaskSpec
 from .policy import require_execution_enabled
 from .protocol import RequestEnvelope, RunnerObservation
+from .runtime_contract import RuntimeContractError
 from .task_store import (
     InvalidTransition,
     LeaseLost,
@@ -43,13 +46,27 @@ class SkillAuthorizationError(SandboxExecutionError):
     """A queued Skill task is no longer authorized to start."""
 
 
-def _record_task_metric(*, operation: str, status: str, duration_s: float = 0.0) -> None:
+def _record_task_metric(
+    *,
+    operation: str,
+    status: str,
+    duration_s: float = 0.0,
+    task: SandboxTask | None = None,
+) -> None:
     """Best-effort low-cardinality metrics; never affect the control plane."""
 
     try:
         from src.observability.metrics import record_sandbox_task
 
-        record_sandbox_task(operation=operation, status=status, duration_s=duration_s)
+        record_sandbox_task(
+            operation=operation,
+            status=status,
+            duration_s=duration_s,
+            result_status=str(task.result_status or "") if task is not None else "",
+            skill_kind="executable" if task is not None and task.skill_ref else "generic"
+            if task is not None
+            else "",
+        )
     except Exception:
         pass
 
@@ -279,6 +296,7 @@ class SandboxExecutionAdapter:
         claimed = self._claim_for_submit(task, lease_seconds=lease_seconds)
         request_envelope = envelope or self._envelope(claimed)
         self._check_envelope(claimed, request_envelope)
+        input_artifacts = self._input_transfer_payload(claimed)
         spec = SandboxTaskSpec(
             idempotency_key=claimed.idempotency_key,
             owner_id=claimed.owner_id,
@@ -296,6 +314,10 @@ class SandboxExecutionAdapter:
             deadline_at=claimed.deadline_at,
             skill_ref=claimed.skill_ref,
             skill_content_digest=claimed.skill_content_digest,
+            skill_version=claimed.skill_version,
+            runtime_contract_version=claimed.runtime_contract_version,
+            parent_task_id=claimed.parent_task_id,
+            resume_from=claimed.resume_from,
         )
         started = time.monotonic()
         try:
@@ -303,6 +325,8 @@ class SandboxExecutionAdapter:
                 envelope=request_envelope,
                 task_id=claimed.task_id,
                 spec=spec,
+                attempt=max(1, claimed.attempt),
+                input_artifacts=input_artifacts,
             )
         except Exception as exc:  # noqa: BLE001 - preserve uncertainty
             updated = self._mark_submit_unknown(claimed, exc)
@@ -310,11 +334,12 @@ class SandboxExecutionAdapter:
                 operation="submit",
                 status="unknown",
                 duration_s=time.monotonic() - started,
+                task=claimed,
             )
             return updated
         if not isinstance(response, Mapping):
             updated = self._mark_submit_unknown(claimed, ValueError("invalid Runner response"))
-            _record_task_metric(operation="submit", status="unknown")
+            _record_task_metric(operation="submit", status="unknown", task=claimed)
             return updated
         execution_id = str(response.get("execution_id") or "").strip()
         backend_ref = str(response.get("backend_ref") or "").strip()
@@ -323,12 +348,13 @@ class SandboxExecutionAdapter:
         # be safely retried or cancelled, so it is explicitly reconciled.
         if not execution_id:
             updated = self._mark_submit_unknown(claimed, ValueError("Runner response omitted execution_id"))
-            _record_task_metric(operation="submit", status="unknown")
+            _record_task_metric(operation="submit", status="unknown", task=claimed)
             return updated
         _record_task_metric(
             operation="submit",
             status="ok",
             duration_s=time.monotonic() - started,
+            task=claimed,
         )
         try:
             return self.store.record_observation(
@@ -345,6 +371,54 @@ class SandboxExecutionAdapter:
         except (LeaseLost, TaskConflict):
             # A stale worker must not overwrite a newer owner.  Re-read only.
             return self.store.require(claimed.task_id)
+
+    def _input_transfer_payload(self, task: SandboxTask) -> tuple[dict[str, Any], ...]:
+        """Build the bounded inline transfer for a task's committed inputs.
+
+        The reference dev-l1 Runner has no network.  HDB therefore forwards the
+        already-authorized bytes inside the authenticated submit request; the
+        Runner never receives a host path or a Broker credential.
+        """
+
+        if not task.input_artifact_ids:
+            return ()
+        if "sandbox.internal_data" not in task.required_capabilities:
+            raise SandboxExecutionError("task is not authorized to read input artifacts")
+        if self.broker is None:
+            raise SandboxExecutionError("Artifact Broker is not configured")
+        limit = max(
+            1,
+            int(getattr(settings, "SANDBOX_RUNNER_MAX_INLINE_INPUT_BYTES", 32 * 1024 * 1024)),
+        )
+        items: list[dict[str, Any]] = []
+        total = 0
+        for artifact_id in task.input_artifact_ids:
+            manifest = self.broker.authorize_input(
+                artifact_id,
+                principal_id=task.owner_id,
+                department_id=task.department_id,
+            )
+            if len(manifest.filename) > 120 or "/" in manifest.filename or "\\" in manifest.filename:
+                raise SandboxExecutionError("input artifact filename is not portable")
+            content = self.broker.read(
+                artifact_id,
+                principal_id=task.owner_id,
+                department_id=task.department_id,
+            )
+            total += len(content)
+            if total > limit:
+                raise SandboxExecutionError("input artifact set exceeds the inline transfer cap")
+            items.append(
+                {
+                    "artifact_id": artifact_id,
+                    "filename": manifest.filename,
+                    "media_type": manifest.media_type,
+                    "sha256": manifest.sha256,
+                    "size": len(content),
+                    "content_base64": base64.b64encode(content).decode("ascii"),
+                }
+            )
+        return tuple(items)
 
     def _mark_submit_unknown(self, task: SandboxTask, exc: Exception) -> SandboxTask:
         try:
@@ -402,14 +476,49 @@ class SandboxExecutionAdapter:
                 operation="observe",
                 status="unknown",
                 duration_s=time.monotonic() - started,
+                task=task,
             )
             return self.store.require(task.task_id)
         _record_task_metric(
             operation="observe",
             status="ok",
             duration_s=time.monotonic() - started,
+            task=task,
         )
         return self._apply_observation(task, observation)
+
+    def _ingest_skill_runtime(
+        self, task: SandboxTask, observation: RunnerObservation
+    ) -> SandboxTask:
+        """Persist contract events and the business result before status moves.
+
+        Runner observations are snapshots: polling may replay the same event
+        batch, so the ledger treats an identical ``(attempt, seq)`` event as a
+        no-op.  A malformed or conflicting contract moves the task into
+        reconciliation instead of silently discarding evidence.
+        """
+
+        current = task
+        if observation.runtime_events:
+            for event in observation.runtime_events:
+                current = self.store.append_runtime_event(
+                    current.task_id,
+                    event,
+                    lease_owner=task.lease_owner,
+                    fencing_token=task.fencing_token,
+                    require_lease=True,
+                    actor_id=self.worker_id,
+                )
+        if observation.result:
+            current = self.store.record_result(
+                current.task_id,
+                observation.result,
+                lease_owner=task.lease_owner,
+                fencing_token=task.fencing_token,
+                require_lease=True,
+                actor_id=self.worker_id,
+            )
+        return current
 
     def _apply_observation(self, task: SandboxTask, observation: RunnerObservation) -> SandboxTask:
         status = _remote_status(observation)
@@ -417,7 +526,44 @@ class SandboxExecutionAdapter:
         if not task.lease_owner or not task.lease_expires_at:
             return task
         try:
+            task = self._ingest_skill_runtime(task, observation)
+        except RuntimeContractError:
+            current = self.store.require(task.task_id)
+            try:
+                return self.store.transition(
+                    current.task_id,
+                    "reconcile_required",
+                    lease_owner=current.lease_owner,
+                    fencing_token=current.fencing_token,
+                    require_lease=True,
+                    expected_revision=current.revision,
+                    actor_id=self.worker_id,
+                    action="sandbox.task_reconcile",
+                    observed_state="runtime_contract_invalid",
+                    cleanup_state="unknown",
+                    error_code="runtime_contract_invalid",
+                    error_message="Runner runtime event or result violated the contract",
+                )
+            except (LeaseLost, TaskConflict, InvalidTransition):
+                return self.store.require(task.task_id)
+        except (LeaseLost, TaskConflict):
+            return self.store.require(task.task_id)
+        try:
             if _is_failure_status(status):
+                manifest: dict[str, Any] | None = None
+                if observation.output_manifest:
+                    try:
+                        # Observation carries references only; ask collect for
+                        # the bounded inline payload so report artifacts can
+                        # still be committed on a failed execution.
+                        collected = self._require_client().collect(
+                            task.task_id, envelope=self._envelope(task)
+                        )
+                        if isinstance(collected, Mapping) and collected.get("output_manifest"):
+                            manifest = self._materialize_output(task, collected)
+                    except Exception:
+                        # Failure reporting must not hide the original error.
+                        manifest = None
                 return self.store.fail(
                     task.task_id,
                     lease_owner=task.lease_owner,
@@ -425,6 +571,7 @@ class SandboxExecutionAdapter:
                     error_code=observation.error_code or "runner_failed",
                     error_message="Runner reported a failed execution",
                     expected_revision=task.revision,
+                    output_manifest=manifest,
                 )
             if _is_cancel_status(status):
                 return self.store.transition(
@@ -503,10 +650,10 @@ class SandboxExecutionAdapter:
         except Exception:
             # The desired state is durable, but the remote side effect is
             # unknown.  Keep cancel_requested/reconciliation semantics.
-            _record_task_metric(operation="cancel", status="unknown")
+            _record_task_metric(operation="cancel", status="unknown", task=task)
             return self.store.require(task_id)
         status = _remote_status(response)
-        _record_task_metric(operation="cancel", status="ok")
+        _record_task_metric(operation="cancel", status="ok", task=task)
         current = self.store.require(task_id)
         if _is_cancel_status(status) and current.lease_owner and current.lease_expires_at:
             try:
@@ -560,11 +707,40 @@ class SandboxExecutionAdapter:
         try:
             response = client.collect(task_id, envelope=request_envelope)
         except Exception as exc:  # noqa: BLE001
-            _record_task_metric(operation="collect", status="unknown", duration_s=time.monotonic() - started)
+            _record_task_metric(
+                operation="collect",
+                status="unknown",
+                duration_s=time.monotonic() - started,
+                task=task,
+            )
             return self._collection_unknown(task, exc)
         if not isinstance(response, Mapping):
-            _record_task_metric(operation="collect", status="unknown")
+            _record_task_metric(operation="collect", status="unknown", task=task)
             return self._collection_unknown(task, ValueError("invalid Runner collection response"))
+        try:
+            task = self._ingest_skill_runtime(task, RunnerObservation.from_dict(response))
+        except RuntimeContractError:
+            current = self.store.require(task.task_id)
+            try:
+                current = self.store.transition(
+                    current.task_id,
+                    "reconcile_required",
+                    lease_owner=current.lease_owner,
+                    fencing_token=current.fencing_token,
+                    require_lease=True,
+                    expected_revision=current.revision,
+                    actor_id=self.worker_id,
+                    action="sandbox.task_reconcile",
+                    observed_state="runtime_contract_invalid",
+                    cleanup_state="unknown",
+                    error_code="runtime_contract_invalid",
+                    error_message="Runner collection violated the runtime contract",
+                )
+            except (LeaseLost, TaskConflict, InvalidTransition):
+                current = self.store.require(task.task_id)
+            return {"task": current.to_dict(), "runner": _safe_summary(response)}
+        except (LeaseLost, TaskConflict):
+            return {"task": self.store.require(task.task_id).to_dict(), "runner": _safe_summary(response)}
         status = _remote_status(response)
         if status in {"queued", "pending", "running", "started", "collecting", "accepted"}:
             try:
@@ -581,6 +757,12 @@ class SandboxExecutionAdapter:
                 current = self.store.require(task.task_id)
             return {"task": current.to_dict(), "runner": _safe_summary(response)}
         if _is_failure_status(status):
+            manifest: dict[str, Any] | None = None
+            try:
+                if response.get("output_manifest"):
+                    manifest = self._materialize_output(task, response)
+            except Exception:
+                manifest = None
             try:
                 failed = self.store.fail(
                     task.task_id,
@@ -589,6 +771,7 @@ class SandboxExecutionAdapter:
                     expected_revision=task.revision,
                     error_code=str(response.get("error_code") or "runner_failed"),
                     error_message="Runner reported a failed collection",
+                    output_manifest=manifest,
                 )
             except (LeaseLost, TaskConflict):
                 failed = self.store.require(task.task_id)
@@ -634,13 +817,14 @@ class SandboxExecutionAdapter:
         except (LeaseLost, TaskConflict, InvalidTransition) as exc:
             raise SandboxExecutionError("task collection result lost its fencing lease") from exc
         except Exception as exc:  # noqa: BLE001 - output failures are not success
-            _record_task_metric(operation="collect", status="failed")
+            _record_task_metric(operation="collect", status="failed", task=task)
             self._collection_unknown(task, exc)
             raise SandboxExecutionError("Runner output could not be verified") from exc
         _record_task_metric(
             operation="collect",
             status="ok",
             duration_s=time.monotonic() - started,
+            task=completed,
         )
         return {
             "task": completed.to_dict(),
@@ -683,7 +867,13 @@ class SandboxExecutionAdapter:
         raw_items = raw_manifest.get("items", raw_manifest.get("artifacts", ()))
         if isinstance(raw_items, Mapping):
             raw_items = [raw_items]
-        if not isinstance(raw_items, (list, tuple)) or not raw_items:
+        if not isinstance(raw_items, (list, tuple)):
+            raise SandboxExecutionError("Runner returned an invalid artifact manifest")
+        if not raw_items:
+            # A Skill may legitimately stop with a structured question or tool
+            # request and no final artifact.  Other empty results stay invalid.
+            if task.result_status in {"needs_user_input", "needs_tool"}:
+                return {"items": []}
             raise SandboxExecutionError("Runner returned no output artifact")
         if "sandbox.write_artifact" not in set(task.required_capabilities):
             raise SandboxExecutionError("sandbox.write_artifact capability is required for output artifacts")
@@ -719,7 +909,12 @@ class SandboxExecutionAdapter:
                         execution_id=execution_id,
                         media_type=str(raw.get("media_type") or ""),
                         artifact_id=artifact_id,
-                        metadata={"source": "sandbox_runner", "bundle_ref": task.bundle_ref},
+                        metadata={
+                            "source": "sandbox_runner",
+                            "bundle_ref": task.bundle_ref,
+                            "relative_path": str(raw.get("relative_path") or "")[:240],
+                            "artifact_class": str(raw.get("artifact_class") or "output")[:32],
+                        },
                     )
                     self.broker.scan(
                         staged.artifact_id,

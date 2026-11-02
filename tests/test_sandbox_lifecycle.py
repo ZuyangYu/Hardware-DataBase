@@ -12,6 +12,7 @@ import hashlib
 import os
 
 import pytest
+from fastapi import HTTPException
 
 import src.settings as settings
 from src.agents.mcp.gateway import (
@@ -160,6 +161,290 @@ def test_lifecycle_submit_observe_collect_commits_verified_output(tmp_path, monk
     assert broker.read(artifact_id, principal_id="user-1", department_id="dept-1") == content
     committed = broker.require(artifact_id)
     assert committed.role == "output" and committed.task_id == task.task_id
+
+
+def test_observe_persists_skill_runtime_events_and_business_result(tmp_path, monkeypatch):
+    store, catalog, broker, bundle = _runtime(tmp_path, monkeypatch)
+    runner = _FakeRunner()
+    adapter = SandboxExecutionAdapter(store=store, catalog=catalog, broker=broker, client=runner)
+    task = adapter.admit(_spec(bundle))
+    task = adapter.submit(task.task_id)
+
+    def observe_with_runtime(task_id, *, envelope=None):
+        return RunnerObservation(
+            task_id=task_id,
+            status="running",
+            observed_state="running",
+            execution_id="exec-1",
+            cleanup_state="running",
+            result={
+                "runtime_contract_version": "v1",
+                "result_status": "validation_failed",
+                "issues": [{"code": "missing_interface"}],
+            },
+            runtime_events=(
+                {
+                    "runtime_contract_version": "v1",
+                    "event_id": "evt-observe-1",
+                    "seq": 1,
+                    "task_id": task_id,
+                    "attempt": 1,
+                    "step_id": "validate",
+                    "event": "validation_issue",
+                    "status": "failed",
+                    "progress": 0.75,
+                    "message": "missing interface",
+                },
+            ),
+        )
+
+    runner.observe = observe_with_runtime
+    observed = adapter.observe(task.task_id)
+
+    assert observed.status == "running"
+    assert observed.result_status == "validation_failed"
+    assert observed.latest_step_id == "validate"
+    assert observed.latest_progress == 0.75
+    assert store.runtime_events(task.task_id)[0]["event"] == "validation_issue"
+
+    # Polling replays the same event snapshot; it must not duplicate events.
+    adapter.observe(task.task_id)
+    assert len(store.runtime_events(task.task_id)) == 1
+
+
+def test_submit_forwards_authorized_input_artifact_bytes(tmp_path, monkeypatch):
+    store, catalog, broker, bundle = _runtime(
+        tmp_path,
+        monkeypatch,
+        capabilities=("sandbox.execute", "sandbox.write_artifact", "sandbox.internal_data"),
+    )
+    monkeypatch.setattr(settings, "SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS", "csv,txt,json")
+    content = b"pin,function\n1,gpio\n"
+    staged = broker.stage_input(
+        task_id="task-source-input-123456",
+        owner_id="user-1",
+        department_id="dept-1",
+        filename="pins.csv",
+        content=content,
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+    broker.scan(staged.artifact_id, department_id="dept-1", task_id="task-source-input-123456")
+    broker.commit(staged.artifact_id, department_id="dept-1", task_id="task-source-input-123456")
+
+    runner = _FakeRunner()
+    captured = {}
+
+    def submit(**kwargs):
+        captured.update(kwargs)
+        return {"execution_id": "exec-1", "observed_state": "queued"}
+
+    runner.submit = submit
+    adapter = SandboxExecutionAdapter(store=store, catalog=catalog, broker=broker, client=runner)
+    task = adapter.admit(
+        _spec(
+            bundle,
+            required_capabilities=(
+                "sandbox.execute",
+                "sandbox.write_artifact",
+                "sandbox.internal_data",
+            ),
+            input_artifact_ids=(staged.artifact_id,),
+        )
+    )
+    adapter.submit(task.task_id)
+
+    transfer = captured["input_artifacts"]
+    assert len(transfer) == 1
+    assert transfer[0]["artifact_id"] == staged.artifact_id
+    assert base64.b64decode(transfer[0]["content_base64"]) == content
+    assert transfer[0]["sha256"] == hashlib.sha256(content).hexdigest()
+
+
+def test_needs_user_input_collect_succeeds_without_final_artifacts(tmp_path, monkeypatch):
+    store, catalog, broker, bundle = _runtime(tmp_path, monkeypatch)
+    runner = _FakeRunner()
+    adapter = SandboxExecutionAdapter(store=store, catalog=catalog, broker=broker, client=runner)
+    task = adapter.submit(adapter.admit(_spec(bundle)).task_id)
+    task = adapter.observe(task.task_id)
+    assert task.status == "collecting"
+
+    runner.collect_response = {
+        "status": "succeeded",
+        "execution_id": "exec-1",
+        "output_manifest": {"items": []},
+        "result": {
+            "runtime_contract_version": "v1",
+            "result_status": "needs_user_input",
+            "required_inputs": ["pin_map.csv"],
+            "issues": [{"code": "missing_pin_map"}],
+        },
+    }
+    result = adapter.collect(task.task_id)
+
+    assert result["task"]["status"] == "succeeded"
+    assert result["task"]["result_status"] == "needs_user_input"
+    assert result["task"]["skill_result"]["required_inputs"] == ["pin_map.csv"]
+    assert result["output_manifest"] == {"items": []}
+
+
+def test_expired_input_artifact_is_rejected(tmp_path, monkeypatch):
+    _, _, broker, _ = _runtime(tmp_path, monkeypatch)
+    content = b"expired"
+    staged = broker.stage_input(
+        task_id="task-expired-1234567890",
+        owner_id="user-1",
+        department_id="dept-1",
+        filename="old.txt",
+        content=content,
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+    broker.scan(staged.artifact_id, department_id="dept-1", task_id="task-expired-1234567890")
+    broker.commit(staged.artifact_id, department_id="dept-1", task_id="task-expired-1234567890")
+    conn = broker._connect()
+    try:
+        conn.execute(
+            "UPDATE sandbox_artifacts SET expires_at = '2020-01-01T00:00:00+00:00' "
+            "WHERE artifact_id = ?",
+            (staged.artifact_id,),
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(Exception, match="expired"):
+        broker.authorize_input(staged.artifact_id, principal_id="user-1", department_id="dept-1")
+
+
+def test_failed_collect_commits_validation_report(tmp_path, monkeypatch):
+    store, catalog, broker, bundle = _runtime(tmp_path, monkeypatch)
+    runner = _FakeRunner()
+    adapter = SandboxExecutionAdapter(store=store, catalog=catalog, broker=broker, client=runner)
+    task = adapter.submit(adapter.admit(_spec(bundle)).task_id)
+    task = adapter.observe(task.task_id)
+    assert task.status == "collecting"
+
+    response = _inline_output(b'{"error": "missing_interface"}', filename="report.json")
+    response["status"] = "failed"
+    response["error_code"] = "bundle_failed"
+    response["result"] = {
+        "runtime_contract_version": "v1",
+        "result_status": "validation_failed",
+        "issues": [{"code": "missing_interface"}],
+    }
+    runner.collect_response = response
+    result = adapter.collect(task.task_id)
+
+    assert result["task"]["status"] == "failed"
+    assert result["task"]["result_status"] == "validation_failed"
+    items = result["task"]["output_manifest"]["items"]
+    assert len(items) == 1 and items[0]["state"] == "committed"
+    assert broker.read(
+        items[0]["artifact_id"], principal_id="user-1", department_id="dept-1",
+    ) == b'{"error": "missing_interface"}'
+
+
+def test_task_lineage_and_parent_artifact_diff(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from src.api.routes import sandbox as routes
+
+    store, _, broker, bundle = _runtime(tmp_path, monkeypatch)
+    parent = store.create(_spec(bundle, idempotency_key="parent-run"))
+    child = store.create(_spec(
+        bundle, idempotency_key="child-run", parent_task_id=parent.task_id,
+    ))
+    user = SimpleNamespace(id="user-1", department_id="dept-1", role="employee")
+
+    def output(task_id: str, content: bytes):
+        staged = broker.stage_output(
+            task_id=task_id, owner_id="user-1", department_id="dept-1",
+            filename="result.json", content=content,
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+        broker.scan(staged.artifact_id, department_id="dept-1", task_id=task_id)
+        return broker.commit(staged.artifact_id, department_id="dept-1", task_id=task_id)
+
+    previous = output(parent.task_id, b'{"nodes": 1}\n')
+    current = output(child.task_id, b'{"nodes": 2}\n')
+    payload = routes.diff_artifact_with_parent(
+        child.task_id, current.artifact_id, user=user, store=store, broker=broker,
+    )
+    assert payload["base_artifact_id"] == previous.artifact_id
+    assert payload["changed"] is True
+    assert payload["added_lines"] == 1 and payload["removed_lines"] == 1
+    assert '+{"nodes": 2}' in payload["diff"]
+
+    lineage = routes.task_lineage(child.task_id, user=user, store=store)
+    assert [item["task_id"] for item in lineage["items"]] == [child.task_id, parent.task_id]
+
+    outsider = SimpleNamespace(id="user-2", department_id="dept-1", role="employee")
+    with pytest.raises(HTTPException) as denied:
+        routes.diff_artifact_with_parent(
+            child.task_id, current.artifact_id, user=outsider, store=store, broker=broker,
+        )
+    assert denied.value.status_code == 404
+
+
+def test_output_promotion_creates_new_input_with_lineage(tmp_path, monkeypatch):
+    _, _, broker, _ = _runtime(tmp_path, monkeypatch)
+    content = b"promoted report"
+    staged = broker.stage_output(
+        task_id="task-output-1234567890",
+        owner_id="user-1",
+        department_id="dept-1",
+        filename="report.txt",
+        content=content,
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+    broker.scan(staged.artifact_id, department_id="dept-1", task_id="task-output-1234567890")
+    output = broker.commit(staged.artifact_id, department_id="dept-1", task_id="task-output-1234567890")
+
+    promoted = broker.promote_output(
+        output.artifact_id, principal_id="user-1", department_id="dept-1",
+    )
+
+    assert promoted.artifact_id != output.artifact_id
+    assert promoted.role == "input" and promoted.state == "committed"
+    assert promoted.sha256 == output.sha256
+    assert promoted.metadata["source_artifact_id"] == output.artifact_id
+    assert broker.authorize_input(
+        promoted.artifact_id, principal_id="user-1", department_id="dept-1",
+    ).artifact_id == promoted.artifact_id
+
+
+def test_bind_inputs_requires_authorized_capability_and_recomputes_fingerprint(tmp_path, monkeypatch):
+    store, catalog, broker, bundle = _runtime(
+        tmp_path,
+        monkeypatch,
+        capabilities=("sandbox.execute", "sandbox.write_artifact", "sandbox.internal_data"),
+    )
+    monkeypatch.setattr(settings, "SANDBOX_ARTIFACT_ALLOWED_EXTENSIONS", "csv,txt,json")
+    task = store.create(
+        _spec(
+            bundle,
+            required_capabilities=(
+                "sandbox.execute",
+                "sandbox.write_artifact",
+                "sandbox.internal_data",
+            ),
+            input_artifact_ids=(),
+        )
+    )
+    content = b"a,b\n1,2\n"
+    staged = broker.stage_input(
+        task_id="task-source-input-123456",
+        owner_id="user-1",
+        department_id="dept-1",
+        filename="pins.csv",
+        content=content,
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+    broker.scan(staged.artifact_id, department_id="dept-1", task_id="task-source-input-123456")
+    broker.commit(staged.artifact_id, department_id="dept-1", task_id="task-source-input-123456")
+
+    original_fingerprint = task.request_fingerprint
+    bound = store.bind_inputs(task.task_id, (staged.artifact_id,))
+    assert bound.input_artifact_ids == (staged.artifact_id,)
+    assert bound.request_fingerprint != original_fingerprint
 
 
 def test_collect_rejects_uncommitted_artifact_and_marks_reconcile(tmp_path, monkeypatch):

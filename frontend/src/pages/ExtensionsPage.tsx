@@ -16,6 +16,7 @@ import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, Input, Label } from '@/components/ui';
 import { notify } from '@/components/ui/app-toast';
+import { clearDisabledSkillRefs, readDisabledSkillRefs, toggleDisabledSkillRef } from '@/lib/skillPreferences';
 
 type Props = { auth: AuthSession };
 
@@ -24,14 +25,75 @@ type ExecutableSkill = {
   version: string;
   bundle_ref: string;
   input_schema: Record<string, unknown>;
+  output_schema?: Record<string, unknown>;
+  metadata?: SkillMetadata;
+  runtime?: SkillRuntime | null;
   subscribed?: boolean;
   description?: string;
   kind?: 'text' | 'executable';
   is_owner?: boolean;
   share_scope?: string;
 };
-type SkillTask = { task_id: string; status: string; error_code?: string };
-type SkillArtifact = { artifact_id: string; filename: string; state: string };
+type SkillMetadata = {
+  skill_name?: string;
+  summary?: string;
+  intent_examples?: string[];
+  input_kinds?: string[];
+  output_kinds?: string[];
+  interaction_modes?: string[];
+  side_effects?: string[];
+  risk?: string;
+  declared_version?: string;
+};
+type SkillRuntime = {
+  profile_ref: string;
+  contract_version: string;
+  runtime_policy_ref: string;
+  runtime_policy_digest: string;
+  required_capabilities: string[];
+  network_policy_ref: string;
+  bundle_digest: string;
+  sbom_ref: string;
+  signature_ref: string;
+};
+type SkillIssue = { code?: string; message?: string; path?: string };
+type SkillTask = {
+  task_id: string;
+  status: string;
+  error_code?: string;
+  result_status?: string;
+  skill_ref?: string;
+  skill_version?: string;
+  parent_task_id?: string;
+  latest_step_id?: string;
+  latest_progress?: number | null;
+  skill_result?: { issues?: SkillIssue[]; required_inputs?: string[] };
+};
+type SkillArtifact = {
+  artifact_id: string; filename: string; state: string;
+  media_type?: string; size?: number; sha256?: string;
+  metadata?: { source_artifact_id?: string; source_sha256?: string; source_task_id?: string };
+};
+type SkillLineageItem = {
+  task_id: string;
+  parent_task_id: string;
+  skill_ref: string;
+  skill_version: string;
+  status: string;
+  result_status: string;
+  created_at: string;
+};
+type ArtifactDiff = {
+  artifact_id: string;
+  base_artifact_id: string;
+  filename: string;
+  base_filename: string;
+  changed: boolean;
+  added_lines: number;
+  removed_lines: number;
+  truncated: boolean;
+  diff: string;
+};
 type PersonalSkill = {
   skill_ref: string;
   version: string;
@@ -89,6 +151,12 @@ export type ExtensionsViewProps = {
   onToggleSkill?: (item: ExecutableSkill) => void;
   onRefreshSkillTask?: () => void;
   onDownloadSkillArtifact?: (artifact: SkillArtifact) => void;
+  skillLineage?: SkillLineageItem[];
+  lineageBusy?: boolean;
+  onRefreshSkillLineage?: () => void;
+  artifactDiffs?: Record<string, ArtifactDiff>;
+  diffBusy?: string | null;
+  onDiffSkillArtifact?: (artifact: SkillArtifact) => void;
 };
 
 type ExtensionSection = 'skills' | 'mcp';
@@ -96,10 +164,35 @@ type ExtensionSection = 'skills' | 'mcp';
 function skillDisplay(skill: ExecutableSkill) {
   const content = (skill.description || '').replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, '');
   const title = content.match(/^#\s+(.+)$/m)?.[1]?.trim() || skill.skill_ref.replace(/^skill\//, '');
-  const summary = skill.description?.match(/^description:\s*(.+)$/m)?.[1]?.trim()
+  const summary = skill.metadata?.summary
+    || skill.description?.match(/^description:\s*(.+)$/m)?.[1]?.trim()
     || content.split('\n').map((line) => line.trim()).find((line) => line && !line.startsWith('#') && !line.startsWith('---'))
     || '管理员审核的扩展能力，添加后即可按授权使用。';
   return { title, summary };
+}
+
+function metadataList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
+}
+
+function riskLabel(value: string | undefined): string {
+  if (value === 'low') return '低风险';
+  if (value === 'medium') return '中风险';
+  if (value === 'high') return '高风险';
+  return value || '未声明';
+}
+
+function skillSearchText(skill: ExecutableSkill): string {
+  const display = skillDisplay(skill);
+  const metadata = skill.metadata || {};
+  return [
+    skill.skill_ref,
+    display.title,
+    display.summary,
+    ...metadataList(metadata.intent_examples),
+    ...metadataList(metadata.input_kinds),
+    ...metadataList(metadata.output_kinds),
+  ].join(' ').toLocaleLowerCase();
 }
 
 /** Pure view: employee catalog with subscription and write-consent controls. */
@@ -135,6 +228,12 @@ export function ExtensionsView({
   onToggleSkill,
   onRefreshSkillTask,
   onDownloadSkillArtifact,
+  skillLineage = [],
+  lineageBusy = false,
+  onRefreshSkillLineage,
+  artifactDiffs = {},
+  diffBusy = null,
+  onDiffSkillArtifact,
 }: ExtensionsViewProps) {
   const [activeSection, setActiveSection] = useState<ExtensionSection>('skills');
   const [skillQuery, setSkillQuery] = useState('');
@@ -147,12 +246,18 @@ export function ExtensionsView({
   const [personalName, setPersonalName] = useState('');
   const [personalVersion, setPersonalVersion] = useState('1.0.0');
   const [personalSchema, setPersonalSchema] = useState('{\n  "type": "object",\n  "properties": {},\n  "additionalProperties": false\n}');
+  const [disabledSkillRefs, setDisabledSkillRefs] = useState<string[]>(() => readDisabledSkillRefs());
+  const disabledSkillSet = new Set(disabledSkillRefs);
+  useEffect(() => {
+    const sync = () => setDisabledSkillRefs(readDisabledSkillRefs());
+    window.addEventListener('storage', sync);
+    return () => window.removeEventListener('storage', sync);
+  }, []);
   const addedSkills = skills.filter((skill) => skill.subscribed).length;
   const subscribedServices = items.filter((item) => item.subscribed).length;
   const visibleSkills = skills.filter((skill) => {
-    const display = skillDisplay(skill);
     return (!onlyAdded || skill.subscribed) &&
-      `${skill.skill_ref} ${display.title} ${display.summary}`.toLocaleLowerCase().includes(skillQuery.trim().toLocaleLowerCase());
+      skillSearchText(skill).includes(skillQuery.trim().toLocaleLowerCase());
   }).sort((a, b) => Number(Boolean(b.subscribed)) - Number(Boolean(a.subscribed)));
   const visibleServices = items.filter((item) =>
     (!onlyAdded || item.subscribed) &&
@@ -219,6 +324,12 @@ export function ExtensionsView({
           </div>
           <Button variant="outline" onClick={() => setUploadOpen(true)} disabled={!onUploadPersonal || !userDepartmentId}><Upload className="size-[15px]" />上传个人 Skill</Button>
         </div>
+        {disabledSkillRefs.length > 0 && (
+          <div data-skill-temporary-notice className="mt-[14px] flex flex-wrap items-center justify-between gap-[10px] rounded-[11px] border border-[#d9e4f5] bg-[#f5f8fd] px-[13px] py-[10px] text-[12px] text-[#536077]">
+            <span>已暂时停用 {disabledSkillRefs.length} 个 Skill；恢复前发送消息时 Agent 不会使用它们，订阅权限不受影响。</span>
+            <Button variant="ghost" size="sm" onClick={() => setDisabledSkillRefs(clearDisabledSkillRefs())}>全部恢复</Button>
+          </div>
+        )}
         {personalLoaded && personalSkills.length > 0 && (
           <div className="mt-[18px] rounded-[16px] border border-[#dce7fb] bg-[#f7faff] p-[16px]">
             <div className="flex flex-wrap items-center justify-between gap-[6px]">
@@ -268,6 +379,16 @@ export function ExtensionsView({
             {visibleSkills.map((skill) => {
               const isText = skill.kind === 'text';
               const { title, summary } = skillDisplay(skill);
+              const metadata = skill.metadata || {};
+              const intentExamples = metadataList(metadata.intent_examples);
+              const inputKinds = metadataList(metadata.input_kinds);
+              const outputKinds = metadataList(metadata.output_kinds);
+              const interactionModes = metadataList(metadata.interaction_modes);
+              const sideEffects = metadataList(metadata.side_effects);
+              const hasDirectoryMetadata = Boolean(
+                intentExamples.length || inputKinds.length || outputKinds.length || interactionModes.length
+                || sideEffects.length || metadata.risk || skill.runtime,
+              );
               const isTesting = testingSkill === skill.skill_ref;
               return (
                 <article key={skill.skill_ref} data-skill-catalog-item={skill.skill_ref} className="min-w-0 rounded-[16px] border border-[#e6eaf1] bg-white p-[20px] shadow-[0_3px_16px_rgba(28,45,75,0.04)]">
@@ -282,19 +403,40 @@ export function ExtensionsView({
                       </div>
                       <p className="mt-[2px] break-all font-mono text-[11px] text-[#919bad]">{skill.skill_ref} · {skill.version}</p>
                     </div>
-                  </div>
-                  <p className="mt-[14px] line-clamp-2 min-h-[42px] break-words text-[13px] leading-[1.65] text-[#536077]">{summary}</p>
-                  <div className="mt-[12px] flex flex-wrap items-center gap-[7px] text-[11px]">
+                   </div>
+                   <p className="mt-[14px] line-clamp-2 min-h-[42px] break-words text-[13px] leading-[1.65] text-[#536077]">{summary}</p>
+                   {hasDirectoryMetadata && (
+                     <div data-skill-metadata className="mt-[13px] grid gap-x-[16px] gap-y-[9px] rounded-[10px] bg-[#f8fafc] px-[12px] py-[10px] text-[11px] sm:grid-cols-2">
+                       {intentExamples.length > 0 && <div className="sm:col-span-2"><p className="font-medium text-[#73819a]">适用意图</p><p className="mt-[3px] break-words leading-[1.5] text-[#536077]">{intentExamples.join(' · ')}</p></div>}
+                       {inputKinds.length > 0 && <div><p className="font-medium text-[#73819a]">输入类型</p><p className="mt-[3px] break-words text-[#536077]">{inputKinds.join('、')}</p></div>}
+                       {outputKinds.length > 0 && <div><p className="font-medium text-[#73819a]">输出类型</p><p className="mt-[3px] break-words text-[#536077]">{outputKinds.join('、')}</p></div>}
+                       {metadata.risk && <div><p className="font-medium text-[#73819a]">风险</p><p className="mt-[3px] text-[#536077]">{riskLabel(metadata.risk)}</p></div>}
+                       {interactionModes.length > 0 && <div><p className="font-medium text-[#73819a]">交互模式</p><p className="mt-[3px] break-words text-[#536077]">{interactionModes.join('、')}</p></div>}
+                       {sideEffects.length > 0 && <div className="sm:col-span-2"><p className="font-medium text-[#73819a]">副作用</p><p className="mt-[3px] break-words text-[#536077]">{sideEffects.join('、')}</p></div>}
+                     </div>
+                   )}
+                   <div className="mt-[12px] flex flex-wrap items-center gap-[7px] text-[11px]">
                     <span className={`rounded-full px-[9px] py-[4px] ${isText ? 'bg-[#f0f5ff] text-[#3768ae]' : 'bg-[#edf8f3] text-[#287a60]'}`}>{isText ? '文本参考' : '沙箱执行'}</span>
                     <span className="text-[#858fa2]">{isText ? '添加后用于对话' : '添加后可在对话中调用或在此测试'}</span>
                     {skill.is_owner && <span className="rounded-full bg-[#eef2fb] px-[9px] py-[4px] text-[#476a9f]">我的上传</span>}
                     {skill.share_scope === 'department' && <span className="rounded-full bg-[#eef2fb] px-[9px] py-[4px] text-[#476a9f]">部门共享</span>}
+                    {!skill.is_owner && skill.share_scope !== 'department' && <span className="rounded-full bg-[#eef2fb] px-[9px] py-[4px] text-[#476a9f]">管理员发布</span>}
                   </div>
                   {!isText && <p className="mt-[7px] truncate font-mono text-[11px] text-[#919bad]" title={skill.bundle_ref}>固定任务：{skill.bundle_ref}</p>}
                   <div className="mt-[16px] flex flex-wrap items-center gap-[8px] border-t border-[#eef0f4] pt-[15px]">
                     <Button variant={skill.subscribed ? 'outline' : 'default'} disabled={skillBusy !== null || !onToggleSkill} onClick={() => onToggleSkill?.(skill)}>
-                      {skill.subscribed ? '移除 Skill' : '添加 Skill'}
+                      {skill.subscribed ? '移出我的工具' : '添加到我的工具'}
                     </Button>
+                    {skill.subscribed && (
+                      <Button
+                        variant={disabledSkillSet.has(skill.skill_ref) ? 'secondary' : 'outline'}
+                        data-skill-temporary-disable={skill.skill_ref}
+                        aria-pressed={disabledSkillSet.has(skill.skill_ref)}
+                        onClick={() => setDisabledSkillRefs(toggleDisabledSkillRef(skill.skill_ref))}
+                      >
+                        {disabledSkillSet.has(skill.skill_ref) ? '恢复使用' : '暂时停用'}
+                      </Button>
+                    )}
                     {!isText && skill.subscribed && (
                       <Button variant="outline" aria-expanded={isTesting} onClick={() => setTestingSkill(isTesting ? null : skill.skill_ref)}>
                         <Play className="size-[14px]" />{isTesting ? '收起测试' : '测试 Skill'}
@@ -302,32 +444,108 @@ export function ExtensionsView({
                     )}
                     {skill.description && <details className="w-full text-[12px] text-[#536077]"><summary className="w-fit cursor-pointer py-[3px] text-[#476a9f] hover:text-[#1d4ed8]">查看完整说明</summary><pre className="mt-[6px] max-h-[200px] overflow-auto whitespace-pre-wrap break-words rounded-[9px] bg-[#f7f9fc] p-[12px] font-sans leading-[1.6]">{skill.description}</pre></details>}
                   </div>
-                  {!isText && skill.subscribed && isTesting && (
-                    <div className="mt-[14px] rounded-[12px] border border-[#e3e9f2] bg-[#f8faff] p-[14px]">
+                   {!isText && skill.subscribed && isTesting && (
+                     <div className="mt-[14px] rounded-[12px] border border-[#e3e9f2] bg-[#f8faff] p-[14px]">
                       <p className="text-[12px] text-[#64718a]">固定任务：<span className="break-all font-mono text-[#34445d]">{skill.bundle_ref}</span></p>
                       <details className="mt-[10px] text-[12px] text-[#536077]"><summary className="w-fit cursor-pointer text-[#476a9f]">查看参数格式</summary><pre className="mt-[7px] max-h-[180px] overflow-auto whitespace-pre-wrap break-all rounded-[8px] bg-white p-[10px] font-mono">{JSON.stringify(skill.input_schema, null, 2)}</pre></details>
                       <label className="mt-[12px] block text-[12px] font-medium text-[#464c5e]">JSON 参数
                         <textarea data-skill-parameters={skill.skill_ref} spellCheck={false} value={skillParameters[skill.skill_ref] ?? '{}'} onChange={(event) => onSkillParametersChange?.(skill.skill_ref, event.target.value)}
                           className="mt-[6px] block min-h-[90px] w-full rounded-[8px] border border-[#dfe5ef] bg-white p-[10px] font-mono text-[12px] outline-none focus:border-[#6b9ae8] focus:ring-2 focus:ring-[#e5efff]" />
                       </label>
-                      <Button className="mt-[10px]" disabled={skillBusy !== null || !onRunSkill} onClick={() => onRunSkill?.(skill)}><Play className="size-[14px]" />在沙箱中运行</Button>
-                    </div>
-                  )}
-                </article>
+                       <Button className="mt-[10px]" disabled={skillBusy !== null || !onRunSkill} onClick={() => onRunSkill?.(skill)}><Play className="size-[14px]" />在沙箱中运行</Button>
+                     </div>
+                   )}
+                   {!isText && skill.runtime && (
+                     <details data-skill-runtime className="mt-[12px] text-[12px] text-[#536077]">
+                       <summary className="w-fit cursor-pointer py-[3px] text-[#476a9f] hover:text-[#1d4ed8]">查看运行时信息</summary>
+                       <div className="mt-[7px] grid gap-[6px] rounded-[9px] bg-[#f7f9fc] p-[11px] text-[11px] leading-[1.5] sm:grid-cols-2">
+                         <div><span className="text-[#8995a9]">运行档位：</span><span className="break-all">{skill.runtime.profile_ref || '未声明'}</span></div>
+                         <div><span className="text-[#8995a9]">契约版本：</span>{skill.runtime.contract_version || '未声明'}</div>
+                         <div><span className="text-[#8995a9]">所需能力：</span><span className="break-words">{skill.runtime.required_capabilities.join('、') || '无'}</span></div>
+                         <div><span className="text-[#8995a9]">网络策略：</span><span className="break-all">{skill.runtime.network_policy_ref || '无'}</span></div>
+                         <div><span className="text-[#8995a9]">SBOM：</span><span className="break-all">{skill.runtime.sbom_ref || '未提供'}</span></div>
+                         <div><span className="text-[#8995a9]">签名：</span><span className="break-all">{skill.runtime.signature_ref || '未提供'}</span></div>
+                         <div className="sm:col-span-2"><span className="text-[#8995a9]">Bundle SHA-256：</span><span className="break-all font-mono">{skill.runtime.bundle_digest || '未声明'}</span></div>
+                       </div>
+                     </details>
+                   )}
+                 </article>
               );
             })}
           </div>
         )}
         {skillTask && (
-          <div className="mt-[18px] rounded-[16px] border border-[#dce6f7] bg-[#f6f9ff] p-[18px]" aria-live="polite">
-            <div className="text-[13px] font-medium text-[#243e68]">最近任务 · {skillTask.status}</div>
+          <div data-skill-task-result className="mt-[18px] rounded-[16px] border border-[#dce6f7] bg-[#f6f9ff] p-[18px]" aria-live="polite">
+            <div className="text-[13px] font-medium text-[#243e68]">最近任务 · {skillTask.status}{skillTask.result_status ? ` · ${skillTask.result_status}` : ''}</div>
             <div className="mt-[4px] break-all font-mono text-[11px] text-[#687894]">{skillTask.task_id}{skillTask.error_code ? ` · ${skillTask.error_code}` : ''}</div>
+            <div className="mt-[7px] flex flex-wrap gap-x-[16px] gap-y-[4px] text-[11px] text-[#687894]">
+              {skillTask.skill_ref && <span className="break-all">Skill：{skillTask.skill_ref}{skillTask.skill_version ? ` · v${skillTask.skill_version}` : ''}</span>}
+              {skillTask.latest_step_id && <span>步骤：{skillTask.latest_step_id}</span>}
+              {typeof skillTask.latest_progress === 'number' && <span>进度：{Math.round(skillTask.latest_progress * 100)}%</span>}
+              {skillTask.parent_task_id && <span className="break-all">父任务：{skillTask.parent_task_id}</span>}
+            </div>
+            {Boolean(skillTask.skill_result?.issues?.length) && (
+              <div data-skill-validation-report className="mt-[11px] rounded-[9px] border border-[#f0dfb8] bg-[#fffaf0] px-[12px] py-[10px] text-[12px] text-[#785e2b]">
+                <div className="font-medium">校验报告 · {skillTask.skill_result?.issues?.length} 项</div>
+                <ul className="mt-[5px] grid gap-[3px] leading-[1.55]">
+                  {skillTask.skill_result?.issues?.slice(0, 6).map((issue, index) => (
+                    <li key={`${issue.code || 'issue'}-${index}`} className="break-words">
+                      {issue.code ? `[${issue.code}] ` : ''}{issue.message || issue.path || '需要人工复核'}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {skillArtifacts.filter((item) => item.state === 'committed').length > 0 && (
+              <div className="mt-[11px] grid gap-[5px] text-[11px] text-[#536077]">
+                {skillArtifacts.filter((item) => item.state === 'committed').map((item) => (
+                  <div key={item.artifact_id} className="flex flex-wrap items-center gap-x-[8px] gap-y-[3px]">
+                    <span className="break-all font-medium">{item.filename}</span>
+                    {typeof item.size === 'number' && <span className="text-[#8995a9]">{item.size} B</span>}
+                    {item.sha256 && <span className="break-all font-mono text-[#8995a9]" title={item.sha256}>版本 {item.sha256.slice(0, 12)}…</span>}
+                    {item.metadata?.source_artifact_id && <span className="break-all text-[#8995a9]">来源 {item.metadata.source_artifact_id.slice(0, 12)}…</span>}
+                    {skillTask.parent_task_id && onDiffSkillArtifact && (
+                      <Button variant="ghost" size="sm" disabled={diffBusy === item.artifact_id} onClick={() => onDiffSkillArtifact(item)}>
+                        {diffBusy === item.artifact_id ? '对比中…' : '对比上一版本'}
+                      </Button>
+                    )}
+                    {artifactDiffs[item.artifact_id] && (
+                      <div data-skill-artifact-diff={item.artifact_id} className="w-full rounded-[8px] border border-[#e3e9f2] bg-white p-[9px] text-[11px]">
+                        <div className="text-[#536077]">
+                          差异：+{artifactDiffs[item.artifact_id].added_lines} / -{artifactDiffs[item.artifact_id].removed_lines}
+                          {artifactDiffs[item.artifact_id].truncated ? '（已截断）' : ''}
+                        </div>
+                        <pre className="mt-[5px] max-h-[220px] overflow-auto whitespace-pre-wrap break-all font-mono text-[10px] leading-[1.5] text-[#536077]">{artifactDiffs[item.artifact_id].diff || '内容一致'}</pre>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
             <div className="mt-[12px] flex flex-wrap gap-[8px]">
               <Button variant="outline" size="sm" onClick={onRefreshSkillTask}><RefreshCw className="size-[13px]" />刷新状态</Button>
+              {skillTask.parent_task_id && onRefreshSkillLineage && (
+                <Button variant="outline" size="sm" disabled={lineageBusy} onClick={onRefreshSkillLineage}>
+                  {lineageBusy ? '读取版本链…' : '查看版本链'}
+                </Button>
+              )}
               {skillArtifacts.filter((item) => item.state === 'committed').map((item) => (
                 <Button key={item.artifact_id} variant="outline" size="sm" onClick={() => onDownloadSkillArtifact?.(item)}><Download className="size-[13px]" />下载 {item.filename}</Button>
               ))}
             </div>
+            {skillLineage.length > 0 && (
+              <div data-skill-lineage className="mt-[12px] rounded-[9px] border border-[#e3e9f2] bg-white px-[12px] py-[10px] text-[11px] text-[#536077]">
+                <div className="font-medium text-[#243e68]">版本链</div>
+                <ol className="mt-[5px] grid gap-[4px]">
+                  {skillLineage.map((item, index) => (
+                    <li key={item.task_id} className="break-all">
+                      {index + 1}. {item.task_id.slice(0, 12)}… · v{item.skill_version || '—'} · {item.status}
+                      {item.result_status ? ` · ${item.result_status}` : ''}
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            )}
           </div>
         )}
       </section>
@@ -492,6 +710,10 @@ export default function ExtensionsPage({ auth }: Props) {
   const [skillBusy, setSkillBusy] = useState<string | null>(null);
   const [skillTask, setSkillTask] = useState<SkillTask | null>(null);
   const [skillArtifacts, setSkillArtifacts] = useState<SkillArtifact[]>([]);
+  const [skillLineage, setSkillLineage] = useState<SkillLineageItem[]>([]);
+  const [lineageBusy, setLineageBusy] = useState(false);
+  const [artifactDiffs, setArtifactDiffs] = useState<Record<string, ArtifactDiff>>({});
+  const [diffBusy, setDiffBusy] = useState<string | null>(null);
 
   const load = useCallback(() => {
     let cancelled = false;
@@ -549,11 +771,42 @@ export default function ExtensionsPage({ auth }: Props) {
   const refreshSkillTask = useCallback(async (taskId: string) => {
     const response = await api.get<{ task: SkillTask }>(`/api/v1/sandbox/tasks/${encodeURIComponent(taskId)}`);
     setSkillTask(response.task);
+    setArtifactDiffs({});
     if (response.task.status === 'succeeded') {
       const artifacts = await api.get<{ items: SkillArtifact[] }>(`/api/v1/sandbox/tasks/${encodeURIComponent(taskId)}/artifacts`);
       setSkillArtifacts(artifacts.items);
     }
   }, []);
+
+  const refreshSkillLineage = useCallback(async () => {
+    if (!skillTask) return;
+    setLineageBusy(true);
+    try {
+      const response = await api.get<{ items: SkillLineageItem[] }>(
+        `/api/v1/sandbox/tasks/${encodeURIComponent(skillTask.task_id)}/lineage`,
+      );
+      setSkillLineage(response.items);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '版本链读取失败');
+    } finally {
+      setLineageBusy(false);
+    }
+  }, [skillTask]);
+
+  const diffSkillArtifact = useCallback(async (artifact: SkillArtifact) => {
+    if (!skillTask) return;
+    setDiffBusy(artifact.artifact_id);
+    try {
+      const response = await api.get<ArtifactDiff>(
+        `/api/v1/sandbox/tasks/${encodeURIComponent(skillTask.task_id)}/artifacts/${encodeURIComponent(artifact.artifact_id)}/diff-parent`,
+      );
+      setArtifactDiffs((previous) => ({ ...previous, [artifact.artifact_id]: response }));
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '未找到可对比的上一版本');
+    } finally {
+      setDiffBusy(null);
+    }
+  }, [skillTask]);
 
   useEffect(() => {
     if (!skillTask || ['succeeded', 'failed', 'cancelled', 'rejected', 'expired', 'reconcile_required'].includes(skillTask.status)) return;
@@ -689,7 +942,7 @@ export default function ExtensionsPage({ auth }: Props) {
         setSkillBusy(skill.skill_ref);
         const path = `/api/v1/sandbox/skills/${encodeURIComponent(skill.skill_ref)}/subscribe`;
         const action = skill.subscribed ? api.delete(path) : api.post(path, {});
-        void action.then(() => { notify.success(skill.subscribed ? '已移除 Skill' : '已添加 Skill'); void load(); })
+        void action.then(() => { notify.success(skill.subscribed ? '已移出我的工具' : '已添加到我的工具'); void load(); })
           .catch((error) => notify.error(error instanceof Error ? error.message : 'Skill 操作失败'))
           .finally(() => setSkillBusy(null));
       }}
@@ -711,6 +964,8 @@ export default function ExtensionsPage({ auth }: Props) {
           .then((response) => {
             setSkillTask(response.task);
             setSkillArtifacts([]);
+            setSkillLineage([]);
+            setArtifactDiffs({});
             notify.success('任务已提交到沙箱');
           })
           .catch((error) => notify.error(error instanceof Error ? error.message : 'Skill 任务提交失败'))
@@ -723,6 +978,12 @@ export default function ExtensionsPage({ auth }: Props) {
         void apiDownload.blob(`/api/v1/sandbox/artifacts/${encodeURIComponent(artifact.artifact_id)}`, artifact.filename)
           .catch((error) => notify.error(error instanceof Error ? error.message : '下载失败'));
       }}
+      skillLineage={skillLineage}
+      lineageBusy={lineageBusy}
+      onRefreshSkillLineage={() => void refreshSkillLineage()}
+      artifactDiffs={artifactDiffs}
+      diffBusy={diffBusy}
+      onDiffSkillArtifact={(artifact) => void diffSkillArtifact(artifact)}
     />
   );
 }

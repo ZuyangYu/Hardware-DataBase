@@ -242,8 +242,13 @@ class RunnerSubmitRequest:
     kind: str = "task"
     network_policy_ref: str = ""
     input_artifact_ids: tuple[str, ...] = ()
+    input_artifacts: tuple[Mapping[str, Any], ...] = ()
     parameters: Mapping[str, Any] = field(default_factory=dict)
     capability_snapshot_hash: str = ""
+    runtime_contract_version: str = "v1"
+    parent_task_id: str = ""
+    resume_from: str = ""
+    attempt: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "task_id", _required_ref(self.task_id, "task_id"))
@@ -269,7 +274,40 @@ class RunnerSubmitRequest:
         if len(set(artifact_ids)) != len(artifact_ids):
             raise ValueError("input_artifact_ids must be unique")
         object.__setattr__(self, "input_artifact_ids", artifact_ids)
+        items = tuple(self.input_artifacts or ())
+        if items:
+            if len(items) != len(artifact_ids):
+                raise ValueError("every input artifact requires one transfer item")
+            normalized_items: list[dict[str, Any]] = []
+            for item in items:
+                if not isinstance(item, Mapping):
+                    raise ValueError("input artifact transfer item must be an object")
+                payload = dict(item)
+                artifact_id = str(payload.get("artifact_id") or "")
+                if artifact_id not in artifact_ids:
+                    raise ValueError("input artifact transfer item is not referenced by the task")
+                content = payload.get("content_base64")
+                if not isinstance(content, str) or len(content) > 48 * 1024 * 1024:
+                    raise ValueError("input artifact payload is invalid")
+                digest = str(payload.get("sha256") or "").strip().lower().removeprefix("sha256:")
+                if not _DIGEST_RE.fullmatch(digest):
+                    raise ValueError("input artifact digest is invalid")
+                normalized_items.append(payload)
+            object.__setattr__(self, "input_artifacts", tuple(normalized_items))
+        else:
+            object.__setattr__(self, "input_artifacts", ())
+        if isinstance(self.attempt, bool) or not isinstance(self.attempt, int) or not 1 <= self.attempt <= 1000:
+            raise ValueError("attempt must be a bounded positive integer")
         _validate_parameters(self.parameters)
+        contract = str(self.runtime_contract_version or "v1").strip()
+        if contract != "v1":
+            raise ValueError("unsupported runtime_contract_version")
+        object.__setattr__(self, "runtime_contract_version", contract)
+        for field_name in ("parent_task_id", "resume_from"):
+            value = str(getattr(self, field_name) or "").strip()
+            if value and not _ID_RE.fullmatch(value):
+                raise ValueError(f"{field_name} must be a bounded reference")
+            object.__setattr__(self, field_name, value)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -280,8 +318,13 @@ class RunnerSubmitRequest:
             "kind": str(self.kind or "task"),
             "network_policy_ref": str(self.network_policy_ref or ""),
             "input_artifact_ids": list(self.input_artifact_ids),
+            "input_artifacts": [dict(item) for item in self.input_artifacts],
             "parameters": dict(self.parameters),
             "capability_snapshot_hash": self.capability_snapshot_hash,
+            "runtime_contract_version": self.runtime_contract_version,
+            "parent_task_id": self.parent_task_id,
+            "resume_from": self.resume_from,
+            "attempt": self.attempt,
             "request": self.envelope.to_dict(),
         }
 
@@ -296,6 +339,8 @@ class RunnerObservation:
     output_manifest: Mapping[str, Any] = field(default_factory=dict)
     resource_summary: Mapping[str, Any] = field(default_factory=dict)
     error_code: str = ""
+    result: Mapping[str, Any] = field(default_factory=dict)
+    runtime_events: tuple[Mapping[str, Any], ...] = ()
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "RunnerObservation":
@@ -308,6 +353,11 @@ class RunnerObservation:
             output_manifest=dict(value.get("output_manifest") or {}),
             resource_summary=dict(value.get("resource_summary") or {}),
             error_code=_safe_code(value.get("error_code") or "") if value.get("error_code") else "",
+            result=dict(value.get("result") or value.get("skill_result") or {}),
+            runtime_events=tuple(
+                item for item in (value.get("runtime_events") or value.get("events") or ())
+                if isinstance(item, Mapping)
+            ),
         )
 
 

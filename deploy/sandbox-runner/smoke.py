@@ -23,6 +23,7 @@ import os
 import secrets
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -100,6 +101,20 @@ def submit(bundle: str, parameters: dict, *, digest: str | None = None, profile:
     )
 
 
+def wait_observation(task_id: str, *, timeout: float = 60) -> dict:
+    deadline = time.monotonic() + timeout
+    observation: dict = {}
+    while time.monotonic() < deadline:
+        status, body = request("GET", f"/v1/tasks/{task_id}")
+        if status != 200:
+            return {"status": "observe_failed", "http_status": status}
+        observation = body.get("observation") or {}
+        if observation.get("status") in {"succeeded", "failed", "cancelled", "timed_out", "unknown"}:
+            return observation
+        time.sleep(0.2)
+    return observation
+
+
 def main() -> int:
     status, body = request("GET", "/v1/health")
     check("health", status == 200 and body.get("status") == "up", str(body)[:80])
@@ -111,12 +126,13 @@ def main() -> int:
     check("audience rejected", status == 403, f"status={status}")
 
     status, body = submit("bundle/report", {"title": "live", "rows": 3})
-    ok = status == 200 and body.get("status") == "succeeded"
-    check("fixed bundle runs on the real runtime", ok, f"status={status} body={str(body)[:120]}")
+    check("asynchronous submission accepted", status == 202 and bool(body.get("task_id")), f"status={status}")
     task_id = body.get("task_id", "")
-    manifest = body.get("output_manifest") or {}
-    items = manifest.get("items") or []
-    check("manifest has two outputs", len(items) == 2, f"items={len(items)}")
+    observation = wait_observation(task_id)
+    check("fixed bundle runs on the real runtime", observation.get("status") == "succeeded", str(observation)[:120])
+    status, body = request("POST", f"/v1/tasks/{task_id}/collect")
+    items = (body.get("output_manifest") or {}).get("items") or []
+    check("collect returns two outputs", status == 200 and len(items) == 2, f"items={len(items)}")
     if items:
         sample = items[0]
         raw = base64.b64decode(sample["content_base64"])
@@ -126,13 +142,6 @@ def main() -> int:
             sample["filename"],
         )
         check("artifact is bound to the execution", bool(sample.get("execution_id")))
-
-    if task_id:
-        status, body = request("GET", f"/v1/tasks/{task_id}")
-        observation = body.get("observation") or {}
-        check("observe returns succeeded", status == 200 and observation.get("status") == "succeeded")
-        status, body = request("POST", f"/v1/tasks/{task_id}/collect")
-        check("collect returns the manifest", status == 200 and len((body.get("output_manifest") or {}).get("items", [])) == 2)
 
     status, body = submit("bundle/report", {"title": "x"}, digest="0" * 64)
     check("digest mismatch rejected", status == 400 and (body.get("detail") or {}).get("error", {}).get("code") == "digest_mismatch", f"status={status}")
@@ -160,7 +169,12 @@ def main() -> int:
     check("unreviewed service rejected", status == 404, f"status={status}")
 
     status, body = submit("bundle/slow", {"seconds": 30})
-    check("slow bundle times out and cleans up", status == 200 and body.get("status") == "timed_out", f"status={status} body={str(body)[:100]}")
+    observation = wait_observation(body.get("task_id", ""), timeout=90)
+    check(
+        "slow bundle times out and cleans up",
+        status == 202 and observation.get("status") == "timed_out",
+        f"status={status} body={str(observation)[:100]}",
+    )
 
     orphan = f"hdb-orphan-{secrets.token_hex(4)}"
     subprocess.run(

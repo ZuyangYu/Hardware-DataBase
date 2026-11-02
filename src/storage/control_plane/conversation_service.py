@@ -121,6 +121,7 @@ class PostgresConversationService:
         wiki_assist: bool = False,
         attachment_ids: list[str] | None = None,
         source_scope: str = "auto",
+        disabled_skill_refs: list[str] | None = None,
         *,
         knowledge_scope=None,
     ) -> ChatTurn:
@@ -134,6 +135,7 @@ class PostgresConversationService:
             wiki_assist=wiki_assist,
             attachment_ids=attachment_ids,
             source_scope=source_scope,
+            disabled_skill_refs=disabled_skill_refs,
             knowledge_scope=knowledge_scope,
         )
 

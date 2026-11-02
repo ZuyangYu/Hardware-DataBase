@@ -239,6 +239,8 @@ class SandboxServiceClient:
         spec: SandboxTaskSpec | None = None,
         envelope: RequestEnvelope | None = None,
         task_id: str = "",
+        attempt: int = 1,
+        input_artifacts: tuple[Mapping[str, Any], ...] | list[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         require_execution_enabled()
         if request is None:
@@ -263,8 +265,13 @@ class SandboxServiceClient:
                 kind=normalized.kind,
                 network_policy_ref=normalized.network_policy_ref,
                 input_artifact_ids=normalized.input_artifact_ids,
+                input_artifacts=tuple(input_artifacts or ()),
                 parameters=normalized.parameters,
                 capability_snapshot_hash=normalized.capability_snapshot_hash,
+                runtime_contract_version=normalized.runtime_contract_version,
+                parent_task_id=normalized.parent_task_id,
+                resume_from=normalized.resume_from,
+                attempt=max(1, int(attempt)),
             )
         return self._request(
             "runner",

@@ -39,6 +39,14 @@ export interface StageEvent extends AgentEventBase {
   label: string;
   status: QueryTraceStatus;
   detail: string;
+  skill_request?: SkillInputRequestEvent;
+}
+
+export interface SkillInputRequestEvent {
+  task_id: string;
+  skill_ref: string;
+  required_inputs: string[];
+  checkpoint_artifact_id: string;
 }
 
 export interface DegradedEvent extends AgentEventBase {
@@ -340,6 +348,20 @@ export function parseAgentEvent(eventType: string, raw: string): AgentEvent | nu
     case 'stage': {
       const key = text(record.key).trim();
       if (!key) return null;
+      const rawSkillRequest = asRecord(record.skill_request);
+      const skillRequest = rawSkillRequest && text(rawSkillRequest.task_id).trim()
+        ? {
+          task_id: text(rawSkillRequest.task_id).trim(),
+          skill_ref: text(rawSkillRequest.skill_ref).trim(),
+          required_inputs: Array.isArray(rawSkillRequest.required_inputs)
+            ? rawSkillRequest.required_inputs
+              .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+              .map((item) => item.trim())
+              .slice(0, 16)
+            : [],
+          checkpoint_artifact_id: text(rawSkillRequest.checkpoint_artifact_id).trim(),
+        }
+        : undefined;
       return {
         ...common,
         type: 'stage',
@@ -347,6 +369,7 @@ export function parseAgentEvent(eventType: string, raw: string): AgentEvent | nu
         label: text(record.label, key),
         status: normalizeTraceStatus(record.status),
         detail: text(record.detail),
+        skill_request: skillRequest,
       };
     }
     case 'degraded':

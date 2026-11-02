@@ -6,6 +6,8 @@ import os
 import sqlite3
 import tempfile
 import unittest
+import base64
+import hashlib
 from unittest.mock import patch
 
 from cryptography.fernet import Fernet
@@ -194,6 +196,29 @@ class McpExecutorTests(unittest.TestCase):
         self.assertIn("ok", result)
         degraded = [event for event in self.events if event["type"] == "degraded"]
         self.assertTrue(any(event["payload"]["failure_type"] == "audit_failed" for event in degraded))
+
+    def test_readonly_artifact_payload_is_saved_for_skill_bridge(self):
+        content = b'{"nodes": []}'
+        payload = {
+            "filename": "mcp-result.json",
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "media_type": "application/json",
+        }
+        with (
+            patch.object(settings, "MCP_ARTIFACT_STORAGE_DIR", self._tmp.name),
+            patch.object(settings, "MCP_ARTIFACT_ALLOWED_EXTENSIONS", "json"),
+            McpStubServer() as stub,
+            patch("src.agents.mcp.executor.sync_call_tool", return_value=payload),
+        ):
+            executor, bindings = self._prepare(stub.url)
+            result = executor.call(bindings["echo"], {"text": "bridge"})
+
+        self.assertIn("artifact_ref", result)
+        records = executor.rt.mcp_artifacts
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["filename"], "mcp-result.json")
+        self.assertEqual(records[0]["sha256"], payload["sha256"])
 
 
 if __name__ == "__main__":

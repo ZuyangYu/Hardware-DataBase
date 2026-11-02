@@ -23,6 +23,7 @@ import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { CHAT_MAIN_CLASS, chatBubbleClass, chatRowClass } from './chatPageStyles';
 import { useKbChat } from './useKbChat';
 import McpWriteProposalCard from './components/McpWriteProposalCard';
+import SkillInputRequestCard from './components/SkillInputRequestCard';
 import ChatSessionSidebar from './components/ChatSessionSidebar';
 import ChatHeader from './components/ChatHeader';
 import MessageList from './components/MessageList';
@@ -210,6 +211,8 @@ export default function ChatPage({
     abortStream,
     forbidden,
     mcpWriteCards,
+    skillInputRequests,
+    dismissSkillInput,
     updateMcpWriteCard,
     refreshMcpWriteCards,
   } = chat;
@@ -230,6 +233,14 @@ export default function ChatPage({
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   }, [mcpWriteCards, refreshMcpWriteCards]);
+
+  function respondToSkillInput(request: typeof skillInputRequests[number]) {
+    const items = request.required_inputs.length
+      ? request.required_inputs.map((item, index) => `${index + 1}. ${item}`).join('\n')
+      : '请说明需要补充的参数或信息。';
+    setInput(`继续 ${request.skill_ref || 'Skill'}，补充信息：\n${items}\n`);
+    dismissSkillInput(request.task_id);
+  }
 
   async function confirmMcpWriteCard(card: typeof mcpWriteCards[number]) {
     try {
@@ -716,6 +727,23 @@ export default function ChatPage({
                   ? `（截止 ${new Date(turnQueueNotice.waitDeadline).toLocaleTimeString()}）`
                   : ''}
               </span>
+            </div>
+          </div>
+        )}
+        {skillInputRequests.length > 0 && (
+          <div className="shrink-0 px-[24px] pb-[6px]" aria-live="polite">
+            <div className="mx-auto flex w-full max-w-[820px] flex-col gap-[10px]">
+              {skillInputRequests.map((request) => (
+                <div key={request.task_id} className={chatRowClass('assistant')}>
+                  <div className={chatBubbleClass('assistant')}>
+                    <SkillInputRequestCard
+                      request={request}
+                      onRespond={respondToSkillInput}
+                      onDismiss={dismissSkillInput}
+                    />
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         )}

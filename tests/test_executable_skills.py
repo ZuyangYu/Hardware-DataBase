@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import json
+
 import pytest
 from fastapi import HTTPException
 from langchain_core.language_models import BaseChatModel
@@ -44,6 +46,9 @@ class _SkillRuntime:
 
     def tool_result(self, **payload) -> None:
         self.events.append(("tool_result", payload))
+
+    def emit(self, event_type: str, payload: dict) -> None:
+        self.events.append((event_type, payload))
 
 
 @pytest.fixture
@@ -197,6 +202,92 @@ def test_available_skills_is_narrowed_by_scope_and_capabilities(setup, monkeypat
     assert available("user-1") == []
 
 
+def test_available_skills_exposes_review_metadata_and_runtime_contract(setup, monkeypatch):
+    _, _, skills, _, bundle = setup
+    skills.register(
+        skill_ref="skill/block-diagram", version="2.1.0", content="# Block diagram\n",
+        owner_id="user-1", department_id="dept-1",
+        metadata={
+            "summary": "根据接口表生成硬件框图。",
+            "intent_examples": ["生成硬件框图", "根据接口表绘图"],
+            "input_kinds": ["csv", "xlsx"], "output_kinds": ["svg", "json"],
+            "interaction_modes": ["self_contained"], "risk": "low",
+        },
+    )
+    skills.bind_execution(
+        "skill/block-diagram", bundle_ref=bundle.bundle_ref,
+        bundle_digest=bundle.bundle_digest, profile_ref=bundle.profile_ref,
+    )
+    skills.review("skill/block-diagram")
+    skills.mark_tested("skill/block-diagram")
+    skills.enable("skill/block-diagram")
+    monkeypatch.setattr(routes, "_context_capabilities", lambda *args: {"sandbox.execute", "sandbox.write_artifact"})
+
+    item = next(item for item in routes.available_skills(
+        user=SimpleNamespace(id="user-1", department_id="dept-1", role="employee"),
+        auth=None, skills=skills, authorization=None,
+    )["items"] if item["skill_ref"] == "skill/block-diagram")
+
+    assert item["metadata"]["intent_examples"] == ["生成硬件框图", "根据接口表绘图"]
+    assert item["metadata"]["input_kinds"] == ["csv", "xlsx"]
+    assert item["metadata"]["output_kinds"] == ["svg", "json"]
+    assert item["metadata"]["risk"] == "low"
+    assert item["runtime"]["profile_ref"] == "profile/dev-l1"
+    assert item["runtime"]["contract_version"] == "v1"
+    assert item["output_schema"] == {}
+
+
+def test_temporary_skill_disable_filters_catalog_without_removing_subscription(setup, monkeypatch):
+    from src.agents.runner import MultiSourceAgentRunner
+    from src.sandbox.agent_tools import make_skill_tools, make_text_skill_tools
+    from src.sandbox.skills import SkillCatalog
+
+    store, _, _, _, bundle = setup
+    skills = SkillCatalog(store.db_path)
+    monkeypatch.setattr(settings, "SANDBOX_TASK_DB_PATH", store.db_path)
+    for ref, content in (
+        ("skill/report", "report reference"),
+        ("skill/summary", "summary reference"),
+        ("skill/checklist", "checklist reference"),
+    ):
+        skills.register(skill_ref=ref, version="v1", content=content, department_id="dept-1")
+    for ref in ("skill/report", "skill/summary"):
+        skills.bind_execution(ref, bundle_ref=bundle.bundle_ref,
+                              bundle_digest=bundle.bundle_digest, profile_ref=bundle.profile_ref)
+    for ref in ("skill/report", "skill/summary", "skill/checklist"):
+        skills.review(ref)
+        skills.mark_tested(ref)
+        skills.enable(ref)
+        skills.subscribe(ref, principal_id=42, department_id="dept-1")
+    monkeypatch.setattr(routes, "_context_capabilities", lambda *args: {"sandbox.execute", "sandbox.write_artifact"})
+    rt = SimpleNamespace(check_cancel=lambda: None, chat_session_id="session-1", emit=lambda *args: None)
+
+    tools = make_skill_tools(rt, user_id=42, department_id="dept-1")
+    invocation = next(tool for tool in tools if tool.name == "skill_invoke")
+    assert "skill/report" in invocation.description and "skill/summary" in invocation.description
+    assert "skill/checklist" not in invocation.description
+    suppressed = make_skill_tools(rt, user_id=42, department_id="dept-1", disabled_skill_refs=["skill/report"])
+    suppressed_invoke = next(tool for tool in suppressed if tool.name == "skill_invoke")
+    assert "skill/report" not in suppressed_invoke.description
+    assert "skill/summary" in suppressed_invoke.description
+    assert "skill_temporarily_disabled" in suppressed_invoke.invoke(
+        {"skill_ref": "skill/report", "parameters": {}}
+    )
+    assert [tool.name for tool in make_text_skill_tools(
+        rt, user_id=42, department_id="dept-1", disabled_skill_refs=["skill/checklist"],
+    )] == []
+    assert skills.is_subscribed("skill/report", 42)
+    assert skills.is_subscribed("skill/checklist", 42)
+
+    context = SimpleNamespace(
+        user_id="tester",
+        metadata={"actor_department_id": "dept-1", "skill_refs": ["skill/checklist"],
+                  "disabled_skill_refs": ["skill/checklist"]},
+        is_system_admin=lambda: True,
+    )
+    assert MultiSourceAgentRunner._load_skill_prompt_context(context) == ""
+
+
 def test_skill_cannot_be_enabled_after_bound_bundle_is_revoked(setup):
     _, bundles, skills, _, bundle = setup
     skills.register(skill_ref="skill/report", version="v1", content="reviewed reference text",
@@ -297,8 +388,9 @@ def test_admin_published_all_department_skills_require_employee_department_and_s
         skills.subscribe("skill/global-run", principal_id="employee-none", department_id="")
 
 
-def test_subscribed_text_is_mounted_in_employee_conversation_only(setup, monkeypatch):
+def test_subscribed_text_is_loaded_on_demand(setup, monkeypatch):
     from src.agents.runner import MultiSourceAgentRunner
+    from src.sandbox.agent_tools import make_text_skill_tools
     import src.core.auth as auth_module
 
     _, _, skills, _, _ = setup
@@ -318,11 +410,28 @@ def test_subscribed_text_is_mounted_in_employee_conversation_only(setup, monkeyp
     load = MultiSourceAgentRunner._load_skill_prompt_context
     assert load(context) == ""
     skills.subscribe("skill/checklist", principal_id=42, department_id="dept-1")
-    assert "Verify component voltage" in load(context)
+    # Subscribed text Skills are not auto-injected anymore.
+    assert load(context) == ""
+    explicit = SimpleNamespace(
+        user_id="tester",
+        metadata={"actor_department_id": "dept-1", "skill_refs": ["skill/checklist"]},
+        is_system_admin=lambda: False,
+    )
+    assert "Verify component voltage" in load(explicit)
     assert load(SimpleNamespace(user_id="tester", metadata={"actor_department_id": "dept-2"},
                                 is_system_admin=lambda: False)) == ""
+
+    events = []
+    rt = SimpleNamespace(check_cancel=lambda: None, emit=lambda kind, payload: events.append(kind))
+    tools = make_text_skill_tools(rt, user_id=42, department_id="dept-1")
+    assert [tool.name for tool in tools] == ["skill_load"]
+    payload = json.loads(tools[0].invoke({"skill_ref": "skill/checklist"}))
+    assert payload["untrusted"] is True and "Verify component voltage" in payload["content"]
+    assert events == ["tool_started", "tool_result"]
+
     skills.unsubscribe("skill/checklist", principal_id=42)
     assert load(context) == ""
+    assert make_text_skill_tools(rt, user_id=42, department_id="dept-1") == []
 
 
 def test_skill_prompt_context_failure_reports_bounded_error(setup, monkeypatch):
@@ -342,8 +451,11 @@ def test_skill_prompt_context_failure_reports_bounded_error(setup, monkeypatch):
         raise RuntimeError("catalog unavailable")
 
     monkeypatch.setattr(skills_module.SkillCatalog, "prompt_blocks", explode)
-    context = SimpleNamespace(user_id="tester", metadata={"actor_department_id": "dept-1"},
-                              is_system_admin=lambda: False)
+    context = SimpleNamespace(
+        user_id="tester",
+        metadata={"actor_department_id": "dept-1", "skill_refs": ["skill/checklist"]},
+        is_system_admin=lambda: False,
+    )
     seen: list[str] = []
     text = MultiSourceAgentRunner._load_skill_prompt_context(
         context, on_error=lambda exc: seen.append(type(exc).__name__),
@@ -380,12 +492,12 @@ def test_agent_sees_only_subscribed_reviewed_skills_and_rechecks_at_call(setup, 
     assert make_skill_tools(rt, user_id=42, department_id="dept-1") == []
     skills.subscribe("skill/agent-report", principal_id=42, department_id="dept-1")
     tools = make_skill_tools(rt, user_id=42, department_id="dept-1")
-    invocation = next(tool for tool in tools if tool.name.startswith("skill__"))
+    invocation = next(tool for tool in tools if tool.name == "skill_invoke")
     assert "skill/agent-report" in invocation.description
     assert '"title"' in invocation.description
-    assert "skill_request_rejected" in invocation.invoke({"parameters_json": "not JSON"})
+    assert "skill_request_rejected" in invocation.invoke({"skill_ref": "skill/agent-report", "parameters": {}})
     skills.unsubscribe("skill/agent-report", principal_id=42)
-    assert "skill_not_subscribed" in invocation.invoke({"parameters_json": '{"title":"report"}'})
+    assert "skill_not_subscribed" in invocation.invoke({"skill_ref": "skill/agent-report", "parameters": {"title": "report"}})
     assert make_skill_tools(rt, user_id=42, department_id="dept-1") == []
     assert events == []
 
@@ -410,15 +522,19 @@ def test_agent_skill_tool_returns_broker_verified_preview_for_followup(setup, mo
 
         def require(self, task_id):
             original = store.require(task_id)
-            return SimpleNamespace(task_id=task_id, status="succeeded", owner_id=original.owner_id,
-                                   department_id=original.department_id, skill_ref=original.skill_ref)
+            return SimpleNamespace(**{**original.to_dict(), "status": "succeeded"})
+
+        def runtime_events(self, task_id, *, limit=200):
+            return []
 
     class VerifiedBroker:
         def list_for_task(self, task_id, *, states=None):
             return [SimpleNamespace(artifact_id="art-" + "0" * 32, filename="input.txt",
-                                    sha256="c" * 64, size=6, role="input"),
+                                    sha256="c" * 64, size=6, role="input", media_type="text/plain",
+                                    state="committed", metadata={}),
                     SimpleNamespace(artifact_id="art-" + "a" * 32, filename="report.txt",
-                                    sha256="b" * 64, size=5, role="output")]
+                                    sha256="b" * 64, size=5, role="output", media_type="text/plain",
+                                    state="committed", metadata={})]
 
         def read(self, artifact_id, **kwargs):
             assert kwargs["principal_id"] == "42"
@@ -429,11 +545,11 @@ def test_agent_skill_tool_returns_broker_verified_preview_for_followup(setup, mo
     events = []
     rt = _SkillRuntime(events)
     tool = next(tool for tool in make_skill_tools(rt, user_id=42, department_id="dept-1")
-                if tool.name.startswith("skill__"))
-    response = tool.invoke({"parameters_json": '{"title":"report"}'})
+                if tool.name == "skill_invoke")
+    response = tool.invoke({"skill_ref": "skill/agent-report", "parameters": {"title": "report"}})
     assert '"status": "succeeded"' in response and '"untrusted_preview": "hello"' in response
     assert "input.txt" not in response
-    assert [kind for kind, _ in events] == ["tool_started", "tool_result"]
+    assert [kind for kind, _ in events] == ["tool_started", "stage", "tool_result"]
 
     class ToolCallingModel(BaseChatModel):
         @property
@@ -449,7 +565,7 @@ def test_agent_skill_tool_returns_broker_verified_preview_for_followup(setup, mo
                 output = AIMessage(content="Report result: " + str(result.content))
             else:
                 output = AIMessage(content="", tool_calls=[{
-                    "name": tool.name, "args": {"parameters_json": '{"title":"report"}'},
+                    "name": tool.name, "args": {"skill_ref": "skill/agent-report", "parameters": {"title": "report"}},
                     "id": "call-skill", "type": "tool_call",
                 }])
             return ChatResult(generations=[ChatGeneration(message=output)])

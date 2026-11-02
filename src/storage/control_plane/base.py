@@ -52,6 +52,7 @@ class ExecutionStore:
         client_request_id: str | None = None,
         query_mode: str = "fast",
         source_scope: str = "auto",
+        disabled_skill_refs: list[str] | None = None,
         knowledge_scope=None,
     ) -> "ChatTurn":
         raise NotImplementedError
