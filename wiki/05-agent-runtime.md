@@ -124,6 +124,7 @@ hash、各 fragment 字节数、evidence 字节数、模型窗口、实际 input
 | `document_search` | `make_document_search` | `RAGBackend.retrieve`（RAGFlow） | 常开 |
 | `kb_grep` | `make_kb_grep` | `storage/pointer_index`（FTS5 + LIKE） | 常开 |
 | `session_recall` | `make_session_recall` | `ToolRuntime.session_recall_items/gaps` | 常开（模型主动调用） |
+| 会话连续性 | `SessionContextMiddleware` | 上一轮问题/结论/缺口/证据指针 | 每次模型调用注入紧凑块 |
 | `evidence_read` | `make_evidence_read` | `ToolRuntime.candidate_evidence`（无外部调用） | 常开（候选优先检索） |
 | `circuit_search` | `make_circuit_search` | `CircuitIndexService.query` | KB 有电路数据时可用 |
 | `spreadsheet_schema_lookup` / `spreadsheet_sql_query` / `spreadsheet_row_search` / `spreadsheet_cell_lookup` | `make_spreadsheet_tools` | 每 KB 表索引 SQLite | 常开 |

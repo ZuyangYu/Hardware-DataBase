@@ -15,6 +15,42 @@ _MAX_PRIOR_GAPS = 5
 _MAX_PRIOR_ITEMS = 12
 
 
+def _session_state_block(
+    history: list[Any], items: list[Evidence], gaps: list[str]
+) -> str:
+    """Build a compact, always-visible continuity block for the next turn."""
+
+    if not history:
+        return ""
+    last = history[0]
+    query = " ".join(str(getattr(last, "query", "") or "").split())[:300]
+    answer = " ".join(str(getattr(last, "answer", "") or "").split())[:800]
+    lines = [
+        "<session_state>",
+        "以下是本会话上一轮的上下文；仅在与当前问题相关时使用，不要重复无关内容。",
+    ]
+    if query:
+        lines.append(f"上一轮问题：{query}")
+    if answer:
+        lines.append(f"上一轮结论：{answer}")
+        lines.append("注意：上一轮结论里的 [n] 是上一轮编号，本轮引用前必须 evidence_read 重新登记。")
+    if gaps:
+        lines.append("未解决缺口：")
+        lines.extend(f"- {gap}" for gap in gaps[:3])
+    if items:
+        lines.append("可用旧证据（引用前必须 evidence_read）：")
+        for item in items[-6:]:
+            locator = ", ".join(
+                f"{name}={value}" for name, value in (item.locator or {}).items()
+            )
+            lines.append(
+                f"- id={item.id} | {item.source_name or '未知来源'}"
+                f" | {locator[:120]}"
+            )
+    lines.append("</session_state>")
+    return "\n".join(lines)
+
+
 def load_session_context(
     rt: Any, session_id: int | None, user_id: int | None
 ) -> None:
@@ -71,6 +107,9 @@ def load_session_context(
             by_id.setdefault(item.id, item)
     rt.session_recall_items = list(by_id.values())[-_MAX_PRIOR_ITEMS:]
     rt.session_recall_gaps = gaps
+    rt.session_state_text = _session_state_block(
+        history, rt.session_recall_items, gaps
+    )
 
 
 def gap_closure_prompt(rt: Any, gaps: list[str]) -> str:

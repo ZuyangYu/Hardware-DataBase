@@ -91,11 +91,12 @@ class Evidence:                    # document_rag/schemas.py:59
 
 指针持久化在 `storage/pointer_index/<sha>.db`（SQLite FTS5 + `LIKE` 合并），
 覆盖 docx/pdf chunk、xlsx 语义行和 EDF 网表/器件；索引按来源记录签名失效，
-同一 KB 的重复检索不再重新解析全文。跨轮证据和缺口不再自动注入：
-最近 3 轮的已读证据和缺口只装入沉睡的 `session_recall` 缓冲区，
-由模型判断当前问题是否延续之前话题；只有模型主动调用 `session_recall`
-时才把旧指针放进候选池并列出缺口，新问题保持干净。正式引用仍在当轮
-由 `evidence_read` 重新登记编号。
+同一 KB 的重复检索不再重新解析全文。跨轮上下文由
+`SessionContextMiddleware` 以紧凑块注入：上一轮问题/结论、未解决缺口、
+可用旧证据指针。它不是硬相关性规则，也不注入正文；块内明确提示旧 `[n]`
+不可复用，引用前必须 `evidence_read`。完全无关的新问题可以忽略该块，
+按全新检索处理。最近 3 轮的已读证据和缺口仍保存在 `session_recall` 缓冲区，
+模型也可以主动调用该工具取用。
 
 候选较多时，前 12 条保留摘要，其余以 `id/来源/位置` 紧凑列出，仍可直接
 `evidence_read`，不会出现“候选未展开但拿不到 id”的情况。回答收尾前会做

@@ -49,6 +49,7 @@ from src.agents.session_recall import (
     gap_closure_prompt,
     load_session_context,
 )
+from src.agents.middleware.session_context import SessionContextMiddleware
 from src.agents.subagent_trace import record_subagent_end, record_subagent_start
 from src.contracts.agent_events import validate_event_envelope
 from src.agents.turn_meta import (
@@ -1784,6 +1785,10 @@ class MultiSourceAgentRunner:
         }
         if agent_subagents:
             agent_kwargs["subagents"] = agent_subagents
+        if getattr(rt, "session_state_text", ""):
+            agent_kwargs["middleware"] = [
+                SessionContextMiddleware(rt.session_state_text)
+            ]
         agent = create_deep_agent(**agent_kwargs)
         config: dict[str, Any] = {"recursion_limit": recursion_limit}
         if checkpointer is not None:
