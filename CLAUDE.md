@@ -245,6 +245,7 @@ tool; they share one per-request `ToolRuntime` (`runtime.py`) that scopes
 leak state. Registered in `runner.py`:
 - `document_search` (`make_document_search`) - `RAGBackend.retrieve` (RAGFlow).
 - `kb_grep` (`make_kb_grep`) - pointer-only exact/regex search across parsed docs, spreadsheet rows and circuit evidence backed by the persistent SQLite FTS5 pointer index; returns ids/locators without registering evidence.
+- `session_recall` (`make_session_recall`) - model-invoked recall of recent-turn evidence pointers and unresolved gaps; dormant until called, so unrelated new questions do not inherit prior context.
 - `evidence_read` (`make_evidence_read`) - promotes selected non-citable search candidates into the formal evidence ledger; broad hits stay out of the evidence budget until read.
 - `circuit_search` (`make_circuit_search`) - `CircuitIndexService.query` -> structured circuit `Evidence`.
 - `spreadsheet_row_search` / `spreadsheet_cell_lookup` (`make_spreadsheet_tools`) - SQL over the per-KB spreadsheet index.

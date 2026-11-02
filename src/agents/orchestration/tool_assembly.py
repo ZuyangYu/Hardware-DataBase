@@ -14,6 +14,7 @@ TOOL_CAPABILITIES: dict[str, str] = {
     "document_search": "knowledge_base.search",
     "document_search_batch": "knowledge_base.search",
     "kb_grep": "knowledge_base.search",
+    "session_recall": "knowledge_base.search",
     "evidence_read": "knowledge_base.search",
     "circuit_search": "knowledge_base.search",
     "spreadsheet_row_search": "knowledge_base.search",

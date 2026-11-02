@@ -1,15 +1,17 @@
-"""Prior-turn evidence is reused as non-citable candidate pointers."""
+"""Prior-turn evidence/gaps are dormant until the model calls session_recall."""
 
 from __future__ import annotations
 
 from types import SimpleNamespace
 
-from src.agents.session_recall import preload_session_context
+from src.agents.session_recall import load_session_context
+from src.agents.tools.evidence_tools import make_evidence_read
 from src.agents.tools.runtime import ToolRuntime
+from src.agents.tools.session_tools import make_session_recall
 
 
 class _ConversationService:
-    def list_recent_turns(self, user_id, session_id, limit=3):
+    def list_recent_turns(self, user_id, session_id, limit=4):
         assert user_id == 4
         assert session_id == 94
         return [
@@ -31,47 +33,61 @@ class _ConversationService:
                             "locator": {"page": 3},
                             "metadata": {"kb_id": 4, "citation_number": 7},
                         }
-                    ]
-                }
+                    ],
+                },
             )
         ]
 
 
-def test_prior_turn_evidence_is_preloaded_as_candidates(monkeypatch):
+def _loaded(monkeypatch, question: str = "") -> ToolRuntime:
     import src.core.conversation as conversation
 
     monkeypatch.setattr(conversation, "ConversationService", _ConversationService)
-    runtime = ToolRuntime(kb_name="AAA", ctx=None, question="那 Q1600 的引脚呢？")
+    runtime = ToolRuntime(kb_name="AAA", ctx=None, question=question)
+    load_session_context(runtime, 94, 4)
+    return runtime
 
-    preload_session_context(runtime, 94, 4)
 
+def test_load_session_context_is_dormant(monkeypatch):
+    runtime = _loaded(monkeypatch)
+
+    assert [item.id for item in runtime.session_recall_items] == ["document:old-1"]
+    assert runtime.session_recall_gaps == ["过压门限数值未给出", "Q1600 内部拓扑缺失"]
+    assert runtime.candidate_evidence == {}
     assert runtime.evidence == []
+    assert runtime.prior_gaps == []
+
+
+def test_session_recall_exposes_pointers_only_when_called(monkeypatch):
+    runtime = _loaded(monkeypatch)
+
+    rendered = make_session_recall(runtime)()
+
+    assert "id=document:old-1" in rendered
+    assert "上一轮未解决缺口" in rendered
     assert "document:old-1" in runtime.candidate_evidence
     assert runtime.prior_gaps == ["过压门限数值未给出", "Q1600 内部拓扑缺失"]
-    prompt = runtime.prior_gap_prompt()
-    assert "上一轮遗留缺口" in prompt
-    assert "过压门限数值未给出" in prompt
-    row = runtime.stash_candidates([runtime.candidate_evidence["document:old-1"]])
-    assert row[0]["id"] == "document:old-1"
+    assert runtime.evidence == []
 
 
-def test_prior_turn_evidence_is_renumbered_when_promoted(monkeypatch):
-    import src.core.conversation as conversation
+def test_session_recall_candidate_can_be_promoted(monkeypatch):
+    runtime = _loaded(monkeypatch)
 
-    from src.agents.tools.evidence_tools import make_evidence_read
-
-    monkeypatch.setattr(conversation, "ConversationService", _ConversationService)
-    runtime = ToolRuntime(kb_name="AAA", ctx=None, question="那 Q1600 的引脚呢？")
-
-    preload_session_context(runtime, 94, 4)
-
-    assert "document:old-1" in runtime.prior_evidence_prompt()
+    make_session_recall(runtime)()
     rendered = make_evidence_read(runtime)(["document:old-1"])
 
     assert "[1] 来源" in rendered
     assert runtime.evidence[0].id == "document:old-1"
     assert runtime.evidence[0].metadata["citation_number"] == 1
     assert "document:old-1" not in runtime.candidate_evidence
+
+
+def test_unrelated_question_gets_no_automatic_context(monkeypatch):
+    runtime = _loaded(monkeypatch, question="KL30 电源管理如何工作？")
+
+    assert runtime.candidate_evidence == {}
+    assert runtime.prior_gaps == []
+    assert runtime.session_recall_items
 
 
 def test_answer_gap_lines_extracts_gap_sentences():
@@ -86,35 +102,3 @@ def test_answer_gap_lines_extracts_gap_sentences():
         "Q1600 拓扑证据不足",
         "没有查到电气参数",
     ]
-
-
-def test_unrelated_question_does_not_inject_prior_context(monkeypatch):
-    import src.core.conversation as conversation
-
-    monkeypatch.setattr(conversation, "ConversationService", _ConversationService)
-    runtime = ToolRuntime(
-        kb_name="AAA", ctx=None, question="KL30 电源管理如何工作？"
-    )
-
-    preload_session_context(runtime, 94, 4)
-
-    assert runtime.candidate_evidence == {}
-    assert runtime.prior_gaps == []
-    assert runtime.prior_evidence_prompt() == ""
-    assert runtime.prior_gap_prompt() == ""
-
-
-def test_same_entity_question_injects_prior_context_without_follow_up_wording(
-    monkeypatch,
-):
-    import src.core.conversation as conversation
-
-    monkeypatch.setattr(conversation, "ConversationService", _ConversationService)
-    runtime = ToolRuntime(
-        kb_name="AAA", ctx=None, question="VCC3V3_EQ 的 UVLO 是多少？"
-    )
-
-    preload_session_context(runtime, 94, 4)
-
-    assert "document:old-1" in runtime.candidate_evidence
-    assert runtime.prior_gaps

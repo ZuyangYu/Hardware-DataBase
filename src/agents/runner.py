@@ -47,7 +47,7 @@ from src.agents.context_budget import (
 from src.agents.session_recall import (
     evidence_rows,
     gap_closure_prompt,
-    preload_session_context,
+    load_session_context,
 )
 from src.agents.subagent_trace import record_subagent_end, record_subagent_start
 from src.contracts.agent_events import validate_event_envelope
@@ -94,6 +94,7 @@ from src.agents.tools.circuit_tools import make_circuit_search
 from src.agents.tools.document_rag_tool import make_document_search, make_document_search_batch
 from src.agents.tools.evidence_tools import CANDIDATE_PROMPT, make_evidence_read
 from src.agents.tools.grep_tools import make_kb_grep
+from src.agents.tools.session_tools import make_session_recall
 from src.agents.tools.external_conversation_tools import make_conversation_search
 from src.agents.tools.memory_tools import make_memory_search
 from src.agents.tools.pipeline_catalog import make_catalog_tool
@@ -1289,7 +1290,7 @@ class MultiSourceAgentRunner:
         )
         rt.candidate_mode = not is_general
         if rt.candidate_mode:
-            preload_session_context(rt, conversation_session_id, numeric_user_id)
+            load_session_context(rt, conversation_session_id, numeric_user_id)
         if knowledge_scope is not None:
             from src.services.retrieval_targets import compile_work_items, looks_like_follow_up, resolve_turn_targets
 
@@ -1437,6 +1438,7 @@ class MultiSourceAgentRunner:
                 make_document_search(rt, self.rag_backend, self.document_store),
                 make_document_search_batch(rt, self.rag_backend, self.document_store),
                 make_kb_grep(rt, self.rag_backend, self.document_store, self.spreadsheet_service, self.circuit_service),
+                make_session_recall(rt),
                 make_evidence_read(rt),
             ]
             if rt.knowledge_scope is None:
@@ -1497,13 +1499,6 @@ class MultiSourceAgentRunner:
         )
         if not is_general:
             system_prompt = f"{system_prompt}\n\n{CANDIDATE_PROMPT}"
-            prior_prompt = "\n\n".join(
-                part
-                for part in (rt.prior_evidence_prompt(), rt.prior_gap_prompt())
-                if part
-            )
-            if prior_prompt:
-                system_prompt = f"{system_prompt}\n\n{prior_prompt}"
 
         if rt.knowledge_scope is None:
             memory_context = self._prefetch_memory_context(

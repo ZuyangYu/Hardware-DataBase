@@ -1,70 +1,24 @@
-"""Session-scoped recall of prior-turn evidence pointers and unresolved gaps."""
+"""Session-scoped recall of prior-turn evidence pointers and unresolved gaps.
+
+The recall buffer is deliberately dormant: nothing is injected into the prompt
+or candidate pool until the model calls the ``session_recall`` tool.  The model,
+not a regex, decides whether the new question continues the previous topic.
+"""
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from src.agents.schemas import Evidence
 
 _MAX_PRIOR_GAPS = 5
-
-_FOLLOW_UP_RE = re.compile(
-    r"^(?:那|那么|这个|该|其|它|上述|刚才|前面|继续|再看|还有|另外)|(?:呢|吗)[？?]?$"
-)
-_ENTITY_RE = re.compile(r"\b[A-Z]{1,6}\d[A-Z0-9_-]*\b", re.IGNORECASE)
-_CJK_SEGMENT_RE = re.compile(r"[\u4e00-\u9fff]+")
-_STOP_BIGRAMS = frozenset({
-    "什么", "怎么", "如何", "哪些", "多少", "是否", "这个", "那个", "可以",
-    "需要", "问题", "资料", "证据", "知识", "没有", "给出", "出现", "无法",
-    "确认", "上一", "一轮", "本轮", "以及", "进行", "一个", "我们", "现在",
-    "具体", "相关", "内容", "还有", "另外", "继续",
-})
+_MAX_PRIOR_ITEMS = 12
 
 
-def _cjk_bigrams(text: str) -> set[str]:
-    grams: set[str] = set()
-    for segment in _CJK_SEGMENT_RE.findall(str(text or "")):
-        for index in range(len(segment) - 1):
-            gram = segment[index:index + 2]
-            if gram not in _STOP_BIGRAMS:
-                grams.add(gram)
-    return grams
-
-
-def prior_context_relevant(query: str, turns: list[Any]) -> bool:
-    """Only carry prior evidence/gaps into an actually related next question."""
-
-    current = str(query or "").strip()
-    if not current or not turns:
-        return False
-    if len(current) <= 120 and _FOLLOW_UP_RE.search(current):
-        return True
-    prior_parts: list[str] = []
-    for turn in turns[:3]:
-        prior_parts.append(str(getattr(turn, "query", "") or ""))
-        summary = turn.summary if isinstance(turn.summary, dict) else {}
-        verification = summary.get("verification") or {}
-        prior_parts.extend(
-            str(gap or "")
-            for gap in [
-                *(verification.get("answer_gaps") or []),
-                *(verification.get("gaps") or []),
-            ]
-        )
-        for row in summary.get("evidence") or []:
-            if isinstance(row, dict):
-                prior_parts.append(str(row.get("source_name") or ""))
-    prior_text = " ".join(prior_parts)
-    if set(_ENTITY_RE.findall(current)) & set(_ENTITY_RE.findall(prior_text)):
-        return True
-    return len(_cjk_bigrams(current) & _cjk_bigrams(prior_text)) >= 2
-
-
-def preload_session_context(
+def load_session_context(
     rt: Any, session_id: int | None, user_id: int | None
 ) -> None:
-    """Reuse recent evidence as candidates and surface last turn's gaps."""
+    """Load recent evidence/gaps into a dormant session recall buffer."""
 
     if not session_id or not user_id:
         return
@@ -81,8 +35,6 @@ def preload_session_context(
         for turn in turns
         if isinstance(getattr(turn, "summary", None), dict) and turn.summary
     ]
-    if not prior_context_relevant(str(getattr(rt, "question", "") or ""), history):
-        return
 
     gaps: list[str] = []
     for turn in history:
@@ -100,28 +52,25 @@ def preload_session_context(
         if len(gaps) >= _MAX_PRIOR_GAPS:
             break
 
-    items: list[Evidence] = []
+    by_id: dict[str, Evidence] = {}
     for turn in reversed(history):
         summary = turn.summary if isinstance(turn.summary, dict) else {}
         for row in summary.get("evidence") or []:
             if not isinstance(row, dict) or not row.get("id") or not row.get("content"):
                 continue
-            items.append(
-                Evidence(
-                    id=str(row.get("id")),
-                    content=str(row.get("content")),
-                    source_name=str(row.get("source_name") or ""),
-                    content_kind=str(row.get("content_kind") or "document_text"),
-                    processor_kind=str(row.get("processor_kind") or "ragflow"),
-                    score=float(row.get("score") or 0.0),
-                    locator=dict(row.get("locator") or {}),
-                    metadata=dict(row.get("metadata") or {}),
-                )
+            item = Evidence(
+                id=str(row.get("id")),
+                content=str(row.get("content")),
+                source_name=str(row.get("source_name") or ""),
+                content_kind=str(row.get("content_kind") or "document_text"),
+                processor_kind=str(row.get("processor_kind") or "ragflow"),
+                score=float(row.get("score") or 0.0),
+                locator=dict(row.get("locator") or {}),
+                metadata=dict(row.get("metadata") or {}),
             )
-    if items:
-        rt.stash_candidates(items)
-        rt.prior_evidence_ids.update(item.id for item in items)
-    rt.prior_gaps = gaps
+            by_id.setdefault(item.id, item)
+    rt.session_recall_items = list(by_id.values())[-_MAX_PRIOR_ITEMS:]
+    rt.session_recall_gaps = gaps
 
 
 def gap_closure_prompt(rt: Any, gaps: list[str]) -> str:
@@ -184,4 +133,4 @@ def evidence_rows(evidence: list[Evidence]) -> list[dict]:
     return rows
 
 
-__all__ = ["evidence_rows", "gap_closure_prompt", "preload_session_context"]
+__all__ = ["evidence_rows", "gap_closure_prompt", "load_session_context"]

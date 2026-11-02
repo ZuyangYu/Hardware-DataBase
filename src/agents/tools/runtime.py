@@ -235,7 +235,8 @@ class ToolRuntime:
     progress_events: int = 0
     loop_stop_reason: str = ""
     seen_sources: set[str] = field(default_factory=set)
-    prior_evidence_ids: set[str] = field(default_factory=set)
+    session_recall_items: list[Evidence] = field(default_factory=list)
+    session_recall_gaps: list[str] = field(default_factory=list)
     prior_gaps: list[str] = field(default_factory=list)
     last_rejection_reasons: dict[str, int] = field(default_factory=dict)
     _invocation_seq: int = 0
@@ -851,43 +852,6 @@ class ToolRuntime:
                 self.candidate_evidence.pop(key, None)
                 if key in self.candidate_order:
                     self.candidate_order.remove(key)
-
-    def prior_evidence_prompt(self, limit: int = 8) -> str:
-        """Render recent-turn evidence pointers for follow-up questions."""
-
-        with self._lock:
-            rows = []
-            for key in self.candidate_order:
-                if key not in self.prior_evidence_ids:
-                    continue
-                item = self.candidate_evidence.get(key)
-                if item is None:
-                    continue
-                rows.append(
-                    f"- id={key} | {item.source_name or '未知来源'} | "
-                    f"{item.locator or '无位置'} | {' '.join(str(item.content or '').split())[:160]}"
-                )
-                if len(rows) >= max(1, int(limit)):
-                    break
-        if not rows:
-            return ""
-        return (
-            "上一轮已读证据（不可直接引用；需要时用 evidence_read 重新登记）：\n"
-            + "\n".join(rows)
-        )
-
-    def prior_gap_prompt(self) -> str:
-        """Render last turn's unresolved gaps as a follow-up checklist."""
-
-        with self._lock:
-            gaps = [gap for gap in self.prior_gaps[:5] if str(gap).strip()]
-        if not gaps:
-            return ""
-        return (
-            "上一轮遗留缺口（若与本轮问题相关，先用不同关键词或不同来源补齐；"
-            "已解决则忽略，不要重复上一轮相同检索）：\n"
-            + "\n".join(f"- {gap}" for gap in gaps)
-        )
 
     def add_memory_context(self, items: list[dict[str, Any]]) -> None:
         """Keep unique long-term memory rows for the final UI summary."""
