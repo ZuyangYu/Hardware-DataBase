@@ -351,7 +351,11 @@ def test_complex_deep_turn_does_not_offer_a_planner_but_keeps_research_subagent(
     )
     runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
     list(runner.stream(query=query, kb_name="kb_hw", history=[]))
-    assert "middleware" not in captured
+    middleware_names = {
+        type(item).__name__.lower() for item in captured.get("middleware") or []
+    }
+    assert not any("plan" in name or "todo" in name for name in middleware_names)
+    assert "loopbudgetmiddleware" in middleware_names
     subagents = captured.get("subagents") or []
     assert [item["name"] for item in subagents] == ["research"]
     tool_names = {

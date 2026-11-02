@@ -38,18 +38,24 @@ from deepagents import (
 )
 from langchain_core.messages import AIMessage, ToolMessage
 
+from src.agents.assembly import build_agent
 from src.agents.context_budget import (
     append_fragment,
     initial_context_state,
     publish_turn_context,
     read_agent_values,
 )
+from src.agents.middleware.loop_budget import (
+    LoopBudget,
+    LoopBudgetMiddleware,
+    ProgressStopped,
+    TimeBudgetExceeded,
+)
 from src.agents.session_recall import (
     evidence_rows,
     gap_closure_prompt,
     load_session_context,
 )
-from src.agents.middleware.session_context import SessionContextMiddleware
 from src.agents.subagent_trace import record_subagent_end, record_subagent_start
 from src.contracts.agent_events import validate_event_envelope
 from src.agents.turn_meta import (
@@ -1777,19 +1783,17 @@ class MultiSourceAgentRunner:
                 "\n引用编号只对当前轮有效；不要复用上一轮回答或对话历史中的 [n]，"
                 "必须使用本轮工具返回的证据编号。"
             )
-        agent_kwargs: dict[str, Any] = {
-            "model": model,
-            "tools": tools,
-            "system_prompt": system_prompt,
-            "checkpointer": checkpointer,
-        }
-        if agent_subagents:
-            agent_kwargs["subagents"] = agent_subagents
-        if getattr(rt, "session_state_text", ""):
-            agent_kwargs["middleware"] = [
-                SessionContextMiddleware(rt.session_state_text)
-            ]
-        agent = create_deep_agent(**agent_kwargs)
+        loop_budget = LoopBudget(rt)
+        agent = build_agent(
+            model=model,
+            tools=tools,
+            system_prompt=system_prompt,
+            checkpointer=checkpointer,
+            subagents=agent_subagents,
+            session_state_text=getattr(rt, "session_state_text", ""),
+            middleware=[LoopBudgetMiddleware(loop_budget)],
+            factory=create_deep_agent,
+        )
         config: dict[str, Any] = {"recursion_limit": recursion_limit}
         if checkpointer is not None:
             config["configurable"] = {"thread_id": str(thread_id)}
@@ -1819,17 +1823,12 @@ class MultiSourceAgentRunner:
         subagents: list[dict[str, Any]] = []
         subagent_by_call: dict[str, dict[str, Any]] = {}
 
-        def _stream_round(round_splitter: _AnswerSplitter, deadline: float | None = None):
-            nonlocal progress_stopped, time_stopped
+        def _stream_round(round_splitter: _AnswerSplitter):
             for chunk, metadata in agent.stream(
                 {"messages": messages},
                 config=config,
                 stream_mode="messages",
             ):
-                if deadline is not None and time.monotonic() > deadline:
-                    if gap_rounds == 0:
-                        time_stopped = True
-                    break
                 rt.check_cancel()
                 node = str((metadata or {}).get("langgraph_node") or "")
                 _accumulate_usage(usage, chunk)
@@ -1843,10 +1842,6 @@ class MultiSourceAgentRunner:
                             failed=str(getattr(chunk, "status", "") or "").lower() == "error",
                             emit_event=emit_event,
                         )
-                    if rt.should_stop_for_no_progress():
-                        progress_stopped = True
-                        rt.mark_ended()
-                        break
                     continue
                 # Real providers stream AIMessageChunk pieces; fake/fallback
                 # paths deliver a whole AIMessage per model call. Empty-text
@@ -1880,15 +1875,23 @@ class MultiSourceAgentRunner:
         from langgraph.errors import GraphRecursionError
 
         gap_rounds = 0
-        stream_deadline: float | None = turn_started + 480
+        loop_budget.deadline = turn_started + 480
         pre_candidates = set(rt.candidate_evidence)
         retracted_answers: list[str] = []
         try:
             with bind_cancel_check(should_cancel):
                 while True:
                     try:
-                        for delta in _stream_round(splitter, stream_deadline):
+                        for delta in _stream_round(splitter):
                             yield delta
+                    except ProgressStopped:
+                        if gap_rounds == 0:
+                            progress_stopped = True
+                        break
+                    except TimeBudgetExceeded:
+                        if gap_rounds == 0:
+                            time_stopped = True
+                        break
                     except GraphRecursionError:
                         if gap_rounds == 0:
                             raise
@@ -1921,7 +1924,7 @@ class MultiSourceAgentRunner:
                         emit_event({"type": "narration", "payload": {"text": draft}})
                         retracted_answers.append(draft)
                     gap_rounds += 1
-                    stream_deadline = min(time.monotonic() + 90, turn_started + 450)
+                    loop_budget.deadline = min(time.monotonic() + 90, turn_started + 450)
                     messages = [
                         {"role": "user", "content": gap_closure_prompt(rt, gaps)}
                     ]
