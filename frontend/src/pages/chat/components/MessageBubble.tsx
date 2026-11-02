@@ -82,6 +82,9 @@ function CollapsibleSection({
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen);
+  useEffect(() => {
+    setOpen(defaultOpen);
+  }, [defaultOpen]);
   return (
     <div className={className}>
       <button
@@ -581,10 +584,7 @@ function MessageBubble({
               {showDiagnostics && !isError && <AssistantIdentity />}
               {showDiagnostics && resolvedSubagents.length > 0 && <SubagentPanel subagents={resolvedSubagents} />}
               {showDiagnostics && traceSteps.length > 0 && (
-                <StepGroup
-                  steps={traceSteps}
-                  defaultOpen={traceSteps.some((step) => step.status === 'error' || step.empty_reason)}
-                />
+                <StepGroup steps={traceSteps} defaultOpen={false} />
               )}
               <MarkdownMessage content={msg.content} />
               <FeedbackActions msg={msg} />
