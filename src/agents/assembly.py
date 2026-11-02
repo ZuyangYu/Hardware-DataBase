@@ -10,6 +10,8 @@ from __future__ import annotations
 from typing import Any, Callable, Sequence
 
 from deepagents import create_deep_agent as default_create_deep_agent
+from deepagents.backends.filesystem import FilesystemBackend
+from deepagents.middleware.filesystem import FilesystemPermission
 
 from src.agents.middleware.session_context import SessionContextMiddleware
 
@@ -22,6 +24,7 @@ def build_agent(
     checkpointer: Any = None,
     subagents: Sequence[Any] | None = None,
     session_state_text: str = "",
+    skill_root: str | None = None,
     middleware: Sequence[Any] | None = None,
     factory: Callable[..., Any] = default_create_deep_agent,
 ) -> Any:
@@ -44,6 +47,19 @@ def build_agent(
         "system_prompt": system_prompt,
         "checkpointer": checkpointer,
     }
+    if skill_root:
+        # Official progressive disclosure: only SKILL.md metadata is in the
+        # prompt; the model reads full instructions on demand.  Writes are
+        # denied so the agent cannot mutate the reviewed skill source.
+        kwargs["skills"] = ["/"]
+        kwargs["backend"] = FilesystemBackend(
+            root_dir=skill_root, virtual_mode=True
+        )
+        kwargs["permissions"] = [
+            FilesystemPermission(
+                operations=["write"], paths=["/**"], mode="deny"
+            )
+        ]
     if stack:
         kwargs["middleware"] = stack
     if subagents:

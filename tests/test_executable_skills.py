@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from deepagents import create_deep_agent
 
 import src.settings as settings
+from src.agents.skill_materializer import load_skill_prompt_context
 from src.api.routes import sandbox as routes
 from src.api.schemas import SandboxSkillExecutionBindingRequest, SandboxSkillRunRequest
 from src.sandbox.artifact_broker import ArtifactBroker
@@ -298,7 +299,6 @@ def test_admin_published_all_department_skills_require_employee_department_and_s
 
 
 def test_subscribed_text_is_mounted_in_employee_conversation_only(setup, monkeypatch):
-    from src.agents.runner import MultiSourceAgentRunner
     import src.core.auth as auth_module
 
     _, _, skills, _, _ = setup
@@ -315,7 +315,7 @@ def test_subscribed_text_is_mounted_in_employee_conversation_only(setup, monkeyp
     skills.enable("skill/checklist")
     context = SimpleNamespace(user_id="tester", metadata={"actor_department_id": "dept-1"},
                               is_system_admin=lambda: False)
-    load = MultiSourceAgentRunner._load_skill_prompt_context
+    load = load_skill_prompt_context
     assert load(context) == ""
     skills.subscribe("skill/checklist", principal_id=42, department_id="dept-1")
     assert "Verify component voltage" in load(context)
@@ -326,7 +326,6 @@ def test_subscribed_text_is_mounted_in_employee_conversation_only(setup, monkeyp
 
 
 def test_skill_prompt_context_failure_reports_bounded_error(setup, monkeypatch):
-    from src.agents.runner import MultiSourceAgentRunner
     from src.sandbox import skills as skills_module
     import src.core.auth as auth_module
 
@@ -345,7 +344,7 @@ def test_skill_prompt_context_failure_reports_bounded_error(setup, monkeypatch):
     context = SimpleNamespace(user_id="tester", metadata={"actor_department_id": "dept-1"},
                               is_system_admin=lambda: False)
     seen: list[str] = []
-    text = MultiSourceAgentRunner._load_skill_prompt_context(
+    text = load_skill_prompt_context(
         context, on_error=lambda exc: seen.append(type(exc).__name__),
     )
     assert text == ""

@@ -47,3 +47,25 @@ def test_build_agent_omits_middleware_without_session_state():
 
     assert "middleware" not in captured
     assert "subagents" not in captured
+
+
+def test_build_agent_wires_official_skills_backend(tmp_path):
+    captured = {}
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return "agent"
+
+    build_agent(
+        model="model",
+        tools=[],
+        system_prompt="prompt",
+        skill_root=str(skill_root),
+        factory=factory,
+    )
+
+    assert captured["skills"] == ["/"]
+    assert captured["backend"].__class__.__name__ == "FilesystemBackend"
+    assert captured["permissions"][0].mode == "deny"
