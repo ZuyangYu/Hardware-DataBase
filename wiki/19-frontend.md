@@ -127,7 +127,7 @@ i18n 库、ESLint/Prettier/Biome（无 lint 配置）。
 
 **消费的 turn 事件**（`useKbChat.ts`）：
 `delta`（追加文本）、`narration`（从累积回答中剥离计划叙述）、
-`stage`/`tool_started`/`tool_result`（轨迹步骤）、`degraded`（降级横幅）、
+`stage`/`tool_started`/`tool_result`（轨迹步骤，统一经 `api/agentEvents.ts` 解析，工具用 `call_id` 配对）、`degraded`（降级横幅）、
 `document_card`/`document_clarification_question`/`document_clarification_ready`（卡片）、
 `done`（**权威回答** + footer + `summary.evidence` + `summary.memory_context`）、`error`。
 
@@ -190,8 +190,10 @@ admin 删除、employee 创建。
   `MessageView.trace_steps` / `.cards` 回填；
 - **停止**：只有显式点「停止」才 `POST /turns/{id}/cancel`；
   导航/切 KB/卸载只**断开客户端流**（`chatTaskLifecycle.ts`）；
-- **轨迹**：`tool_started`/`tool_result`/`stage` → 每次调用的步骤（单调 `toolCallSeqRef` + 活动键映射）、
-  工具中文标签、完成后 5s 自动隐藏、流式文本 64ms 节流 flush；
+- **处理过程**：`narration` 仍只从最终答案中剥离，不进入时间线；`stage`/`tool_started`/
+  `tool_result` → 按 `call_id` 配对的扁平时间线；工具行显示输入 query/SQL、命中数、来源、
+  证据条数、候选条数（未登记、不可引用）、`empty_reason`（零命中原因）。完成后 5s 自动隐藏，流式文本 64ms 节流 flush；
+  刷新后从 `MessageView.trace_steps` 恢复同一时间线。
 - **证据/引用**：`EvidenceBlock`（默认折叠，`[n]` + 文件名 + 3 行预览 + 定位：sheet+cell / 页码 /
   chunk / 设计）；记忆上下文单独以 `[M n]` 渲染；
 - **附件**：左侧「+」，`CHAT_ATTACHMENT_ACCEPT = .pdf,.docx,.txt,.md,.xlsx,.xlsm,.edf,.edif`；

@@ -203,9 +203,6 @@ export default function ChatPage({
     streamingText,
     traceSteps,
     traceByMessageId,
-    livePlan,
-    liveBudget,
-    liveVerification,
     liveSubagents,
     degradedNotes,
     turnQueueNotice,
@@ -676,20 +673,7 @@ export default function ChatPage({
           streamingText={streamingText}
           traceSteps={traceSteps}
           traceByMessageId={traceByMessageId}
-          livePlan={livePlan}
-          liveBudget={liveBudget}
-          liveVerification={liveVerification}
           liveSubagents={liveSubagents}
-          onContinue={() => {
-            void send({
-              attachmentIds: [],
-              textOverride:
-                '请基于上一轮已经收集到的证据，继续完成未完成的部分；先说明哪些部分已完成、哪些仍待确认，并保留有效引用。',
-            });
-          }}
-          onNarrowScope={() => {
-            setInput('请缩小范围：只完成上一轮任务中最关键的一个小节，并明确列出其余待确认项。');
-          }}
           degradedNotes={degradedNotes}
           onCreateMemory={(messageIds) => void openUserMemoryDialog(messageIds)}
           onCreateProjectMemory={

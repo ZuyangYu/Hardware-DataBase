@@ -32,7 +32,8 @@ def make_memory_search(
         rt.check_cancel()
         query = str(query or "").strip()
         requested = max(1, min(int(top_k), 20))
-        rt.emit("tool_started", {"tool_name": "memory_search", "query": query})
+        call_id = rt.next_invocation_id()
+        rt.tool_started(call_id=call_id, tool_name="memory_search", query=query)
         started = time.monotonic()
         service = memory_service
         owns_service = False
@@ -61,7 +62,13 @@ def make_memory_search(
                     filters={"scope": str(scope or "all"), "status": str(status or "all")},
                 )
             )
-            rt.emit("tool_result", {"tool_name": "memory_search", "hit_count": len(public), "status": "done"})
+            rt.tool_result(
+                call_id=call_id,
+                tool_name="memory_search",
+                hit_count=len(public),
+                status="done",
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
             return json.dumps(output, ensure_ascii=False)
         except MemoryAuthorizationError as exc:
             rt.record_diagnostic(
@@ -73,7 +80,14 @@ def make_memory_search(
                     filters={"scope": str(scope or "all"), "status": str(status or "all")},
                 )
             )
-            rt.emit("tool_result", {"tool_name": "memory_search", "hit_count": 0, "status": "failed"})
+            rt.tool_result(
+                call_id=call_id,
+                tool_name="memory_search",
+                hit_count=0,
+                status="failed",
+                latency_ms=int((time.monotonic() - started) * 1000),
+                error=str(exc)[:300],
+            )
             return json.dumps({"results": [], "error": "当前请求没有可用的长期记忆范围"}, ensure_ascii=False)
         except Exception as exc:
             rt.record_diagnostic(
@@ -84,7 +98,14 @@ def make_memory_search(
                     latency_ms=int((time.monotonic() - started) * 1000),
                 )
             )
-            rt.emit("tool_result", {"tool_name": "memory_search", "hit_count": 0, "status": "failed"})
+            rt.tool_result(
+                call_id=call_id,
+                tool_name="memory_search",
+                hit_count=0,
+                status="failed",
+                latency_ms=int((time.monotonic() - started) * 1000),
+                error=str(exc)[:300],
+            )
             return json.dumps({"results": [], "error": "长期记忆暂时不可用"}, ensure_ascii=False)
         finally:
             if owns_service:

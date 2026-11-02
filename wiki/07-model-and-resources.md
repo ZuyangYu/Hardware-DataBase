@@ -58,7 +58,7 @@ resolve_chat_model_config(*, profile, provider="", model="",
 | endpoint | `AGENT_CUSTOM_BASE_URL` | `AGENT_OLLAMA_BASE_URL`（默认 `http://localhost:11434`） |
 | api_key | `AGENT_CUSTOM_API_KEY` | `""` |
 | 传输重试 | `AGENT_RATE_LIMIT_MAX_RETRIES`（4） | 0 |
-| 公共 | `max_tokens=AGENT_CUSTOM_MAX_TOKENS`(4096)、`temperature=AGENT_TEMPERATURE`(0.2)、`timeout=AGENT_TIMEOUT_SECONDS`(120)、`max_input_tokens=AGENT_MODEL_MAX_INPUT_TOKENS`(65536) | |
+| 公共 | `max_tokens=AGENT_CUSTOM_MAX_TOKENS`(4096)、`temperature=AGENT_TEMPERATURE`(0.2)、`timeout=AGENT_TIMEOUT_SECONDS`(120)、`max_input_tokens=min(AGENT_MODEL_MAX_INPUT_TOKENS, 模型目录窗口)` | 模型目录见 `src/core/model_context.py`；已知小窗口模型会压回真实值 |
 
 profile 覆盖：
 
@@ -292,7 +292,7 @@ default_multimodal_gateway() -> gateway | None
 | `ProviderQuotaExceeded` | `PROVIDER_RPM/TPM_LIMIT` 触发 | 调额或关闭（0） |
 | 流式卡住不结束 | 模型端挂起 | 设 `LLM_STREAM_IDLE_TIMEOUT_SECONDS > 0` |
 | 429 但模型没被调用 | 请求级准入 RPM | 看 reason 码；调 `ADMISSION_*` |
-| 长回答被截断/摘要 | `AGENT_MODEL_MAX_INPUT_TOKENS` 触发摘要中间件 | 调大或置 0 |
+| 长回答被截断/摘要 | `AGENT_MODEL_MAX_INPUT_TOKENS` 与模型目录窗口共同触发摘要中间件 | 看 `context_compacted` / `context_pressure` 与 `summary.context_manifest`；确认模型目录是否匹配 |
 | 结构化输出报错 | 模型不支持 tool/结构化 | 依赖 `invoke_structured` 的 `text_fallback`；日志有 `text_compat` 标注 |
 | 评估结果标记 bypassed | `govern_ragas_llm` 未成功装配 | 该结果不得用于生产容量/质量验收 |
 | token 用量对不上 | 有的调用没返回 usage | `usage_returned_calls` 与 `calls` 的差值就是无 usage 的调用数 |

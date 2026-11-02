@@ -8,6 +8,8 @@
 import unittest
 
 from src.agents.schemas import Evidence
+from types import SimpleNamespace
+
 from src.agents.tools.runtime import (
     ToolRuntime,
     empty_result_message,
@@ -15,6 +17,7 @@ from src.agents.tools.runtime import (
     timed_tool_call,
 )
 from src.agents.tools.spreadsheet_tools import _sql_evidence_id
+from src.services.turn_evidence_plan import EvidenceRequirement, TurnEvidencePlan
 
 
 def _evidence(eid: str, content: str = "MCU 供电为 VCC3V3_MCU。") -> Evidence:
@@ -31,6 +34,78 @@ def _evidence(eid: str, content: str = "MCU 供电为 VCC3V3_MCU。") -> Evidenc
 
 
 class TimedToolCallRepeatTests(unittest.TestCase):
+    def test_tool_events_share_a_stable_call_id(self):
+        events: list[dict] = []
+        rt = ToolRuntime(kb_name="kb", ctx=None, on_event=events.append)
+        timed_tool_call(
+            rt, "document_search", "电源方案", None, lambda: [_evidence("document:1")]
+        )
+        timed_tool_call(
+            rt, "document_search", "电源方案二", None, lambda: [_evidence("document:2")]
+        )
+        started = [event for event in events if event["type"] == "tool_started"]
+        completed = [event for event in events if event["type"] == "tool_result"]
+        self.assertEqual(len(started), 2)
+        self.assertEqual(len(completed), 2)
+        self.assertEqual(
+            [event["payload"]["call_id"] for event in started],
+            ["inv-1", "inv-2"],
+        )
+        self.assertEqual(
+            [event["payload"]["call_id"] for event in started],
+            [event["payload"]["call_id"] for event in completed],
+        )
+        self.assertTrue(
+            all(event["payload"]["item_id"] == f"tool:{event['payload']['call_id']}" for event in started)
+        )
+        self.assertEqual(completed[0]["payload"]["sources"], ["设计说明.docx"])
+        self.assertEqual(completed[0]["payload"]["evidence_count"], 1)
+        self.assertEqual(completed[0]["payload"]["citation_numbers"], [1])
+        self.assertEqual(completed[0]["payload"]["empty_reason"], "")
+
+    def test_out_of_scope_is_not_reported_as_budget_exhausted(self):
+        events: list[dict] = []
+        rt = ToolRuntime(kb_name="kb", ctx=None, on_event=events.append)
+        rt.knowledge_scope = SimpleNamespace(sources=[SimpleNamespace(kb_id=999)])
+        rt.turn_evidence_plan = TurnEvidencePlan(
+            turn_id="t1",
+            required=[
+                EvidenceRequirement(
+                    requirement_id="target-other:q1:1",
+                    target_id="target-other",
+                    query_id="q1",
+                    kb_id=999,
+                    kb_name="other",
+                    record_id=999,
+                )
+            ],
+            targeted_kb_ids=[999],
+            selected_kb_ids=[999],
+        )
+        items, _ = timed_tool_call(
+            rt, "document_search", "电源方案", None, lambda: [_evidence("document:1")]
+        )
+        self.assertFalse(items.budget_blocked)
+        self.assertEqual(items.empty_reason, "out_of_scope")
+        result = [event for event in events if event["type"] == "tool_result"][-1]
+        self.assertEqual(result["payload"]["empty_reason"], "out_of_scope")
+        self.assertIn("来源范围", format_tool_result(rt, False, items))
+
+    def test_full_budget_is_reported_as_budget_exhausted(self):
+        events: list[dict] = []
+        rt = ToolRuntime(kb_name="kb", ctx=None, evidence_budget=1, on_event=events.append)
+        first, _ = timed_tool_call(
+            rt, "document_search", "q1", None, lambda: [_evidence("document:1")]
+        )
+        self.assertEqual(len(first), 1)
+        second, _ = timed_tool_call(
+            rt, "document_search", "q2", None, lambda: [_evidence("document:2")]
+        )
+        self.assertTrue(second.budget_blocked)
+        self.assertEqual(second.empty_reason, "budget_blocked")
+        result = [event for event in events if event["type"] == "tool_result"][-1]
+        self.assertEqual(result["payload"]["empty_reason"], "budget_blocked")
+
     def test_first_call_renders_full_evidence(self):
         rt = ToolRuntime(kb_name="kb", ctx=None)
         items, adds_nothing = timed_tool_call(

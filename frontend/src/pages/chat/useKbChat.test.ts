@@ -1,42 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import {
-  buildTurnRequest,
-  mergeMcpWriteProposalFromSseEvent,
-  parseTurnBudget,
-  parseTurnPlan,
-  parseTurnSubagent,
-  parseTurnVerification,
-} from './useKbChat';
-
-describe('MCP write proposal card lifecycle', () => {
-  it('parses and updates the inline proposal card without treating it as evidence', () => {
-    const first = mergeMcpWriteProposalFromSseEvent([], 'mcp_write_proposal', JSON.stringify({
-      card: {
-        kind: 'mcp_write_proposal',
-        proposal_id: 'proposal-1',
-        server: 'kicad',
-        server_name: 'KiCad',
-        tool: 'create_schematic',
-        arguments_digest: 'abc123',
-        artifact_hint: 'kicad_sch',
-        status: 'proposed',
-        expires_at: '2030-01-01T00:00:00Z',
-      },
-    }));
-    expect(first).toHaveLength(1);
-    const completed = mergeMcpWriteProposalFromSseEvent(first, 'mcp_write_proposal', JSON.stringify({
-      card: {
-        kind: 'mcp_write_proposal',
-        proposal_id: 'proposal-1',
-        status: 'completed',
-        artifact_filename: 'board.kicad_sch',
-      },
-    }));
-    expect(completed[0]).toMatchObject({ status: 'completed', artifact_filename: 'board.kicad_sch' });
-    expect(mergeMcpWriteProposalFromSseEvent(completed, 'tool_result', '{}')).toEqual(completed);
-  });
-});
+import { buildTurnRequest } from './useKbChat';
 
 describe('turn request construction', () => {
   it('keeps attachments and the knowledge scope separate from the query', () => {
@@ -90,38 +54,5 @@ describe('turn request construction', () => {
 
     expect(request.attachment_ids).toEqual(['attachment-1']);
     expect(request).not.toHaveProperty('source_scope');
-  });
-});
-
-describe('turn meta SSE projection', () => {
-  it('normalizes plan items and drops empty entries', () => {
-    const plan = parseTurnPlan(JSON.stringify({
-      revision: 2,
-      items: [
-        { content: '读取 BOM', status: 'completed' },
-        { content: '', status: 'pending' },
-        { content: '输出表格', status: 'unexpected' },
-      ],
-    }));
-    expect(plan?.revision).toBe(2);
-    expect(plan?.items).toEqual([
-      { content: '读取 BOM', status: 'completed' },
-      { content: '输出表格', status: 'pending' },
-    ]);
-  });
-
-  it('parses budget, verification and subagent payloads', () => {
-    expect(parseTurnBudget(JSON.stringify({ status: 'exhausted', exhausted: true }))?.exhausted)
-      .toBe(true);
-    expect(parseTurnVerification(JSON.stringify({
-      status: 'partial',
-      checks: [{ key: 'answer_present', label: '回答非空', status: 'pass' }],
-    }))?.status).toBe('partial');
-    expect(parseTurnSubagent(JSON.stringify({
-      name: 'research',
-      status: 'completed',
-    }))?.name).toBe('research');
-    expect(parseTurnVerification('{"status":"weird"}')).toBeNull();
-    expect(parseTurnPlan('not-json')).toBeNull();
   });
 });

@@ -203,20 +203,33 @@ list_turn_events(user_id, turn_id, after_seq=0)
 
 ### 5.2 SSE 事件目录（前端消费契约）
 
+每个事件的 `payload_json` 都由 `src/contracts/agent_events.py` 的 payload
+模型校验后落库；所有事件带 `schema_version` 与稳定 `item_id`，工具事件还必须带
+`call_id`。SSE 仍用事件名做判别，`data` 是校验后的 payload。前端统一由
+`frontend/src/api/agentEvents.ts` 解析，不再按工具名做兜底配对。
+
 | 事件 | 载荷要点 | 前端行为 |
 |---|---|---|
-| `delta` | `{text}` | 追加流式文本（64ms 节流合并渲染） |
-| `narration` | `{text}` | 从累积回答中剥离「计划叙述」段落 |
-| `stage` | `{stage, status, message, ...}` | 轨迹步骤（含 blocked/error 控制路径） |
-| `tool_started` | `{tool, args, seq, automatic?}` | 插入活动轨迹项 |
-| `tool_result` | `{tool, status, hit_count, ...}` | 结束轨迹项；失败标红 |
-| `degraded` | `{stage, reason}` | 降级横幅 |
-| `document_clarification_question` / `_ready` | 澄清问答 | 快捷回复 |
+| `delta` | `{text, item_id="answer"}` | 追加流式文本（64ms 节流合并渲染） |
+| `narration` | `{text, item_id="answer"}` | 从累积回答中剥离「计划叙述」段落 |
+| `stage` | `{key, label, status, detail, item_id="stage:<key>"}` | 轨迹步骤（含 blocked/error 控制路径） |
+| `tool_started` | `{call_id, tool_name, tool_kind, label, detail, query?, ...}` | 用 `call_id` 插入活动轨迹项 |
+| `tool_result` | `{call_id, tool_name, tool_kind, status, label, detail, hit_count, evidence_count, sources?, citation_numbers?, empty_reason?, latency_ms?, ...}` | 用 `call_id` 结束同一轨迹项；展示来源/证据条数/零命中原因；失败/拒绝标红 |
+| `degraded` | `{stage, reason, item_id}` | 降级横幅 |
+| `plan_created` / `plan_updated` | `{items, revision, source?, item_id="plan"}` | 历史事件兼容；计划模式已移除，当前不再产生 |
+| `budget` / `budget_exhausted` | `{status, exhausted, stopped_reason, tool_calls, evidence_count, ...}` | 后端预算状态；`stopped_reason` 区分 `recursion_limit` / `no_progress`；前端不再渲染预算/部分交付卡片 |
+| `verification` | `{status, checks, gaps, ...}` | 后端校验结果；仅持久化，前端不渲染校验卡片 |
+| `evidence_compressed` | `{stage="partial_synthesis", evidence_count, compressed_bytes, max_bytes}` | 收尾时证据正文压缩；仅持久化，前端不提示 |
+| `context_pressure` | `{max_prompt_tokens, window_tokens, threshold_tokens, note}` | 仅后端诊断，前端不提示 |
+| `context_compacted` | `{stage="summarization", trigger, cutoff_index, dropped_messages, retained_messages, before_tokens, after_tokens, summary_sha256, offload_path, ...}` | 真实压缩事件；仅持久化，前端不提示 |
+| `subagent_started` / `_completed` | `{name, status, tool_call_id, item_id="subagent:<id>"}` | 更新子任务摘要 |
+| `document_card` | `{card, item_id="document_card:<kind>:<id>"}` | 渲染附件候选卡 |
+| `mcp_write_proposal` | `{card, item_id="mcp_write_proposal:<proposal_id>"}` | 渲染写入确认卡 |
 | `done` | `{answer, footer, summary{evidence,memory_context}, ...}` | **权威回答**（覆盖流式文本） |
 | `error` | `{message, cancelled?}` | 错误展示 |
 | `attachment_ready` / `attachment_failed` | 等待收敛 | 队列提示条 |
 
-`purpose`/`footer` 之外的细节由 `src/api/schemas.py` 的 `TurnEventView` 定义。
+`done` 之外的细节由 `src/api/schemas.py` 的 `TurnEventView` 定义。
 
 ### 5.3 取消（协作式）
 

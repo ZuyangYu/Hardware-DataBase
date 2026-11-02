@@ -406,6 +406,66 @@ def record_agent_step(*, step_count: int, status: str) -> None:
     )
 
 
+def record_context_compaction(
+    *,
+    trigger: str,
+    outcome: str,
+    dropped_messages: int,
+    before_tokens: int,
+    after_tokens: int,
+    summary_chars: int,
+) -> None:
+    counter(
+        "hdb.agent.compaction_total",
+        attributes={"trigger": trigger, "outcome": outcome},
+        description="Real summarization events observed from the agent state",
+    )
+    histogram(
+        "hdb.agent.compaction_dropped_messages",
+        max(0, int(dropped_messages)),
+        unit="1",
+        description="Messages replaced by one compaction window",
+    )
+    histogram(
+        "hdb.agent.compaction_tokens_before",
+        max(0, int(before_tokens)),
+        unit="1",
+        description="Raw persisted context tokens before compaction",
+    )
+    histogram(
+        "hdb.agent.compaction_tokens_after",
+        max(0, int(after_tokens)),
+        unit="1",
+        description="Effective context tokens after compaction",
+    )
+    histogram(
+        "hdb.agent.compaction_summary_chars",
+        max(0, int(summary_chars)),
+        unit="1",
+        description="Summary length produced by compaction",
+    )
+
+
+def record_context_pressure(*, stage: str, max_prompt_tokens: int, window_tokens: int) -> None:
+    counter(
+        "hdb.agent.context_pressure_total",
+        attributes={"stage": stage or "warning"},
+        description="Turns approaching the model context window without compaction",
+    )
+    histogram(
+        "hdb.agent.context_pressure_tokens",
+        max(0, int(max_prompt_tokens)),
+        unit="1",
+        description="Observed prompt tokens when context pressure is reported",
+    )
+    histogram(
+        "hdb.agent.context_window_tokens",
+        max(0, int(window_tokens)),
+        unit="1",
+        description="Resolved model context window",
+    )
+
+
 def record_agent_cancel(*, reason: str) -> None:
     counter(
         "hdb.agent.cancel_count",

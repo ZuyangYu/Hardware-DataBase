@@ -23,12 +23,14 @@
    （丢掉朴素 source_group 硬过滤，保留冻结的 `source_names` 作用域）。
 
 循环预算：基础 `recursion_limit` 仍由 `AGENT_MAX_RETRIEVAL_ROUNDS` 决定
-（`deep` 模式 `rounds*12`，`fast` 模式 `rounds*6`）；复杂轮次再按
+（`deep` 模式 `max(48, rounds*16)`，`fast` 模式 `max(24, rounds*8)`）；复杂轮次再按
 **问题长度/显式子任务数/附件数/知识库数** 增加预算，并由
-`AGENT_RECURSION_LIMIT_MAX` 封顶。复杂度只影响预算和可选质量机制，不决定工具面或路由。
+`AGENT_RECURSION_LIMIT_MAX`（默认 120）封顶。复杂度只影响预算和可选质量机制，不决定工具面或路由。
+循环不靠固定步数硬砍：每次工具调用后检查是否新增证据、候选或来源；
+连续多次没有新增才以 `no_progress` 提前收尾，有进展的多跳问题可以继续使用剩余预算。
 步数耗尽后不会只返回错误：先发 `budget_exhausted`，再用已登记证据做一次
 **非工具收尾 synthesis**（内置常量 `PARTIAL_SYNTHESIS_ENABLED=true`），输出“部分结果 + 缺口”；
-模型失败时回退到确定性证据摘要。`context_compacted` 事件记录证据压缩；压缩会优先保留
+模型失败时回退到确定性证据摘要。`evidence_compressed` 事件记录证据正文压缩（不是对话窗口压缩）；压缩会优先保留
 短附件/每个来源的代表块，避免把一份短 BOM 只截成前两行。收尾答案会追加回 checkpoint，
 下一轮追问仍能看到它。复杂轮次还会提供可选的只读 research 子代理
 （内置常量 `RESEARCH_SUBAGENT_ENABLED=true`）和独立语义 rubric 校验
@@ -36,10 +38,9 @@
 模型输出 `[K6]`/`[A2]`/`【知识库:6】` 时，会在持久化前归一化为 `[6]`，引用面板继续按
 evidence metadata 区分附件与知识库。
 
-`deep` 轮次向模型提供 `write_todos`（TodoListMiddleware）；模型自行决定是否使用。
-计划、预算、子任务和校验结果通过 `plan_created/plan_updated`、`budget`、
-`subagent_started/completed`、`verification` 事件下发，并投影到 turn summary，
-刷新后仍可从消息恢复。子代理只返回摘要/状态，不把原始上下文写进聊天区。
+`deep` 轮次不再向模型提供 `write_todos`/执行计划；计划模式已移除，聊天区也不再渲染计划卡片。
+预算、子任务和校验结果通过 `budget`、`subagent_started/completed`、`verification` 事件下发，
+并投影到 turn summary，刷新后仍可从消息恢复。子代理只返回摘要/状态，不把原始上下文写进聊天区。
 
 ---
 
@@ -99,9 +100,18 @@ messages = [{"role":"user","content":query}] if has_state else _build_messages(q
 
 ### 2.3 上下文自动压缩
 
-`AGENT_MODEL_MAX_INPUT_TOKENS`（默认 65536）会在 model profile 上写入
-`{"max_input_tokens": ...}`，激活 deepagents 的 `SummarizationMiddleware`
-（85% 触发 / 保留 10%）。设为 0 关闭。
+`src/core/model_context.py` 先按 provider/model 解析保守的上下文窗口；
+`AGENT_MODEL_MAX_INPUT_TOKENS` 只是上限覆盖：已知模型（如 `qwen2.5:32b`）
+会把过大的全局默认值压回模型真实窗口，避免压缩触发晚于模型上限。设为 0 关闭。
+解析结果写入 model profile 的 `{"max_input_tokens": ...}`，激活 deepagents 的
+`SummarizationMiddleware`（85% 触发 / 保留 10%）。
+
+压缩不再是事后猜测：runner 在 turn 前读取 `_summarization_event` 快照，turn 后
+对比真实事件，发 `context_compacted`（`cutoff_index`、丢弃/保留消息数、
+before/after tokens、摘要 hash、offload path）；只有“接近窗口但没有压缩”时才发
+`context_pressure`。每轮同时写 `turn.summary["context_manifest"]`（system prompt
+hash、各 fragment 字节数、evidence 字节数、模型窗口、实际 input tokens），
+不落 prompt/证据正文。
 
 ---
 
@@ -112,6 +122,9 @@ messages = [{"role":"user","content":query}] if has_state else _build_messages(q
 | 工具 | 工厂 | 连接的服务 | 默认可见性 |
 |---|---|---|---|
 | `document_search` | `make_document_search` | `RAGBackend.retrieve`（RAGFlow） | 常开 |
+| `kb_grep` | `make_kb_grep` | `storage/pointer_index`（FTS5 + LIKE） | 常开 |
+| `session_recall` | `make_session_recall` | `ToolRuntime.session_recall_items/gaps` | 常开（模型主动调用） |
+| `evidence_read` | `make_evidence_read` | `ToolRuntime.candidate_evidence`（无外部调用） | 常开（候选优先检索） |
 | `circuit_search` | `make_circuit_search` | `CircuitIndexService.query` | KB 有电路数据时可用 |
 | `spreadsheet_schema_lookup` / `spreadsheet_sql_query` / `spreadsheet_row_search` / `spreadsheet_cell_lookup` | `make_spreadsheet_tools` | 每 KB 表索引 SQLite | 常开 |
 | `conversation_search` | `make_conversation_search` | 外部对话索引 | KB 有外部对话时可用 |

@@ -1,6 +1,6 @@
 # 06 · 工具层与证据契约
 
-对应代码：`src/agents/tools/`（11 个模块）、`src/agents/tools/runtime.py`（ToolRuntime）、
+对应代码：`src/agents/tools/`（各工具模块）、`src/agents/tools/runtime.py`（ToolRuntime）、
 `src/agents/tools/retrieval_executor.py`（批量检索执行器）、
 `src/pipelines/document_rag/schemas.py::Evidence`。
 
@@ -44,8 +44,9 @@ class Evidence:                    # document_rag/schemas.py:59
 |---|---|
 | 作用域 | `kb_name`、`ctx`、附件 refs、`source_scope`、`department_id`；构造后不可变 |
 | 取消 | `should_cancel()` 回调；工具调用前后检查 |
-| 事件 | `emit(event_type, payload)`：`tool_started` / `tool_result` / `stage` / `degraded` 等 |
-| 证据 | `add_evidence(evidence)`（去重 + 预算裁剪）、`evidence` 列表、citation 编号分配 |
+| 事件 | `emit(event_type, payload)` 经 `src/contracts/agent_events.py` 校验；工具事件用 `tool_started/tool_result` 辅助方法，必须有稳定 `call_id` |
+| 证据 | `add_evidence(evidence, admit_limit=...)`（去重 + 预算裁剪 + 可选单次准入上限）、`evidence` 列表、citation 编号分配 |
+| 候选 | `candidate_mode` + `candidate_evidence`：检索命中默认先进入不可引用的候选索引，`evidence_read` 再按 id 提升为正式证据 |
 | 预算 | `evidence_budget`（有附件时 `max(30, 80)`）、`budget_blocked` 标记与超限提示 |
 | 诊断 | `diagnostics`（每工具 status/hit_count/top_k/duration/scoped） |
 | 查询账本 | `queries`（每轮检索的 query 指纹/命中数） |
@@ -72,13 +73,55 @@ class Evidence:                    # document_rag/schemas.py:59
 比较工具按 `evidence.compare` 能力开放，由模型自行选择来源和调用时机；
 服务端不再根据正则/`purpose` 自动预检，也不会替模型预选附件。
 
+### 2.2 指针优先检索（2026-10-30）
+
+知识库对话默认开启 `ToolRuntime.candidate_mode`：
+
+1. `document_search`、`document_search_batch`、`kb_grep`、`circuit_search`、
+   `conversation_search`、`wiki_search`、表格行/单元格检索、附件检索等工具
+   返回的全部命中先进入 `candidate_evidence`（非引用、非正式证据）；
+2. **不再自动准入**：任何搜索命中都不会直接获得 `[n]`，也不会占用正式证据预算；
+3. 命中以 `id / 来源 / 位置 / score / ≤180 字符摘要` 的候选索引返回；
+4. 模型判断候选与问题直接相关后调用 `evidence_read(candidate_ids=[...])`，
+   选中的候选才进入正式证据账本并获得引用编号；
+5. 已提升的候选从候选索引移除，重复检索不会再次提升同一批候选。
+
+`kb_grep` 是精确/正则/多模式指针检索：一次可传多个型号、位号或信号名，
+只返回指针，不登记证据；适合 TC377、VCC3V3_EQ 这类精确关键词。
+
+指针持久化在 `storage/pointer_index/<sha>.db`（SQLite FTS5 + `LIKE` 合并），
+覆盖 docx/pdf chunk、xlsx 语义行和 EDF 网表/器件；索引按来源记录签名失效，
+同一 KB 的重复检索不再重新解析全文。跨轮证据和缺口不再自动注入：
+最近 3 轮的已读证据和缺口只装入沉睡的 `session_recall` 缓冲区，
+由模型判断当前问题是否延续之前话题；只有模型主动调用 `session_recall`
+时才把旧指针放进候选池并列出缺口，新问题保持干净。正式引用仍在当轮
+由 `evidence_read` 重新登记编号。
+
+候选较多时，前 12 条保留摘要，其余以 `id/来源/位置` 紧凑列出，仍可直接
+`evidence_read`，不会出现“候选未展开但拿不到 id”的情况。回答收尾前会做
+同轮缺口闭环：若草稿出现“未找到/未给出/证据不足”，先把草稿作为 narration
+撤回，带着缺口和未读候选再检索一轮，补齐后重新输出最终回答；补齐轮最多
+再执行 3 次工具调用、软上限 90 秒，且只在本轮仍有未读候选时触发；首轮已
+超过 360 秒的慢轮次直接跳过，保证仍在 600 秒轮次窗口内结束。只有一轮
+闭环仍无法补齐时才保留缺口。首轮另有 480 秒软上限：到点停止继续检索，
+用已登记证据合成部分结果，避免触发布局层的 600 秒超时。每轮回答还会把缺口句写入
+`summary.verification.answer_gaps`，下一轮作为“上一轮遗留缺口”注入；
+`evidence_read` 会在问题中的位号或门限数值尚未出现在证据里时，提示改用
+`kb_grep`/`circuit_search` 或表格查询。
+
+候选索引受 `candidate_store_limit=60` 约束；模型只对真正要引用的正文付费。
+
 关键函数：
 
 ```python
 timed_tool_call(rt, name, fn, *, top_k=..., ...)
-    # 取消检查 → 计时 → tool_started → governor tool permit → 执行 →
-    # 证据准入 → tool_result；异常 → degraded + 空结果（fail-open）
+    # 取消检查 → next_invocation_id()=call_id → 计时 → tool_started →
+    # governor tool permit → 执行 → 候选分流/证据准入 → tool_result；
+    # 异常 → degraded + 空结果（fail-open）
+    # 成功/失败事件共用同一 call_id，前端和持久化投影不再按工具名配对。
 format_evidence_for_llm(rt, evidences)      # 注入 LLM 的文本形态
+format_candidates_for_llm(rows)             # 候选索引（不含正式证据块）
+make_evidence_read(rt)                      # 候选 → 正式证据
 budget_message(rt)                          # 预算耗尽时的说明段
 format_tool_result(...)                     # 返回给模型的工具结果文本
 ```
@@ -205,7 +248,9 @@ memory_search(query: str, scope: str = "all", status: str = "all", top_k: int = 
 
 ```
 工具返回 Evidence[]
-   ↓ add_evidence（去重：按 id）
+   ↓ candidate_mode：全部命中进入 candidate_evidence（不可引用、不占预算）
+   ↓ 搜索不自动准入；候选保持指针状态
+   ↓ evidence_read(candidate_ids)（模型按需提升候选）
 ToolRuntime.evidence 列表（预算内；超限标记 budget_blocked）
    ↓ format_evidence_for_llm（≤1200 字符/条 + 编号 + 来源行 + 定位器）
 注入模型上下文（下一轮工具结果 / 最终回答前的证据段落）

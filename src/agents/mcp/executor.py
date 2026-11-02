@@ -103,6 +103,11 @@ class MCPToolExecutor:
         self.department_id = department_id
         self.username = str(username or "")
 
+    def _new_call_id(self) -> str:
+        if self.rt is not None:
+            return self.rt.next_invocation_id()
+        return f"mcp-{time.monotonic_ns()}"
+
     def wrap(self, binding: McpToolBinding) -> Any:
         """Build the sync LangChain tool the model actually sees.
 
@@ -150,25 +155,42 @@ class MCPToolExecutor:
             return "policy"
         return None
 
-    def propose(self, binding: McpToolBinding, arguments: dict[str, Any]) -> str:
+    def propose(
+        self,
+        binding: McpToolBinding,
+        arguments: dict[str, Any],
+        *,
+        call_id: str | None = None,
+    ) -> str:
         """Create a write proposal; the external call happens only after confirm."""
 
         rt = self.rt
         if rt is None:  # pragma: no cover - worker path never proposes
             raise RuntimeError("write proposals require a turn runtime")
         rt.check_cancel()
+        call_id = call_id or self._new_call_id()
         started = time.monotonic()
+        rt.tool_started(
+            call_id=call_id,
+            tool_name=binding.safe_name,
+            tool_kind="mcp",
+            server=binding.server.slug,
+            tool=binding.tool_name,
+            transport=binding.transport,
+        )
         rejection = self._policy_rejection(binding) or self._write_rejection(binding)
         if rejection is not None:
-            return self._finish(binding, "rejected", rejection, started)
+            return self._finish(binding, "rejected", rejection, started, call_id=call_id)
         if not rt.reserve_mcp_call(int(getattr(settings, "MCP_CALLS_PER_TURN", 8))):
-            return self._finish(binding, "rejected", "quota", started)
+            return self._finish(binding, "rejected", "quota", started, call_id=call_id)
         try:
             payload = json.dumps(arguments, ensure_ascii=False, default=str)
         except (TypeError, ValueError):
             payload = str(arguments)
         if len(payload) > int(getattr(settings, "MCP_MAX_ARGUMENT_CHARS", 12000)):
-            return self._finish(binding, "rejected", "invalid_argument", started)
+            return self._finish(
+                binding, "rejected", "invalid_argument", started, call_id=call_id
+            )
 
         try:
             proposal = self.write_store.create(
@@ -181,7 +203,7 @@ class MCPToolExecutor:
                 ttl_seconds=int(getattr(settings, "MCP_WRITE_CONFIRM_TTL_SECONDS", 1800)),
             )
         except Exception:
-            return self._finish(binding, "rejected", "store_error", started)
+            return self._finish(binding, "rejected", "store_error", started, call_id=call_id)
 
         latency_ms = int((time.monotonic() - started) * 1000)
         record_mcp_write(transport=binding.transport, status="proposed")
@@ -198,20 +220,18 @@ class MCPToolExecutor:
                 "proposal_id": proposal.proposal_id,
             }
         )
-        rt.emit(
-            "tool_result",
-            {
-                "tool_name": binding.safe_name,
-                "tool_kind": "mcp",
-                "server": binding.server.slug,
-                "tool": binding.tool_name,
-                "transport": binding.transport,
-                "status": "proposed",
-                "latency_ms": latency_ms,
-                "result_bytes": 0,
-                "truncated": False,
-                "hit_count": 0,
-            },
+        rt.tool_result(
+            call_id=call_id,
+            tool_name=binding.safe_name,
+            tool_kind="mcp",
+            server=binding.server.slug,
+            tool=binding.tool_name,
+            transport=binding.transport,
+            status="proposed",
+            latency_ms=latency_ms,
+            result_bytes=0,
+            truncated=False,
+            hit_count=0,
         )
         rt.emit(
             "mcp_write_proposal",
@@ -514,22 +534,39 @@ class MCPToolExecutor:
             pass
 
     # ------------------------------------------------------------------
-    def call(self, binding: McpToolBinding, arguments: dict[str, Any]) -> str:
+    def call(
+        self,
+        binding: McpToolBinding,
+        arguments: dict[str, Any],
+        *,
+        call_id: str | None = None,
+    ) -> str:
         rt = self.rt
         rt.check_cancel()
+        call_id = call_id or self._new_call_id()
         started = time.monotonic()
+        rt.tool_started(
+            call_id=call_id,
+            tool_name=binding.safe_name,
+            tool_kind="mcp",
+            server=binding.server.slug,
+            tool=binding.tool_name,
+            transport=binding.transport,
+        )
 
         rejection = self._policy_rejection(binding)
         if rejection is not None:
-            return self._finish(binding, "rejected", rejection, started)
+            return self._finish(binding, "rejected", rejection, started, call_id=call_id)
         if not rt.reserve_mcp_call(int(getattr(settings, "MCP_CALLS_PER_TURN", 8))):
-            return self._finish(binding, "rejected", "quota", started)
+            return self._finish(binding, "rejected", "quota", started, call_id=call_id)
         try:
             payload = json.dumps(arguments, ensure_ascii=False, default=str)
         except (TypeError, ValueError):
             payload = str(arguments)
         if len(payload) > int(getattr(settings, "MCP_MAX_ARGUMENT_CHARS", 12000)):
-            return self._finish(binding, "rejected", "invalid_argument", started)
+            return self._finish(
+                binding, "rejected", "invalid_argument", started, call_id=call_id
+            )
 
         global_timeout = float(getattr(settings, "MCP_CALL_TIMEOUT_SECONDS", 60) or 60)
         call_timeout = min(float(binding.server.timeout_s or global_timeout), global_timeout)
@@ -546,15 +583,6 @@ class MCPToolExecutor:
                 "mcp.tool.read_only": True,
             },
         ) as span:
-            rt.emit(
-                "tool_started",
-                {
-                    "tool_name": binding.safe_name,
-                    "tool_kind": "mcp",
-                    "server": slug,
-                    "tool": tool_name,
-                },
-            )
             try:
                 with governor_acquire("mcp", interactive=True, timeout=call_timeout):
                     raw = sync_call_tool(
@@ -582,6 +610,7 @@ class MCPToolExecutor:
             status,
             failure,
             started,
+            call_id=call_id,
             result_text=result_text,
             truncated=truncated,
             result_bytes=result_bytes,
@@ -618,11 +647,14 @@ class MCPToolExecutor:
         failure: str,
         started: float,
         *,
+        call_id: str,
         result_text: str = "",
         truncated: bool = False,
         result_bytes: int = 0,
     ) -> str:
         rt = self.rt
+        if rt is None:  # pragma: no cover - worker path does not emit turn events
+            raise RuntimeError("turn events require a runtime")
         latency_ms = int((time.monotonic() - started) * 1000)
         record_mcp_call(
             transport=binding.transport, status=status, duration_s=latency_ms / 1000.0
@@ -644,20 +676,19 @@ class MCPToolExecutor:
                 "truncated": truncated,
             }
         )
-        rt.emit(
-            "tool_result",
-            {
-                "tool_name": binding.safe_name,
-                "tool_kind": "mcp",
-                "server": binding.server.slug,
-                "tool": binding.tool_name,
-                "transport": binding.transport,
-                "status": "done" if status == "ok" else status,
-                "latency_ms": latency_ms,
-                "result_bytes": result_bytes,
-                "truncated": truncated,
-                "hit_count": 0,
-            },
+        rt.tool_result(
+            call_id=call_id,
+            tool_name=binding.safe_name,
+            tool_kind="mcp",
+            server=binding.server.slug,
+            tool=binding.tool_name,
+            transport=binding.transport,
+            status="done" if status == "ok" else status,
+            latency_ms=latency_ms,
+            result_bytes=result_bytes,
+            truncated=truncated,
+            hit_count=0,
+            error=failure,
         )
         if status != "ok":
             rt.emit(

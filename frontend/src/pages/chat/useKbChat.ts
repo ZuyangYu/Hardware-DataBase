@@ -8,6 +8,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api, ApiError, isForbiddenError, sseGetStream } from '@/api/client';
+import {
+  mergeMcpWriteProposal,
+  parseAgentEvent,
+  traceStepFromToolEvent,
+  type AgentEvent,
+  type DoneEvent,
+} from '@/api/agentEvents';
 import type {
   AttachmentSnapshot,
   CreateTurnRequest,
@@ -16,17 +23,15 @@ import type {
   MemoryConsentView,
   MemoryOperationResponse,
   McpWriteProposal,
+  McpWriteProposalCard,
   McpWriteProposalListResponse,
   MessageView,
   AttachmentRevisionCard,
   OkResponse,
-  QueryDonePayload,
-  QueryTraceStatus,
   QueryTraceStep,
   SessionMemorySummary,
   SessionView,
   TurnBudget,
-  TurnPlanState,
   TurnStartResponse,
   TurnSubagent,
   TurnVerification,
@@ -83,41 +88,6 @@ function requestUuid(): string {
   return createClientRequestId();
 }
 
-export type McpWriteProposalCard = {
-  kind: 'mcp_write_proposal';
-  proposal_id: string;
-  server: string;
-  server_name: string;
-  tool: string;
-  arguments_digest: string;
-  artifact_hint: string;
-  status: string;
-  expires_at: string;
-  artifact_ref?: string;
-  artifact_filename?: string;
-  artifact_sha256?: string;
-  error_code?: string;
-};
-
-export function mergeMcpWriteProposalFromSseEvent(
-  previous: McpWriteProposalCard[],
-  eventType: string,
-  data: string,
-): McpWriteProposalCard[] {
-  if (eventType !== 'mcp_write_proposal') return previous;
-  try {
-    const parsed = JSON.parse(data) as { card?: Partial<McpWriteProposalCard> };
-    const card = parsed.card;
-    if (!card?.proposal_id || card.kind !== 'mcp_write_proposal') return previous;
-    const normalized = card as McpWriteProposalCard;
-    const index = previous.findIndex((item) => item.proposal_id === normalized.proposal_id);
-    if (index < 0) return [...previous, normalized];
-    return previous.map((item, itemIndex) => (itemIndex === index ? { ...item, ...normalized } : item));
-  } catch {
-    return previous;
-  }
-}
-
 /**
  * Build the persistent-turn request. Chat attachments and the knowledge scope
  * are separate optional fields; the user query is never decorated with them.
@@ -150,33 +120,12 @@ export function buildTurnRequest(
   return request;
 }
 
-function normalizeTraceStatus(status: unknown): QueryTraceStatus {
-  return status === 'pending' || status === 'running' || status === 'done' || status === 'error'
-    ? status
-    : 'running';
-}
-
 function createInitialTrace(_isGeneralChat: boolean): QueryTraceStep[] {
   // Route LLM is skipped for KB chat (deterministic, near-instant), so we must
   // NOT inject a misleading "正在判断是否需要检索知识库" step at the start of
   // every conversation — that reads as an auth/judgement preflight. The stepper
   // only appears once the agent emits tool_started / tool_result events.
   return [];
-}
-
-// Tool names emitted by the agent loop, mirrored from the backend ToolRuntime.
-const TOOL_LABELS: Record<string, string> = {
-  document_search: '文档检索',
-  circuit_search: '电路检索',
-  spreadsheet_row_search: '表格行检索',
-  spreadsheet_cell_lookup: '单元格检索',
-  list_kb_sources: '读取知识库目录',
-  conversation_search: '外部对话检索',
-};
-
-function toolLabel(name: string): string {
-  if (name.startsWith('skill__') || name === 'skill_task_status') return '沙箱 Skill';
-  return TOOL_LABELS[name] || name;
 }
 
 /**
@@ -196,103 +145,11 @@ function stripNarrationText(accumulated: string, text: string): string {
   return accumulated;
 }
 
-/** Translate a backend tool/trace event into a UI step, or null if irrelevant. */
-function traceStepFromToolEvent(etype: string, raw: string): QueryTraceStep | null {
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(raw) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-  if (etype === 'tool_started') {
-    const name = String(parsed.tool_name ?? '');
-    if (parsed.tool_kind === 'sandbox') return {
-      key: name, label: `运行 Skill · ${String(parsed.skill_ref ?? '')}`,
-      status: 'running', detail: `任务 ${String(parsed.task_id ?? '')}`,
-    };
-    return { key: name, label: toolLabel(name), status: 'running', detail: String(parsed.query ?? '') };
-  }
-  if (etype === 'tool_result') {
-    const name = String(parsed.tool_name ?? '');
-    if (parsed.tool_kind === 'sandbox') return {
-      key: name, label: `Skill · ${String(parsed.skill_ref ?? '')}`,
-      status: parsed.status === 'succeeded' ? 'done'
-        : ['failed', 'rejected', 'cancelled', 'expired', 'timed_out'].includes(String(parsed.status)) ? 'error' : 'running',
-      detail: `任务 ${String(parsed.task_id ?? '')} · ${String(parsed.status ?? '')}`,
-    };
-    const status: QueryTraceStatus = parsed.status === 'failed' ? 'error' : 'done';
-    const hits = Number(parsed.hit_count ?? 0);
-    const latency = Number(parsed.latency_ms ?? NaN);
-    const latencyText = Number.isFinite(latency) ? ` · ${latency}ms` : '';
-    return { key: name, label: toolLabel(name), status, detail: `${hits} 条命中${latencyText}` };
-  }
-  if (etype === 'stage') {
-    const key = parsed.key ? String(parsed.key) : '';
-    if (!key) return null;
-    return {
-      key,
-      label: parsed.label ? String(parsed.label) : key,
-      status: normalizeTraceStatus(parsed.status),
-      detail: parsed.detail ? String(parsed.detail) : '',
-    };
-  }
-  return null;
-}
-
-function parseJsonRecord(raw: string): Record<string, unknown> | null {
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-export function parseTurnPlan(raw: string): TurnPlanState | null {
-  const parsed = parseJsonRecord(raw);
-  const rawItems = Array.isArray(parsed?.items) ? parsed.items : [];
-  const items = rawItems
-    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
-    .map((item) => {
-      const status = String(item.status ?? 'pending');
-      return {
-        content: String(item.content ?? '').trim(),
-        status: status === 'completed' || status === 'in_progress' ? status : 'pending',
-      } as const;
-    })
-    .filter((item) => item.content);
-  if (items.length === 0) return null;
-  return {
-    items,
-    revision: Number(parsed?.revision ?? 1),
-    source: typeof parsed?.source === 'string' ? parsed.source : undefined,
-  };
-}
-
-export function parseTurnBudget(raw: string): TurnBudget | null {
-  const parsed = parseJsonRecord(raw);
-  return parsed ? (parsed as TurnBudget) : null;
-}
-
-export function parseTurnVerification(raw: string): TurnVerification | null {
-  const parsed = parseJsonRecord(raw);
-  if (!parsed) return null;
-  const status = String(parsed.status ?? 'unknown');
-  if (!['pass', 'warn', 'fail', 'partial', 'unknown'].includes(status)) return null;
-  return parsed as unknown as TurnVerification;
-}
-
-export function parseTurnSubagent(raw: string): TurnSubagent | null {
-  const parsed = parseJsonRecord(raw);
-  if (!parsed) return null;
-  return parsed as unknown as TurnSubagent;
-}
-
 function mergeTraceDetail(current: string | undefined, next: string | undefined): string | undefined {
   const nextText = next?.trim();
   if (!nextText) return current;
+  const currentText = current?.trim();
+  if (currentText && nextText.startsWith(currentText)) return nextText;
   const lines = (current || '')
     .split('\n')
     .map((line) => line.trim())
@@ -393,35 +250,13 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   // creations; share one in-flight request so only one durable session and
   // one selection exist.
   const pendingCreateRef = useRef<{ scope: string; promise: Promise<SessionView> } | null>(null);
-  // opencode 风格轨迹:同一工具的多次调用各自占一行。
-  // toolCallSeqRef 生成单调序号;toolActiveKeyRef 记录"工具名 -> 最近一次 running 的 step key",
-  // 使 tool_result 能挂回正确的调用条目(流式恢复场景下退化为按工具名合并)。
-  const toolCallSeqRef = useRef(0);
-  const toolActiveKeyRef = useRef<Map<string, string>>(new Map());
   const liveAttachmentCardsRef = useRef<AttachmentRevisionCard[]>([]);
   const onTurnCompletedRef = useRef(options.onTurnCompleted);
   onTurnCompletedRef.current = options.onTurnCompleted;
 
-  const stepFromToolEvent = useCallback((etype: string, raw: string): QueryTraceStep | null => {
-    const step = traceStepFromToolEvent(etype, raw);
-    if (!step) return null;
-    if (etype === 'tool_started') {
-      toolCallSeqRef.current += 1;
-      const key = `${step.key}#${toolCallSeqRef.current}`;
-      toolActiveKeyRef.current.set(step.key, key);
-      return { ...step, key };
-    }
-    if (etype === 'tool_result') {
-      const activeKey = toolActiveKeyRef.current.get(step.key);
-      return { ...step, key: activeKey ?? step.key };
-    }
-    return step;
-  }, []);
-  const applyTurnMetaEvent = useCallback((etype: string, raw: string) => {
-    if (etype === 'document_card') {
-      const parsed = parseJsonRecord(raw) as { card?: AttachmentRevisionCard } | null;
-      const card = parsed?.card;
-      if (!card || card.kind !== 'attachment_revision') return;
+  const applyTurnMetaEvent = useCallback((event: AgentEvent) => {
+    if (event.type === 'document_card') {
+      const card = event.card;
       const key = (item: AttachmentRevisionCard) =>
         (item.artifacts ?? []).map((artifact) => artifact.artifact_id).join(',') || item.content || '';
       if (!liveAttachmentCardsRef.current.some((item) => key(item) === key(card))) {
@@ -429,55 +264,15 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       }
       return;
     }
-    if (etype === 'plan_created' || etype === 'plan_updated') {
-      const plan = parseTurnPlan(raw);
-      if (plan) setLivePlan(plan);
-      return;
-    }
-    if (etype === 'budget' || etype === 'budget_exhausted') {
-      const budget = parseTurnBudget(raw);
-      if (budget) setLiveBudget(budget);
-      return;
-    }
-    if (etype === 'verification') {
-      const verification = parseTurnVerification(raw);
-      if (verification) setLiveVerification(verification);
-      return;
-    }
-    if (etype === 'partial_result') {
-      const parsed = parseJsonRecord(raw);
-      if (!parsed) return;
-      setLiveBudget((previous) => previous
-        ? { ...previous, partial_answer: parsed.synthesized === true }
-        : previous);
-      return;
-    }
-    if (etype === 'context_compacted') {
-      const parsed = parseJsonRecord(raw);
-      if (!parsed) return;
-      setLiveBudget((previous) => ({
-        ...(previous ?? {}),
-        ...(parsed.stage === 'context_window'
-          ? {
-            context_window: {
-              max_prompt_tokens: Number(parsed.max_prompt_tokens ?? 0),
-              window_tokens: Number(parsed.window_tokens ?? 0),
-              threshold_tokens: Number(parsed.threshold_tokens ?? 0),
-              note: typeof parsed.note === 'string' ? parsed.note : undefined,
-            },
-          }
-          : {
-            context_compressed: {
-              evidence_count: Number(parsed.evidence_count ?? 0),
-              compressed_bytes: Number(parsed.compressed_bytes ?? 0),
-              max_bytes: Number(parsed.max_bytes ?? 0),
-            },
-          }),
-      }));
-    }
-    if (etype === 'subagent_started' || etype === 'subagent_completed') {
-      const subagent = parseTurnSubagent(raw);
-      if (!subagent) return;
+    if (event.type === 'subagent_started' || event.type === 'subagent_completed') {
+      const subagent: TurnSubagent = {
+        name: event.name,
+        description: event.description,
+        status: event.status,
+        tool_call_id: event.tool_call_id,
+        result_chars: event.result_chars,
+        duration_ms: event.duration_ms,
+      };
       setLiveSubagents((previous) => {
         const identity = subagent.tool_call_id || `${subagent.name ?? 'research'}:${subagent.description ?? ''}`;
         const index = previous.findIndex(
@@ -497,9 +292,6 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const [traceByMessageId, setTraceByMessageId] = useState<Record<number, QueryTraceStep[]>>({});
   // 复杂任务元数据：计划/预算/校验/子任务。实时值供流式气泡使用；
   // 完成后随 done.summary 落到 assistant message（刷新从服务端消息投影恢复）。
-  const [livePlan, setLivePlan] = useState<TurnPlanState | null>(null);
-  const [liveBudget, setLiveBudget] = useState<TurnBudget | null>(null);
-  const [liveVerification, setLiveVerification] = useState<TurnVerification | null>(null);
   const [liveSubagents, setLiveSubagents] = useState<TurnSubagent[]>([]);
 
   const flushStreamingText = useCallback((force = false) => {
@@ -834,8 +626,6 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     clearTraceTimer();
     traceClearTimerRef.current = setTimeout(() => {
       setTraceSteps([]);
-      toolCallSeqRef.current = 0;
-      toolActiveKeyRef.current.clear();
       traceClearTimerRef.current = null;
     }, QUERY_TRACE_HIDE_DELAY_MS);
   }, [clearTraceTimer]);
@@ -908,13 +698,8 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       abortRef.current = controller;
       setStreaming(true);
       resetStreamingText();
-      toolCallSeqRef.current = 0;
-      toolActiveKeyRef.current.clear();
       setTraceSteps(createInitialTrace(turn.kb_name === GENERAL_CHAT_KB_NAME));
       setDegradedNotes([]);
-      setLivePlan(null);
-      setLiveBudget(null);
-      setLiveVerification(null);
       setLiveSubagents([]);
       let accumulated = '';
       try {
@@ -923,73 +708,82 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         // Start from zero on a reload so the already-generated prefix is also restored.
         for await (const evt of sseGetStream(`/api/v1/turns/${turn.id}/events`, controller.signal)) {
           if (!ownsStream(turn.id, turn.session_id)) break;
-          if (evt.event === 'delta') {
-            const parsed = JSON.parse(evt.data) as { text?: string };
-            accumulated += parsed.text ?? '';
-            queueStreamingText(accumulated);
-          } else if (evt.event === 'narration') {
-            const parsed = JSON.parse(evt.data) as { text?: string };
-            accumulated = stripNarrationText(accumulated, parsed.text ?? '');
-            queueStreamingText(accumulated);
-          } else if (evt.event === 'stage' || evt.event === 'tool_started' || evt.event === 'tool_result') {
-            const step = stepFromToolEvent(evt.event, evt.data);
-            if (step) upsertTraceStep(step);
-          } else if (evt.event === 'degraded') {
-            const parsed = JSON.parse(evt.data) as { stage?: string; reason?: string };
-            setDegradedNotes((prev) => [...prev, { stage: parsed.stage ?? '', reason: parsed.reason ?? '' }]);
-          } else if (
-            evt.event === 'plan_created'
-            || evt.event === 'plan_updated'
-            || evt.event === 'budget'
-            || evt.event === 'budget_exhausted'
-            || evt.event === 'verification'
-            || evt.event === 'partial_result'
-            || evt.event === 'context_compacted'
-            || evt.event === 'subagent_started'
-            || evt.event === 'subagent_completed'
-          ) {
-            applyTurnMetaEvent(evt.event, evt.data);
-          } else if (evt.event === 'mcp_write_proposal') {
-            setMcpWriteCards((prev) => mergeMcpWriteProposalFromSseEvent(prev, evt.event, evt.data));
-          } else if (evt.event === 'done') {
-            if (!ownsStream(turn.id, turn.session_id)) break;
-            const payload = JSON.parse(evt.data) as QueryDonePayload;
-            const answer = payload.answer ?? accumulated;
-            const summary = payload.summary ?? {};
-            setMessages((prev) => [
-              ...prev.filter((message) => message.id !== turn.assistant_message_id),
-              {
-                id: turn.assistant_message_id,
-                session_id: turn.session_id,
-                turn_id: turn.id,
-                role: 'assistant',
-                content: answer,
-                footer: (payload.footer ?? '').trim(),
-                memory_context: summary.memory_context ?? [],
-                created_at: turn.created_at,
-                plan: (summary.plan as TurnPlanState | undefined) ?? null,
-                budget: (summary.budget as TurnBudget | undefined) ?? null,
-                verification: (summary.verification as TurnVerification | undefined) ?? null,
-                subagents: (summary.subagents as TurnSubagent[] | undefined) ?? [],
-              },
-            ]);
-            // 刷新恢复时同样回填证据面板,否则引用标号 [n] 没有来源可看
-            const recoveredEvidence = payload.summary?.evidence ?? [];
-            if (recoveredEvidence.length > 0 && turn.assistant_message_id != null) {
-              setEvidenceByMessageId((prev) => ({
-                ...prev,
-                [turn.assistant_message_id as number]: recoveredEvidence,
-              }));
+          const event = parseAgentEvent(evt.event, evt.data);
+          if (!event) continue;
+          switch (event.type) {
+            case 'delta':
+              accumulated += event.text;
+              queueStreamingText(accumulated);
+              break;
+            case 'narration':
+              accumulated = stripNarrationText(accumulated, event.text);
+              queueStreamingText(accumulated);
+              break;
+            case 'stage':
+              upsertTraceStep({
+                key: event.key,
+                kind: 'stage',
+                label: event.label,
+                status: event.status,
+                detail: event.detail,
+              });
+              break;
+            case 'tool_started':
+            case 'tool_result':
+              upsertTraceStep(traceStepFromToolEvent(event));
+              break;
+            case 'degraded':
+              setDegradedNotes((prev) => [...prev, { stage: event.stage, reason: event.reason }]);
+              break;
+            case 'subagent_started':
+            case 'subagent_completed':
+              applyTurnMetaEvent(event);
+              break;
+            case 'mcp_write_proposal':
+              setMcpWriteCards((prev) => mergeMcpWriteProposal(prev, event));
+              break;
+            case 'done': {
+              if (!ownsStream(turn.id, turn.session_id)) break;
+              const answer = event.answer || accumulated;
+              const summary = event.summary ?? {};
+              setMessages((prev) => [
+                ...prev.filter((message) => message.id !== turn.assistant_message_id),
+                {
+                  id: turn.assistant_message_id,
+                  session_id: turn.session_id,
+                  turn_id: turn.id,
+                  role: 'assistant',
+                  content: answer,
+                  footer: (event.footer ?? '').trim(),
+                  memory_context: summary.memory_context ?? [],
+                  created_at: turn.created_at,
+                  plan: null,
+                  budget: (summary.budget as TurnBudget | undefined) ?? null,
+                  verification: (summary.verification as TurnVerification | undefined) ?? null,
+                  subagents: (summary.subagents as TurnSubagent[] | undefined) ?? [],
+                },
+              ]);
+              // 刷新恢复时同样回填证据面板,否则引用标号 [n] 没有来源可看
+              const recoveredEvidence = summary.evidence ?? [];
+              if (recoveredEvidence.length > 0 && turn.assistant_message_id != null) {
+                setEvidenceByMessageId((prev) => ({
+                  ...prev,
+                  [turn.assistant_message_id as number]: recoveredEvidence,
+                }));
+              }
+              finishTrace('done', '已完成输出');
+              void refreshMemorySummary();
+              if (turn.assistant_message_id != null) {
+                setTraceByMessageId((prev) => ({ ...prev, [turn.assistant_message_id as number]: traceRef.current }));
+              }
+              break;
             }
-            finishTrace('done', '已完成输出');
-            void refreshMemorySummary();
-            if (turn.assistant_message_id != null) {
-              setTraceByMessageId((prev) => ({ ...prev, [turn.assistant_message_id as number]: traceRef.current }));
-            }
-          } else if (evt.event === 'error') {
-            if (!ownsStream(turn.id, turn.session_id)) break;
-            const parsed = JSON.parse(evt.data) as { message?: string };
-            finishTrace('error', parsed.message || '查询失败');
+            case 'error':
+              if (!ownsStream(turn.id, turn.session_id)) break;
+              finishTrace('error', event.message || '查询失败');
+              break;
+            default:
+              break;
           }
         }
       } catch (error) {
@@ -1155,13 +949,8 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     setStreaming(true);
     resetStreamingText();
     clearTraceTimer();
-    toolCallSeqRef.current = 0;
-    toolActiveKeyRef.current.clear();
     setTraceSteps(createInitialTrace(scopeKbName === GENERAL_CHAT_KB_NAME));
     setDegradedNotes([]);
-    setLivePlan(null);
-    setLiveBudget(null);
-    setLiveVerification(null);
     setLiveSubagents([]);
 
     let sessionId = mustStartNewSession ? null : activeSessionId;
@@ -1247,75 +1036,65 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       if (!ownsGeneration()) return;
       const ownsStream = () =>
         ownsGeneration() && currentTurnRef.current === created.turn.id && activeSessionRef.current === sessionId;
-      let finalPayload: QueryDonePayload | null = null;
+      let finalPayload: DoneEvent | null = null;
       let errorMessage: string | null = null;
       let accumulated = '';
 
       for await (const evt of sseGetStream(`/api/v1/turns/${created.turn.id}/events`, controller.signal)) {
         if (!ownsStream()) break;
-        if (evt.event === 'delta') {
-          try {
-            const parsed = JSON.parse(evt.data) as { text?: string };
-            accumulated += parsed.text ?? '';
+        const event = parseAgentEvent(evt.event, evt.data);
+        if (!event) continue;
+        switch (event.type) {
+          case 'delta':
+            accumulated += event.text;
             queueStreamingText(accumulated);
-          } catch {
-            // 忽略坏帧
-          }
-        } else if (evt.event === 'narration') {
-          try {
-            const parsed = JSON.parse(evt.data) as { text?: string };
-            accumulated = stripNarrationText(accumulated, parsed.text ?? '');
+            break;
+          case 'narration':
+            accumulated = stripNarrationText(accumulated, event.text);
             queueStreamingText(accumulated);
-          } catch {
-            // 忽略坏帧
-          }
-        } else if (evt.event === 'stage' || evt.event === 'tool_started' || evt.event === 'tool_result') {
-          try {
-            const step = stepFromToolEvent(evt.event, evt.data);
-            if (step) upsertTraceStep(step);
-          } catch {
-            // 忽略坏帧
-          }
-        } else if (evt.event === 'degraded') {
-          try {
-            const parsed = JSON.parse(evt.data) as { stage?: string; reason?: string };
-            setDegradedNotes((prev) => [...prev, { stage: parsed.stage ?? '', reason: parsed.reason ?? '' }]);
-          } catch {
-            // 忽略坏帧
-          }
-        } else if (
-          evt.event === 'plan_created'
-          || evt.event === 'plan_updated'
-          || evt.event === 'budget'
-          || evt.event === 'budget_exhausted'
-          || evt.event === 'verification'
-          || evt.event === 'partial_result'
-          || evt.event === 'context_compacted'
-          || evt.event === 'subagent_started'
-          || evt.event === 'subagent_completed'
-        ) {
-          applyTurnMetaEvent(evt.event, evt.data);
-        } else if (evt.event === 'mcp_write_proposal') {
-          setMcpWriteCards((prev) => mergeMcpWriteProposalFromSseEvent(prev, evt.event, evt.data));
-        } else if (evt.event === 'done') {
-          finalPayload = JSON.parse(evt.data) as QueryDonePayload;
-          finishTrace('done', '已完成输出');
-          setTraceByMessageId((prev) => ({ ...prev, [created.turn.assistant_message_id]: traceRef.current }));
-        } else if (evt.event === 'error') {
-          try {
-            errorMessage = (JSON.parse(evt.data) as { message?: string }).message ?? '查询失败';
-          } catch {
-            errorMessage = '查询失败';
-          }
-          finishTrace('error', errorMessage);
+            break;
+          case 'stage':
+            upsertTraceStep({
+              key: event.key,
+              kind: 'stage',
+              label: event.label,
+              status: event.status,
+              detail: event.detail,
+            });
+            break;
+          case 'tool_started':
+          case 'tool_result':
+            upsertTraceStep(traceStepFromToolEvent(event));
+            break;
+          case 'degraded':
+            setDegradedNotes((prev) => [...prev, { stage: event.stage, reason: event.reason }]);
+            break;
+          case 'subagent_started':
+          case 'subagent_completed':
+            applyTurnMetaEvent(event);
+            break;
+          case 'mcp_write_proposal':
+            setMcpWriteCards((prev) => mergeMcpWriteProposal(prev, event));
+            break;
+          case 'done':
+            finalPayload = event;
+            finishTrace('done', '已完成输出');
+            setTraceByMessageId((prev) => ({ ...prev, [created.turn.assistant_message_id]: traceRef.current }));
+            break;
+          case 'error':
+            errorMessage = event.message || '查询失败';
+            finishTrace('error', errorMessage);
+            break;
+          default:
+            break;
         }
       }
 
       // 4. 收尾:done -> 落库 assistant 消息;error/中断 -> 提示
       if (!ownsStream()) return;
       if (finalPayload) {
-        const payload: QueryDonePayload = finalPayload;
-        const answer = payload.answer ?? accumulated;
+        const payload: DoneEvent = finalPayload;
+        const answer = payload.answer || accumulated;
         const summary = payload.summary ?? {};
         const assistantMessage: MessageView = {
           id: created.turn.assistant_message_id,
@@ -1326,7 +1105,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           footer: (payload.footer ?? '').trim(),
           memory_context: summary.memory_context ?? [],
           created_at: new Date().toISOString(),
-          plan: (summary.plan as TurnPlanState | undefined) ?? null,
+          plan: null,
           budget: (summary.budget as TurnBudget | undefined) ?? null,
           verification: (summary.verification as TurnVerification | undefined) ?? null,
           subagents: (summary.subagents as TurnSubagent[] | undefined) ?? [],
@@ -1482,9 +1261,6 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     traceSteps,
     traceByMessageId,
     degradedNotes,
-    livePlan,
-    liveBudget,
-    liveVerification,
     liveSubagents,
     mcpWriteCards,
     updateMcpWriteCard,

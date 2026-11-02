@@ -79,7 +79,7 @@ def _normalize_citation_labels(text: str) -> str:
 # These are built-in agent behaviors.  Keep the switches as module constants
 # so tests can exercise the fallbacks without exposing deployment knobs.
 COMPLEXITY_BUDGET_ENABLED = True
-RECURSION_LIMIT_MAX = int(os.getenv("AGENT_RECURSION_LIMIT_MAX", "72") or 72)
+RECURSION_LIMIT_MAX = int(os.getenv("AGENT_RECURSION_LIMIT_MAX", "120") or 120)
 PARTIAL_SYNTHESIS_ENABLED = True
 PARTIAL_SYNTHESIS_MAX_EVIDENCE_BYTES = int(
     os.getenv("AGENT_PARTIAL_SYNTHESIS_MAX_EVIDENCE_BYTES", "24000") or 24000
@@ -178,7 +178,6 @@ _RESEARCH_SUBAGENT_TOOLS = frozenset({
     "wiki_search",
 })
 
-_PLAN_STATUSES = frozenset({"pending", "in_progress", "completed"})
 _HARDWARE_REFDES_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:U|X|R|C|L|D|Q|J|TP|CN)\d{2,5}(?:-\d+)?(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -191,7 +190,7 @@ _HARDWARE_TERMS = (
     "寄存器", "阈值", "电源采样", "拆除", "差分", "总线", "信号名",
     "表号", "WCCA", "BOM", "车规", "AEC", "ASIL", "PMIC", "ADC",
     "MCU", "SoC", "PHY", "CAN FD", "CAN0", "CAN1", "以太网", "电源",
-    "采样", "复位", "时钟", "接口", "时序",
+    "采样", "复位", "时钟", "接口", "时序", "最小系统", "器件", "型号",
 )
 _HARDWARE_EVIDENCE_BUDGET = int(
     os.getenv("AGENT_HARDWARE_EVIDENCE_BUDGET", "80") or 80
@@ -223,14 +222,9 @@ def _tool_name(tool: Any) -> str:
 
 
 def _complex_task_prompt(system_prompt: str, *, has_subagents: bool = False) -> str:
-    """Append the deep-task planning/delegation nudge to the agent prompt."""
+    """Append the deep-task delegation and hardware-search nudge to the prompt."""
 
-    prompt = (
-        system_prompt.rstrip()
-        + "\n\n## 复杂任务执行计划\n"
-        "本轮包含多个显式步骤或来源。开始检索前，先调用 write_todos 建立 3-7 步计划；"
-        "每完成一步及时更新状态。计划只用于组织执行，不能代替最终回答。"
-    )
+    prompt = system_prompt.rstrip()
     if has_subagents:
         prompt += (
             "\n当检索面很宽（多库、多附件、表格/电路/文档混合）时，可将大范围证据收集"
@@ -335,9 +329,9 @@ def _agent_recursion_limit(
 
     rounds = max(1, int(settings.AGENT_MAX_RETRIEVAL_ROUNDS))
     if query_mode == "deep":
-        base = max(12, rounds * 12)
+        base = max(72, rounds * 24)
     else:
-        base = max(8, rounds * 6)
+        base = max(24, rounds * 8)
     complexity = _turn_complexity(
         query=query,
         query_mode=query_mode,
@@ -347,7 +341,7 @@ def _agent_recursion_limit(
     enabled = COMPLEXITY_BUDGET_ENABLED
     max_limit = max(base, RECURSION_LIMIT_MAX)
     if enabled:
-        multiplier = 4 if query_mode == "deep" else 2
+        multiplier = 8 if query_mode == "deep" else 3
         limit = min(max_limit, base + int(complexity["score"]) * multiplier)
     else:
         limit = base
@@ -358,23 +352,6 @@ def _agent_recursion_limit(
         "complexity": complexity,
         "enabled": enabled,
     }
-
-
-def _normalize_plan_items(raw_items: Any) -> list[dict[str, str]]:
-    if not isinstance(raw_items, list):
-        return []
-    items: list[dict[str, str]] = []
-    for raw in raw_items[:20]:
-        if not isinstance(raw, dict):
-            continue
-        content = str(raw.get("content") or raw.get("title") or "").strip()
-        if not content:
-            continue
-        status = str(raw.get("status") or "pending").strip().lower()
-        if status not in _PLAN_STATUSES:
-            status = "pending"
-        items.append({"content": content[:240], "status": status})
-    return items
 
 
 def _research_subagent_spec(*, tools: list[Any], model: Any) -> dict[str, Any] | None:
@@ -607,7 +584,7 @@ def _synthesize_partial_answer(
                 }
             emit_event(
                 {
-                    "type": "context_compacted",
+                    "type": "evidence_compressed",
                     "payload": {
                         "stage": "partial_synthesis",
                         "evidence_count": len(evidence),
@@ -1141,6 +1118,28 @@ def _build_citation_verification(answer_text: str, evidence: list[Evidence]) -> 
         "citation_coverage": len(cited_ids) / len(evidence) if evidence else 0.0,
         "citation_coverage_basis": "distinct_cited_evidence/available_evidence",
     }
+
+
+_GAP_MARKER_RE = re.compile(
+    r"(?:未|没有)(?:找到|给出|出现|收录|提供|能确认|检索到|查到|明确)"
+    r"|证据不足|资料(?:不足|缺失)|无法(?:确认|给出|确定|判断)"
+    r"|缺少(?:相关)?(?:证据|数据|资料|数值)"
+)
+
+
+def answer_gap_lines(answer_text: str, limit: int = 5) -> list[str]:
+    """Extract self-declared gap sentences so the next turn can resume them."""
+
+    lines: list[str] = []
+    for sentence in re.split(r"[。\n；;]", str(answer_text or "")):
+        text = sentence.strip(" \t-#|")
+        if len(text) < 6 or not _GAP_MARKER_RE.search(text):
+            continue
+        if text not in lines:
+            lines.append(text[:240])
+        if len(lines) >= limit:
+            break
+    return lines
 
 
 def _agent_evidence_budget(attachment_refs: list[Any], question: str = "") -> int:

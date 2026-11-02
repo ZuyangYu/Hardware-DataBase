@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Sequence
 
 import src.settings
+from src.contracts.agent_events import validate_agent_event
 
 # Sentinel kb_name persisted in chat sessions/turns for general (non-KB) chat.
 # The literal value is part of the durable schema; never change it.
@@ -131,6 +132,18 @@ class ChatTurnEvent:
     event_type: str
     payload: dict
     created_at: str
+
+    @property
+    def schema_version(self) -> int:
+        return int(self.payload.get("schema_version") or 0)
+
+    @property
+    def item_id(self) -> str:
+        return str(self.payload.get("item_id") or "")
+
+    @property
+    def call_id(self) -> str:
+        return str(self.payload.get("call_id") or "")
 
 
 @dataclass
@@ -2374,6 +2387,9 @@ class ConversationService:
         ownership; the helper performs no guard of its own.
         """
         now = created_at or utc_now()
+        # One validation point for every writer: the runner, the query worker,
+        # terminal events and crash-recovery paths all persist through here.
+        payload = validate_agent_event(event_type, payload)
         row = conn.execute("SELECT last_event_seq FROM chat_turns WHERE id = ?", (turn_id,)).fetchone()
         if row is None:
             raise KeyError("turn not found")

@@ -512,12 +512,18 @@ class ApiRoutesTests(unittest.TestCase):
         conv.append_turn_event(
             turn_id,
             "tool_started",
-            {"tool_name": "document_search", "query": "电源结构"},
+            {"call_id": "inv-route-1", "tool_name": "document_search", "query": "电源结构"},
         )
         conv.append_turn_event(
             turn_id,
             "tool_result",
-            {"tool_name": "document_search", "hit_count": 3, "status": "done", "latency_ms": 9},
+            {
+                "call_id": "inv-route-1",
+                "tool_name": "document_search",
+                "hit_count": 3,
+                "status": "done",
+                "latency_ms": 9,
+            },
         )
         conv.append_turn_event(
             turn_id,
@@ -530,7 +536,7 @@ class ApiRoutesTests(unittest.TestCase):
         ).json()
         assistant = [message for message in messages if message["role"] == "assistant"][-1]
         steps = assistant["trace_steps"]
-        self.assertEqual([step["key"] for step in steps], ["route", "document_search#2"])
+        self.assertEqual([step["key"] for step in steps], ["route", "inv-route-1"])
         self.assertEqual(steps[0]["status"], "done")
         self.assertEqual(steps[0]["detail"], "命中 2 个来源组")
         self.assertEqual(steps[1]["label"], "文档检索")

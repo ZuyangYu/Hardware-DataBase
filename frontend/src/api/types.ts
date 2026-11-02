@@ -383,6 +383,22 @@ export interface AttachmentRevisionCard {
   artifacts?: AttachmentRevisionArtifact[];
 }
 
+export interface McpWriteProposalCard {
+  kind: 'mcp_write_proposal';
+  proposal_id: string;
+  server: string;
+  server_name: string;
+  tool: string;
+  arguments_digest: string;
+  artifact_hint: string;
+  status: string;
+  expires_at: string;
+  artifact_ref?: string;
+  artifact_filename?: string;
+  artifact_sha256?: string;
+  error_code?: string;
+}
+
 export interface MessageView {
   id: number;
   session_id: number;
@@ -402,7 +418,7 @@ export interface MessageView {
   cards?: AttachmentRevisionCard[];
   /** 该 turn 持久化的执行轨迹步骤（刷新后轨迹面板回填）。 */
   trace_steps?: QueryTraceStep[];
-  /** 复杂任务的执行计划（agent todo 投影）。 */
+  /** 历史消息的执行计划数据；前端不再渲染计划卡片。 */
   plan?: TurnPlanState | null;
   /** 本轮 agent 循环预算与复杂度。 */
   budget?: TurnBudget | null;
@@ -454,6 +470,21 @@ export interface TurnBudget {
     max_prompt_tokens?: number;
     window_tokens?: number;
     threshold_tokens?: number;
+    note?: string;
+  };
+  context_compaction?: {
+    stage?: string;
+    trigger?: string;
+    cutoff_index?: number;
+    dropped_messages?: number;
+    retained_messages?: number;
+    before_tokens?: number;
+    after_tokens?: number;
+    summary_chars?: number;
+    summary_sha256?: string;
+    offload_path?: string;
+    window_id?: string;
+    window_tokens?: number;
     note?: string;
   };
 }
@@ -820,6 +851,26 @@ export interface EvidenceItem {
   [key: string]: unknown;
 }
 
+export interface ContextManifestFragment {
+  kind: string;
+  chars?: number;
+  bytes?: number;
+  count?: number;
+  sha256?: string;
+}
+
+export interface ContextManifest {
+  system_prompt_sha256?: string;
+  system_prompt_bytes?: number;
+  fragments?: ContextManifestFragment[];
+  fragment_bytes?: number;
+  evidence_count?: number;
+  evidence_bytes?: number;
+  history_turns?: number;
+  model_context_window?: number;
+  estimated_input_tokens?: number;
+}
+
 export interface QueryDonePayload {
   answer: string;
   summary?: {
@@ -828,6 +879,7 @@ export interface QueryDonePayload {
     final_top_k?: number;
     evidence?: EvidenceItem[];
     memory_context?: MemoryContextItem[];
+    context_manifest?: ContextManifest;
     [key: string]: unknown;
   } | null;
   footer?: string;
@@ -887,12 +939,21 @@ export interface ExportBatchResponse {
 }
 
 export type QueryTraceStatus = 'pending' | 'running' | 'done' | 'error';
+export type QueryTraceKind = 'tool' | 'stage';
 
 export interface QueryTraceStep {
   key: string;
   label: string;
   status: QueryTraceStatus;
   detail?: string;
+  kind?: QueryTraceKind;
+  call_id?: string;
+  input?: string;
+  sources?: string[];
+  evidence_count?: number;
+  candidate_count?: number;
+  citation_numbers?: number[];
+  empty_reason?: string;
 }
 
 // ---- 管理:用户/部门/KB 授权(对齐 src/api/schemas.py) ----

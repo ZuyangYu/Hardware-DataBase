@@ -16,10 +16,7 @@ import type {
   MemoryContextItem,
   MessageView,
   QueryTraceStep,
-  TurnBudget,
-  TurnPlanState,
   TurnSubagent,
-  TurnVerification,
 } from '@/api/types';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
@@ -44,18 +41,8 @@ type Props = {
   streaming?: boolean;
   streamingText?: string;
   traceSteps?: QueryTraceStep[];
-  /** 复杂任务执行计划（实时气泡传入；历史消息从 msg.plan 读取）。 */
-  plan?: TurnPlanState | null;
-  /** 本轮 agent 循环预算。 */
-  budget?: TurnBudget | null;
-  /** 系统校验结果。 */
-  verification?: TurnVerification | null;
   /** 检索子 agent 摘要（不含原始上下文）。 */
   subagents?: TurnSubagent[];
-  /** 预算耗尽后的继续操作。 */
-  onContinue?: () => void;
-  /** 预算耗尽后的缩小范围操作。 */
-  onNarrowScope?: () => void;
   /** 降级提醒(fail-open 发生时)。 */
   degradedNotes?: Array<{ stage: string; reason: string }>;
   /** 通用对话不展示内部执行轨迹和检索概要。 */
@@ -107,7 +94,7 @@ function CollapsibleSection({
         <span>{title}</span>
         {badge != null && <span className="font-normal text-[#a1a7b5]">{badge}</span>}
       </button>
-      {open && <div className="mt-[9px] space-y-[6px]">{children}</div>}
+      {open && <div className="mt-[9px] min-w-0 space-y-[6px]">{children}</div>}
     </div>
   );
 }
@@ -126,33 +113,91 @@ function AssistantIdentity({ live = false }: { live?: boolean }) {
   );
 }
 
-// Agent steps from the agent loop's tool_started / tool_result events (keyed
-// by tool name; label already humanized on the hook side). Collapsible and
-// collapsed by default on completed messages; open while streaming so live
-// progress stays visible.
+const EMPTY_REASON_LABELS: Record<string, string> = {
+  no_match: '知识库未命中',
+  out_of_scope: '不在本轮来源范围',
+  budget_blocked: '证据预算已满',
+  tool_error: '工具执行失败',
+  timeout: '检索超时',
+  rejected: '调用被拒绝',
+};
+
+function stepStatusDot(status: QueryTraceStep['status']) {
+  return status === 'running'
+    ? 'animate-pulse bg-[#1d4ed8]'
+    : status === 'done'
+      ? 'bg-[#16a34a]'
+      : status === 'error'
+        ? 'bg-[#d20b0b]'
+        : 'bg-[#d1d5db]';
+}
+
+function StepRow({ step }: { step: QueryTraceStep }) {
+  const emptyReason = step.empty_reason
+    ? (EMPTY_REASON_LABELS[step.empty_reason] ?? step.empty_reason)
+    : '';
+  return (
+    <div className="flex min-w-0 items-start gap-[7px] py-[3px] text-[12px]">
+      <span className={cn('mt-[5px] h-1.5 w-1.5 shrink-0 rounded-full', stepStatusDot(step.status))} />
+      <div className="min-w-0 flex-1">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-[6px] gap-y-[3px]">
+          <span className={cn('font-medium', step.status === 'error' ? 'text-[#d20b0b]' : 'text-[#464c5e]')}>
+            {step.label}
+          </span>
+          {step.detail && <span className="min-w-0 break-words text-[#9aa1b1]">{step.detail}</span>}
+          {(step.evidence_count ?? 0) > 0 && (
+            <span className="rounded-full bg-[#eef4ff] px-[7px] py-[1px] text-[10px] text-[#315ea8]">
+              {step.evidence_count} 条证据
+            </span>
+          )}
+          {(step.candidate_count ?? 0) > 0 && (
+            <span className="rounded-full bg-[#f4f5f7] px-[7px] py-[1px] text-[10px] text-[#667085]">
+              {step.candidate_count} 条候选
+            </span>
+          )}
+        </div>
+        {step.input && (
+          <div className="mt-[2px] line-clamp-2 break-all font-mono text-[11px] leading-[16px] text-[#8b93a7]">
+            {step.input}
+          </div>
+        )}
+        {(step.sources?.length ?? 0) > 0 && (
+          <div className="mt-[4px] flex min-w-0 flex-wrap gap-[4px]">
+            {step.sources!.map((source) => (
+              <span
+                key={source}
+                title={source}
+                className="min-w-0 max-w-full whitespace-normal break-words wrap-anywhere rounded-full border border-[#e3e7f1] px-[7px] py-[1px] text-left text-[10px] text-[#667085]"
+              >
+                {source}
+              </span>
+            ))}
+          </div>
+        )}
+        {emptyReason && (
+          <div className="mt-[3px] text-[11px] text-[#b45309]">无结果：{emptyReason}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Chronological process: retrieval/tool calls and their result summaries.
+// Tool rows are correlated by call_id, never by tool name.
 function StepGroup({ steps, defaultOpen = false }: { steps: QueryTraceStep[]; defaultOpen?: boolean }) {
   if (steps.length === 0) return null;
   const runningCount = steps.filter((s) => s.status === 'running').length;
   return (
     <CollapsibleSection
-      title="执行轨迹"
-      badge={`(${steps.length}${runningCount > 0 ? ` · ${runningCount} running` : ''})`}
+      title="处理过程"
+      badge={`(${steps.length}${runningCount > 0 ? ` · ${runningCount} 进行中` : ''})`}
       defaultOpen={defaultOpen}
     >
-      {steps.map((s, idx) => (
-        <div key={`${s.key}-${idx}`} className="flex items-start gap-[6px] text-[12px]">
-          <span
-            className={cn(
-              'mt-[5px] h-1.5 w-1.5 shrink-0 rounded-full',
-              s.status === 'running' ? 'animate-pulse bg-[#1d4ed8]' : s.status === 'done' ? 'bg-[#16a34a]' : s.status === 'error' ? 'bg-[#d20b0b]' : 'bg-[#d1d5db]',
-            )}
-          />
-          <div className="min-w-0 flex-1 whitespace-pre-wrap break-words">
-            <span className={cn(s.status === 'error' ? 'text-[#d20b0b]' : 'text-[#464c5e]')}>{s.label}</span>
-            {s.detail && <span className="text-[#9aa1b1]"> · {s.detail}</span>}
-          </div>
-        </div>
-      ))}
+      <div className="flex min-w-0 flex-col divide-y divide-[#f2f3f7]">
+        {steps.map((s, idx) => (
+          <StepRow key={`${s.key}-${idx}`} step={s} />
+        ))}
+      </div>
     </CollapsibleSection>
   );
 }
@@ -178,224 +223,6 @@ function DegradedBanner({ notes }: { notes: Array<{ stage: string; reason: strin
           {n.reason}
         </div>
       ))}
-    </div>
-  );
-}
-
-const PLAN_STATUS_META: Record<string, { icon: string; label: string; className: string }> = {
-  completed: { icon: '✓', label: '已完成', className: 'text-[#15803d]' },
-  in_progress: { icon: '◐', label: '进行中', className: 'text-[#1d4ed8]' },
-  pending: { icon: '○', label: '待开始', className: 'text-[#9aa1b1]' },
-};
-
-function PlanPanel({ plan, defaultOpen = false }: { plan: TurnPlanState; defaultOpen?: boolean }) {
-  if (!plan.items?.length) return null;
-  const completed = plan.items.filter((item) => item.status === 'completed').length;
-  const percent = Math.round((completed / plan.items.length) * 100);
-  return (
-    <CollapsibleSection
-      title="执行计划"
-      badge={`${completed}/${plan.items.length}`}
-      icon={<AppIcon name="check-list" size={11} />}
-      defaultOpen={defaultOpen}
-      className="rounded-[12px] border border-[#e6e9f0] bg-white px-[12px] py-[10px] shadow-[0_1px_2px_rgba(24,24,26,0.03)]"
-    >
-      <div className="mb-[9px] h-[3px] overflow-hidden rounded-full bg-[#eef1f6]">
-        <div
-          className="h-full rounded-full bg-[#18181a] transition-all duration-300"
-          style={{ width: `${Math.max(0, Math.min(100, percent))}%` }}
-        />
-      </div>
-      <div className="grid gap-[7px]">
-        {plan.items.map((item, index) => {
-          const meta = PLAN_STATUS_META[item.status] ?? PLAN_STATUS_META.pending;
-          return (
-            <div key={`${item.content}-${index}`} className="flex items-start gap-[8px] text-[12px] leading-[18px]">
-              <span className={cn('mt-[1px] inline-grid size-[16px] shrink-0 place-items-center rounded-full border border-[#eceef3] bg-[#fafbfc] text-[9px]', meta.className)}>
-                {meta.icon}
-              </span>
-              <span className={cn('min-w-0 flex-1 break-words', item.status === 'completed' ? 'text-[#858b9c]' : 'text-[#464c5e]')}>
-                {item.content}
-              </span>
-              <span className={cn('mt-[1px] shrink-0 text-[10px]', meta.className)}>{meta.label}</span>
-            </div>
-          );
-        })}
-      </div>
-    </CollapsibleSection>
-  );
-}
-
-function BudgetPanel({
-  budget,
-  onContinue,
-  onNarrowScope,
-}: {
-  budget: TurnBudget;
-  onContinue?: () => void;
-  onNarrowScope?: () => void;
-}) {
-  const exhausted = budget.exhausted === true || budget.status === 'exhausted';
-  const partial = budget.partial_answer === true || budget.status === 'partial';
-  const contextWindow = budget.context_window;
-  if (!exhausted && !partial && !contextWindow) return null;
-  const tone = exhausted || partial
-    ? 'border-[#f0d28a] bg-[#fff8e6] text-[#8a6a1f]'
-    : 'border-[#dbe3f0] bg-[#f8faff] text-[#46506b]';
-  const complexity = budget.complexity;
-  const compressed = budget.context_compressed;
-  const limit = Number(budget.recursion_limit ?? 0);
-  const calls = Number(budget.tool_calls ?? 0);
-  const usagePercent = limit > 0 ? Math.min(100, Math.round((calls / limit) * 100)) : 0;
-  return (
-    <div className={cn('rounded-[12px] border px-[12px] py-[10px] text-[12px] leading-[18px] shadow-[0_1px_2px_rgba(24,24,26,0.03)]', tone)}>
-      {exhausted || partial ? (
-        <>
-          <div className="mb-[3px] flex items-center gap-[6px] font-semibold">
-            <AppIcon name="chart" size={12} />
-            {exhausted ? '本轮执行预算已用完' : '本轮为部分交付'}
-          </div>
-          <div>
-            已执行 {budget.tool_calls ?? 0} 次工具调用，登记 {budget.evidence_count ?? 0} 条证据；
-            {budget.partial_answer ? '已基于已有证据生成本轮可交付的部分结果。' : '未能生成可交付结果。'}
-          </div>
-          {limit > 0 && (
-            <div className="mt-[8px]">
-              <div className="h-[3px] overflow-hidden rounded-full bg-white/70">
-                <div
-                  className={cn('h-full rounded-full transition-all', exhausted ? 'bg-[#c98a16]' : 'bg-[#8b93a7]')}
-                  style={{ width: `${Math.max(3, usagePercent)}%` }}
-                />
-              </div>
-              <div className="mt-[3px] text-[10px] opacity-70">工具调用 {calls}/{limit}</div>
-            </div>
-          )}
-        </>
-      ) : (
-        <>
-          <div className="mb-[3px] flex items-center gap-[6px] font-semibold">
-            <AppIcon name="history" size={12} />
-            上下文预算
-          </div>
-          <div>
-            本轮最大输入约 {contextWindow?.max_prompt_tokens ?? 0} tokens
-            {contextWindow?.window_tokens ? `（模型窗口 ${contextWindow.window_tokens}）` : ''}；
-            长对话由框架摘要中间件保留近期消息与关键事实。
-          </div>
-        </>
-      )}
-      {complexity && (
-        <div className="mt-[6px] flex flex-wrap items-center gap-[6px] text-[10px] opacity-80">
-          <span className="rounded-full border border-white/50 bg-white/55 px-[7px] py-[2px]">
-            复杂度 {complexity.level ?? 'unknown'}
-            {typeof complexity.score === 'number' ? ` · ${complexity.score} 分` : ''}
-          </span>
-          {typeof budget.recursion_limit === 'number' && (
-            <span className="rounded-full border border-white/50 bg-white/55 px-[7px] py-[2px]">
-              步数上限 {budget.recursion_limit}
-            </span>
-          )}
-        </div>
-      )}
-      {compressed && (
-        <div className="mt-[5px] text-[10px] opacity-75">
-          收尾时已将 {compressed.evidence_count ?? 0} 条证据压缩为有界上下文
-          {compressed.compressed_bytes ? `（${Math.max(1, Math.round(compressed.compressed_bytes / 1024))} KB）` : ''}。
-        </div>
-      )}
-      {(onContinue || onNarrowScope) && (
-        <div className="mt-[7px] flex flex-wrap gap-[8px]">
-          {onContinue && (
-            <button
-              type="button"
-              onClick={onContinue}
-              className="rounded-[6px] border border-[#d9b95c] bg-white px-[9px] py-[3px] text-[11px] font-medium text-[#7a5a12] hover:bg-[#fffdf5]"
-            >
-              继续完成
-            </button>
-          )}
-          {onNarrowScope && (
-            <button
-              type="button"
-              onClick={onNarrowScope}
-              className="rounded-[6px] border border-[#e4d6b0] bg-transparent px-[9px] py-[3px] text-[11px] text-[#8a6a1f] hover:bg-white/60"
-            >
-              缩小范围
-            </button>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-const VERIFICATION_STATUS_META: Record<string, { label: string; className: string; badge: string }> = {
-  pass: { label: '通过', className: 'border-[#bbf7d0] bg-[#f0fdf4] text-[#166534]', badge: '✓' },
-  warn: { label: '有缺口', className: 'border-[#f0d28a] bg-[#fff8e6] text-[#8a6a1f]', badge: '!' },
-  fail: { label: '未通过', className: 'border-[#fecaca] bg-[#fef2f2] text-[#b42318]', badge: '×' },
-  partial: { label: '部分完成', className: 'border-[#f0d28a] bg-[#fff8e6] text-[#8a6a1f]', badge: '◐' },
-  unknown: { label: '未评估', className: 'border-[#e3e7f1] bg-[#fafbfc] text-[#697187]', badge: '?' },
-};
-
-const CHECK_STATUS_META: Record<string, { icon: string; className: string }> = {
-  pass: { icon: '✓', className: 'text-[#15803d]' },
-  warn: { icon: '!', className: 'text-[#b45309]' },
-  fail: { icon: '×', className: 'text-[#b42318]' },
-  unknown: { icon: '?', className: 'text-[#858b9c]' },
-};
-
-function VerificationPanel({
-  verification,
-  defaultOpen = false,
-}: {
-  verification: TurnVerification;
-  defaultOpen?: boolean;
-}) {
-  if (!verification.status) return null;
-  const meta = VERIFICATION_STATUS_META[verification.status] ?? VERIFICATION_STATUS_META.unknown;
-  const checks = verification.checks ?? [];
-  const gaps = verification.gaps ?? [];
-  return (
-    <div className="rounded-[12px] border border-[#e6e9f0] bg-white px-[12px] py-[10px] shadow-[0_1px_2px_rgba(24,24,26,0.03)]">
-      <CollapsibleSection
-        title="系统校验"
-        badge={`${meta.badge} ${meta.label}${checks.length ? ` · ${checks.length} 项` : ''}`}
-        icon={<AppIcon name="check-list" size={11} />}
-        defaultOpen={defaultOpen}
-      >
-        <div className={cn('mb-[8px] inline-flex w-fit items-center gap-[5px] rounded-full border px-[8px] py-[2px] text-[10px] font-medium', meta.className)}>
-          <span>{meta.badge}</span>
-          <span>{meta.label}</span>
-        </div>
-        <div className="grid gap-[6px]">
-          {checks.map((check, index) => {
-            const checkMeta = CHECK_STATUS_META[check.status] ?? CHECK_STATUS_META.unknown;
-            return (
-              <div key={`${check.key}-${index}`} className="flex items-start gap-[7px] text-[12px] leading-[18px]">
-                <span className={cn('mt-[1px] inline-grid size-[15px] shrink-0 place-items-center rounded-full bg-[#fafbfc] text-[10px] font-semibold', checkMeta.className)}>
-                  {checkMeta.icon}
-                </span>
-                <div className="min-w-0 flex-1">
-                  <span className="text-[#464c5e]">{check.label}</span>
-                  {check.source === 'model_rubric' && (
-                    <span className="ml-[5px] rounded-[4px] bg-[#eef2ff] px-[4px] py-[0px] text-[9px] text-[#4f46e5]">模型</span>
-                  )}
-                  {check.detail && <span className="text-[#9aa1b1]"> · {check.detail}</span>}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-        {gaps.length > 0 && (
-          <div className="mt-[8px] rounded-[8px] border border-[#f0f2f6] bg-[#fafbfc] px-[9px] py-[7px] text-[11px] leading-[17px] text-[#697187]">
-            <div className="mb-[3px] text-[10px] font-semibold text-[#5b6273]">缺口与待确认</div>
-            {gaps.map((gap, index) => <div key={index} className="flex gap-[5px]"><span className="text-[#b3b8c4]">·</span><span>{gap}</span></div>)}
-          </div>
-        )}
-        {verification.semantic_verification?.status === 'unknown' && (
-          <div className="mt-[4px] text-[10px] text-[#9aa1b1]">独立模型校验未完成；以上为结构与引用检查。</div>
-        )}
-      </CollapsibleSection>
     </div>
   );
 }
@@ -491,11 +318,11 @@ function EvidenceBlock({ evidence }: { evidence: EvidenceItem[] }) {
             return (
               <div
                 key={index}
-                className="rounded-[8px] border border-[#e3e7f1] bg-[#fafbfc] px-[10px] py-[8px]"
+                className="rounded-[8px] border border-[#e3e7f1] px-[10px] py-[8px]"
               >
-                <div className="mb-[4px] flex items-center gap-[6px] text-[12px] font-semibold text-[#18181a]">
-                  <span className="text-[#757f9c]">[{index + 1}]</span>
-                  <span className="min-w-0 truncate">{fileName}</span>
+                <div className="mb-[4px] flex items-start gap-[6px] text-[12px] font-semibold text-[#18181a]">
+                  <span className="shrink-0 text-[#757f9c]">[{index + 1}]</span>
+                  <span className="min-w-0 flex-1 break-words wrap-anywhere leading-[18px]">{fileName}</span>
                   {sourceKind && (
                     <span className="ml-auto shrink-0 text-[11px] font-normal text-[#858b9c]">
                       {sourceKind}
@@ -703,12 +530,7 @@ function MessageBubble({
   streaming,
   streamingText,
   traceSteps = [],
-  plan,
-  budget,
-  verification,
   subagents = [],
-  onContinue,
-  onNarrowScope,
   degradedNotes = [],
   showDiagnostics = true,
   onCreateMemory,
@@ -722,9 +544,6 @@ function MessageBubble({
   exportPreviews = {},
   exportFormats,
 }: Props) {
-  const resolvedPlan = plan ?? msg.plan ?? null;
-  const resolvedBudget = budget ?? msg.budget ?? null;
-  const resolvedVerification = verification ?? msg.verification ?? null;
   const resolvedSubagents = subagents.length > 0 ? subagents : (msg.subagents ?? []);
   // 流式临时气泡
   if (streaming) {
@@ -737,15 +556,8 @@ function MessageBubble({
               {showDiagnostics && <AssistantIdentity live />}
               {degradedNotes.length > 0 && <DegradedBanner notes={degradedNotes} />}
               {!generating && (!showDiagnostics || traceSteps.length === 0) && <WaitSpinner />}
-              {showDiagnostics && resolvedPlan && <PlanPanel plan={resolvedPlan} defaultOpen />}
               {showDiagnostics && resolvedSubagents.length > 0 && <SubagentPanel subagents={resolvedSubagents} defaultOpen />}
               {showDiagnostics && traceSteps.length > 0 && <StepGroup steps={traceSteps} defaultOpen />}
-              {showDiagnostics && resolvedBudget && (
-                <BudgetPanel budget={resolvedBudget} />
-              )}
-              {showDiagnostics && resolvedVerification && (
-                <VerificationPanel verification={resolvedVerification} defaultOpen />
-              )}
               {generating && (
                 <div data-i18n-ignore>
                   <StreamingText content={streamingText} />
@@ -767,19 +579,14 @@ function MessageBubble({
           {msg.role === 'assistant' ? (
             <div className="grid gap-[12px]" data-i18n-ignore>
               {showDiagnostics && !isError && <AssistantIdentity />}
-              {showDiagnostics && resolvedPlan && <PlanPanel plan={resolvedPlan} />}
               {showDiagnostics && resolvedSubagents.length > 0 && <SubagentPanel subagents={resolvedSubagents} />}
-              {showDiagnostics && traceSteps.length > 0 && <StepGroup steps={traceSteps} />}
-              <MarkdownMessage content={msg.content} />
-              {showDiagnostics && resolvedBudget && (
-                <BudgetPanel budget={resolvedBudget} onContinue={onContinue} onNarrowScope={onNarrowScope} />
-              )}
-              {showDiagnostics && resolvedVerification && (
-                <VerificationPanel
-                  verification={resolvedVerification}
-                  defaultOpen={resolvedVerification.status === 'fail' || resolvedVerification.status === 'partial'}
+              {showDiagnostics && traceSteps.length > 0 && (
+                <StepGroup
+                  steps={traceSteps}
+                  defaultOpen={traceSteps.some((step) => step.status === 'error' || step.empty_reason)}
                 />
               )}
+              <MarkdownMessage content={msg.content} />
               <FeedbackActions msg={msg} />
               {msg.memory_context && msg.memory_context.length > 0 && (
                 <MemoryContextBlock memories={msg.memory_context} />

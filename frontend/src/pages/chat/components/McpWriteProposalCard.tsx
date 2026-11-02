@@ -1,4 +1,4 @@
-import type { McpWriteProposalCard as ProposalCard } from '../useKbChat';
+import type { McpWriteProposalCard as ProposalCard } from '@/api/types';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 

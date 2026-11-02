@@ -7,6 +7,7 @@ transport policy ad hoc.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
@@ -15,9 +16,10 @@ import src.settings as settings
 
 from src.core.llm_governor import PRIORITY_INTERACTIVE
 from src.core.llm_headers import opencode_extra_headers
+from src.core.model_context import resolve_model_context_window
 from src.core.model_gateway import build_governed_model
 
-
+_LOGGER = logging.getLogger(__name__)
 
 _SETTINGS_GENERATION = 0
 _PROFILE_NAMES = frozenset({
@@ -142,6 +144,25 @@ def resolve_chat_model_config(
     if not resolved_model:
         raise ValueError(f"Chat model is not configured for provider {normalized_provider}")
 
+    configured_window = max(
+        0, int(getattr(settings_source, "AGENT_MODEL_MAX_INPUT_TOKENS", 0) or 0)
+    )
+    context = resolve_model_context_window(
+        normalized_provider,
+        resolved_model,
+        configured_window,
+    )
+    if context.capped:
+        _LOGGER.warning(
+            "Configured AGENT_MODEL_MAX_INPUT_TOKENS=%s exceeds the known %s window "
+            "for %s/%s; using %s to keep compaction proactive",
+            configured_window,
+            context.catalog_window,
+            normalized_provider,
+            resolved_model,
+            context.window,
+        )
+
     return ChatModelConfig(
         profile=profile_name,
         provider=normalized_provider,
@@ -153,9 +174,7 @@ def resolve_chat_model_config(
         temperature=float(getattr(settings_source, "AGENT_TEMPERATURE", 0.2)),
         max_retries=max(0, int(default_retries)),
         require_structured_tools=require_structured_tools,
-        max_input_tokens=max(
-            0, int(getattr(settings_source, "AGENT_MODEL_MAX_INPUT_TOKENS", 0) or 0)
-        ),
+        max_input_tokens=context.window,
         priority=str(priority or PRIORITY_INTERACTIVE),
     )
 

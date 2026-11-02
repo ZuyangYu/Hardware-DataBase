@@ -14,7 +14,6 @@ from src.agents.runner import (
     _agent_recursion_limit,
     _build_turn_verification,
     _normalize_citation_labels,
-    _normalize_plan_items,
     _research_subagent_spec,
     _scrub_invalid_citations,
     _synthesize_partial_answer,
@@ -80,8 +79,8 @@ def test_complexity_budget_scores_multi_part_attachment_turn():
     )
     assert budget["complexity"]["level"] == "complex"
     assert budget["complexity"]["numbered_items"] >= 6
-    assert budget["base_recursion_limit"] == 36
-    assert 36 < limit <= 72
+    assert budget["base_recursion_limit"] == 72
+    assert 72 < limit <= 120
     assert budget["recursion_limit"] == limit
 
 
@@ -92,7 +91,7 @@ def test_simple_turn_keeps_historical_recursion_limit():
         attachment_refs=[],
         knowledge_scope=None,
     )
-    assert limit == 36
+    assert limit == 72
     assert budget["complexity"]["level"] == "simple"
 
 
@@ -106,8 +105,20 @@ def test_short_hardware_question_gets_complex_budget_and_evidence_room():
     )
     assert budget["complexity"]["hardware"]["is_hardware"] is True
     assert budget["complexity"]["level"] == "complex"
-    assert limit > 36
+    assert limit > 72
     assert _agent_evidence_budget([], question=query) > _agent_evidence_budget([], question="你好")
+
+
+def test_minimum_system_question_is_treated_as_hardware_multihop():
+    limit, budget = _agent_recursion_limit(
+        query="TC377 最小系统包含哪些关键器件？",
+        query_mode="deep",
+        attachment_refs=[],
+        knowledge_scope=None,
+    )
+    assert budget["complexity"]["hardware"]["is_hardware"] is True
+    assert budget["complexity"]["level"] == "complex"
+    assert limit > 72
 
 
 def test_hardware_removal_target_mismatch_is_a_failed_check():
@@ -124,19 +135,6 @@ def test_hardware_removal_target_mismatch_is_a_failed_check():
     assert checks["removal_target"]["status"] == "fail"
     assert checks["hardware_entities"]["status"] == "warn"
     assert result["status"] == "fail"
-
-
-def test_plan_items_are_bounded_and_status_normalized():
-    items = _normalize_plan_items(
-        [
-            {"content": "读取 BOM", "status": "completed"},
-            {"content": "查知识库", "status": "unexpected"},
-            {"content": "", "status": "pending"},
-            {"content": "x" * 500, "status": "in_progress"},
-        ]
-    )
-    assert [item["status"] for item in items] == ["completed", "pending", "in_progress"]
-    assert len(items[2]["content"]) == 240
 
 
 def test_research_subagent_receives_read_only_tools_only():
@@ -171,7 +169,7 @@ def test_partial_synthesis_trims_unregistered_citations_and_compacts_context():
     assert "[1]" in text
     assert "[9]" not in text
     assert budget["context_compressed"]["evidence_count"] == 1
-    assert events[0]["type"] == "context_compacted"
+    assert events[0]["type"] == "evidence_compressed"
 
 
 def test_semantic_verifier_sanitizes_json_and_exposes_gaps():
@@ -323,9 +321,7 @@ def test_turn_verification_marks_partial_and_detects_source_separation():
     assert result["budget_exhausted"] is True
 
 
-def test_complex_deep_turn_offers_planner_and_read_only_research_subagent(monkeypatch):
-    from langchain.agents.middleware import TodoListMiddleware
-
+def test_complex_deep_turn_does_not_offer_a_planner_but_keeps_research_subagent(monkeypatch):
     captured: dict = {}
 
     class _Agent:
@@ -355,7 +351,7 @@ def test_complex_deep_turn_offers_planner_and_read_only_research_subagent(monkey
     )
     runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
     list(runner.stream(query=query, kb_name="kb_hw", history=[]))
-    assert any(isinstance(item, TodoListMiddleware) for item in captured["middleware"])
+    assert "middleware" not in captured
     subagents = captured.get("subagents") or []
     assert [item["name"] for item in subagents] == ["research"]
     tool_names = {
@@ -367,7 +363,7 @@ def test_complex_deep_turn_offers_planner_and_read_only_research_subagent(monkey
     assert "generate_document_from_template" not in tool_names
 
 
-def test_runner_emits_plan_and_persists_turn_metadata(monkeypatch):
+def test_runner_does_not_emit_plan_events(monkeypatch):
     query = "\n".join(
         [
             "请完成五类 BOM 复用建议并给出风险、引用和推荐表。",
@@ -379,32 +375,16 @@ def test_runner_emits_plan_and_persists_turn_metadata(monkeypatch):
             "6. 资料不足处标注待确认。",
         ]
     )
-    plan_call = AIMessage(
-        content="",
-        tool_calls=[
-            {
-                "name": "write_todos",
-                "args": {
-                    "todos": [
-                        {"content": "读取上一代 BOM", "status": "completed"},
-                        {"content": "检索知识库约束", "status": "in_progress"},
-                    ]
-                },
-                "id": "call-plan-1",
-                "type": "tool_call",
-            }
-        ],
-    )
     final = AIMessage(content="候选 BOM 如下。")
-    runner, events = _run_with_chunks(monkeypatch, query=query, chunks=[plan_call, final])
+    runner, events = _run_with_chunks(monkeypatch, query=query, chunks=[final])
 
     event_types = [event["type"] for event in events]
-    assert "plan_created" in event_types
+    assert "plan_created" not in event_types
+    assert "plan_updated" not in event_types
     assert "budget" in event_types
     assert "verification" in event_types
     summary = runner.get_last_retrieval_summary()
-    assert summary["plan"]["revision"] == 1
-    assert summary["plan"]["items"][0]["status"] == "completed"
+    assert "plan" not in summary
     assert summary["budget"]["complexity"]["level"] in {"moderate", "complex"}
     assert summary["verification"]["status"] in {"warn", "fail", "pass"}
 

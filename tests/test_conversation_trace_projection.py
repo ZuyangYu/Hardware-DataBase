@@ -12,10 +12,14 @@ class TraceStepProjectionTests(unittest.TestCase):
     def test_tool_call_pair_becomes_one_completed_step(self):
         steps = _trace_steps_from_events(
             [
-                event("tool_started", {"tool_name": "document_search", "query": "电源结构"}),
+                event(
+                    "tool_started",
+                    {"call_id": "inv-1", "tool_name": "document_search", "query": "电源结构"},
+                ),
                 event(
                     "tool_result",
                     {
+                        "call_id": "inv-1",
                         "tool_name": "document_search",
                         "hit_count": 3,
                         "status": "done",
@@ -25,7 +29,7 @@ class TraceStepProjectionTests(unittest.TestCase):
             ]
         )
         self.assertEqual(len(steps), 1)
-        self.assertEqual(steps[0]["key"], "document_search#1")
+        self.assertEqual(steps[0]["key"], "inv-1")
         self.assertEqual(steps[0]["label"], "文档检索")
         self.assertEqual(steps[0]["status"], "done")
         self.assertEqual(steps[0]["detail"], "3 条命中 · 12ms")
@@ -33,23 +37,93 @@ class TraceStepProjectionTests(unittest.TestCase):
     def test_repeated_tool_calls_keep_separate_steps(self):
         steps = _trace_steps_from_events(
             [
-                event("tool_started", {"tool_name": "memory_search", "query": "a"}),
-                event("tool_result", {"tool_name": "memory_search", "hit_count": 0}),
-                event("tool_started", {"tool_name": "memory_search", "query": "b"}),
-                event("tool_result", {"tool_name": "memory_search", "hit_count": 2}),
+                event("tool_started", {"call_id": "inv-1", "tool_name": "memory_search", "query": "a"}),
+                event("tool_result", {"call_id": "inv-1", "tool_name": "memory_search", "hit_count": 0}),
+                event("tool_started", {"call_id": "inv-2", "tool_name": "memory_search", "query": "b"}),
+                event("tool_result", {"call_id": "inv-2", "tool_name": "memory_search", "hit_count": 2}),
             ]
         )
-        self.assertEqual([step["key"] for step in steps], ["memory_search#1", "memory_search#2"])
+        self.assertEqual([step["key"] for step in steps], ["inv-1", "inv-2"])
         self.assertEqual(steps[0]["detail"], "0 条命中")
         self.assertEqual(steps[1]["detail"], "2 条命中")
+
+    def test_tool_result_summary_is_projected_without_commentary(self):
+        steps = _trace_steps_from_events(
+            [
+                event("narration", {"text": "先确认电源方案"}),
+                event(
+                    "tool_started",
+                    {"call_id": "inv-1", "tool_name": "document_search", "query": "电源方案"},
+                ),
+                event(
+                    "tool_result",
+                    {
+                        "call_id": "inv-1",
+                        "tool_name": "document_search",
+                        "hit_count": 5,
+                        "evidence_count": 3,
+                        "candidate_count": 2,
+                        "sources": ["设计说明.docx", "BOM.xlsx"],
+                        "citation_numbers": [1, 2, 3],
+                        "status": "done",
+                    },
+                ),
+            ]
+        )
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["kind"], "tool")
+        self.assertEqual(steps[0]["sources"], ["设计说明.docx", "BOM.xlsx"])
+        self.assertEqual(steps[0]["evidence_count"], 3)
+        self.assertEqual(steps[0]["candidate_count"], 2)
+        self.assertEqual(steps[0]["citation_numbers"], [1, 2, 3])
+
+    def test_empty_tool_result_keeps_reason(self):
+        steps = _trace_steps_from_events(
+            [
+                event("tool_started", {"call_id": "inv-1", "tool_name": "circuit_search", "query": "PMU"}),
+                event(
+                    "tool_result",
+                    {
+                        "call_id": "inv-1",
+                        "tool_name": "circuit_search",
+                        "status": "done",
+                        "hit_count": 0,
+                        "sources": [],
+                        "empty_reason": "no_match",
+                    },
+                ),
+            ]
+        )
+        self.assertEqual(steps[0]["status"], "done")
+        self.assertEqual(steps[0]["empty_reason"], "no_match")
+        self.assertEqual(steps[0]["sources"], [])
+
+    def test_parallel_same_tool_calls_pair_by_call_id(self):
+        steps = _trace_steps_from_events(
+            [
+                event("tool_started", {"call_id": "inv-1", "tool_name": "document_search", "query": "a"}),
+                event("tool_started", {"call_id": "inv-2", "tool_name": "document_search", "query": "b"}),
+                event(
+                    "tool_result",
+                    {"call_id": "inv-2", "tool_name": "document_search", "hit_count": 2, "status": "done"},
+                ),
+                event(
+                    "tool_result",
+                    {"call_id": "inv-1", "tool_name": "document_search", "hit_count": 1, "status": "done"},
+                ),
+            ]
+        )
+        self.assertEqual([step["key"] for step in steps], ["inv-1", "inv-2"])
+        self.assertEqual([step["status"] for step in steps], ["done", "done"])
+        self.assertEqual([step["detail"] for step in steps], ["1 条命中", "2 条命中"])
 
     def test_failed_tool_result_marks_error(self):
         steps = _trace_steps_from_events(
             [
-                event("tool_started", {"tool_name": "circuit_search", "query": "net"}),
+                event("tool_started", {"call_id": "inv-1", "tool_name": "circuit_search", "query": "net"}),
                 event(
                     "tool_result",
-                    {"tool_name": "circuit_search", "hit_count": 0, "status": "failed"},
+                    {"call_id": "inv-1", "tool_name": "circuit_search", "hit_count": 0, "status": "failed"},
                 ),
             ]
         )

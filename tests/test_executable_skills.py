@@ -25,6 +25,27 @@ from src.sandbox.service import SandboxExecutionAdapter, SandboxExecutionError
 from src.sandbox.task_store import SandboxTaskStore
 
 
+class _SkillRuntime:
+    """Minimal ToolRuntime surface used by the Skill tool factory."""
+
+    def __init__(self, events: list[tuple[str, dict]]):
+        self.events = events
+        self._seq = 0
+
+    def check_cancel(self) -> None:
+        return None
+
+    def next_invocation_id(self) -> str:
+        self._seq += 1
+        return f"inv-{self._seq}"
+
+    def tool_started(self, **payload) -> None:
+        self.events.append(("tool_started", payload))
+
+    def tool_result(self, **payload) -> None:
+        self.events.append(("tool_result", payload))
+
+
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
     for key, value in {
@@ -355,7 +376,7 @@ def test_agent_sees_only_subscribed_reviewed_skills_and_rechecks_at_call(setup, 
     skills.mark_tested("skill/agent-report")
     skills.enable("skill/agent-report")
     events = []
-    rt = SimpleNamespace(check_cancel=lambda: None, emit=lambda kind, data: events.append((kind, data)))
+    rt = _SkillRuntime(events)
     assert make_skill_tools(rt, user_id=42, department_id="dept-1") == []
     skills.subscribe("skill/agent-report", principal_id=42, department_id="dept-1")
     tools = make_skill_tools(rt, user_id=42, department_id="dept-1")
@@ -406,7 +427,7 @@ def test_agent_skill_tool_returns_broker_verified_preview_for_followup(setup, mo
     monkeypatch.setattr(agent_tools, "SandboxTaskStore", lambda: FinishedStore())
     monkeypatch.setattr(agent_tools, "ArtifactBroker", lambda **kwargs: VerifiedBroker())
     events = []
-    rt = SimpleNamespace(check_cancel=lambda: None, emit=lambda kind, data: events.append((kind, data)))
+    rt = _SkillRuntime(events)
     tool = next(tool for tool in make_skill_tools(rt, user_id=42, department_id="dept-1")
                 if tool.name.startswith("skill__"))
     response = tool.invoke({"parameters_json": '{"title":"report"}'})

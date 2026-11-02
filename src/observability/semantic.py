@@ -53,4 +53,7 @@ METRIC_LABEL_KEYS = {
     # External MCP plugins: transport is a closed set and status a bounded
     # outcome enum; server slugs/tool names never become metric dimensions.
     "transport",
+    # Context governance: bounded enums only (auto/manual/overflow, ok/failed).
+    "trigger",
+    "outcome",
 }
