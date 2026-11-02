@@ -14,6 +14,7 @@ class _ConversationService:
         assert session_id == 94
         return [
             SimpleNamespace(
+                query="VCC3V3_EQ 的过压门限是多少？",
                 summary={
                     "verification": {
                         "answer_gaps": ["过压门限数值未给出"],
@@ -40,7 +41,7 @@ def test_prior_turn_evidence_is_preloaded_as_candidates(monkeypatch):
     import src.core.conversation as conversation
 
     monkeypatch.setattr(conversation, "ConversationService", _ConversationService)
-    runtime = ToolRuntime(kb_name="AAA", ctx=None)
+    runtime = ToolRuntime(kb_name="AAA", ctx=None, question="那 Q1600 的引脚呢？")
 
     preload_session_context(runtime, 94, 4)
 
@@ -60,7 +61,7 @@ def test_prior_turn_evidence_is_renumbered_when_promoted(monkeypatch):
     from src.agents.tools.evidence_tools import make_evidence_read
 
     monkeypatch.setattr(conversation, "ConversationService", _ConversationService)
-    runtime = ToolRuntime(kb_name="AAA", ctx=None)
+    runtime = ToolRuntime(kb_name="AAA", ctx=None, question="那 Q1600 的引脚呢？")
 
     preload_session_context(runtime, 94, 4)
 
@@ -85,3 +86,35 @@ def test_answer_gap_lines_extracts_gap_sentences():
         "Q1600 拓扑证据不足",
         "没有查到电气参数",
     ]
+
+
+def test_unrelated_question_does_not_inject_prior_context(monkeypatch):
+    import src.core.conversation as conversation
+
+    monkeypatch.setattr(conversation, "ConversationService", _ConversationService)
+    runtime = ToolRuntime(
+        kb_name="AAA", ctx=None, question="KL30 电源管理如何工作？"
+    )
+
+    preload_session_context(runtime, 94, 4)
+
+    assert runtime.candidate_evidence == {}
+    assert runtime.prior_gaps == []
+    assert runtime.prior_evidence_prompt() == ""
+    assert runtime.prior_gap_prompt() == ""
+
+
+def test_same_entity_question_injects_prior_context_without_follow_up_wording(
+    monkeypatch,
+):
+    import src.core.conversation as conversation
+
+    monkeypatch.setattr(conversation, "ConversationService", _ConversationService)
+    runtime = ToolRuntime(
+        kb_name="AAA", ctx=None, question="VCC3V3_EQ 的 UVLO 是多少？"
+    )
+
+    preload_session_context(runtime, 94, 4)
+
+    assert "document:old-1" in runtime.candidate_evidence
+    assert runtime.prior_gaps

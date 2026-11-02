@@ -2,11 +2,63 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from src.agents.schemas import Evidence
 
 _MAX_PRIOR_GAPS = 5
+
+_FOLLOW_UP_RE = re.compile(
+    r"^(?:那|那么|这个|该|其|它|上述|刚才|前面|继续|再看|还有|另外)|(?:呢|吗)[？?]?$"
+)
+_ENTITY_RE = re.compile(r"\b[A-Z]{1,6}\d[A-Z0-9_-]*\b", re.IGNORECASE)
+_CJK_SEGMENT_RE = re.compile(r"[\u4e00-\u9fff]+")
+_STOP_BIGRAMS = frozenset({
+    "什么", "怎么", "如何", "哪些", "多少", "是否", "这个", "那个", "可以",
+    "需要", "问题", "资料", "证据", "知识", "没有", "给出", "出现", "无法",
+    "确认", "上一", "一轮", "本轮", "以及", "进行", "一个", "我们", "现在",
+    "具体", "相关", "内容", "还有", "另外", "继续",
+})
+
+
+def _cjk_bigrams(text: str) -> set[str]:
+    grams: set[str] = set()
+    for segment in _CJK_SEGMENT_RE.findall(str(text or "")):
+        for index in range(len(segment) - 1):
+            gram = segment[index:index + 2]
+            if gram not in _STOP_BIGRAMS:
+                grams.add(gram)
+    return grams
+
+
+def prior_context_relevant(query: str, turns: list[Any]) -> bool:
+    """Only carry prior evidence/gaps into an actually related next question."""
+
+    current = str(query or "").strip()
+    if not current or not turns:
+        return False
+    if len(current) <= 120 and _FOLLOW_UP_RE.search(current):
+        return True
+    prior_parts: list[str] = []
+    for turn in turns[:3]:
+        prior_parts.append(str(getattr(turn, "query", "") or ""))
+        summary = turn.summary if isinstance(turn.summary, dict) else {}
+        verification = summary.get("verification") or {}
+        prior_parts.extend(
+            str(gap or "")
+            for gap in [
+                *(verification.get("answer_gaps") or []),
+                *(verification.get("gaps") or []),
+            ]
+        )
+        for row in summary.get("evidence") or []:
+            if isinstance(row, dict):
+                prior_parts.append(str(row.get("source_name") or ""))
+    prior_text = " ".join(prior_parts)
+    if set(_ENTITY_RE.findall(current)) & set(_ENTITY_RE.findall(prior_text)):
+        return True
+    return len(_cjk_bigrams(current) & _cjk_bigrams(prior_text)) >= 2
 
 
 def preload_session_context(
@@ -20,13 +72,20 @@ def preload_session_context(
         from src.core.conversation import ConversationService
 
         turns = ConversationService().list_recent_turns(
-            int(user_id), int(session_id), limit=3
+            int(user_id), int(session_id), limit=4
         )
     except Exception:
         return
+    history = [
+        turn
+        for turn in turns
+        if isinstance(getattr(turn, "summary", None), dict) and turn.summary
+    ]
+    if not prior_context_relevant(str(getattr(rt, "question", "") or ""), history):
+        return
 
     gaps: list[str] = []
-    for turn in turns:
+    for turn in history:
         summary = turn.summary if isinstance(turn.summary, dict) else {}
         verification = summary.get("verification") or {}
         for gap in [
@@ -42,7 +101,7 @@ def preload_session_context(
             break
 
     items: list[Evidence] = []
-    for turn in reversed(turns):
+    for turn in reversed(history):
         summary = turn.summary if isinstance(turn.summary, dict) else {}
         for row in summary.get("evidence") or []:
             if not isinstance(row, dict) or not row.get("id") or not row.get("content"):
