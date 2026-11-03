@@ -1,6 +1,6 @@
 # 05 · Agent 查询运行时
 
-对应代码：`src/agents/runner.py`（3646 行，核心）、`src/agents/schemas.py`、
+对应代码：`src/agents/runner.py`（2083 行，核心）、`src/agents/schemas.py`、
 `src/agents/orchestration/`、`src/agents/checkpoints/`、`src/agents/subagents/`、
 `src/agents/claim_evidence.py`、`src/agents/scopes/`。
 
@@ -57,45 +57,57 @@ MultiSourceAgentRunner.stream(
 )
 ```
 
-阶段与行号锚点：
+阶段与模块锚点（行号会随重构移动，以函数/模块为准）：
 
 | 阶段 | 位置 | 做什么 |
 |---|---|---|
-| ① 作用域 | `runner.py:2021-2210` | 解析 KB/附件作用域、`KbScope`、权限、附件 refs、`source_scope` 归一化 |
-| ② 运行时 | `2222-2248` | 构造 `ToolRuntime`（一次性，绑定 kb/ctx/取消/事件回调/预算） |
-| ③ 工具装配 | `2261-2557` | 按 `allowed_tools`/capability 过滤、注册工具、构造 action plan 模式 |
-| ④ 计划/执行器 | `2559-2675` | `ConversationOrchestrator.plan` → action plan 解析/校验/执行（可选） |
-| ⑤ 快捷通道 | `2687-3358` | 无模型直答路径：导出协议、文档澄清回答、附件提案审批/取消、模板分析等确定性响应 |
-| ⑥ Agent 流 | `3360-3523` | `agent.stream(...)`：模型 + 工具循环；事件驱动前端轨迹 |
-| ⑦ 汇总 | `3547-3646` | footer / retrieval_summary / diagnostics / token usage / claim_coverage |
+| ① 作用域 | `_prepare_turn` 前段 | 解析 KB/附件作用域、`KbScope`、权限、附件 refs、`source_scope` 归一化 |
+| ② 运行时 | `_prepare_turn` | 构造 `ToolRuntime`（一次性，绑定 kb/ctx/取消/事件回调/预算） |
+| ③ 工具装配 | `turn_tools.py` | 按 `allowed_tools`/capability 过滤、注册工具、构造 action plan 模式 |
+| ④ Prompt 组装 | `turn_prompt.py` | 系统提示、memory/skill/tool/export fragments |
+| ⑤ 快捷通道 | `_prepare_turn` 后段 | 无模型直答路径：导出协议、文档澄清回答、附件提案审批/取消、模板分析等确定性响应 |
+| ⑥ Agent 流 | `_stream_impl` | `agent.stream(...)`：模型 + 工具循环；事件驱动前端轨迹 |
+| ⑦ 汇总 | `_stream_impl` 后段 | footer / retrieval_summary / diagnostics / token usage / claim_coverage |
 
 ### 2.1 消息构造与 checkpoint
 
 ```python
-config["configurable"]["thread_id"] = attempt_thread      # 由 checkpoints 模块派生
-has_state = checkpointer.get_tuple(config) is not None
-messages = [{"role":"user","content":query}] if has_state else _build_messages(query, history)
+session = prepare_session(
+    thread_id=attempt_thread,          # 由 checkpoints 模块派生
+    persist_thread=persist_thread,
+    recursion_limit=recursion_limit,
+    history=history,
+)
+config, messages = session.config, session.messages
 ```
 
 - `persist_thread=True`（持久化 turn worker）时才挂 checkpointer；
 - 无状态时由 `history` 播种最近 6 轮（`_build_messages`）；
 - 有状态时**只喂当前问题**，历史来自 checkpoint——这是多轮上下文复用的关键，
-  但要求 view 层不要把历史重复塞进 prompt。
+  但要求 view 层不要把历史重复塞进 prompt；
+- 存量会话首次接入 checkpoint（`has_state=False` 但 `history` 非空）会一次性播种，
+  之后只追加当前问题。
 
 ### 2.2 系统提示词装配顺序（安全相关，不能乱）
 
+组装点：`src/agents/turn_prompt.py::build_turn_prompt`。
+
 ```
-1. 作用域行（KB 行 + 附件行：可写时附完整 attachment_edit/release/revision_history 操作规则）
-2. 基础提示词（settings.SYSTEM_PROMPT 覆盖，否则内置 _SYSTEM_PROMPT），
+1. 作用域行（KB 行 + 附件行：可写时附 attachment_edit/release/revision_history 操作规则）
+2. 基础提示词（settings.SYSTEM_PROMPT 覆盖，否则内置 SYSTEM_PROMPT），
    含 {kb_name} / {workflow} 占位（_Fast/_Deep workflow）
-3. 导出协议 _EXPORT_PROMPT（仅当服务端判定导出意图时）
+3. 受控动作规则（只能调用当前可见业务工具，不得访问文件系统）
+4. 候选证据规则（领域问答轮；通用对话跳过）
 5. 记忆上下文（<untrusted_memory>，在固定规则之后 → 不能改变证据优先级）
-6. 附件预检（<untrusted_attachment>，≤12000 字符）
-7. action 收据摘要（enabled 模式下执行过的动作摘要行）
-8. 统一工具模式下的受控动作说明句
+6. Skill 提示上下文（未物化文本 Skill 时的兼容路径）
+7. 工具 prompt suffix（MCP 不可信规则 / 执行型 Skill 规则）
+8. 导出协议 EXPORT_PROMPT（仅当服务端判定导出意图时）
 ```
 
-> 顺序即安全边界：**固定规则在前，不可信内容在后**；`settings._PromptDict` 机制保证
+`kb_scope` / `base_rules` / `memory` / `skill` / `mcp` / `skill_tools` / `export`
+同时作为 fragments 写入 turn summary；工具 fragments 只用于追踪，正文只由 suffix 注入一次。
+
+> 顺序即安全边界：**固定规则在前，不可信内容在后**；`_PromptDict` 机制保证
 > 自定义 `SYSTEM_PROMPT` 缺少占位符时也不会被格式化炸掉（占位符原样保留）。
 
 ### 2.3 上下文自动压缩
@@ -128,6 +140,11 @@ hash、各 fragment 字节数、evidence 字节数、模型窗口、实际 input
 | 循环预算 | `LoopBudgetMiddleware` | 时间预算 / no-progress | 每轮 middleware |
 | Agent 装配 | `src/agents/assembly.py` | 唯一 `create_deep_agent` 调用点 | — |
 | 文本 Skill | `skill_materializer` + 官方 `SkillsMiddleware` | 审核/订阅目录 → 只读 SKILL.md | 渐进式披露 |
+| 流式答案适配 | `answer_stream.py` | answer/narration 分流与撤回 | 复用于 SSE/eval |
+| 缺口闭环 | `gap_closure.py` + `middleware/gap_closure.py` | 缺口判断与 `jump_to="model"` | 官方 middleware hook |
+| 会话准备 | `session_service.py` | checkpointer / thread config / 初始消息 | runner 只调用 |
+| 工具装配 | `turn_tools.py` | base / MCP / Skill 工具与 prompt fragments | runner 只消费 |
+| Prompt 组装 | `turn_prompt.py` | 系统提示、memory/skill/tool/export fragments | 顺序可单测 |
 | `evidence_read` | `make_evidence_read` | `ToolRuntime.candidate_evidence`（无外部调用） | 常开（候选优先检索） |
 | `circuit_search` | `make_circuit_search` | `CircuitIndexService.query` | KB 有电路数据时可用 |
 | `spreadsheet_schema_lookup` / `spreadsheet_sql_query` / `spreadsheet_row_search` / `spreadsheet_cell_lookup` | `make_spreadsheet_tools` | 每 KB 表索引 SQLite | 常开 |
