@@ -1,6 +1,6 @@
 # 05 · Agent 查询运行时
 
-对应代码：`src/agents/runner.py`（3646 行，核心）、`src/agents/schemas.py`、
+对应代码：`src/agents/runner.py`（2083 行，核心）、`src/agents/schemas.py`、
 `src/agents/orchestration/`、`src/agents/checkpoints/`、`src/agents/subagents/`、
 `src/agents/claim_evidence.py`、`src/agents/scopes/`。
 
@@ -57,17 +57,17 @@ MultiSourceAgentRunner.stream(
 )
 ```
 
-阶段与行号锚点：
+阶段与模块锚点（行号会随重构移动，以函数/模块为准）：
 
 | 阶段 | 位置 | 做什么 |
 |---|---|---|
-| ① 作用域 | `runner.py:2021-2210` | 解析 KB/附件作用域、`KbScope`、权限、附件 refs、`source_scope` 归一化 |
-| ② 运行时 | `2222-2248` | 构造 `ToolRuntime`（一次性，绑定 kb/ctx/取消/事件回调/预算） |
-| ③ 工具装配 | `2261-2557` | 按 `allowed_tools`/capability 过滤、注册工具、构造 action plan 模式 |
-| ④ 计划/执行器 | `2559-2675` | `ConversationOrchestrator.plan` → action plan 解析/校验/执行（可选） |
-| ⑤ 快捷通道 | `2687-3358` | 无模型直答路径：导出协议、文档澄清回答、附件提案审批/取消、模板分析等确定性响应 |
-| ⑥ Agent 流 | `3360-3523` | `agent.stream(...)`：模型 + 工具循环；事件驱动前端轨迹 |
-| ⑦ 汇总 | `3547-3646` | footer / retrieval_summary / diagnostics / token usage / claim_coverage |
+| ① 作用域 | `_prepare_turn` 前段 | 解析 KB/附件作用域、`KbScope`、权限、附件 refs、`source_scope` 归一化 |
+| ② 运行时 | `_prepare_turn` | 构造 `ToolRuntime`（一次性，绑定 kb/ctx/取消/事件回调/预算） |
+| ③ 工具装配 | `turn_tools.py` | 按 `allowed_tools`/capability 过滤、注册工具、构造 action plan 模式 |
+| ④ Prompt 组装 | `turn_prompt.py` | 系统提示、memory/skill/tool/export fragments |
+| ⑤ 快捷通道 | `_prepare_turn` 后段 | 无模型直答路径：导出协议、文档澄清回答、附件提案审批/取消、模板分析等确定性响应 |
+| ⑥ Agent 流 | `_stream_impl` | `agent.stream(...)`：模型 + 工具循环；事件驱动前端轨迹 |
+| ⑦ 汇总 | `_stream_impl` 后段 | footer / retrieval_summary / diagnostics / token usage / claim_coverage |
 
 ### 2.1 消息构造与 checkpoint
 
@@ -129,9 +129,10 @@ hash、各 fragment 字节数、evidence 字节数、模型窗口、实际 input
 | Agent 装配 | `src/agents/assembly.py` | 唯一 `create_deep_agent` 调用点 | — |
 | 文本 Skill | `skill_materializer` + 官方 `SkillsMiddleware` | 审核/订阅目录 → 只读 SKILL.md | 渐进式披露 |
 | 流式答案适配 | `answer_stream.py` | answer/narration 分流与撤回 | 复用于 SSE/eval |
-| 缺口闭环策略 | `gap_closure.py` | 是否值得补一轮的确定性判断 | runner 只执行 |
+| 缺口闭环 | `gap_closure.py` + `middleware/gap_closure.py` | 缺口判断与 `jump_to="model"` | 官方 middleware hook |
 | 会话准备 | `session_service.py` | checkpointer / thread config / 初始消息 | runner 只调用 |
 | 工具装配 | `turn_tools.py` | base / MCP / Skill 工具与 prompt fragments | runner 只消费 |
+| Prompt 组装 | `turn_prompt.py` | 系统提示、memory/skill/tool/export fragments | 顺序可单测 |
 | `evidence_read` | `make_evidence_read` | `ToolRuntime.candidate_evidence`（无外部调用） | 常开（候选优先检索） |
 | `circuit_search` | `make_circuit_search` | `CircuitIndexService.query` | KB 有电路数据时可用 |
 | `spreadsheet_schema_lookup` / `spreadsheet_sql_query` / `spreadsheet_row_search` / `spreadsheet_cell_lookup` | `make_spreadsheet_tools` | 每 KB 表索引 SQLite | 常开 |
