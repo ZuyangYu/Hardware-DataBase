@@ -14,6 +14,7 @@ from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.middleware.filesystem import FilesystemPermission
 
 from src.agents.middleware.session_context import SessionContextMiddleware
+from src.agents.middleware.skill_read import SkillReadGateMiddleware
 
 
 def build_agent(
@@ -37,6 +38,9 @@ def build_agent(
     """
 
     stack = list(middleware or [])
+    # The official SkillsMiddleware reads SKILL.md through read_file.  Keep
+    # that tool only on turns with a materialized, read-only skill root.
+    stack.append(SkillReadGateMiddleware(enabled=bool(skill_root)))
     if session_state_text:
         # Innermost: append after any other middleware that rewrites the
         # system message, so the continuity block is never lost.

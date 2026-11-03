@@ -140,7 +140,7 @@ hash、各 fragment 字节数、evidence 字节数、模型窗口、实际 input
 | 循环预算 | `LoopBudgetMiddleware` | 时间预算 / no-progress | 每轮 middleware |
 | MCP 工具搜索 | `McpToolSearchMiddleware` | 只向模型暴露搜索选中的 MCP schema | 可见工具 ≥12 时启用 |
 | Agent 装配 | `src/agents/assembly.py` | 唯一 `create_deep_agent` 调用点 | — |
-| 文本 Skill | `skill_materializer` + 官方 `SkillsMiddleware` | 审核/订阅目录 → 只读 SKILL.md | 渐进式披露 |
+| 文本 Skill | `skill_materializer` + 官方 `SkillsMiddleware` | 审核/订阅目录 → 只读 SKILL.md | 渐进式披露；`read_file` 仅在有 Skill 的回合放行 |
 | 流式答案适配 | `answer_stream.py` | answer/narration 分流与撤回 | 复用于 SSE/eval |
 | 缺口闭环 | `gap_closure.py` + `middleware/gap_closure.py` | 缺口判断与 `jump_to="model"` | 官方 middleware hook |
 | 会话准备 | `session_service.py` | checkpointer / thread config / 初始消息 | runner 只调用 |

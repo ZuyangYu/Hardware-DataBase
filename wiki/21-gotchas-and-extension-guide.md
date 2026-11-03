@@ -291,7 +291,9 @@
 `sandbox.execute`/工具/网络能力。含 hooks/bin/command 或 prompt-injection
 模式的内容只生成审核标记，不会被解释或执行。启用时 runner 只把已审核、已订阅的
 Skill 物化为只读 `SKILL.md` 目录，交给官方 `SkillsMiddleware` 做渐进式披露：
-系统提示只出现名称/描述，正文由 `read_file` 按需读取；文件系统写入被拒绝。
+系统提示只出现名称/描述，正文由 `read_file` 按需读取；`read_file` 只在该回合
+存在物化 Skill 时由 `SkillReadGateMiddleware` 放行，backend 固定到本次 Skill
+目录，文件系统写入被拒绝。
 当前有 HDB 自有/管理员审核固定负载的 dev-l1
 参考部署；第三方或模型生成代码、敏感多租户生产使用仍未通过安全验收。Skill 类型、个人提交与共享、
 权限矩阵、任务/产物流和观测方式见 [22 · 外部扩展](22-external-extensions.md)；部署限制见
