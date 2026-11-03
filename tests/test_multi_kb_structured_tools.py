@@ -167,5 +167,11 @@ def test_authorized_runner_mounts_controlled_structured_tools(auth_scope, tmp_pa
     list(runner.stream(query="question", kb_name="A", history=[], knowledge_scope=scope,
                       knowledge_scope_resolver=resolver, thread_id="structured-multi-kb"))
     names = {str(getattr(tool, "name", None) or getattr(tool, "__name__", "")) for tool in captured["tools"]}
-    assert {"circuit_search", "spreadsheet_row_search", "spreadsheet_cell_lookup", "conversation_search"} <= names
+    # Main agent sees the capability layer; controlled structured adapters are
+    # execution tools used behind knowledge_search / the research subagent.
+    assert "knowledge_search" in names
+    assert "circuit_search" not in names
+    assert "spreadsheet_row_search" not in names
+    assert "spreadsheet_cell_lookup" not in names
+    assert "conversation_search" not in names
     assert "memory_search" not in names

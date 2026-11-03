@@ -27,6 +27,7 @@ from src.agents.tools.document_rag_tool import (
 from src.agents.tools.evidence_tools import make_evidence_read
 from src.agents.tools.external_conversation_tools import make_conversation_search
 from src.agents.tools.grep_tools import make_kb_grep
+from src.agents.tools.knowledge_search import make_knowledge_search
 from src.agents.tools.memory_tools import make_memory_search
 from src.agents.tools.pipeline_catalog import make_catalog_tool
 from src.agents.tools.session_tools import make_session_recall
@@ -40,6 +41,8 @@ from src.agents.tools.wiki_tools import make_wiki_search
 @dataclass
 class TurnTools:
     tools: list[Any] = field(default_factory=list)
+    # Low-level adapters used by the capability layer / research subagent.
+    execution_tools: list[Any] = field(default_factory=list)
     fragments: list[tuple[str, str]] = field(default_factory=list)
     prompt_suffix: str = ""
     mcp_tool_search_enabled: bool = False
@@ -73,28 +76,44 @@ def build_turn_tools(
 
     result = TurnTools()
     if not is_general and scope_allows_kb(effective_scope):
-        kb_tools = [
-            make_document_search(rt, rag_backend, document_store),
-            make_document_search_batch(rt, rag_backend, document_store),
-            make_kb_grep(rt, rag_backend, document_store, spreadsheet_service, circuit_service),
-            make_session_recall(rt),
-            make_evidence_read(rt),
-        ]
+        document_tool = make_document_search(rt, rag_backend, document_store)
+        document_batch_tool = make_document_search_batch(
+            rt, rag_backend, document_store
+        )
+        grep_tool = make_kb_grep(
+            rt, rag_backend, document_store, spreadsheet_service, circuit_service
+        )
+        session_tool = make_session_recall(rt)
+        evidence_tool = make_evidence_read(rt)
+
+        catalog_tool = None
+        circuit_tool = None
+        conversation_tool = None
+        wiki_tool = None
+        spreadsheet_row_tool = None
+        spreadsheet_cell_tool = None
+        spreadsheet_schema_tool = None
+        spreadsheet_sql_tool = None
+        scoped_tools: list[Any] = []
+
         if rt.knowledge_scope is None:
-            kb_tools = [
-                make_catalog_tool(
-                    rt,
-                    document_store=document_store,
-                    spreadsheet_service=spreadsheet_service,
-                    circuit_service=circuit_service,
-                    rag_backend=rag_backend,
-                ),
-                *kb_tools,
-                make_circuit_search(rt, circuit_service),
-                *make_spreadsheet_tools(rt, spreadsheet_service),
-                *make_spreadsheet_sql_tools(rt, spreadsheet_service),
-                make_conversation_search(rt, conversation_service),
-            ]
+            catalog_tool = make_catalog_tool(
+                rt,
+                document_store=document_store,
+                spreadsheet_service=spreadsheet_service,
+                circuit_service=circuit_service,
+                rag_backend=rag_backend,
+            )
+            circuit_tool = make_circuit_search(rt, circuit_service)
+            spreadsheet_row_tool, spreadsheet_cell_tool = make_spreadsheet_tools(
+                rt, spreadsheet_service
+            )
+            spreadsheet_schema_tool, spreadsheet_sql_tool = (
+                make_spreadsheet_sql_tools(rt, spreadsheet_service)
+            )
+            conversation_tool = make_conversation_search(rt, conversation_service)
+            if wiki_assist:
+                wiki_tool = make_wiki_search(rt, wiki_service)
         elif rt.multi_kb_retrieval is not None:
             from src.agents.tools.knowledge_scope_catalog import (
                 make_knowledge_scope_catalog_tool,
@@ -103,28 +122,85 @@ def build_turn_tools(
                 make_scoped_structured_tools,
             )
 
-            kb_tools.append(make_knowledge_scope_catalog_tool(rt))
-            scoped_tools = make_scoped_structured_tools(rt, wiki_assist=wiki_assist)
-            kb_tools.extend(
-                tool
-                for tool in scoped_tools
-                if getattr(tool, "multi_kb_exposed", True)
+            catalog_tool = make_knowledge_scope_catalog_tool(rt)
+            scoped_tools = make_scoped_structured_tools(
+                rt, wiki_assist=wiki_assist
             )
-        result.tools.extend(kb_tools)
-        if wiki_assist and rt.knowledge_scope is None:
-            result.tools.append(make_wiki_search(rt, wiki_service))
+            by_name = {
+                str(getattr(tool, "__name__", "") or ""): tool
+                for tool in scoped_tools
+            }
+            circuit_tool = by_name.get("circuit_search")
+            conversation_tool = by_name.get("conversation_search")
+            wiki_tool = by_name.get("wiki_search")
+            spreadsheet_row_tool = by_name.get("spreadsheet_row_search")
+            spreadsheet_cell_tool = by_name.get("spreadsheet_cell_lookup")
+
+        low_level: list[Any] = [
+            document_tool,
+            document_batch_tool,
+            grep_tool,
+            session_tool,
+            evidence_tool,
+        ]
+        for tool in (
+            circuit_tool,
+            conversation_tool,
+            wiki_tool,
+            spreadsheet_row_tool,
+            spreadsheet_cell_tool,
+        ):
+            if tool is not None:
+                low_level.append(tool)
+        if rt.knowledge_scope is None:
+            for tool in (spreadsheet_schema_tool, spreadsheet_sql_tool):
+                if tool is not None:
+                    low_level.append(tool)
+
+        knowledge_tool = make_knowledge_search(
+            rt,
+            document_search_batch=document_batch_tool,
+            document_search=document_tool,
+            kb_grep=grep_tool,
+            circuit_search=circuit_tool,
+            conversation_search=conversation_tool,
+            wiki_search=wiki_tool,
+            spreadsheet_row_search=spreadsheet_row_tool,
+        )
+        # Main agent sees capabilities, not the source-specific adapter list.
+        visible: list[Any] = [knowledge_tool, session_tool, evidence_tool]
+        if catalog_tool is not None:
+            visible.append(catalog_tool)
+        if rt.knowledge_scope is None:
+            for tool in (spreadsheet_schema_tool, spreadsheet_sql_tool):
+                if tool is not None:
+                    visible.append(tool)
+        # Multi-KB scoped structured tools are execution adapters; keep them
+        # out of the main surface as well.
+        result.tools.extend(visible)
+        result.execution_tools.extend(low_level)
+        result.execution_tools.append(knowledge_tool)
+        if catalog_tool is not None:
+            result.execution_tools.append(catalog_tool)
 
     if getattr(rt, "attachment_refs", None):
         from src.agents.tools.attachment_tools import build_attachment_tools
 
-        result.tools.extend(build_attachment_tools(rt))
+        attachment_tools = build_attachment_tools(rt)
+        result.tools.extend(attachment_tools)
+        result.execution_tools.extend(attachment_tools)
     if rt.knowledge_scope is None:
-        result.tools.append(
-            make_memory_search(rt, memory_service_factory=memory_service_factory)
+        memory_tool = make_memory_search(
+            rt, memory_service_factory=memory_service_factory
         )
+        result.tools.append(memory_tool)
+        result.execution_tools.append(memory_tool)
     if ctx is not None:
         result.tools = filter_tools_by_capability(
             result.tools, available_capabilities=effective_capabilities
+        )
+        result.execution_tools = filter_tools_by_capability(
+            result.execution_tools, available_capabilities=effective_capabilities
         )
 
     if not unified_tools_enabled:
@@ -140,7 +216,8 @@ def build_turn_tools(
         mcp_snapshot,
         effective_capabilities=effective_capabilities,
         local_tool_names={
-            str(getattr(tool, "name", "") or "") for tool in result.tools
+            str(getattr(tool, "name", "") or getattr(tool, "__name__", ""))
+            for tool in [*result.tools, *result.execution_tools]
         },
         wrap=mcp_executor.wrap,
     )

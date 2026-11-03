@@ -50,6 +50,7 @@ def test_fragment_order_and_prompt_sections(monkeypatch):
         )
     ]
     assert positions == sorted(positions)
+    assert tp.KNOWLEDGE_SEARCH_RULE in prompt.system_prompt
     # Tool prompt text is carried by the suffix, not repeated per fragment.
     assert "MCP-CONTEXT" not in prompt.system_prompt
     assert "TOOL-CONTEXT" not in prompt.system_prompt
@@ -61,6 +62,7 @@ def test_general_turn_skips_candidate_rules(monkeypatch):
     prompt = _build(is_general=True, wiki_assist=False)
 
     assert CANDIDATE_PROMPT not in prompt.system_prompt
+    assert tp.KNOWLEDGE_SEARCH_RULE not in prompt.system_prompt
     assert "本次未启用 Wiki 检索" in prompt.system_prompt
     assert [kind for kind, _ in prompt.fragments] == ["kb_scope", "base_rules"]
 

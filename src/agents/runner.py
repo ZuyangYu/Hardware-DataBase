@@ -410,6 +410,7 @@ class _TurnPlan:
     direct_control_answer: str | None
     direct_answer_grounding: str
     context_fragments: list[tuple[str, str]] = field(default_factory=list)
+    execution_tools: list[Any] = field(default_factory=list)
     skill_root: str | None = None
     mcp_tool_search_enabled: bool = False
 
@@ -1323,6 +1324,7 @@ class MultiSourceAgentRunner:
             direct_control_answer=direct_control_answer,
             direct_answer_grounding=direct_answer_grounding,
             context_fragments=context_fragments,
+            execution_tools=tool_bundle.execution_tools,
             skill_root=skill_root,
             mcp_tool_search_enabled=tool_bundle.mcp_tool_search_enabled,
         )
@@ -1472,7 +1474,7 @@ class MultiSourceAgentRunner:
             and str(budget_state["complexity"].get("level") or "simple") == "complex"
         ):
             research = _research_subagent_spec(
-                tools=tools, model=model, skill_root=skill_root
+                tools=plan.execution_tools, model=model, skill_root=skill_root
             )
             if research is not None:
                 agent_subagents = [research]

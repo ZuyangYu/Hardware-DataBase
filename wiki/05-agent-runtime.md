@@ -133,8 +133,9 @@ hash、各 fragment 字节数、evidence 字节数、模型窗口、实际 input
 
 | 工具 | 工厂 | 连接的服务 | 默认可见性 |
 |---|---|---|---|
-| `document_search` | `make_document_search` | `RAGBackend.retrieve`（RAGFlow） | 常开 |
-| `kb_grep` | `make_kb_grep` | `storage/pointer_index`（FTS5 + LIKE） | 常开 |
+| `knowledge_search` | `make_knowledge_search` | 多查询/多来源能力层（内部 fan-out） | 主 Agent 常开 |
+| `document_search` / `document_search_batch` | `make_document_search*` | `RAGBackend.retrieve`（RAGFlow） | 执行层/研究子代理 |
+| `kb_grep` | `make_kb_grep` | `storage/pointer_index`（FTS5 + LIKE） | 执行层/研究子代理 |
 | `session_recall` | `make_session_recall` | `ToolRuntime.session_evidence_store / session_recall_items/gaps` | 常开（模型主动调用，可按关键词检索） |
 | 会话连续性 | `SessionContextMiddleware` | 上一轮问题/结论/缺口/证据指针 | 每次模型调用注入紧凑块 |
 | 循环预算 | `LoopBudgetMiddleware` | 时间预算 / no-progress | 每轮 middleware |
@@ -148,10 +149,11 @@ hash、各 fragment 字节数、evidence 字节数、模型窗口、实际 input
 | 工具装配 | `turn_tools.py` | base / MCP / Skill 工具与 prompt fragments | runner 只消费 |
 | Prompt 组装 | `turn_prompt.py` | 系统提示、memory/skill/tool/export fragments | 顺序可单测 |
 | `evidence_read` | `make_evidence_read` | `ToolRuntime.candidate_evidence`（无外部调用） | 常开（候选优先检索） |
-| `circuit_search` | `make_circuit_search` | `CircuitIndexService.query` | KB 有电路数据时可用 |
-| `spreadsheet_schema_lookup` / `spreadsheet_sql_query` / `spreadsheet_row_search` / `spreadsheet_cell_lookup` | `make_spreadsheet_tools` | 每 KB 表索引 SQLite | 常开 |
-| `conversation_search` | `make_conversation_search` | 外部对话索引 | KB 有外部对话时可用 |
-| `wiki_search` | `make_wiki_search` | `WikiService.search_pages` | 仅 `wiki_assist=True` 且 capability 过滤通过 |
+| `circuit_search` | `make_circuit_search` | `CircuitIndexService.query` | 执行层/研究子代理 |
+| `spreadsheet_schema_lookup` / `spreadsheet_sql_query` | `make_spreadsheet_sql_tools` | 每 KB 表索引 SQLite | 主 Agent（结构化查询） |
+| `spreadsheet_row_search` / `spreadsheet_cell_lookup` | `make_spreadsheet_tools` | 每 KB 表索引 SQLite | 执行层/`knowledge_search` |
+| `conversation_search` | `make_conversation_search` | 外部对话索引 | 执行层/`knowledge_search` |
+| `wiki_search` | `make_wiki_search` | `WikiService.search_pages` | 执行层/`knowledge_search`；`wiki_assist=True` |
 | `memory_search` | `make_memory_tool` | `MemoryService.search` | **`_ALWAYS_AVAILABLE`**（通用对话也挂） |
 | `list_kb_sources` | `make_catalog_tool` | `scan_kb_sources`（非检索工具） | 常开 |
 | 附件工具族 | `build_attachment_tools` | `AttachmentService` / 附件检索 / 修订 | 仅当作用域允许且有 refs |
