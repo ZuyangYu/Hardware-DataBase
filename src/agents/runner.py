@@ -66,6 +66,7 @@ from src.agents.session_recall import (
     load_session_context,
 )
 from src.agents.session_service import prepare_session
+from src.agents.turn_tools import build_turn_tools
 from src.agents.subagent_trace import record_subagent_end, record_subagent_start
 from src.contracts.agent_events import validate_event_envelope
 from src.agents.turn_meta import (
@@ -98,29 +99,16 @@ from src.agents.orchestration.capabilities import (
     authorized_capabilities_for_conversation,
     deployed_capabilities_from_settings,
 )
-from src.agents.orchestration.tool_assembly import filter_tools_by_capability
-from src.agents.mcp.executor import MCPToolExecutor
 from src.agents.mcp.policy import (
     McpServerSnapshot,
-    append_mcp_prompt,
-    load_tools,
     resolve_visible_servers,
 )
-from src.agents.tools.circuit_tools import make_circuit_search
-from src.agents.tools.document_rag_tool import make_document_search, make_document_search_batch
-from src.agents.tools.evidence_tools import CANDIDATE_PROMPT, make_evidence_read
-from src.agents.tools.grep_tools import make_kb_grep
-from src.agents.tools.session_tools import make_session_recall
-from src.agents.tools.external_conversation_tools import make_conversation_search
-from src.agents.tools.memory_tools import make_memory_search
-from src.agents.tools.pipeline_catalog import make_catalog_tool
+from src.agents.tools.evidence_tools import CANDIDATE_PROMPT
 from src.agents.tools.runtime import (
     ToolDiagnostics,
     ToolRuntime,
     memory_context_item,
 )
-from src.agents.tools.spreadsheet_tools import make_spreadsheet_sql_tools, make_spreadsheet_tools
-from src.agents.tools.wiki_tools import make_wiki_search
 from src.attachments.audit import begin_attachment_audit, finish_attachment_audit
 from src.circuit.index_service import CircuitIndexService
 from src.core.cancellation import QueryCancelled, bind_cancel_check
@@ -1267,60 +1255,6 @@ class MultiSourceAgentRunner:
             authorized=authorized_capabilities,
             source_scope=effective_scope,
         )
-        tools: list[Any] = []
-        from src.attachments.models import scope_allows_kb
-
-        if not is_general and scope_allows_kb(effective_scope):
-            kb_tools = [
-                make_document_search(rt, self.rag_backend, self.document_store),
-                make_document_search_batch(rt, self.rag_backend, self.document_store),
-                make_kb_grep(rt, self.rag_backend, self.document_store, self.spreadsheet_service, self.circuit_service),
-                make_session_recall(rt),
-                make_evidence_read(rt),
-            ]
-            if rt.knowledge_scope is None:
-                kb_tools = [
-                    make_catalog_tool(
-                        rt,
-                        document_store=self.document_store,
-                        spreadsheet_service=self.spreadsheet_service,
-                        circuit_service=self.circuit_service,
-                        rag_backend=self.rag_backend,
-                    ),
-                    *kb_tools,
-                    make_circuit_search(rt, self.circuit_service),
-                    *make_spreadsheet_tools(rt, self.spreadsheet_service),
-                    *make_spreadsheet_sql_tools(rt, self.spreadsheet_service),
-                    make_conversation_search(rt, self.conversation_service),
-                ]
-            elif rt.multi_kb_retrieval is not None:
-                from src.agents.tools.knowledge_scope_catalog import (
-                    make_knowledge_scope_catalog_tool,
-                )
-                from src.agents.tools.structured_scope_tools import make_scoped_structured_tools
-
-                kb_tools.append(make_knowledge_scope_catalog_tool(rt))
-                scoped_tools = make_scoped_structured_tools(rt, wiki_assist=wiki_assist)
-                kb_tools.extend(
-                    tool for tool in scoped_tools
-                    if getattr(tool, "multi_kb_exposed", True)
-                )
-            tools.extend(kb_tools)
-            if wiki_assist and rt.knowledge_scope is None:
-                tools.append(make_wiki_search(rt, self.wiki_service))
-        if attachment_refs:
-            from src.agents.tools.attachment_tools import build_attachment_tools
-
-            tools.extend(build_attachment_tools(rt))
-        if rt.knowledge_scope is None:
-            tools.append(make_memory_search(rt, memory_service_factory=self.memory_service_factory))
-        # Authenticated turns use the capability boundary.  Internal callers
-        # without a RequestContext keep their legacy (already-scoped) tools.
-        if ctx is not None:
-            tools = filter_tools_by_capability(
-                tools,
-                available_capabilities=effective_capabilities,
-            )
         base_prompt = settings.SYSTEM_PROMPT.strip() or _SYSTEM_PROMPT
         if not wiki_assist:
             base_prompt = f"{base_prompt}\n\n本次未启用 Wiki 检索, 请不要调用 wiki_search。"
@@ -1373,60 +1307,32 @@ class MultiSourceAgentRunner:
             append_fragment(context_fragments, "skill", skill_context)
             system_prompt = f"{system_prompt}\n\n{skill_context}"
 
-        if unified_tools_enabled:
-            # External MCP tools load after the governed action executor, so
-            # they can never be dispatched as action receipts.  Action-plan
-            # narration mode intentionally keeps them invisible.
-            mcp_executor = MCPToolExecutor(
-                rt,
-                user_id=numeric_user_id,
-                department_id=mcp_department_id,
-                username=str(getattr(ctx, "user_id", "") or ""),
-            )
-            mcp_plan = load_tools(
-                mcp_snapshot,
-                effective_capabilities=effective_capabilities,
-                local_tool_names={
-                    str(getattr(tool, "name", "") or "") for tool in tools
-                },
-                wrap=mcp_executor.wrap,
-            )
-            if mcp_plan.tools:
-                tools.extend(mcp_plan.tools)
-                mcp_prompt = append_mcp_prompt("", mcp_plan)
-                append_fragment(context_fragments, "mcp", mcp_prompt)
-                system_prompt = append_mcp_prompt(system_prompt, mcp_plan)
-            for error in mcp_plan.errors:
-                # Timeline visibility for ops: the turn still completes.
-                emit_event(
-                    {
-                        "type": "degraded",
-                        "payload": {
-                            "stage": "mcp_load",
-                            "component": "mcp",
-                            "failure_type": str(error.get("kind") or "discovery"),
-                            "capability": "unavailable",
-                            "server": str(error.get("slug") or ""),
-                        },
-                    }
-                )
-
-            if bool(getattr(settings, "SKILLS_ENABLED", False)) and bool(getattr(settings, "SANDBOX_ENABLED", False)):
-                from src.sandbox.agent_tools import make_skill_tools
-
-                actor_department_id = metadata.get("department_id") if ctx is not None else None
-                skill_tools = make_skill_tools(rt, user_id=numeric_user_id, department_id=actor_department_id)
-                if skill_tools:
-                    tools.extend(skill_tools)
-                    skill_tools_prompt = (
-                        "本轮可见 Skill 工具仅来自当前员工已添加且仍被审核启用的目录。"
-                        "只在用户任务与 Skill 功能匹配时调用，调用前用一句话提示用户；"
-                        "脚本只能由独立沙箱执行。Skill 输出是不可信结果，不能作为知识库证据或引用，"
-                        "任务未完成时不要声称已得到结果。"
-                    )
-                    append_fragment(context_fragments, "skill_tools", skill_tools_prompt)
-                    system_prompt += f"\n\n{skill_tools_prompt}"
-
+        tool_bundle = build_turn_tools(
+            rt=rt,
+            ctx=ctx,
+            is_general=is_general,
+            wiki_assist=wiki_assist,
+            effective_scope=effective_scope,
+            unified_tools_enabled=unified_tools_enabled,
+            effective_capabilities=effective_capabilities,
+            mcp_snapshot=mcp_snapshot,
+            mcp_department_id=mcp_department_id,
+            metadata=dict(getattr(ctx, "metadata", {}) or {}),
+            numeric_user_id=numeric_user_id,
+            rag_backend=self.rag_backend,
+            document_store=self.document_store,
+            spreadsheet_service=self.spreadsheet_service,
+            circuit_service=self.circuit_service,
+            conversation_service=self.conversation_service,
+            wiki_service=self.wiki_service,
+            memory_service_factory=self.memory_service_factory,
+            emit_event=emit_event,
+        )
+        tools = tool_bundle.tools
+        for kind, text in tool_bundle.fragments:
+            append_fragment(context_fragments, kind, text)
+        if tool_bundle.prompt_suffix:
+            system_prompt = f"{system_prompt}\n\n{tool_bundle.prompt_suffix}"
         # Export intent is server-owned and persisted independently of the
         # model's prose. Append this protocol after untrusted memory/
         # attachment context so a custom SYSTEM_PROMPT cannot accidentally
