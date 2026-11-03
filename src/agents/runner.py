@@ -1291,6 +1291,7 @@ class MultiSourceAgentRunner:
             skill_context=skill_context,
             tool_fragments=tool_bundle.fragments,
             tool_suffix=tool_bundle.prompt_suffix,
+            skill_present=bool(skill_root),
             export=infer_export_intent(query) is not None,
         )
         system_prompt = turn_prompt.system_prompt
