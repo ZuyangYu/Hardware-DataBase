@@ -17,7 +17,6 @@ import secrets
 import sys
 import time
 import zipfile
-from types import SimpleNamespace
 
 import httpx
 
@@ -144,8 +143,29 @@ def main() -> int:
 
             from src.sandbox.agent_tools import make_skill_tools
 
-            events = []
-            rt = SimpleNamespace(check_cancel=lambda: None, emit=lambda kind, payload: events.append((kind, payload)))
+            class _AgentRuntime:
+                def __init__(self):
+                    self.events: list[tuple[str, dict]] = []
+                    self._seq = 0
+
+                def check_cancel(self):
+                    return None
+
+                def emit(self, kind, payload):
+                    self.events.append((kind, payload))
+
+                def next_invocation_id(self):
+                    self._seq += 1
+                    return f"smoke-{self._seq}"
+
+                def tool_started(self, **_kwargs):
+                    self.events.append(("tool_started", _kwargs))
+
+                def tool_result(self, **_kwargs):
+                    self.events.append(("tool_result", _kwargs))
+
+            rt = _AgentRuntime()
+            events = rt.events
             tools = make_skill_tools(rt, user_id=int(employee["id"]), department_id=primary)
             skill_tool = next(tool for tool in tools if tool.name.startswith("skill__"))
             agent_result = json.loads(skill_tool.invoke({"parameters_json": '{"label":"agent"}'}))
