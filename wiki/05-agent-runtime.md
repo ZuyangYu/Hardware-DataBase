@@ -130,6 +130,7 @@ hash、各 fragment 字节数、evidence 字节数、模型窗口、实际 input
 | 文本 Skill | `skill_materializer` + 官方 `SkillsMiddleware` | 审核/订阅目录 → 只读 SKILL.md | 渐进式披露 |
 | 流式答案适配 | `answer_stream.py` | answer/narration 分流与撤回 | 复用于 SSE/eval |
 | 缺口闭环策略 | `gap_closure.py` | 是否值得补一轮的确定性判断 | runner 只执行 |
+| 会话准备 | `session_service.py` | checkpointer / thread config / 初始消息 | runner 只调用 |
 | `evidence_read` | `make_evidence_read` | `ToolRuntime.candidate_evidence`（无外部调用） | 常开（候选优先检索） |
 | `circuit_search` | `make_circuit_search` | `CircuitIndexService.query` | KB 有电路数据时可用 |
 | `spreadsheet_schema_lookup` / `spreadsheet_sql_query` / `spreadsheet_row_search` / `spreadsheet_cell_lookup` | `make_spreadsheet_tools` | 每 KB 表索引 SQLite | 常开 |

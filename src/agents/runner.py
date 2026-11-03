@@ -65,6 +65,7 @@ from src.agents.session_recall import (
     gap_closure_prompt,
     load_session_context,
 )
+from src.agents.session_service import prepare_session
 from src.agents.subagent_trace import record_subagent_end, record_subagent_start
 from src.contracts.agent_events import validate_event_envelope
 from src.agents.turn_meta import (
@@ -79,7 +80,6 @@ from src.agents.turn_meta import (
     _build_citation_verification,
     _build_claim_coverage,
     _build_evidence_quality,
-    _build_messages,
     _build_turn_verification,
     _complex_task_prompt,
     _empty_answer_delivery,
@@ -1575,20 +1575,21 @@ class MultiSourceAgentRunner:
                 knowledge_scope.actor_user_id, knowledge_scope
             )
         model = self._get_model()
-        # 会话状态持久化：thread 模式挂 checkpointer，LangGraph 按
-        # configurable.thread_id 自动恢复/续写该会话的完整消息历史；
-        # stateless 路径（legacy /query、eval、测试）保持现状。
-        checkpointer = (
-            _create_checkpointer()
-            if (persist_thread and str(thread_id or "").strip())
-            else None
-        )
         recursion_limit, budget_state = _agent_recursion_limit(
             query=query,
             query_mode=query_mode,
             attachment_refs=list(getattr(rt, "attachment_refs", []) or []),
             knowledge_scope=knowledge_scope,
         )
+        session = prepare_session(
+            thread_id=thread_id,
+            persist_thread=persist_thread,
+            recursion_limit=recursion_limit,
+            history=history,
+            query=query,
+            checkpointer_factory=_create_checkpointer,
+        )
+        checkpointer = session.checkpointer
         budget_state.update(
             {
                 "status": "allocated",
@@ -1634,18 +1635,8 @@ class MultiSourceAgentRunner:
             middleware=[LoopBudgetMiddleware(loop_budget)],
             factory=create_deep_agent,
         )
-        config: dict[str, Any] = {"recursion_limit": recursion_limit}
-        if checkpointer is not None:
-            config["configurable"] = {"thread_id": str(thread_id)}
-            # checkpoint 已存在 → 只喂本轮新消息（历史由框架恢复）；
-            # 首次接触该 thread（新会话/存量会话迁移）→ 把 DB 近期历史一次性播种。
-            has_state = checkpointer.get_tuple(config) is not None
-            if has_state or not history:
-                messages: list[dict[str, str]] = [{"role": "user", "content": query}]
-            else:
-                messages = _build_messages(query, history)
-        else:
-            messages = _build_messages(query, history)
+        config = session.config
+        messages = session.messages
         usage = TokenUsageSummary(
             provider=str(type(model).__module__),
             model=str(getattr(model, "model_name", None) or getattr(model, "model", "") or ""),
