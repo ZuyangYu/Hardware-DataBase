@@ -66,6 +66,13 @@ shell、任意命令、宿主路径、容器参数或任意环境快照。认证
 `allow_write` 同意，以及 `external_tool.write` 能力。写工具不会直接在模型回合修改系统或原件：
 它先建立提案，用户确认后由 Worker 调用外部服务生成候选产物。
 
+当单回合可见工具达到 12 个时，Agent 不再把所有 MCP schema 直接塞给模型：
+
+- 先只暴露本地 `mcp_tool_search`，模型按关键词搜索工具目录；
+- 搜索只读已发现的 `tools/list` 元数据，不发起外部调用、不消耗 `MCP_CALLS_PER_TURN`、不进入证据链；
+- 被选中的工具在下一次模型调用时由 `McpToolSearchMiddleware` 放行，未选中的 MCP schema 继续隐藏；
+- 执行仍走同一个 `MCPToolExecutor`，授权、配额、超时、截断、审计和写提案规则不变。
+
 ### 3.2 Skill
 
 - Skill 必须处于 `enabled` 状态，且调用者处于允许的部门/所有者范围；员工还必须主动订阅。
@@ -200,7 +207,8 @@ Artifact Scanner 引用。HDB 只接受运维控制的这些配置；策略校�
 
 | 内容 | 位置 |
 |---|---|
-| MCP 插件存储、策略、客户端与执行器 | `src/agents/mcp/` |
+| MCP 插件存储、策略、客户端、工具搜索与执行器 | `src/agents/mcp/` |
+| MCP 懒加载 schema 过滤 | `src/agents/middleware/mcp_tool_search.py` |
 | Skill catalog、包校验和个人提交 | `src/sandbox/skills.py`、`src/sandbox/skill_packages.py` |
 | Agent Skill 工具 | `src/sandbox/agent_tools.py`、`src/agents/runner.py` |
 | Sandbox API 与权限检查 | `src/api/routes/sandbox.py`、`src/sandbox/authorization.py`、`src/sandbox/policy.py` |

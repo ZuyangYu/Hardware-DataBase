@@ -13,6 +13,11 @@ from typing import Any, Callable
 import src.settings as settings
 from src.agents.mcp.executor import MCPToolExecutor
 from src.agents.mcp.policy import append_mcp_prompt, load_tools
+from src.agents.mcp.tool_search import (
+    append_mcp_search_prompt,
+    make_mcp_tool_search,
+    should_use_tool_search,
+)
 from src.agents.orchestration.tool_assembly import filter_tools_by_capability
 from src.agents.tools.circuit_tools import make_circuit_search
 from src.agents.tools.document_rag_tool import (
@@ -37,6 +42,7 @@ class TurnTools:
     tools: list[Any] = field(default_factory=list)
     fragments: list[tuple[str, str]] = field(default_factory=list)
     prompt_suffix: str = ""
+    mcp_tool_search_enabled: bool = False
 
 
 def build_turn_tools(
@@ -140,12 +146,21 @@ def build_turn_tools(
     )
     if mcp_plan.tools:
         result.tools.extend(mcp_plan.tools)
-        mcp_prompt = append_mcp_prompt("", mcp_plan)
-        if mcp_prompt:
-            result.fragments.append(("mcp", mcp_prompt))
+        search_mode = should_use_tool_search(mcp_plan.bindings)
+        if search_mode:
+            result.mcp_tool_search_enabled = True
+            result.tools.append(make_mcp_tool_search(rt, mcp_plan.bindings))
+            mcp_prompt = append_mcp_search_prompt("", mcp_plan.bindings)
+            result.prompt_suffix = append_mcp_search_prompt(
+                result.prompt_suffix, mcp_plan.bindings
+            )
+        else:
+            mcp_prompt = append_mcp_prompt("", mcp_plan)
             result.prompt_suffix = append_mcp_prompt(
                 result.prompt_suffix, mcp_plan
             )
+        if mcp_prompt:
+            result.fragments.append(("mcp", mcp_prompt))
     for error in mcp_plan.errors:
         emit_event(
             {
