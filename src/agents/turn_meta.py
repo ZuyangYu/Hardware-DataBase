@@ -18,6 +18,7 @@ from typing import Any, Callable
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src import settings
+from src.agents.middleware.skill_read import SkillReadGateMiddleware
 from src.agents.schemas import Evidence
 from src.agents.tools.runtime import compress_evidence_for_context
 
@@ -354,7 +355,9 @@ def _agent_recursion_limit(
     }
 
 
-def _research_subagent_spec(*, tools: list[Any], model: Any) -> dict[str, Any] | None:
+def _research_subagent_spec(
+    *, tools: list[Any], model: Any, skill_root: str | None = None
+) -> dict[str, Any] | None:
     """Build a read-only research subagent for delegated source exploration."""
 
     sub_tools = [tool for tool in tools if _tool_name(tool) in _RESEARCH_SUBAGENT_TOOLS]
@@ -377,6 +380,10 @@ def _research_subagent_spec(*, tools: list[Any], model: Any) -> dict[str, Any] |
         ),
         "tools": sub_tools,
         "model": model,
+        "middleware": [
+            # Subagents inherit the backend; keep read_file gated the same way.
+            SkillReadGateMiddleware(enabled=bool(skill_root))
+        ],
     }
 
 

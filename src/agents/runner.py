@@ -133,10 +133,11 @@ from src.services.multi_kb_retrieval import MultiKnowledgeRetrievalService, Retr
 
 # M9: 收窄 deepagents 默认能力面。禁用框架自动装配的 general-purpose 子代理
 # (task 工具随之移除)，并剥离与 SYSTEM_PROMPT 声明不符的文件系统/命令执行工具，
-# 仅保留业务检索工具。FilesystemMiddleware 为框架必需脚手架无法摘除，
-# 但其注入的工具经 excluded_tools 从模型可见集合中移除。
+# 仅保留业务检索工具与官方 Skill 渐进式披露所需的 read_file。
+# read_file 只在有物化 Skill 的回合由 SkillReadGateMiddleware 放行；backend
+# 固定 root 到本次只读 Skill 目录，写操作继续 deny。
 _APP_AGENT_EXCLUDED_TOOLS = frozenset({
-    "ls", "read_file", "write_file", "edit_file", "glob", "grep", "delete", "execute",
+    "ls", "write_file", "edit_file", "glob", "grep", "delete", "execute",
 })
 for _provider_key in ("openai", "ollama"):
     try:
@@ -1469,7 +1470,9 @@ class MultiSourceAgentRunner:
             and query_mode == "deep"
             and str(budget_state["complexity"].get("level") or "simple") == "complex"
         ):
-            research = _research_subagent_spec(tools=tools, model=model)
+            research = _research_subagent_spec(
+                tools=tools, model=model, skill_root=skill_root
+            )
             if research is not None:
                 agent_subagents = [research]
         if show_turn_meta and query_mode == "deep":
@@ -1480,6 +1483,11 @@ class MultiSourceAgentRunner:
             system_prompt += (
                 "\n引用编号只对当前轮有效；不要复用上一轮回答或对话历史中的 [n]，"
                 "必须使用本轮工具返回的证据编号。"
+            )
+        if skill_root:
+            system_prompt += (
+                "\n本轮 read_file 仅用于读取已审核并物化的 Skill 的 SKILL.md，"
+                "不得读取或尝试读取其他路径。"
             )
         turn_started = time.monotonic()
         pre_candidates = set(rt.candidate_evidence)

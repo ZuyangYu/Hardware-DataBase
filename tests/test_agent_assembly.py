@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from src.agents.assembly import build_agent
 from src.agents.middleware.session_context import SessionContextMiddleware
+from src.agents.middleware.skill_read import SkillReadGateMiddleware
 
 
 def test_build_agent_passes_checkpointer_and_session_middleware():
@@ -31,7 +32,7 @@ def test_build_agent_passes_checkpointer_and_session_middleware():
     assert isinstance(captured["middleware"][-1], SessionContextMiddleware)
 
 
-def test_build_agent_omits_middleware_without_session_state():
+def test_build_agent_gates_read_file_without_skills():
     captured = {}
 
     def factory(**kwargs):
@@ -45,8 +46,10 @@ def test_build_agent_omits_middleware_without_session_state():
         factory=factory,
     )
 
-    assert "middleware" not in captured
     assert "subagents" not in captured
+    gate = captured["middleware"][0]
+    assert isinstance(gate, SkillReadGateMiddleware)
+    assert gate.enabled is False
 
 
 def test_build_agent_wires_official_skills_backend(tmp_path):
@@ -69,3 +72,6 @@ def test_build_agent_wires_official_skills_backend(tmp_path):
     assert captured["skills"] == ["/"]
     assert captured["backend"].__class__.__name__ == "FilesystemBackend"
     assert captured["permissions"][0].mode == "deny"
+    gate = captured["middleware"][0]
+    assert isinstance(gate, SkillReadGateMiddleware)
+    assert gate.enabled is True
