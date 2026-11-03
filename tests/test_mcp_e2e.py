@@ -301,6 +301,57 @@ class McpE2ETests(unittest.TestCase):
             diagnostic_names,
         )
 
+    def test_large_catalogue_searches_then_calls_real_tool(self):
+        from langchain.agents.middleware.types import ModelRequest
+
+        from src.agents.middleware.mcp_tool_search import McpToolSearchMiddleware
+
+        with McpStubServer(extra_read_tools=10) as stub:
+            self._provision(stub.url)
+            _runner, _deltas, captured = self._run_turn(invoke=None, events=[])
+
+            tools = {getattr(tool, "name", ""): tool for tool in captured["tools"]}
+            self.assertIn("mcp_tool_search", tools)
+            self.assertIn("mcp__stub__extra_7", tools)
+            middleware = next(
+                item
+                for item in captured["middleware"]
+                if isinstance(item, McpToolSearchMiddleware)
+            )
+            request = ModelRequest(
+                model=object(),
+                messages=[],
+                tools=captured["tools"],
+                state={"messages": []},
+            )
+
+            before = {
+                getattr(tool, "name", "")
+                for tool in middleware.wrap_model_call(
+                    request, lambda current: current.tools
+                )
+            }
+            self.assertIn("mcp_tool_search", before)
+            self.assertFalse(any(name.startswith("mcp__") for name in before))
+
+            rendered = tools["mcp_tool_search"].invoke({"query": "extra_7"})
+            self.assertIn("mcp__stub__extra_7", rendered)
+
+            after = {
+                getattr(tool, "name", "")
+                for tool in middleware.wrap_model_call(
+                    request, lambda current: current.tools
+                )
+            }
+            self.assertIn("mcp__stub__extra_7", after)
+            self.assertNotIn("mcp__stub__echo", after)
+
+            # Selection only changes visibility; the real guarded wrapper still runs.
+            self.assertIn(
+                "extra-7:E2E",
+                tools["mcp__stub__extra_7"].invoke({"text": "E2E"}),
+            )
+
     def test_outage_degrades_without_failing_the_turn(self):
         events: list = []
         with McpStubServer() as stub:

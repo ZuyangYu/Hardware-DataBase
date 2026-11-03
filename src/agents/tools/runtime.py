@@ -249,6 +249,10 @@ class ToolRuntime:
     # grounding footer.
     mcp_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     mcp_call_count: int = 0
+    # Lazy MCP discovery: the search tool adds names here, and the middleware
+    # reveals exactly these wrappers on the next model call.
+    selected_mcp_tools: set[str] = field(default_factory=set)
+    mcp_search_count: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
     # P0-007: per-call epochs make late evidence registration impossible once
     # a call (or the whole cancellation path) has ended; checks and appends

@@ -49,6 +49,7 @@ from src.agents.turn_prompt import (
     build_turn_prompt,
 )
 from src.agents.middleware.gap_closure import GapClosureMiddleware
+from src.agents.middleware.mcp_tool_search import McpToolSearchMiddleware
 from src.agents.skill_materializer import (
     load_skill_prompt_context,
     materialize_text_skills,
@@ -409,6 +410,7 @@ class _TurnPlan:
     direct_answer_grounding: str
     context_fragments: list[tuple[str, str]] = field(default_factory=list)
     skill_root: str | None = None
+    mcp_tool_search_enabled: bool = False
 
 
 def _current_run() -> _RunRecord:
@@ -1320,6 +1322,7 @@ class MultiSourceAgentRunner:
             direct_answer_grounding=direct_answer_grounding,
             context_fragments=context_fragments,
             skill_root=skill_root,
+            mcp_tool_search_enabled=tool_bundle.mcp_tool_search_enabled,
         )
 
 
@@ -1489,6 +1492,10 @@ class MultiSourceAgentRunner:
             query_mode=query_mode,
             has_checkpointer=checkpointer is not None,
         )
+        agent_middleware: list[Any] = [LoopBudgetMiddleware(loop_budget)]
+        if plan.mcp_tool_search_enabled:
+            agent_middleware.append(McpToolSearchMiddleware(rt))
+        agent_middleware.append(gap_middleware)
         agent = build_agent(
             model=model,
             tools=tools,
@@ -1497,10 +1504,7 @@ class MultiSourceAgentRunner:
             subagents=agent_subagents,
             session_state_text=getattr(rt, "session_state_text", ""),
             skill_root=skill_root,
-            middleware=[
-                LoopBudgetMiddleware(loop_budget),
-                gap_middleware,
-            ],
+            middleware=agent_middleware,
             factory=create_deep_agent,
         )
         config = session.config

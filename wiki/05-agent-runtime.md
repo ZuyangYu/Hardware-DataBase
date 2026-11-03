@@ -138,6 +138,7 @@ hash、各 fragment 字节数、evidence 字节数、模型窗口、实际 input
 | `session_recall` | `make_session_recall` | `ToolRuntime.session_recall_items/gaps` | 常开（模型主动调用） |
 | 会话连续性 | `SessionContextMiddleware` | 上一轮问题/结论/缺口/证据指针 | 每次模型调用注入紧凑块 |
 | 循环预算 | `LoopBudgetMiddleware` | 时间预算 / no-progress | 每轮 middleware |
+| MCP 工具搜索 | `McpToolSearchMiddleware` | 只向模型暴露搜索选中的 MCP schema | 可见工具 ≥12 时启用 |
 | Agent 装配 | `src/agents/assembly.py` | 唯一 `create_deep_agent` 调用点 | — |
 | 文本 Skill | `skill_materializer` + 官方 `SkillsMiddleware` | 审核/订阅目录 → 只读 SKILL.md | 渐进式披露 |
 | 流式答案适配 | `answer_stream.py` | answer/narration 分流与撤回 | 复用于 SSE/eval |
