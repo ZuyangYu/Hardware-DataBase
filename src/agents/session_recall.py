@@ -10,8 +10,8 @@ from __future__ import annotations
 from typing import Any
 
 from src.agents.schemas import Evidence
+from src.agents.session_evidence import load_session_evidence
 
-_MAX_PRIOR_GAPS = 5
 _MAX_PRIOR_ITEMS = 12
 
 
@@ -47,6 +47,9 @@ def _session_state_block(
                 f"- id={item.id} | {item.source_name or '未知来源'}"
                 f" | {locator[:120]}"
             )
+    lines.append(
+        "需要更多历史证据时调用 session_recall(query=\"关键词\") 检索会话目录。"
+    )
     lines.append("</session_state>")
     return "\n".join(lines)
 
@@ -56,59 +59,14 @@ def load_session_context(
 ) -> None:
     """Load recent evidence/gaps into a dormant session recall buffer."""
 
-    if not session_id or not user_id:
-        return
-    try:
-        from src.core.conversation import ConversationService
-
-        turns = ConversationService().list_recent_turns(
-            int(user_id), int(session_id), limit=4
-        )
-    except Exception:
-        return
-    history = [
-        turn
-        for turn in turns
-        if isinstance(getattr(turn, "summary", None), dict) and turn.summary
-    ]
-
-    gaps: list[str] = []
-    for turn in history:
-        summary = turn.summary if isinstance(turn.summary, dict) else {}
-        verification = summary.get("verification") or {}
-        for gap in [
-            *(verification.get("answer_gaps") or []),
-            *(verification.get("gaps") or []),
-        ]:
-            text = str(gap or "").strip()
-            if text and text not in gaps:
-                gaps.append(text[:240])
-            if len(gaps) >= _MAX_PRIOR_GAPS:
-                break
-        if len(gaps) >= _MAX_PRIOR_GAPS:
-            break
-
-    by_id: dict[str, Evidence] = {}
-    for turn in reversed(history):
-        summary = turn.summary if isinstance(turn.summary, dict) else {}
-        for row in summary.get("evidence") or []:
-            if not isinstance(row, dict) or not row.get("id") or not row.get("content"):
-                continue
-            item = Evidence(
-                id=str(row.get("id")),
-                content=str(row.get("content")),
-                source_name=str(row.get("source_name") or ""),
-                content_kind=str(row.get("content_kind") or "document_text"),
-                processor_kind=str(row.get("processor_kind") or "ragflow"),
-                score=float(row.get("score") or 0.0),
-                locator=dict(row.get("locator") or {}),
-                metadata=dict(row.get("metadata") or {}),
-            )
-            by_id.setdefault(item.id, item)
-    rt.session_recall_items = list(by_id.values())[-_MAX_PRIOR_ITEMS:]
-    rt.session_recall_gaps = gaps
+    store = load_session_evidence(user_id, session_id)
+    rt.session_evidence_store = store
+    # Keep the legacy oldest-to-newest list for prompt rendering and callers
+    # that predate the catalogue's search API.
+    rt.session_recall_items = list(reversed(store.recent(_MAX_PRIOR_ITEMS)))
+    rt.session_recall_gaps = store.gaps
     rt.session_state_text = _session_state_block(
-        history, rt.session_recall_items, gaps
+        store.history, rt.session_recall_items, store.gaps
     )
 
 

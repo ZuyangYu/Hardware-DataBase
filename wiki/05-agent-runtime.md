@@ -135,7 +135,7 @@ hash、各 fragment 字节数、evidence 字节数、模型窗口、实际 input
 |---|---|---|---|
 | `document_search` | `make_document_search` | `RAGBackend.retrieve`（RAGFlow） | 常开 |
 | `kb_grep` | `make_kb_grep` | `storage/pointer_index`（FTS5 + LIKE） | 常开 |
-| `session_recall` | `make_session_recall` | `ToolRuntime.session_recall_items/gaps` | 常开（模型主动调用） |
+| `session_recall` | `make_session_recall` | `ToolRuntime.session_evidence_store / session_recall_items/gaps` | 常开（模型主动调用，可按关键词检索） |
 | 会话连续性 | `SessionContextMiddleware` | 上一轮问题/结论/缺口/证据指针 | 每次模型调用注入紧凑块 |
 | 循环预算 | `LoopBudgetMiddleware` | 时间预算 / no-progress | 每轮 middleware |
 | MCP 工具搜索 | `McpToolSearchMiddleware` | 只向模型暴露搜索选中的 MCP schema | 可见工具 ≥12 时启用 |
@@ -144,6 +144,7 @@ hash、各 fragment 字节数、evidence 字节数、模型窗口、实际 input
 | 流式答案适配 | `answer_stream.py` | answer/narration 分流与撤回 | 复用于 SSE/eval |
 | 缺口闭环 | `gap_closure.py` + `middleware/gap_closure.py` | 缺口判断与 `jump_to="model"` | 官方 middleware hook |
 | 会话准备 | `session_service.py` | checkpointer / thread config / 初始消息 | runner 只调用 |
+| 会话证据目录 | `session_evidence.py` | 最近 12 轮证据指针、去重、关键词召回 | 模型按需取用 |
 | 工具装配 | `turn_tools.py` | base / MCP / Skill 工具与 prompt fragments | runner 只消费 |
 | Prompt 组装 | `turn_prompt.py` | 系统提示、memory/skill/tool/export fragments | 顺序可单测 |
 | `evidence_read` | `make_evidence_read` | `ToolRuntime.candidate_evidence`（无外部调用） | 常开（候选优先检索） |

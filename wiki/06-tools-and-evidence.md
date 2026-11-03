@@ -95,8 +95,10 @@ class Evidence:                    # document_rag/schemas.py:59
 `SessionContextMiddleware` 以紧凑块注入：上一轮问题/结论、未解决缺口、
 可用旧证据指针。它不是硬相关性规则，也不注入正文；块内明确提示旧 `[n]`
 不可复用，引用前必须 `evidence_read`。完全无关的新问题可以忽略该块，
-按全新检索处理。最近 3 轮的已读证据和缺口仍保存在 `session_recall` 缓冲区，
-模型也可以主动调用该工具取用。
+按全新检索处理。最近 12 轮的已读证据和缺口保存在会话级证据目录
+（`session_evidence.py`）；模型可调用 `session_recall()` 取最近指针，或
+`session_recall(query="关键词")` 在整段目录中检索旧证据。两种路径都只返回
+指针，正文必须再经 `evidence_read` 登记，旧 `[n]` 永不复用。
 
 候选较多时，前 12 条保留摘要，其余以 `id/来源/位置` 紧凑列出，仍可直接
 `evidence_read`，不会出现“候选未展开但拿不到 id”的情况。回答收尾前会做
