@@ -59,6 +59,7 @@ def test_load_session_context_is_dormant(monkeypatch):
     assert runtime.prior_gaps == []
     assert "<session_state>" in runtime.session_state_text
     assert "门限是 2.884V" in runtime.session_state_text
+    assert 'session_recall(query="关键词")' in runtime.session_state_text
 
 
 def test_session_recall_exposes_pointers_only_when_called(monkeypatch):
@@ -105,3 +106,73 @@ def test_answer_gap_lines_extracts_gap_sentences():
         "Q1600 拓扑证据不足",
         "没有查到电气参数",
     ]
+
+
+class _MultiTurnConversationService:
+    def list_recent_turns(self, user_id, session_id, limit=4):
+        assert user_id == 4
+        assert session_id == 95
+        return [
+            SimpleNamespace(
+                id="t-new",
+                query="P1 电源轨是否正常？",
+                answer="上一轮结论：P1 正常。",
+                created_at="2026-11-03T10:00:02",
+                summary={
+                    "verification": {"answer_gaps": []},
+                    "evidence": [
+                        {
+                            "id": "document:p1",
+                            "content": "P1 电源轨输出 3.3V。",
+                            "source_name": "rail.docx",
+                            "locator": {"page": 1},
+                            "metadata": {"citation_number": 4},
+                        }
+                    ],
+                },
+            ),
+            SimpleNamespace(
+                id="t-old",
+                query="KL30 电源管理如何工作？",
+                answer="上一轮结论：KL30 由主电源管理。",
+                created_at="2026-11-03T09:00:00",
+                summary={
+                    "verification": {"answer_gaps": ["KL30 欠压门限未给出"]},
+                    "evidence": [
+                        {
+                            "id": "document:kl30",
+                            "content": "KL30 常电由主电源管理芯片控制。",
+                            "source_name": "power.docx",
+                            "locator": {"page": 7},
+                            "metadata": {"citation_number": 2},
+                        }
+                    ],
+                },
+            ),
+        ]
+
+
+def test_session_recall_searches_older_turns_by_keyword(monkeypatch):
+    import src.core.conversation as conversation
+
+    monkeypatch.setattr(
+        conversation, "ConversationService", _MultiTurnConversationService
+    )
+    runtime = ToolRuntime(kb_name="AAA", ctx=None, question="KL30 门限是多少？")
+    load_session_context(runtime, 95, 4)
+
+    assert [item.id for item in runtime.session_evidence_store.search("KL30")] == [
+        "document:kl30"
+    ]
+    assert runtime.session_recall_items[0].metadata.get("citation_number") is None
+
+    rendered = make_session_recall(runtime)(query="KL30")
+
+    assert "id=document:kl30" in rendered
+    assert "id=document:p1" not in rendered
+    assert "document:kl30" in runtime.candidate_evidence
+    assert runtime.evidence == []
+    assert runtime.prior_gaps == ["KL30 欠压门限未给出"]
+
+    missing = make_session_recall(runtime)(query="不存在的关键词")
+    assert "没有匹配" in missing
