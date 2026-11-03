@@ -183,6 +183,6 @@ class SystemPromptDualPathTests(unittest.TestCase):
     def test_prompt_contains_dual_path_protocol(self):
         from src.agents.runner import _SYSTEM_PROMPT
 
-        self.assertIn("回退用 spreadsheet_row_search/spreadsheet_cell_lookup", _SYSTEM_PROMPT)
+        self.assertIn("回退用 knowledge_search(source_types=[\"spreadsheet\"])", _SYSTEM_PROMPT)
         self.assertIn("交叉验证", _SYSTEM_PROMPT)
         self.assertIn("不能合并成一个确定结论", _SYSTEM_PROMPT)

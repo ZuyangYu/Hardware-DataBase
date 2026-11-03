@@ -75,11 +75,13 @@ class Evidence:                    # document_rag/schemas.py:59
 
 ### 2.2 指针优先检索（2026-10-30）
 
-知识库对话默认开启 `ToolRuntime.candidate_mode`：
+知识库对话默认开启 `ToolRuntime.candidate_mode`。主 Agent 默认只看到能力层
+`knowledge_search`；`document_search`、`document_search_batch`、`kb_grep`、
+`circuit_search`、`conversation_search`、`wiki_search`、表格行/单元格检索等
+底层适配器留给执行层和 research 子代理：
 
-1. `document_search`、`document_search_batch`、`kb_grep`、`circuit_search`、
-   `conversation_search`、`wiki_search`、表格行/单元格检索、附件检索等工具
-   返回的全部命中先进入 `candidate_evidence`（非引用、非正式证据）；
+1. 上述检索与 `knowledge_search` 返回的全部命中先进入 `candidate_evidence`
+   （非引用、非正式证据）；
 2. **不再自动准入**：任何搜索命中都不会直接获得 `[n]`，也不会占用正式证据预算；
 3. 命中以 `id / 来源 / 位置 / score / ≤180 字符摘要` 的候选索引返回；
 4. 模型判断候选与问题直接相关后调用 `evidence_read(candidate_ids=[...])`，
@@ -134,6 +136,14 @@ format_tool_result(...)                     # 返回给模型的工具结果文�
 ---
 
 ## 3. 工具逐个说明
+
+### 3.0 `knowledge_search`（`tools/knowledge_search.py`）
+
+主 Agent 的检索能力层。一次调用接收 1–6 个独立 `queries` 和
+`source_types`（`document` / `grep` / `circuit` / `conversation` / `wiki` /
+`spreadsheet`），内部 fan-out 到对应底层适配器，合并返回候选指针和
+“已执行/未配置/未请求”的覆盖信息。它不直接产生 `[n]`；候选仍需
+`evidence_read`。底层工具保留给 research 子代理和调试路径。
 
 ### 3.1 `document_search`（`tools/document_rag_tool.py`）
 
@@ -271,8 +281,8 @@ ragas 的 retrieved_contexts / evidence_consistency 指标
 ### 5.x 模型自行比较，无专用比较工具（2026-10-26）
 
 Agent 工具面不再提供 `document_compare` / `comparison_expand`，整篇文档比较
-服务及其只读报告 API 也已删除。比较是模型的行为：模型用普通 `document_search`、
-`attachment_search`、`attachment_read` 等工具读取两侧内容并自行对比，不再由
+服务及其只读报告 API 也已删除。比较是模型的行为：模型用 `knowledge_search`、
+`attachment_search`、`attachment_read` 等能力读取两侧内容并自行对比，不再由
 路由或预检自动触发。
 
 ---

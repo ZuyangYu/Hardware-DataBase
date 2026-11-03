@@ -9,6 +9,7 @@ footer after the stream finishes.
 """
 
 from __future__ import annotations
+from contextlib import contextmanager
 import re
 import threading
 import time
@@ -234,6 +235,9 @@ class ToolRuntime:
     no_progress_limit: int = 4
     no_progress_streak: int = 0
     progress_events: int = 0
+    # Capability-layer calls fan out several adapters; count progress once per
+    # outer tool call instead of once per internal adapter.
+    _suppress_progress: int = 0
     loop_stop_reason: str = ""
     seen_sources: set[str] = field(default_factory=set)
     session_recall_items: list[Evidence] = field(default_factory=list)
@@ -292,6 +296,18 @@ class ToolRuntime:
         with self._lock:
             self.no_progress_streak = 0
             self.progress_events += 1
+
+    @contextmanager
+    def suppress_progress(self):
+        """Temporarily let a capability layer own the progress accounting."""
+
+        with self._lock:
+            self._suppress_progress += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._suppress_progress = max(0, self._suppress_progress - 1)
 
     def note_no_progress(self) -> None:
         """Stop a loop that keeps returning the same material."""
@@ -1243,10 +1259,13 @@ def timed_tool_call(
         new_candidates = bool(set(rt.candidate_evidence) - pre_candidates)
         new_sources = bool(set(source_names) - rt.seen_sources)
         rt.seen_sources.update(source_names)
-    if new_evidence or new_sources or (new_candidates and not admitted_items.budget_blocked):
-        rt.note_progress()
-    else:
-        rt.note_no_progress()
+    with rt._lock:
+        suppress_progress = getattr(rt, "_suppress_progress", 0) > 0
+    if not suppress_progress:
+        if new_evidence or new_sources or (new_candidates and not admitted_items.budget_blocked):
+            rt.note_progress()
+        else:
+            rt.note_no_progress()
     citation_numbers = [
         int(item.metadata.get("citation_number") or 0)
         for item in admitted_items

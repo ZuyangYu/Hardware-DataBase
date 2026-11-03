@@ -110,6 +110,7 @@ def test_multi_kb_runner_does_not_mount_or_prefetch_long_term_memory(monkeypatch
         for tool in captured["tools"]
     }
     assert "memory_search" not in names
+    assert "knowledge_search" in names
     assert "circuit_search" not in names
     assert "spreadsheet_row_search" not in names
     assert "spreadsheet_cell_lookup" not in names

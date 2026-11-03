@@ -363,6 +363,8 @@ def test_complex_deep_turn_does_not_offer_a_planner_but_keeps_research_subagent(
         for tool in subagents[0]["tools"]
     }
     assert "document_search" in tool_names
+    assert "knowledge_search" in tool_names
+    assert "evidence_read" in tool_names
     assert "attachment_edit" not in tool_names
     assert "generate_document_from_template" not in tool_names
 

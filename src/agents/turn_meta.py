@@ -161,6 +161,10 @@ def _extract_text_delta(chunk: Any) -> str:
 
 _RESEARCH_SUBAGENT_TOOLS = frozenset({
     "list_kb_sources",
+    "list_knowledge_sources",
+    "knowledge_search",
+    "evidence_read",
+    "session_recall",
     "document_search",
     "document_search_batch",
     "circuit_search",
