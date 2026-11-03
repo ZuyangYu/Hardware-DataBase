@@ -66,7 +66,9 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def build_stub_app(*, include_write_tools: bool = False) -> FastMCP:
+def build_stub_app(
+    *, include_write_tools: bool = False, extra_read_tools: int = 0
+) -> FastMCP:
     """Build the stub FastMCP app with the fixed tool matrix."""
 
     mcp = FastMCP("hdb-mcp-stub")
@@ -96,6 +98,21 @@ def build_stub_app(*, include_write_tools: bool = False) -> FastMCP:
     def dup_name(text: str) -> str:
         """Placeholder for a name colliding with a local HDB tool."""
         return text
+
+    def _make_extra(extra_index: int):
+        def _extra(text: str = "") -> str:
+            """Return a tagged extra tool result."""
+            return f"extra-{extra_index}:{text}"
+
+        return _extra
+
+    for index in range(max(0, int(extra_read_tools or 0))):
+        mcp.add_tool(
+            _make_extra(index),
+            name=f"extra_{index}",
+            description=f"Extra tool {index} for lazy-discovery tests.",
+            annotations=ToolAnnotations(readOnlyHint=True),
+        )
 
     if include_write_tools:
         # Phase 2 write tools: return a candidate-artifact reference, never
@@ -149,10 +166,19 @@ def build_stub_app(*, include_write_tools: bool = False) -> FastMCP:
 class McpStubServer:
     """Context manager running the stub over ``streamable_http``."""
 
-    def __init__(self, host: str = "127.0.0.1", *, include_write_tools: bool = False) -> None:
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        *,
+        include_write_tools: bool = False,
+        extra_read_tools: int = 0,
+    ) -> None:
         self.host = host
         self.port = _free_port()
-        self._mcp = build_stub_app(include_write_tools=include_write_tools)
+        self._mcp = build_stub_app(
+            include_write_tools=include_write_tools,
+            extra_read_tools=extra_read_tools,
+        )
         self._server: uvicorn.Server | None = None
         self._thread: threading.Thread | None = None
 
