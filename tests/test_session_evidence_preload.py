@@ -173,6 +173,11 @@ def test_session_recall_searches_older_turns_by_keyword(monkeypatch):
     assert "document:kl30" in runtime.candidate_evidence
     assert runtime.evidence == []
     assert runtime.prior_gaps == ["KL30 欠压门限未给出"]
+    diagnostic = next(
+        item for item in runtime.diagnostics if item["tool_name"] == "session_recall"
+    )
+    assert diagnostic["candidate_count"] == 1
+    assert diagnostic["hit_count"] == 0
 
     missing = make_session_recall(runtime)(query="不存在的关键词")
     assert "没有匹配" in missing

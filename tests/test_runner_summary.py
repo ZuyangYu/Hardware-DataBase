@@ -27,11 +27,12 @@ def _ev(citations, score=0.9, content="x"):
     return items
 
 
-def _diag(tool_name, status="ok", hit_count=3, error=""):
+def _diag(tool_name, status="ok", hit_count=3, error="", candidate_count=0):
     return ToolDiagnostics(
         tool_name=tool_name,
         status=status,
         hit_count=hit_count,
+        candidate_count=candidate_count,
         error=error,
         latency_ms=1,
         filters={},
@@ -160,6 +161,16 @@ class RetrievalSummaryTests(unittest.TestCase):
         self.assertIn("目标证据覆盖", footer)
         self.assertIn("未完成来源", footer)
         self.assertIn("kb:6 timeout", footer)
+
+    def test_footer_shows_session_recall_candidates(self):
+        rt = ToolRuntime(kb_name="k", ctx=None)
+        rt.record_diagnostic(
+            _diag("session_recall", hit_count=0, candidate_count=12)
+        )
+
+        footer = self._runner()._format_footer(rt, self._verification(), [])
+
+        self.assertIn("session_recall hits=0 candidates=12", footer)
 
 
 if __name__ == "__main__":

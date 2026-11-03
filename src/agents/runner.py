@@ -1704,10 +1704,13 @@ class MultiSourceAgentRunner:
 
         # Translate live diagnostics into the summary/footer projections.
         for diag in rt.diagnostics:
+            message = f"{diag.get('hit_count')} hits"
+            if int(diag.get("candidate_count") or 0) > 0:
+                message += f" · {diag['candidate_count']} candidates"
             timeline.append(
                 {
                     "node": diag.get("tool_name"),
-                    "message": f"{diag.get('hit_count')} hits",
+                    "message": message,
                     "metadata": diag,
                 }
             )
@@ -2007,9 +2010,14 @@ class MultiSourceAgentRunner:
         sections.append("\n**检索诊断**")
         if rt.diagnostics:
             for diag in rt.diagnostics[-8:]:
+                candidates = int(diag.get("candidate_count") or 0)
+                candidate_text = (
+                    f" candidates={candidates}" if candidates > 0 else ""
+                )
                 sections.append(
-                    f"- {diag.get('tool_name')} hits={diag.get('hit_count')} "
-                    f"status={diag.get('status')} latency={diag.get('latency_ms')}ms"
+                    f"- {diag.get('tool_name')} hits={diag.get('hit_count')}"
+                    f"{candidate_text} status={diag.get('status')}"
+                    f" latency={diag.get('latency_ms')}ms"
                 )
         else:
             sections.append("- 无")

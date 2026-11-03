@@ -110,6 +110,7 @@ def _evidence_relevance(question_tokens: set[str], item: Evidence) -> float:
 class ToolDiagnostics:
     tool_name: str
     hit_count: int = 0
+    candidate_count: int = 0
     status: str = "ok"
     error: str = ""
     latency_ms: int = 0
@@ -905,6 +906,7 @@ class ToolRuntime:
                 {
                     "tool_name": diag.tool_name,
                     "hit_count": diag.hit_count,
+                    "candidate_count": diag.candidate_count,
                     "status": diag.status,
                     "error": diag.error,
                     "latency_ms": diag.latency_ms,
@@ -1213,6 +1215,7 @@ def timed_tool_call(
         ToolDiagnostics(
             tool_name=tool_name,
             hit_count=len(admitted_items),
+            candidate_count=len(candidate_rows),
             latency_ms=latency_ms,
             filters=dict(filters or {}),
         )
