@@ -1,9 +1,8 @@
 """Same-turn gap-closure policy.
 
-The runner still owns the mechanics of retracting a draft and running the next
-stream; this module owns only the deterministic decision of whether a closure
-round is worth attempting.  Keeping the policy separate makes it testable and
-ready to move behind a middleware hook.
+``GapClosureMiddleware`` owns the hook and the jump; this module owns only the
+deterministic decision of whether a closure round is worth attempting.  Keeping
+the policy separate from the graph mechanics makes it unit-testable.
 """
 
 from __future__ import annotations

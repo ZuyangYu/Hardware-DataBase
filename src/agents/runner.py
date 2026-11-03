@@ -43,7 +43,7 @@ from src.agents.answer_stream import (
     strip_narration_segments,  # noqa: F401 - re-exported for API/eval callers
 )
 from src.agents.assembly import build_agent
-from src.agents.gap_closure import decide_gap_closure
+from src.agents.middleware.gap_closure import GapClosureMiddleware
 from src.agents.skill_materializer import (
     load_skill_prompt_context,
     materialize_text_skills,
@@ -62,7 +62,6 @@ from src.agents.middleware.loop_budget import (
 )
 from src.agents.session_recall import (
     evidence_rows,
-    gap_closure_prompt,
     load_session_context,
 )
 from src.agents.session_service import prepare_session
@@ -1529,7 +1528,17 @@ class MultiSourceAgentRunner:
                 "\n引用编号只对当前轮有效；不要复用上一轮回答或对话历史中的 [n]，"
                 "必须使用本轮工具返回的证据编号。"
             )
+        turn_started = time.monotonic()
+        pre_candidates = set(rt.candidate_evidence)
         loop_budget = LoopBudget(rt)
+        gap_middleware = GapClosureMiddleware(
+            rt=rt,
+            pre_candidates=pre_candidates,
+            turn_started=turn_started,
+            is_general=is_general,
+            query_mode=query_mode,
+            has_checkpointer=checkpointer is not None,
+        )
         agent = build_agent(
             model=model,
             tools=tools,
@@ -1538,7 +1547,10 @@ class MultiSourceAgentRunner:
             subagents=agent_subagents,
             session_state_text=getattr(rt, "session_state_text", ""),
             skill_root=skill_root,
-            middleware=[LoopBudgetMiddleware(loop_budget)],
+            middleware=[
+                LoopBudgetMiddleware(loop_budget),
+                gap_middleware,
+            ],
             factory=create_deep_agent,
         )
         config = session.config
@@ -1555,7 +1567,6 @@ class MultiSourceAgentRunner:
             on_narration=lambda text: emit_event({"type": "narration", "payload": {"text": text}})
         )
         recursion_stopped = progress_stopped = time_stopped = False
-        turn_started = time.monotonic()
         seen_tool_calls: set[str] = set()
         subagents: list[dict[str, Any]] = []
         subagent_by_call: dict[str, dict[str, Any]] = {}
@@ -1611,59 +1622,15 @@ class MultiSourceAgentRunner:
 
         from langgraph.errors import GraphRecursionError
 
-        gap_rounds = 0
         loop_budget.deadline = turn_started + 480
-        pre_candidates = set(rt.candidate_evidence)
-        retracted_answers: list[str] = []
         try:
             with bind_cancel_check(should_cancel):
-                while True:
-                    try:
-                        for delta in _stream_round(splitter):
-                            yield delta
-                    except ProgressStopped:
-                        if gap_rounds == 0:
-                            progress_stopped = True
-                        break
-                    except TimeBudgetExceeded:
-                        if gap_rounds == 0:
-                            time_stopped = True
-                        break
-                    except GraphRecursionError:
-                        if gap_rounds == 0:
-                            raise
-                        break
-                    if gap_rounds:
-                        progress_stopped = False
-                    if time_stopped or progress_stopped:
-                        break
-                    draft = splitter.finish()
-                    decision = decide_gap_closure(
-                        draft=draft,
-                        rt=rt,
-                        pre_candidates=pre_candidates,
-                        elapsed_seconds=time.monotonic() - turn_started,
-                        gap_rounds=gap_rounds,
-                        is_general=is_general,
-                        query_mode=query_mode,
-                        has_checkpointer=checkpointer is not None,
-                    )
-                    if not decision.should_close:
-                        break
-                    gaps = decision.gaps
-                    if draft:
-                        emit_event({"type": "narration", "payload": {"text": draft}})
-                        retracted_answers.append(draft)
-                    gap_rounds += 1
-                    loop_budget.deadline = min(time.monotonic() + 90, turn_started + 450)
-                    messages = [
-                        {"role": "user", "content": gap_closure_prompt(rt, gaps)}
-                    ]
-                    splitter = _AnswerSplitter(
-                        on_narration=lambda text: emit_event(
-                            {"type": "narration", "payload": {"text": text}}
-                        )
-                    )
+                for delta in _stream_round(splitter):
+                    yield delta
+        except ProgressStopped:
+            progress_stopped = True
+        except TimeBudgetExceeded:
+            time_stopped = True
         except QueryCancelled:
             return
         except Exception as exc:
@@ -1704,8 +1671,6 @@ class MultiSourceAgentRunner:
         # finish() only returns the final text for the record; it is not re-yielded.
         rt.finalize_evidence()
         answer_text = _normalize_citation_labels(splitter.finish())
-        if not answer_text and retracted_answers:
-            answer_text = _normalize_citation_labels(retracted_answers[-1])
         partial_delivery = False
         if recursion_stopped or progress_stopped or time_stopped:
             reason = (
