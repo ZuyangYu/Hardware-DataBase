@@ -72,30 +72,42 @@ MultiSourceAgentRunner.stream(
 ### 2.1 消息构造与 checkpoint
 
 ```python
-config["configurable"]["thread_id"] = attempt_thread      # 由 checkpoints 模块派生
-has_state = checkpointer.get_tuple(config) is not None
-messages = [{"role":"user","content":query}] if has_state else _build_messages(query, history)
+session = prepare_session(
+    thread_id=attempt_thread,          # 由 checkpoints 模块派生
+    persist_thread=persist_thread,
+    recursion_limit=recursion_limit,
+    history=history,
+)
+config, messages = session.config, session.messages
 ```
 
 - `persist_thread=True`（持久化 turn worker）时才挂 checkpointer；
 - 无状态时由 `history` 播种最近 6 轮（`_build_messages`）；
 - 有状态时**只喂当前问题**，历史来自 checkpoint——这是多轮上下文复用的关键，
-  但要求 view 层不要把历史重复塞进 prompt。
+  但要求 view 层不要把历史重复塞进 prompt；
+- 存量会话首次接入 checkpoint（`has_state=False` 但 `history` 非空）会一次性播种，
+  之后只追加当前问题。
 
 ### 2.2 系统提示词装配顺序（安全相关，不能乱）
 
+组装点：`src/agents/turn_prompt.py::build_turn_prompt`。
+
 ```
-1. 作用域行（KB 行 + 附件行：可写时附完整 attachment_edit/release/revision_history 操作规则）
-2. 基础提示词（settings.SYSTEM_PROMPT 覆盖，否则内置 _SYSTEM_PROMPT），
+1. 作用域行（KB 行 + 附件行：可写时附 attachment_edit/release/revision_history 操作规则）
+2. 基础提示词（settings.SYSTEM_PROMPT 覆盖，否则内置 SYSTEM_PROMPT），
    含 {kb_name} / {workflow} 占位（_Fast/_Deep workflow）
-3. 导出协议 _EXPORT_PROMPT（仅当服务端判定导出意图时）
+3. 受控动作规则（只能调用当前可见业务工具，不得访问文件系统）
+4. 候选证据规则（领域问答轮；通用对话跳过）
 5. 记忆上下文（<untrusted_memory>，在固定规则之后 → 不能改变证据优先级）
-6. 附件预检（<untrusted_attachment>，≤12000 字符）
-7. action 收据摘要（enabled 模式下执行过的动作摘要行）
-8. 统一工具模式下的受控动作说明句
+6. Skill 提示上下文（未物化文本 Skill 时的兼容路径）
+7. 工具 prompt suffix（MCP 不可信规则 / 执行型 Skill 规则）
+8. 导出协议 EXPORT_PROMPT（仅当服务端判定导出意图时）
 ```
 
-> 顺序即安全边界：**固定规则在前，不可信内容在后**；`settings._PromptDict` 机制保证
+`kb_scope` / `base_rules` / `memory` / `skill` / `mcp` / `skill_tools` / `export`
+同时作为 fragments 写入 turn summary；工具 fragments 只用于追踪，正文只由 suffix 注入一次。
+
+> 顺序即安全边界：**固定规则在前，不可信内容在后**；`_PromptDict` 机制保证
 > 自定义 `SYSTEM_PROMPT` 缺少占位符时也不会被格式化炸掉（占位符原样保留）。
 
 ### 2.3 上下文自动压缩
