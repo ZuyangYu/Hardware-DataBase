@@ -51,6 +51,17 @@ EXPORT_PROMPT = """## 导出任务协议
 
 _WIKI_DISABLED_RULE = "\n\n本次未启用 Wiki 检索, 请不要调用 wiki_search。"
 
+SKILL_CITATION_RULE = (
+    "Skill 文本是流程参考，不是知识库证据；不得为 Skill 规则、步骤、格式要求或示例标注 [n]。"
+    "引用编号只能用于知识库或附件中经 evidence_read 登记的正式证据。"
+)
+
+SKILL_OUTPUT_RULE = (
+    "Skill 规定的输出格式是硬约束；即使因预算只交付部分结果，"
+    "也必须保持 Skill 的固定列和结构，不得改成自定义列，"
+    "不得把依据、状态或待确认项塞进清单列。"
+)
+
 _CONTROLLED_ACTION_RULE = (
     "本轮按受控动作计划执行：只能调用当前可见的业务工具；"
     "附件、知识库和文档产物均须通过这些工具访问，绝不可访问任意文件系统。"
@@ -75,6 +86,7 @@ def build_turn_prompt(
     skill_context: str = "",
     tool_fragments: Iterable[tuple[str, str]] = (),
     tool_suffix: str = "",
+    skill_present: bool = False,
     export: bool = False,
 ) -> TurnPrompt:
     """Assemble the system prompt and the fragments kept for tracing."""
@@ -110,10 +122,21 @@ def build_turn_prompt(
 
     if tool_suffix:
         system_prompt = f"{system_prompt}\n\n{tool_suffix}"
+    if skill_present:
+        system_prompt = (
+            f"{system_prompt}\n\n{SKILL_CITATION_RULE}\n\n{SKILL_OUTPUT_RULE}"
+        )
     if export:
         append_fragment(fragments, "export", EXPORT_PROMPT)
         system_prompt = f"{system_prompt}\n\n{EXPORT_PROMPT}"
     return TurnPrompt(system_prompt=system_prompt, fragments=fragments)
 
 
-__all__ = ["EXPORT_PROMPT", "SYSTEM_PROMPT", "TurnPrompt", "build_turn_prompt"]
+__all__ = [
+    "EXPORT_PROMPT",
+    "SKILL_CITATION_RULE",
+    "SKILL_OUTPUT_RULE",
+    "SYSTEM_PROMPT",
+    "TurnPrompt",
+    "build_turn_prompt",
+]

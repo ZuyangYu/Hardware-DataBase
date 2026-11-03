@@ -72,3 +72,16 @@ def test_blank_system_prompt_falls_back_to_default(monkeypatch):
 
     assert "Hardware DataBase" in prompt.system_prompt
     assert "Hardware DataBase" in tp.SYSTEM_PROMPT
+
+
+def test_skill_turn_appends_citation_rule_even_with_custom_prompt(monkeypatch):
+    monkeypatch.setattr(tp.settings, "SYSTEM_PROMPT", "CUSTOM BASE")
+
+    with_skill = _build(skill_present=True)
+    without_skill = _build()
+
+    assert tp.SKILL_CITATION_RULE in with_skill.system_prompt
+    assert tp.SKILL_OUTPUT_RULE in with_skill.system_prompt
+    assert "Skill 文本是流程参考" in with_skill.system_prompt
+    assert "固定列和结构" in with_skill.system_prompt
+    assert tp.SKILL_CITATION_RULE not in without_skill.system_prompt
