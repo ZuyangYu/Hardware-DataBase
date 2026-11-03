@@ -6,6 +6,8 @@ import time
 import threading
 from types import SimpleNamespace
 
+from langchain.agents import create_agent
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 
 from src.agents.middleware.gap_closure import GapClosureMiddleware
@@ -70,3 +72,30 @@ def test_general_or_fast_turn_does_not_jump():
     state = {"messages": [AIMessage(content="过压门限数值未给出。")]}
     assert _middleware(_rt(candidates={"doc:1": _candidate()}), is_general=True).after_agent(state) is None
     assert _middleware(_rt(candidates={"doc:1": _candidate()}), query_mode="fast").after_agent(state) is None
+
+
+def test_middleware_jumps_inside_a_real_agent_graph():
+    middleware = _middleware(_rt(candidates={"doc:1": _candidate()}))
+    model = GenericFakeChatModel(
+        messages=iter(
+            [
+                AIMessage(content="过压门限数值未给出。"),
+                AIMessage(content="补齐后的完整回答：门限 2.884V。"),
+            ]
+        )
+    )
+    agent = create_agent(model=model, tools=[], middleware=[middleware])
+
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": "过压门限是多少？"}]}
+    )
+
+    answers = [
+        message.content
+        for message in result["messages"]
+        if isinstance(message, AIMessage)
+    ]
+    assert answers == [
+        "过压门限数值未给出。",
+        "补齐后的完整回答：门限 2.884V。",
+    ]
