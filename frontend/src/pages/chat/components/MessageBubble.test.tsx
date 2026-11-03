@@ -148,6 +148,31 @@ describe('complex turn meta panels', () => {
     expect(html).toContain('无结果：知识库未命中');
   });
 
+  it('collapses the completed process panel after streaming ends', () => {
+    const html = renderToStaticMarkup(
+      <MessageBubble
+        msg={{ ...baseMessage, content: '最终回答 [1]' }}
+        traceSteps={[
+          {
+            key: 'inv-1',
+            kind: 'tool',
+            call_id: 'inv-1',
+            label: '文档检索',
+            status: 'done',
+            detail: '3 条命中 · 9ms',
+            input: '电源方案',
+            sources: ['设计说明.docx'],
+            evidence_count: 3,
+            candidate_count: 2,
+          },
+        ]}
+      />,
+    );
+    expect(html).toContain('处理过程');
+    expect(html).not.toContain('文档检索');
+    expect(html).not.toContain('3 条命中');
+  });
+
   it('does not render automatic compaction as a message card', () => {
     const html = renderToStaticMarkup(
       <MessageBubble

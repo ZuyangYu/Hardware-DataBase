@@ -289,7 +289,12 @@
 文本 Skill 使用 `src/sandbox/skills.py` 的独立 catalog：固定版本和 digest、
 管理员审核后才能加载；即使启用也只有 `<untrusted_skill>` 提示数据，没有任何
 `sandbox.execute`/工具/网络能力。含 hooks/bin/command 或 prompt-injection
-模式的内容只生成审核标记，不会被解释或执行。当前有 HDB 自有/管理员审核固定负载的 dev-l1
+模式的内容只生成审核标记，不会被解释或执行。启用时 runner 只把已审核、已订阅的
+Skill 物化为只读 `SKILL.md` 目录，交给官方 `SkillsMiddleware` 做渐进式披露：
+系统提示只出现名称/描述，正文由 `read_file` 按需读取；文件系统写入被拒绝。
+执行型 Skill 不通过该目录执行：Agent 只能调用 `skill_invoke`，由 HDB 校验
+Bundle/能力/订阅后提交给独立 Sandbox Runner；其源码目录不会暴露给文件工具。
+当前有 HDB 自有/管理员审核固定负载的 dev-l1
 参考部署；第三方或模型生成代码、敏感多租户生产使用仍未通过安全验收。Skill 类型、个人提交与共享、
 权限矩阵、任务/产物流和观测方式见 [22 · 外部扩展](22-external-extensions.md)；部署限制见
 [`deploy/mcp-sandbox/README.md`](../deploy/mcp-sandbox/README.md)，员工和管理员操作见

@@ -17,6 +17,7 @@ class _ConversationService:
         return [
             SimpleNamespace(
                 query="VCC3V3_EQ 的过压门限是多少？",
+                answer="上一轮结论：门限是 2.884V / 3.782V。",
                 summary={
                     "verification": {
                         "answer_gaps": ["过压门限数值未给出"],
@@ -56,6 +57,8 @@ def test_load_session_context_is_dormant(monkeypatch):
     assert runtime.candidate_evidence == {}
     assert runtime.evidence == []
     assert runtime.prior_gaps == []
+    assert "<session_state>" in runtime.session_state_text
+    assert "门限是 2.884V" in runtime.session_state_text
 
 
 def test_session_recall_exposes_pointers_only_when_called(monkeypatch):

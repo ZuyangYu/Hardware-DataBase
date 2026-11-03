@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import json
-
 import pytest
 from fastapi import HTTPException
 from langchain_core.language_models import BaseChatModel
@@ -15,6 +13,7 @@ from pydantic import ValidationError
 from deepagents import create_deep_agent
 
 import src.settings as settings
+from src.agents.skill_materializer import load_skill_prompt_context
 from src.api.routes import sandbox as routes
 from src.api.schemas import SandboxSkillExecutionBindingRequest, SandboxSkillRunRequest
 from src.sandbox.artifact_broker import ArtifactBroker
@@ -238,8 +237,8 @@ def test_available_skills_exposes_review_metadata_and_runtime_contract(setup, mo
 
 
 def test_temporary_skill_disable_filters_catalog_without_removing_subscription(setup, monkeypatch):
-    from src.agents.runner import MultiSourceAgentRunner
-    from src.sandbox.agent_tools import make_skill_tools, make_text_skill_tools
+    from src.agents.skill_materializer import select_text_skills
+    from src.sandbox.agent_tools import make_skill_tools
     from src.sandbox.skills import SkillCatalog
 
     store, _, _, _, bundle = setup
@@ -273,9 +272,6 @@ def test_temporary_skill_disable_filters_catalog_without_removing_subscription(s
     assert "skill_temporarily_disabled" in suppressed_invoke.invoke(
         {"skill_ref": "skill/report", "parameters": {}}
     )
-    assert [tool.name for tool in make_text_skill_tools(
-        rt, user_id=42, department_id="dept-1", disabled_skill_refs=["skill/checklist"],
-    )] == []
     assert skills.is_subscribed("skill/report", 42)
     assert skills.is_subscribed("skill/checklist", 42)
 
@@ -285,7 +281,7 @@ def test_temporary_skill_disable_filters_catalog_without_removing_subscription(s
                   "disabled_skill_refs": ["skill/checklist"]},
         is_system_admin=lambda: True,
     )
-    assert MultiSourceAgentRunner._load_skill_prompt_context(context) == ""
+    assert select_text_skills(context) == []
 
 
 def test_skill_cannot_be_enabled_after_bound_bundle_is_revoked(setup):
@@ -388,9 +384,7 @@ def test_admin_published_all_department_skills_require_employee_department_and_s
         skills.subscribe("skill/global-run", principal_id="employee-none", department_id="")
 
 
-def test_subscribed_text_is_loaded_on_demand(setup, monkeypatch):
-    from src.agents.runner import MultiSourceAgentRunner
-    from src.sandbox.agent_tools import make_text_skill_tools
+def test_subscribed_text_is_mounted_in_employee_conversation_only(setup, monkeypatch):
     import src.core.auth as auth_module
 
     _, _, skills, _, _ = setup
@@ -407,11 +401,10 @@ def test_subscribed_text_is_loaded_on_demand(setup, monkeypatch):
     skills.enable("skill/checklist")
     context = SimpleNamespace(user_id="tester", metadata={"actor_department_id": "dept-1"},
                               is_system_admin=lambda: False)
-    load = MultiSourceAgentRunner._load_skill_prompt_context
+    load = load_skill_prompt_context
     assert load(context) == ""
     skills.subscribe("skill/checklist", principal_id=42, department_id="dept-1")
-    # Subscribed text Skills are not auto-injected anymore.
-    assert load(context) == ""
+    assert "Verify component voltage" in load(context)
     explicit = SimpleNamespace(
         user_id="tester",
         metadata={"actor_department_id": "dept-1", "skill_refs": ["skill/checklist"]},
@@ -421,21 +414,11 @@ def test_subscribed_text_is_loaded_on_demand(setup, monkeypatch):
     assert load(SimpleNamespace(user_id="tester", metadata={"actor_department_id": "dept-2"},
                                 is_system_admin=lambda: False)) == ""
 
-    events = []
-    rt = SimpleNamespace(check_cancel=lambda: None, emit=lambda kind, payload: events.append(kind))
-    tools = make_text_skill_tools(rt, user_id=42, department_id="dept-1")
-    assert [tool.name for tool in tools] == ["skill_load"]
-    payload = json.loads(tools[0].invoke({"skill_ref": "skill/checklist"}))
-    assert payload["untrusted"] is True and "Verify component voltage" in payload["content"]
-    assert events == ["tool_started", "tool_result"]
-
     skills.unsubscribe("skill/checklist", principal_id=42)
     assert load(context) == ""
-    assert make_text_skill_tools(rt, user_id=42, department_id="dept-1") == []
 
 
 def test_skill_prompt_context_failure_reports_bounded_error(setup, monkeypatch):
-    from src.agents.runner import MultiSourceAgentRunner
     from src.sandbox import skills as skills_module
     import src.core.auth as auth_module
 
@@ -457,7 +440,7 @@ def test_skill_prompt_context_failure_reports_bounded_error(setup, monkeypatch):
         is_system_admin=lambda: False,
     )
     seen: list[str] = []
-    text = MultiSourceAgentRunner._load_skill_prompt_context(
+    text = load_skill_prompt_context(
         context, on_error=lambda exc: seen.append(type(exc).__name__),
     )
     assert text == ""

@@ -237,6 +237,7 @@ class ToolRuntime:
     seen_sources: set[str] = field(default_factory=set)
     session_recall_items: list[Evidence] = field(default_factory=list)
     session_recall_gaps: list[str] = field(default_factory=list)
+    session_state_text: str = ""
     prior_gaps: list[str] = field(default_factory=list)
     last_rejection_reasons: dict[str, int] = field(default_factory=dict)
     _invocation_seq: int = 0
