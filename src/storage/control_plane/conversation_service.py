@@ -333,6 +333,8 @@ class PostgresConversationService:
         fencing_token: int | None = None,
         terminal_events_builder=None,
         domain_writer=None,
+        partial_answer: str | None = None,
+        summary: dict | None = None,
     ) -> TurnFinalization:
         return self._store.fail_turn(
             user_id,
@@ -344,6 +346,8 @@ class PostgresConversationService:
             fencing_token=fencing_token,
             terminal_events_builder=terminal_events_builder,
             domain_writer=domain_writer,
+            partial_answer=partial_answer,
+            summary=summary,
         )
 
     # -- queue and governance ----------------------------------------------

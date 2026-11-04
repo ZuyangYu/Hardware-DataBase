@@ -43,6 +43,7 @@ from src.api.routes import (
     status,
     sandbox,
     structured,
+    tasks,
     upload,
     users,
     wiki,
@@ -334,6 +335,7 @@ def create_app() -> FastAPI:
     app.include_router(files.router, prefix=api_v1)
     app.include_router(parse_tasks.router, prefix=api_v1)
     app.include_router(query.router, prefix=api_v1)
+    app.include_router(tasks.router, prefix=api_v1)
     app.include_router(quality.router, prefix=api_v1)
     app.include_router(costs.router, prefix=api_v1)
     app.include_router(quality_workflow.router, prefix=api_v1)

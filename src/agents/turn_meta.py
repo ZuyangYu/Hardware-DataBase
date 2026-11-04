@@ -323,6 +323,34 @@ def _turn_complexity(
     }
 
 
+# 用户在问题里声明的检索工具调用上限："最多 8 次检索工具调用" → 8。
+# 关键词 lookahead 保证只在检索/调用语境匹配，避免"最多列出三行"这类误伤。
+_USER_TOOL_CALL_CAP_RE = re.compile(
+    r"(?:最多|不超过|至多|不要超过)\s*(\d{1,3})\s*次"
+    r"(?=[^\n。!？;；]{0,12}(?:检索|工具|调用|查询))"
+)
+
+
+def parse_user_tool_call_cap(query: str) -> int | None:
+    """Parse the per-turn tool-call cap declared by the user, if any.
+
+    Returns ``None`` when the query does not declare a usable cap. Caps below
+    1 are ignored and caps at or above the deep-mode base (72) are treated as
+    "no extra constraint" so the regular budget stays authoritative.
+    """
+
+    match = _USER_TOOL_CALL_CAP_RE.search(str(query or ""))
+    if match is None:
+        return None
+    try:
+        cap = int(match.group(1))
+    except ValueError:
+        return None
+    if cap < 1 or cap >= 72:
+        return None
+    return cap
+
+
 def _agent_recursion_limit(
     *,
     query: str,
@@ -350,13 +378,18 @@ def _agent_recursion_limit(
         limit = min(max_limit, base + int(complexity["score"]) * multiplier)
     else:
         limit = base
-    return limit, {
+    budget: dict[str, Any] = {
         "mode": query_mode,
         "base_recursion_limit": base,
         "recursion_limit": limit,
         "complexity": complexity,
         "enabled": enabled,
     }
+    cap = parse_user_tool_call_cap(query)
+    if cap is not None:
+        budget["tool_call_cap"] = cap
+        budget["tool_call_cap_source"] = "user_query"
+    return limit, budget
 
 
 def _research_subagent_spec(
@@ -391,8 +424,8 @@ def _research_subagent_spec(
     }
 
 
-def _agent_step_budget_answer(rt: Any) -> str:
-    """Explain a clean stop after the agent loop exhausted its step budget."""
+def _agent_step_budget_answer(rt: Any, reason: str = "") -> str:
+    """Explain a clean stop after a budgeted agent loop ended."""
 
     evidence = list(getattr(rt, "evidence", []) or [])
     sources = [
@@ -402,7 +435,14 @@ def _agent_step_budget_answer(rt: Any) -> str:
         )
         if name
     ]
-    lines = ["本轮工具调用已达到单轮步数上限，为避免无限循环已停止继续检索。"]
+    if reason == "time_limit":
+        lines = ["本轮执行时间预算已到，为避免无限等待已停止继续检索。"]
+    elif reason == "no_progress":
+        lines = ["连续多次检索没有带来新证据，已停止继续检索。"]
+    elif reason == "tool_call_limit":
+        lines = ["本轮工具调用已达到你指定的次数上限，已停止继续检索。"]
+    else:
+        lines = ["本轮工具调用已达到单轮步数上限，为避免无限循环已停止继续检索。"]
     if evidence and sources:
         listed = "、".join(sources[:5]) + (" 等" if len(sources) > 5 else "")
         lines.append(f"已登记 {len(evidence)} 条证据（来源：{listed}），但尚未完成全部任务。")

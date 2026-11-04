@@ -537,6 +537,35 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             return None
 
     def _fail_owned(message: str, *, cancelled_turn: bool = False) -> None:
+        # 看门狗/取消掐断时主线程可能仍堵在下游调用里；能拿到多少就抢救
+        # 多少：已流出的部分答案 + 本轮已登记的证据摘要。runner 若已
+        # 产出权威答案（可能带引用清洗）则优先于流式拼接的文本。
+        rescued_answer = ""
+        rescued_summary: dict | None = None
+        try:
+            get_agent_answer = getattr(pipeline, "get_last_agent_answer", None)
+            authoritative = (
+                str(get_agent_answer() or "").strip()
+                if callable(get_agent_answer)
+                else ""
+            )
+            streamed = strip_narration_segments(
+                "".join(answer_parts), narrated
+            ).strip()
+            rescued_answer = (authoritative or streamed).strip()
+        except Exception:
+            rescued_answer = ""
+        try:
+            raw_summary = (
+                pipeline.get_last_retrieval_summary()
+                if pipeline is not None
+                else None
+            )
+            if isinstance(raw_summary, dict) and raw_summary.get("evidence"):
+                rescued_summary = raw_summary
+        except Exception:
+            rescued_summary = None
+
         def _final_events(_final: ChatTurn) -> list[tuple[str, dict]]:
             if cancelled_turn:
                 return [
@@ -549,15 +578,33 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             ]
 
         try:
-            finalization = conv.fail_turn_result(
-                user.id,
-                turn_id,
-                message,
-                cancelled=cancelled_turn,
-                worker_id=worker_id,
-                fencing_token=ownership_token,
-                terminal_events_builder=_final_events,
-            )
+            try:
+                finalization = conv.fail_turn_result(
+                    user.id,
+                    turn_id,
+                    message,
+                    cancelled=cancelled_turn,
+                    worker_id=worker_id,
+                    fencing_token=ownership_token,
+                    terminal_events_builder=_final_events,
+                    partial_answer=rescued_answer or None,
+                    summary=rescued_summary,
+                )
+            except TypeError as exc:
+                # 抢救参数是新增能力：若某个 ConversationService 实现尚未
+                # 跟上签名，绝不能把轮次留在中间态——退回最小终态调用，
+                # 至少保证看门狗能给出明确的 failed/cancelled。
+                if "partial_answer" not in str(exc) and "summary" not in str(exc):
+                    raise
+                finalization = conv.fail_turn_result(
+                    user.id,
+                    turn_id,
+                    message,
+                    cancelled=cancelled_turn,
+                    worker_id=worker_id,
+                    fencing_token=ownership_token,
+                    terminal_events_builder=_final_events,
+                )
         except StaleTurnOwner:
             # A newer attempt owns the turn; it will finalise it.
             return
@@ -571,14 +618,20 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     deadline_event = threading.Event()
     # Cap by the provider's own retry budget as well: a single turn should not
     # outlive ``timeout × (retries + 2)`` even if the queue deadline is larger.
-    deadline_seconds = max(
-        60,
-        min(
-            int(getattr(src.settings, "CHAT_QUEUE_DEADLINE_SECONDS", 600)),
-            int(getattr(src.settings, "AGENT_TIMEOUT_SECONDS", 120))
-            * (int(getattr(src.settings, "AGENT_RATE_LIMIT_MAX_RETRIES", 4)) + 2),
-        ),
+    provider_retry_budget = int(getattr(src.settings, "AGENT_TIMEOUT_SECONDS", 120)) * (
+        int(getattr(src.settings, "AGENT_RATE_LIMIT_MAX_RETRIES", 4)) + 2
     )
+    queue_deadline = int(getattr(src.settings, "CHAT_QUEUE_DEADLINE_SECONDS", 600))
+    # 未声明调用上限的 deep 回合以完整性优先，看门狗放宽到 deep 预算；
+    # 其余回合保持普通 600s 预算。
+    deep_deadline = max(
+        queue_deadline,
+        int(getattr(src.settings, "CHAT_QUEUE_DEADLINE_DEEP_SECONDS", 900)),
+    )
+    if str(getattr(turn, "query_mode", "") or "") == "deep":
+        deadline_seconds = max(60, deep_deadline)
+    else:
+        deadline_seconds = max(60, min(queue_deadline, provider_retry_budget))
 
     def _deadline_exceeded() -> None:
         deadline_event.set()
@@ -764,6 +817,11 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             "turn_id": turn_id,
             "plan_version": "v1",
         }
+        # General-agent task attempts carry the durable task id; the runner
+        # rebuilds plan/workspace/artifacts from it on every turn.
+        task_id = str(
+            (getattr(turn, "trace_context", {}) or {}).get("task_id") or ""
+        )
         gen = _query_generator(
             pipeline,
             turn.query,
@@ -784,6 +842,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             action_scope=action_scope,
             knowledge_scope=knowledge_scope,
             knowledge_scope_resolver=knowledge_scope_resolver,
+            task_id=task_id,
         )
         try:
             for chunk in gen:
@@ -1452,6 +1511,7 @@ def _query_generator(
     action_scope=None,
     knowledge_scope=None,
     knowledge_scope_resolver=None,
+    task_id="",
 ):
     params = inspect.signature(pipeline.query).parameters
     if "event_callback" in params:
@@ -1483,6 +1543,8 @@ def _query_generator(
             kwargs["knowledge_scope"] = knowledge_scope
         if "knowledge_scope_resolver" in params:
             kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
+        if "task_id" in params:
+            kwargs["task_id"] = task_id
         return pipeline.query(
             query,
             kb_name,
@@ -1515,6 +1577,8 @@ def _query_generator(
         kwargs["knowledge_scope"] = knowledge_scope
     if "knowledge_scope_resolver" in params:
         kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
+    if "task_id" in params:
+        kwargs["task_id"] = task_id
     return pipeline.query(query, kb_name, history, ctx, **kwargs)
 
 

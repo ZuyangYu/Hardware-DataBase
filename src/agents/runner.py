@@ -60,6 +60,7 @@ from src.agents.context_budget import (
     read_agent_values,
 )
 from src.agents.middleware.loop_budget import (
+    CallBudgetExceeded,
     LoopBudget,
     LoopBudgetMiddleware,
     ProgressStopped,
@@ -580,8 +581,15 @@ def _direct_intent_clarification_answer(plan: IntentPlan | None) -> str | None:
     return None
 
 
+def _finalize_task_attempt(*, store: Any, task: Any, partial: bool) -> None:
+    """Sync task status/artifacts after one attempt; never break the turn."""
 
-
+    try:
+        store.scan_workspace_artifacts(task.id)
+        store.set_status(task.id, "paused" if partial else "completed")
+    except Exception:
+        # Task bookkeeping must never fail a user-visible answer.
+        pass
 
 
 class MultiSourceAgentRunner:
@@ -815,6 +823,7 @@ class MultiSourceAgentRunner:
         action_scope: Any | None = None,
         knowledge_scope: KnowledgeScopeSnapshot | None = None,
         knowledge_scope_resolver: KnowledgeScopeResolver | None = None,
+        task_id: str = "",
     ) -> Generator[str, None, None]:
         """Observability wrapper: one agent span + metrics per run."""
         started = time.monotonic()
@@ -848,6 +857,7 @@ class MultiSourceAgentRunner:
                     action_scope=action_scope,
                     knowledge_scope=knowledge_scope,
                     knowledge_scope_resolver=knowledge_scope_resolver,
+                    task_id=task_id,
                 )
             except QueryCancelled:
                 status = "cancelled"
@@ -1350,6 +1360,7 @@ class MultiSourceAgentRunner:
         action_scope: Any | None = None,
         knowledge_scope: KnowledgeScopeSnapshot | None = None,
         knowledge_scope_resolver: KnowledgeScopeResolver | None = None,
+        task_id: str = "",
     ) -> Generator[str, None, None]:
         """Run the deep agent and stream answer deltas live.
 
@@ -1391,6 +1402,25 @@ class MultiSourceAgentRunner:
         direct_control_answer = plan.direct_control_answer
         direct_answer_grounding = plan.direct_answer_grounding
         skill_root = plan.skill_root
+
+        # General-agent task mode: a durable task supplies the workspace and an
+        # *optional* external definition; there is no fixed workflow here.
+        task = None
+        task_store = None
+        if task_id:
+            from src.agents.task_definitions import build_task_prompt, resolve_definition
+            from src.agents.tools.workspace_tools import build_workspace_tools
+            from src.core.task_store import TaskStore
+
+            task_store = TaskStore()
+            task = task_store.get_task(str(task_id))
+            if task is not None:
+                definition = resolve_definition(task.definition_id)
+                task_artifacts = task_store.list_artifacts(task.id)
+                tools = list(tools) + build_workspace_tools(task.workspace_dir, rt)
+                system_prompt = system_prompt + build_task_prompt(
+                    task, definition, task_artifacts
+                )
 
         if direct_control_answer is not None:
             record.answer = direct_control_answer
@@ -1492,9 +1522,32 @@ class MultiSourceAgentRunner:
                 "\n本轮 read_file 仅用于读取已审核并物化的 Skill 的 SKILL.md，"
                 "不得读取或尝试读取其他路径。"
             )
+        tool_call_cap = budget_state.get("tool_call_cap")
+        if tool_call_cap:
+            system_prompt += (
+                f"\n本轮所有工具调用总次数硬上限为 {int(tool_call_cap)} 次"
+                "(用户在问题上指定的约束，包括检索、读证据等全部工具)。"
+                "达到上限后系统会立即停止检索并转入部分答案合成；"
+                "请把调用集中在最必要的查询上，不要重复相近的检索。"
+            )
         turn_started = time.monotonic()
         pre_candidates = set(rt.candidate_evidence)
         loop_budget = LoopBudget(rt)
+        loop_budget.tool_call_cap = tool_call_cap
+        # Internal loop time limit. A declared tool-call cap already implies a
+        # short turn, so the regular 480 s stop stands. Without a declared cap
+        # a deep turn is completeness-first: it gets the external deep watchdog
+        # (CHAT_QUEUE_DEADLINE_DEEP_SECONDS) minus a wrap-up margin, instead of
+        # being cut at 480 s. Everything else keeps the regular stop. The
+        # deadline is set before the agent is built so the middleware instance
+        # bound into the graph always sees it.
+        loop_seconds = 480
+        if query_mode == "deep" and not loop_budget.tool_call_cap:
+            loop_seconds = max(
+                60,
+                int(getattr(settings, "CHAT_QUEUE_DEADLINE_DEEP_SECONDS", 900)) - 120,
+            )
+        loop_budget.deadline = turn_started + loop_seconds
         gap_middleware = GapClosureMiddleware(
             rt=rt,
             pre_candidates=pre_candidates,
@@ -1531,7 +1584,7 @@ class MultiSourceAgentRunner:
         splitter = _AnswerSplitter(
             on_narration=lambda text: emit_event({"type": "narration", "payload": {"text": text}})
         )
-        recursion_stopped = progress_stopped = time_stopped = False
+        recursion_stopped = progress_stopped = time_stopped = cap_stopped = False
         seen_tool_calls: set[str] = set()
         subagents: list[dict[str, Any]] = []
         subagent_by_call: dict[str, dict[str, Any]] = {}
@@ -1587,7 +1640,6 @@ class MultiSourceAgentRunner:
 
         from langgraph.errors import GraphRecursionError
 
-        loop_budget.deadline = turn_started + 480
         try:
             with bind_cancel_check(should_cancel):
                 for delta in _stream_round(splitter):
@@ -1596,6 +1648,8 @@ class MultiSourceAgentRunner:
             progress_stopped = True
         except TimeBudgetExceeded:
             time_stopped = True
+        except CallBudgetExceeded:
+            cap_stopped = True
         except QueryCancelled:
             return
         except Exception as exc:
@@ -1637,9 +1691,10 @@ class MultiSourceAgentRunner:
         rt.finalize_evidence()
         answer_text = _normalize_citation_labels(splitter.finish())
         partial_delivery = False
-        if recursion_stopped or progress_stopped or time_stopped:
+        if recursion_stopped or progress_stopped or time_stopped or cap_stopped:
             reason = (
                 "recursion_limit" if recursion_stopped
+                else "tool_call_limit" if cap_stopped
                 else "time_limit" if time_stopped
                 else "no_progress"
             )
@@ -1686,7 +1741,7 @@ class MultiSourceAgentRunner:
                 # visible as a bounded digest, then append the actionable
                 # budget notice.
                 digest = _evidence_digest(rt.evidence)
-                notice = _agent_step_budget_answer(rt)
+                notice = _agent_step_budget_answer(rt, reason)
                 combined = "\n\n".join(
                     part for part in (answer_text.strip(), digest, notice) if part
                 )
@@ -1765,6 +1820,10 @@ class MultiSourceAgentRunner:
             yield answer_text
         answer_text, removed_citations = _scrub_invalid_citations(answer_text, rt.evidence)
         record.answer = _current_run().answer = answer_text
+        if task is not None and task_store is not None:
+            _finalize_task_attempt(
+                store=task_store, task=task, partial=partial_delivery
+            )
         if (
             answer_text
             and (partial_delivery or recursion_stopped)
@@ -1812,7 +1871,10 @@ class MultiSourceAgentRunner:
                 answer_text=answer_text,
                 evidence=rt.evidence,
                 query=query,
-                model=model,
+                # 部分交付跳过独立模型校验：此时收尾时间预算最紧，
+                # `_semantic_verification` 是循环后唯一可能还在跑的大 LLM 调用，
+                # 留着它撞看门狗就把已流出的部分答案一起拖死（B1 案例）。
+                model=None if partial_delivery else model,
                 complexity=budget_state.get("complexity") or {},
                 budget_exhausted=recursion_stopped,
                 partial_delivery=partial_delivery,

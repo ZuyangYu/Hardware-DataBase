@@ -2692,6 +2692,8 @@ class ConversationService:
         fencing_token: int | None = None,
         terminal_events_builder: Callable[[ChatTurn], Sequence[tuple[str, dict]]] | None = None,
         domain_writer: Callable[[sqlite3.Connection, ChatTurn], None] | None = None,
+        partial_answer: str | None = None,
+        summary: dict | None = None,
     ) -> TurnFinalization:
         now = utc_now()
         status = "cancelled" if cancelled else "failed"
@@ -2727,7 +2729,31 @@ class ConversationService:
                 if cursor.rowcount == 0:
                     conn.execute("COMMIT")
                     return TurnFinalization(turn=None)
-                placeholder = "已停止生成" if cancelled else f"生成失败：{message[:500]}"
+                # 守门狗/上游失败时，被流式冲刷出的部分答案不应随之蒸发：
+                # 回填 answer 列与 assistant 消息正文，让用户留住已生成的
+                # 部分结果（如止损合成的草稿表）。answer/summary 只在原本
+                # 为空时回填，绝不覆盖更完整的内容。
+                rescued = str((partial_answer or "").strip())
+                if rescued:
+                    conn.execute(
+                        """
+                        UPDATE chat_turns SET answer = ?
+                        WHERE id = ? AND COALESCE(answer, '') = ''
+                        """,
+                        (rescued, turn_id),
+                    )
+                if summary:
+                    conn.execute(
+                        """
+                        UPDATE chat_turns SET summary_json = ?
+                        WHERE id = ? AND COALESCE(summary_json, '{}') = '{}'
+                        """,
+                        (json.dumps(summary, ensure_ascii=False, default=str), turn_id),
+                    )
+                placeholder = (
+                    rescued
+                    or ("已停止生成" if cancelled else f"生成失败：{message[:500]}")
+                )
                 conn.execute(
                     "UPDATE chat_messages SET content = ? WHERE id = ? AND content = ''",
                     (placeholder, row["assistant_message_id"]),

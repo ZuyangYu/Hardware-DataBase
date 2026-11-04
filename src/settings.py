@@ -86,6 +86,17 @@ STORAGE_DIR = os.getenv("STORAGE_DIR") or os.path.join(BASE_DIR, "storage")
 PIPELINE_ARCHIVE_ROOT = os.getenv("PIPELINE_ARCHIVE_ROOT", os.path.join(STORAGE_DIR, "pipeline_archives"))
 RAGFLOW_FILE_ROOT = os.getenv("RAGFLOW_FILE_ROOT", PIPELINE_ARCHIVE_ROOT)
 LOG_DIR = os.path.join(STORAGE_DIR, "logs")
+# General-agent task layer: plan/artifacts persist across turns, and every
+# task owns an isolated workspace directory (no shell yet).
+TASK_DB_PATH = os.getenv("TASK_DB_PATH", os.path.join(STORAGE_DIR, "tasks.db"))
+TASK_WORKSPACE_ROOT = os.getenv(
+    "TASK_WORKSPACE_ROOT", os.path.join(STORAGE_DIR, "workspaces")
+)
+# Optional external task definitions (dcode-skill style).  Empty/absent means
+# the agent works in freeform mode with no predefined workflow.
+TASK_DEFINITION_DIR = os.getenv(
+    "TASK_DEFINITION_DIR", os.path.join(STORAGE_DIR, "task_definitions")
+)
 
 
 def _resolve_storage_path(raw_path: str | None, default_name: str) -> str:
@@ -357,6 +368,11 @@ RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED = _env_bool(
     "RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED", False
 )
 CHAT_QUEUE_DEADLINE_SECONDS = int(os.getenv("CHAT_QUEUE_DEADLINE_SECONDS", "600"))
+# Deep（知识库复杂任务）回合的硬看门狗：未声明调用上限时完整性优先，
+# 允许更长的探索时间；声明了上限的回合仍受普通 600s 预算约束。
+CHAT_QUEUE_DEADLINE_DEEP_SECONDS = int(
+    os.getenv("CHAT_QUEUE_DEADLINE_DEEP_SECONDS", "900")
+)
 RESOURCE_LLM_MAX_CONCURRENT = int(os.getenv("RESOURCE_LLM_MAX_CONCURRENT", "4"))
 RESOURCE_LLM_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_LLM_RESERVED_INTERACTIVE", "2"))
 RESOURCE_RAG_MAX_CONCURRENT = int(os.getenv("RESOURCE_RAG_MAX_CONCURRENT", "8"))
