@@ -156,3 +156,20 @@ def test_task_status_follows_current_turn(client):
     conv.turns["turn-1"].error_message = "boom"
     fetched = http.get(f"/api/v1/tasks/{task_id}").json()
     assert fetched["status"] == "failed"
+
+
+def test_external_task_definitions_endpoint(client, monkeypatch, tmp_path):
+    from src import settings
+
+    root = tmp_path / "defs"
+    root.mkdir()
+    (root / "review.yaml").write_text(
+        "id: review\ntitle: 审阅\ngoal: 审阅并给出结论\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(settings, "TASK_DEFINITION_DIR", str(root))
+    http, _conv, _store = client
+    response = http.get("/api/v1/task-definitions")
+    assert response.status_code == 200, response.text
+    items = response.json()["items"]
+    assert items[0]["id"] == "review"
+    assert items[0]["title"] == "审阅"

@@ -167,6 +167,30 @@ def _create_turn_for_task(
     return turn
 
 
+@router.get("/task-definitions")
+def list_task_definitions(
+    user: AuthUser = Depends(current_user),
+) -> dict:
+    """List optional external task definitions (skills) for the workbench."""
+
+    from src.agents.task_definitions import load_definitions
+
+    items = []
+    for definition in load_definitions().values():
+        items.append(
+            {
+                "id": definition.id,
+                "title": definition.title,
+                "goal": definition.goal,
+                "deliverable": definition.deliverable,
+                "coverage": list(definition.coverage),
+                "skill": definition.skill,
+                "applies_when": list(definition.applies_when),
+            }
+        )
+    return {"items": items}
+
+
 @router.post("/tasks", status_code=201)
 def create_task(
     body: CreateTaskRequest,

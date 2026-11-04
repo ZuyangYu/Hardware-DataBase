@@ -34,6 +34,7 @@ const NAV_GROUPS: NavGroup[] = [
       { path: '/assets', label: '资产中心', icon: 'grid', description: '文档与业务资产', access: 'workspace' },
       { path: '/kbs', label: '知识库', icon: 'database', description: '授权知识库', access: 'workspace', matchChildren: true },
       { path: '/chat', label: '对话', icon: 'send', description: '问答与对话', access: 'workspace' },
+      { path: '/tasks', label: '任务', icon: 'tool', description: '通用 agent 任务与产物', access: 'workspace' },
       { path: '/memory', label: '长期记忆', icon: 'history', description: '个人与项目记忆', access: 'workspace' },
       { path: '/extensions', label: '个人扩展', icon: 'tool', description: '订阅和管理你的 Skill 与 MCP', access: 'workspace' },
     ],
@@ -79,7 +80,7 @@ const PRIMARY_NAV_ITEMS: (Omit<PrimaryNavItem, 'items'> & { itemSource: () => Na
     label: '工作台',
     icon: 'grid',
     description: '知识库与业务资产',
-    itemSource: () => workspaceGroup().filter((item) => item.path === '/assets' || item.path === '/kbs'),
+    itemSource: () => workspaceGroup().filter((item) => item.path === '/assets' || item.path === '/kbs' || item.path === '/tasks'),
   },
   {
     id: 'chat',

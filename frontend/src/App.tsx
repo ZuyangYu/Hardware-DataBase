@@ -31,6 +31,7 @@ import LoginPage from './pages/LoginPage';
 const KbListPage = lazy(() => import('./pages/KbListPage'));
 const HelpPage = lazy(() => import('./pages/HelpPage'));
 const ChatPage = lazy(() => import('./pages/chat/ChatPage'));
+const TasksPage = lazy(() => import('./pages/TasksPage'));
 const KbFilesPage = lazy(() => import('./pages/KbFilesPage'));
 const DocumentAssetsPage = lazy(() => import('./pages/DocumentAssetsPage'));
 const WikiPage = lazy(() => import('./pages/WikiPage'));
@@ -221,6 +222,14 @@ function Shell({ auth, onLogout }: { auth: AuthSession; onLogout: () => void }) 
               element={
                 <KbContentRoute auth={auth}>
                   <ChatRoute auth={auth} onLogout={onLogout} kbs={kbs} />
+                </KbContentRoute>
+              }
+            />
+            <Route
+              path="/tasks"
+              element={
+                <KbContentRoute auth={auth}>
+                  <TasksPage kbs={kbs} />
                 </KbContentRoute>
               }
             />
