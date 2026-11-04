@@ -142,7 +142,7 @@ export default function Composer({
                 title={kbName ? `当前会话锚定库：${kbName}` : '选择会话锚定库'}
                 className={cn(
                   CHAT_COMPOSER_MODEL_BTN_CLASS,
-                  'min-w-[190px] max-w-[min(340px,calc(100vw-48px))]',
+                  'min-w-[150px] max-w-[min(220px,calc(100vw-48px))]',
                 )}
               >
                 <span className="grid size-[14px] shrink-0 place-items-center" aria-hidden>
@@ -158,14 +158,14 @@ export default function Composer({
                 position="popper"
                 align="start"
                 sideOffset={6}
-                className="min-w-[240px] max-w-[min(560px,calc(100vw-48px))]"
+                className="min-w-[200px] max-w-[min(320px,calc(100vw-48px))]"
               >
                 <SelectItem value="__none__">不使用知识库（仅附件/普通对话）</SelectItem>
                 {availableKbs.map((kb) => {
                   const label = kbOptionLabel(kb, showDepartmentInKbOptions);
                   return (
                     <SelectItem key={kb.kb_id ?? `${kb.department_id ?? 'none'}:${kb.name}`} value={kb.name}>
-                      <span className="block max-w-[480px] truncate" title={label}>{label}</span>
+                      <span className="block max-w-[280px] truncate" title={label}>{label}</span>
                     </SelectItem>
                   );
                 })}

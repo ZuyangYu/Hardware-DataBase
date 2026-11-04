@@ -144,6 +144,13 @@ describe('Composer knowledge-base selector', () => {
     expect(markup).toContain('会话锚定库');
   });
 
+  it('keeps the knowledge-base mount selector compact', () => {
+    const markup = renderComposer();
+
+    expect(markup).toContain('min-w-[150px]');
+    expect(markup).toContain('max-w-[min(220px,calc(100vw-48px))]');
+  });
+
   it('does not render a multi-knowledge-base picker', () => {
     const markup = renderComposer({
       availableKbs: [
