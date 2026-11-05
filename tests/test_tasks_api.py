@@ -207,3 +207,28 @@ def test_task_events_endpoint(client):
     items = response.json()["items"]
     assert [item["type"] for item in items] == ["turn_start", "tool_started"]
     assert items[1]["payload"]["tool_name"] == "workspace_write"
+
+
+def test_stop_completed_task_is_noop(client):
+    http, conv, _store = client
+    created = http.post(
+        "/api/v1/tasks", json={"query": "做点什么", "kb_name": "AAA"}
+    ).json()
+    task_id = created["task"]["id"]
+    conv.turns["turn-1"].status = "completed"
+    stopped = http.post(f"/api/v1/tasks/{task_id}/stop")
+    assert stopped.status_code == 200
+    assert stopped.json()["task"]["status"] == "completed"
+
+
+def test_stop_cancelled_task_still_cancels_streaming_turn(client):
+    http, conv, store = client
+    created = http.post(
+        "/api/v1/tasks", json={"query": "长任务", "kb_name": "AAA"}
+    ).json()
+    task_id = created["task"]["id"]
+    store.set_status(task_id, "cancelled", finished=True)
+    conv.turns["turn-1"].status = "streaming"
+    stopped = http.post(f"/api/v1/tasks/{task_id}/stop")
+    assert stopped.status_code == 200
+    assert conv.cancelled == ["turn-1"]

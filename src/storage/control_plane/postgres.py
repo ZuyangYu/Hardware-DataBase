@@ -1588,7 +1588,7 @@ class PostgresExecutionStore:
                     )
                 if not lease_valid:
                     conn.execute(
-                        "UPDATE chat_turns SET status = CASE WHEN trace_context_json LIKE '%\"task_id\"%' THEN 'task_pending' WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END, worker_id = '',"
+                        "UPDATE chat_turns SET status = CASE WHEN trace_context_json::text LIKE '%%\"task_id\"%%' THEN 'task_pending' WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END, worker_id = '',"
                         " worker_heartbeat_at = NULL"
                         " WHERE id = %s AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')",
                         (str(turn_id),),
@@ -2089,7 +2089,7 @@ class PostgresExecutionStore:
                 cursor = conn.execute(
                     """
                     UPDATE chat_turns
-                    SET status = CASE WHEN trace_context_json LIKE '%\"task_id\"%' THEN 'task_pending' WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END,
+                    SET status = CASE WHEN trace_context_json::text LIKE '%%\"task_id\"%%' THEN 'task_pending' WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END,
                         worker_id = '', worker_heartbeat_at = NULL
                     WHERE id = %s AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                     """,

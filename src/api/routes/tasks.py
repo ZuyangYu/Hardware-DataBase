@@ -107,6 +107,21 @@ def _artifact_projection(artifact: TaskArtifact) -> dict:
     }
 
 
+def _effective_status(task: Task, turn) -> str:
+    status = task.status
+    turn_status = str(getattr(turn, "status", "") or "") if turn else ""
+    if status in {"queued", "running"}:
+        if turn_status == "completed":
+            return "completed"
+        if turn_status == "failed":
+            return "failed"
+        if turn_status == "cancelled":
+            return "cancelled"
+        if turn_status in {"streaming", "cancelling"}:
+            return "running"
+    return status
+
+
 def _task_projection(
     task: Task,
     *,
@@ -116,17 +131,7 @@ def _task_projection(
     turn = None
     if task.current_turn_id:
         turn = conv.get_turn(task.user_id, task.current_turn_id)
-    effective_status = task.status
-    turn_status = str(getattr(turn, "status", "") or "") if turn else ""
-    if effective_status in {"queued", "running"}:
-        if turn_status == "completed":
-            effective_status = "completed"
-        elif turn_status == "failed":
-            effective_status = "failed"
-        elif turn_status == "cancelled":
-            effective_status = "cancelled"
-        elif turn_status in {"streaming", "cancelling"}:
-            effective_status = "running"
+    effective_status = _effective_status(task, turn)
     return {
         "id": task.id,
         "title": task.title,
@@ -335,12 +340,23 @@ def stop_task(
     if task is None:
         raise HTTPException(status_code=404, detail="task not found")
     _ensure_task_readable(task, user=user, auth=auth, conv=conv)
-    if task.current_turn_id:
+    # The turn status is authoritative when the task row has not been
+    # finalised yet.  A terminal task can still own a running turn (e.g. a
+    # stop that raced the worker), so cancel the turn first, then only rewrite
+    # the task row when its effective status is not already terminal.
+    current_turn = (
+        conv.get_turn(task.user_id, task.current_turn_id)
+        if task.current_turn_id
+        else None
+    )
+    turn_status = str(getattr(current_turn, "status", "") or "")
+    if task.current_turn_id and turn_status not in {"completed", "failed", "cancelled"}:
         try:
             conv.request_turn_cancel(user.id, task.current_turn_id)
         except Exception:
             pass
-    store.set_status(task.id, "cancelled", finished=True)
+    if _effective_status(task, current_turn) not in {"completed", "failed", "cancelled"}:
+        store.set_status(task.id, "cancelled", finished=True)
     refreshed = store.get_task(task.id, user.id) or task
     return {"task": _task_projection(refreshed, conv=conv, store=store)}
 
