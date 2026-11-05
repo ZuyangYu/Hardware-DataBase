@@ -339,6 +339,7 @@ class CreateSessionRequest(BaseModel):
     kb_name: str
     title: str = "新对话"
     knowledge_scope: KnowledgeSelectionInput | None = None
+    workspace_id: str | None = None
 
 
 class SessionView(BaseModel):
@@ -351,6 +352,7 @@ class SessionView(BaseModel):
     knowledge_scope: KnowledgeScopeSnapshot | None = None
     knowledge_selection_hash: str = ""
     source_access_restricted: bool = False
+    workspace_id: str = ""
 
 
 class MemoryContextView(BaseModel):

@@ -16,6 +16,7 @@ from src.api.deps import current_user
 from src.core.auth import AuthUser
 from src.core.conversation import ConversationService
 from src.core.task_store import get_task_store
+from src.core.workspace_store import get_workspace_store
 
 router = APIRouter(tags=["artifacts"])
 
@@ -26,6 +27,10 @@ def _conv_service() -> ConversationService:
 
 def _task_store():
     return get_task_store()
+
+
+def _workspace_store():
+    return get_workspace_store()
 
 
 def _artifact_view(artifact) -> dict:
@@ -64,6 +69,21 @@ def list_conversation_artifacts(
             item = _artifact_view(artifact)
             item["task_id"] = task.id
             items.append(item)
+    try:
+        workspace_store = get_workspace_store()
+        workspace = workspace_store.get_workspace_for_session(session_id)
+        if workspace is not None and workspace.user_id == user.id:
+            for artifact in workspace_store.list_artifacts(
+                workspace.id, session_id=session_id
+            ):
+                if artifact.id in seen:
+                    continue
+                seen.add(artifact.id)
+                item = _artifact_view(artifact)
+                item["workspace_id"] = workspace.id
+                items.append(item)
+    except Exception:
+        pass
     items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
     return {"items": items}
 
@@ -75,13 +95,26 @@ def download_artifact(
     store=Depends(_task_store),
 ) -> FileResponse:
     artifact = store.get_artifact(artifact_id)
-    if artifact is None:
-        raise HTTPException(status_code=404, detail="artifact not found")
-    task = store.get_task(artifact.task_id, user.id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="artifact not found")
+    root_dir = ""
+    if artifact is not None:
+        task = store.get_task(artifact.task_id, user.id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="artifact not found")
+        root_dir = task.workspace_dir
+    else:
+        workspace_store = get_workspace_store()
+        workspace_artifact = workspace_store.get_artifact(artifact_id)
+        if workspace_artifact is None:
+            raise HTTPException(status_code=404, detail="artifact not found")
+        workspace = workspace_store.get_workspace(
+            workspace_artifact.workspace_id, user.id
+        )
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="artifact not found")
+        artifact = workspace_artifact
+        root_dir = workspace.workspace_dir
     path = Path(artifact.path).resolve()
-    root = Path(task.workspace_dir).resolve()
+    root = Path(root_dir).resolve()
     if root not in path.parents or not path.is_file():
         raise HTTPException(status_code=404, detail="artifact file not found")
     return FileResponse(

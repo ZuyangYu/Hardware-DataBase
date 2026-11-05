@@ -38,8 +38,23 @@ def login() -> tuple[httpx.Client, dict]:
     return c, {"Authorization": f"Bearer {r.json()['token']}"}
 
 
-def new_session(c: httpx.Client, h: dict, title: str) -> int:
-    r = c.post(f"{BASE}/conversations", json={"kb_name": KB, "title": title}, headers=h)
+def new_workspace(c: httpx.Client, h: dict, name: str) -> str:
+    r = c.post(
+        f"{BASE}/workspaces",
+        json={"name": name, "kind": "knowledge", "kb_name": KB},
+        headers=h,
+    )
+    r.raise_for_status()
+    return str(r.json()["id"])
+
+
+def new_session(
+    c: httpx.Client, h: dict, title: str, *, workspace_id: str | None = None
+) -> int:
+    payload = {"kb_name": KB, "title": title}
+    if workspace_id:
+        payload["workspace_id"] = workspace_id
+    r = c.post(f"{BASE}/conversations", json=payload, headers=h)
     r.raise_for_status()
     return int(r.json()["id"])
 
@@ -111,12 +126,13 @@ def case_overview(c, h):
 
 
 def case_publish_and_continue(c, h):
-    sid = new_session(c, h, "AAA artifact")
+    wid = new_workspace(c, h, f"AAA artifact {time.time_ns()}")
+    sid = new_session(c, h, "AAA artifact", workspace_id=wid)
     first = run_turn(
         c,
         h,
         sid,
-        "查询 TCN2 网表里 U1800 的型号和封装，用 task_publish_artifact 发布 u1800.md，"
+        "查询 TCN2 网表里 U1800 的型号和封装，用 workspace_publish_artifact 发布 u1800.md，"
         "内容必须包含型号、封装和引用编号；不要在回答里写 out/ 或磁盘路径。",
     )
     first_answer = first.get("answer") or ""

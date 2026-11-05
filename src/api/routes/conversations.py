@@ -37,7 +37,14 @@ def _can_read_turn(auth, user, turn, conv: ConversationService) -> bool:
     )
 
 
-def _session_view(s, *, user=None, auth=None, scope=None) -> SessionView:
+def _session_view(
+    s,
+    *,
+    user=None,
+    auth=None,
+    scope=None,
+    workspace_id: str = "",
+) -> SessionView:
     restricted = False
     if scope is None and getattr(s, "knowledge_selection", None) and user is not None:
         try:
@@ -54,6 +61,7 @@ def _session_view(s, *, user=None, auth=None, scope=None) -> SessionView:
         knowledge_scope=scope,
         knowledge_selection_hash=getattr(s, "knowledge_selection_hash", ""),
         source_access_restricted=restricted,
+        workspace_id=workspace_id,
     )
 
 
@@ -231,12 +239,31 @@ def _ensure_history_access(user: AuthUser, auth: AuthService) -> None:
 @router.get("/conversations", response_model=list[SessionView])
 def list_sessions(
     kb_name: str | None = None,
+    workspace_id: str | None = None,
     user: AuthUser = Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
     conv: ConversationService = Depends(_conv_service),
 ):
     _ensure_history_access(user, auth)
-    return [_session_view(s, user=user, auth=auth) for s in conv.list_sessions(user.id, kb_name)]
+    sessions = conv.list_sessions(user.id, kb_name)
+    if workspace_id:
+        from src.core.workspace_store import get_workspace_store
+
+        workspace_store = get_workspace_store()
+        workspace = workspace_store.get_workspace(workspace_id, user.id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="workspace not found")
+        allowed = set(workspace_store.list_session_ids(workspace.id))
+        sessions = [session for session in sessions if session.id in allowed]
+    return [
+        _session_view(
+            session,
+            user=user,
+            auth=auth,
+            workspace_id=workspace_id or "",
+        )
+        for session in sessions
+    ]
 
 
 @router.post("/conversations", response_model=SessionView)
@@ -246,28 +273,48 @@ def create_session(
     auth: AuthService = Depends(get_auth_service),
     conv: ConversationService = Depends(_conv_service),
 ):
+    from src.core.workspace_store import get_workspace_store
+
+    workspace_store = get_workspace_store()
+    workspace = None
+    if body.workspace_id:
+        workspace = workspace_store.get_workspace(body.workspace_id, user.id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="workspace not found")
+        kb_name = workspace.kb_name if workspace.kind == "knowledge" else GENERAL_CHAT_KB_NAME
+    else:
+        kb_name = body.kb_name
     scope = None
     if body.knowledge_scope is not None:
         from types import SimpleNamespace
         try:
-            scope = resolve_session_scope(auth, user, SimpleNamespace(kb_name=body.kb_name, knowledge_selection=None), body.knowledge_scope)
+            scope = resolve_session_scope(auth, user, SimpleNamespace(kb_name=kb_name, knowledge_selection=None), body.knowledge_scope)
         except KnowledgeScopeDenied as exc:
             raise HTTPException(status_code=403, detail="knowledge_scope_denied") from exc
         except KnowledgeScopeInvalid as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except MultiKnowledgeRetrievalUnavailable as exc:
             raise HTTPException(status_code=409, detail="feature_unavailable") from exc
-    _ensure_kb_read(user, body.kb_name, auth)
-    ctx = build_context_for_user(user, body.kb_name, auth=auth)
+    _ensure_kb_read(user, kb_name, auth)
+    ctx = build_context_for_user(user, kb_name, auth=auth)
     s = conv.create_session(
         user.id,
-        body.kb_name,
+        kb_name,
         body.title,
         department_id=ctx.metadata.get("resource_department_id") or ctx.metadata.get("department_id"),
         kb_id=ctx.metadata.get("kb_id"),
         **({"knowledge_selection": body.knowledge_scope} if scope is not None else {}),
     )
-    return _session_view(s, scope=scope)
+    if workspace is None:
+        kind = "knowledge" if kb_name != GENERAL_CHAT_KB_NAME else "general"
+        workspace = workspace_store.get_or_create_for_user(
+            user_id=user.id,
+            kind=kind,
+            kb_name=kb_name if kind == "knowledge" else "",
+            kb_id=ctx.metadata.get("kb_id") if kind == "knowledge" else None,
+        )
+    workspace_store.attach_session(workspace.id, s.id)
+    return _session_view(s, scope=scope, workspace_id=workspace.id)
 
 
 @router.get("/conversations/{session_id}", response_model=SessionView)

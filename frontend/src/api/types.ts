@@ -335,12 +335,14 @@ export interface SessionView {
   knowledge_scope?: KnowledgeScopeSnapshot | null;
   knowledge_selection_hash?: string;
   source_access_restricted?: boolean;
+  workspace_id?: string;
 }
 
 export interface CreateSessionRequest {
   kb_name: string;
   title?: string;
   knowledge_scope?: KnowledgeSelectionInput | null;
+  workspace_id?: string;
 }
 
 export interface MemoryContextItem {

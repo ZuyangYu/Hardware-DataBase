@@ -1,32 +1,36 @@
-# 通用 Agent：任务、工作区与产物
+# 通用 Agent：Workspace、Session 与产物
 
-这套实现把 agent 从"检索问答"升级为"可挂载知识库的通用 agent"：
+这套实现把底层 agent 从"知识库问答"升级为 **Workspace-first 的通用 agent**：
 
-- **通用**：文件读写、知识库检索、表格 SQL、网表查询都是工具；任务不预设固定流程。
-- **持久**：一个任务（task）拥有工作区、产物和多个 turn，可以继续、修改、续跑。
-- **知识库一等公民**：任务挂载 KB 时，项目事实必须以 KB 证据为准；工作区文件和计算只用于加工与交付。
-- **外部扩展**：任务定义（可选）放在 `storage/task_definitions/`，平台不内置业务模板。
+- **通用**：文件读写、知识库检索、表格 SQL、网表查询都是工具；不预设固定流程。
+- **持久**：Workspace 是项目容器，Session 是会话，Turn/Run 是一次执行。
+- **知识库是工具**：Workspace 可以绑定 KB，绑定后 `kb_search` 可用；未绑定就是通用工作区。
+- **外部扩展**：MCP / Skill / 任务定义都是可选扩展。
 
 ## 数据模型
 
 ```
-task (durable session)
- ├─ plan           # 可选；默认空，由 agent 自行规划
- ├─ workspace/     # 每任务一个隔离目录
- │   └─ out/       # 交付物；任务结束时自动登记为 artifact
- ├─ turn 1..N      # 复用现有 turn 队列 / fencing / SSE
- └─ artifacts      # 版本化产物，可下载
+workspace
+ ├─ kind: general | knowledge
+ ├─ kb binding（knowledge workspace 可选）
+ ├─ hidden workspace/<id>/
+ │   └─ out/              # 交付物；发布后登记为 artifact
+ ├─ session 1..N
+ │   └─ turn/run 1..N     # 复用现有 turn 队列 / fencing / SSE
+ └─ artifacts             # 版本化产物，可下载
 ```
 
-聊天回合会自动关联当前会话的任务（`trace_context={"task_id": ..., "task_origin": "chat"}`），
-因此每一轮都复用同一个 workspace / plan / artifacts；短问答一轮结束，长任务多轮继续。
-`task_origin=chat` 的回合使用交互 chat 资源类，显式任务使用 `task` 资源类。
+普通聊天不再自动创建 task。聊天 turn 通过 `trace_context={"workspace_id": ...}` 关联
+session 的 workspace；显式长任务才使用 `/tasks` 的 `task_id`。
 
 ## API
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/v1/tasks` | 创建任务（自动建会话 + 首个 turn） |
+| POST | `/api/v1/workspaces` | 创建通用/知识库工作区 |
+| GET | `/api/v1/workspaces` | 当前用户的工作区 |
+| GET | `/api/v1/workspaces/{id}/sessions` | 工作区下的会话 |
+| POST | `/api/v1/tasks` | 创建显式长任务（自动建会话 + 首个 turn） |
 | GET | `/api/v1/tasks` | 当前用户的任务列表 |
 | GET | `/api/v1/tasks/{id}` | 任务详情（当前 turn、产物、turns） |
 | POST | `/api/v1/tasks/{id}/messages` | 继续/修改：同一任务新建 turn |
@@ -74,12 +78,13 @@ instructions: 不要展开完整 BOM
 
 - 工具：`workspace_list` / `workspace_read` / `workspace_write` /
   `workspace_edit`（唯一匹配保护）/ `workspace_glob` / `workspace_grep`；
-- 计划：`task_plan_update` 由 agent 维护（pending/running/done/blocked）；
+- 显式 task 使用 `task_plan_update` 维护计划；普通聊天没有任务计划；
 - 路径必须是工作区内的相对路径，拒绝 `..`、绝对路径和越界符号链接；
-- agent 用 `task_publish_artifact(name, content, kind)` 发布交付物；内部仍写入工作区，
-  但回答和前端不暴露 `out/` 或磁盘路径；
-- turn 结束时也会扫描内部目录兜底登记 artifact（同名文件自动递增版本）；
-- 下载接口会再次校验产物路径必须在任务工作区内。
+- 普通聊天用 `workspace_publish_artifact(name, content, kind)` 发布交付物；
+  显式 task 仍用 `task_publish_artifact`；
+- 内部仍写入工作区，但回答和前端不暴露 `out/` 或磁盘路径；
+- `workspace_artifacts` 按 `session_id + turn_id` 归属，同名文件自动递增版本；
+- 下载接口会再次校验产物路径必须在 workspace 目录内。
 
 ## 验收与执行记录
 

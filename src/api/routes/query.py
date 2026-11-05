@@ -844,22 +844,27 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             "turn_id": turn_id,
             "plan_version": "v1",
         }
-        # General-agent task attempts carry the durable task id; the runner
-        # rebuilds plan/workspace/artifacts from it on every turn.
+        # Explicit task attempts carry task_id; ordinary chats carry the
+        # session workspace id instead.  The runner rebuilds the workspace
+        # tools from this id on every turn.
         task_id = turn_task_id
-        try:
-            emit(
-                "stage",
-                {
-                    "key": "task_context",
-                    "label": "任务上下文",
-                    "status": "running",
-                    "task_id": task_id,
-                    "turn_status": str(getattr(turn, "status", "") or ""),
-                },
-            )
-        except Exception:
-            pass
+        workspace_id = str(
+            (getattr(turn, "trace_context", {}) or {}).get("workspace_id") or ""
+        )
+        if task_id:
+            try:
+                emit(
+                    "stage",
+                    {
+                        "key": "task_context",
+                        "label": "任务上下文",
+                        "status": "running",
+                        "task_id": task_id,
+                        "turn_status": str(getattr(turn, "status", "") or ""),
+                    },
+                )
+            except Exception:
+                pass
         gen = _query_generator(
             pipeline,
             turn.query,
@@ -881,6 +886,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             knowledge_scope=knowledge_scope,
             knowledge_scope_resolver=knowledge_scope_resolver,
             task_id=task_id,
+            workspace_id=workspace_id,
             turn_id=turn_id,
         )
         try:
@@ -1263,46 +1269,33 @@ def create_turn(
                 },
             )
     trace_context = inject_trace_context()
-    # Convergence: a chat turn is an execution attempt of the session's
-    # durable task, so it gets the same workspace/artifacts/plan.  A clear
-    # document-export request keeps the deterministic export path.
-    turn_task = None
-    turn_task_store = None
-    try:
-        from src.result_exports import infer_export_intent
+    # Workspace-first: a chat turn belongs to the session's workspace.  The
+    # workspace owns the hidden file tree and optional KB binding; there is no
+    # per-chat task anymore.  Explicit task APIs still attach task_id.
+    from src.core.workspace_store import get_workspace_store
 
-        if infer_export_intent(body.query) is None:
-            from src.core.task_store import get_task_store
-
-            turn_task_store = get_task_store()
-            turn_task = turn_task_store.get_or_create_task_for_session(
-                user_id=user.id,
-                session_id=session_id,
-                kb_name=session.kb_name,
-                title=(
-                    session.title
-                    if session.title and session.title != "新对话"
-                    else body.query[:40]
-                ),
-                query=body.query,
-            )
-            trace_context = {
-                **trace_context,
-                "task_id": turn_task.id,
-                "task_origin": "chat",
-            }
-    except Exception:
-        turn_task = None
+    workspace_store = get_workspace_store()
+    workspace = workspace_store.get_workspace_for_session(session_id)
+    if workspace is None:
+        kind = "knowledge" if session.kb_name != GENERAL_CHAT_KB_NAME else "general"
+        workspace = workspace_store.get_or_create_for_user(
+            user_id=user.id,
+            kind=kind,
+            kb_name=session.kb_name if kind == "knowledge" else "",
+            kb_id=getattr(session, "kb_id", None) if kind == "knowledge" else None,
+        )
+        workspace_store.attach_session(workspace.id, session_id)
+    trace_context = {**trace_context, "workspace_id": workspace.id}
     try:
         turn = conv.create_turn(
-        user.id,
-        session_id,
-        body.query,
-        body.client_request_id,
-        query_mode,
-        trace_context=trace_context,
-        wiki_assist=body.wiki_assist,
-        attachment_ids=[ref.attachment_id for ref in attachment_refs],
+            user.id,
+            session_id,
+            body.query,
+            body.client_request_id,
+            query_mode,
+            trace_context=trace_context,
+            wiki_assist=body.wiki_assist,
+            attachment_ids=[ref.attachment_id for ref in attachment_refs],
             source_scope=effective_scope,
             **({"knowledge_scope": knowledge_scope} if knowledge_scope is not None else {}),
         )
@@ -1310,13 +1303,6 @@ def create_turn(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except KnowledgeScopeInvalid as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    if turn_task is not None and turn_task_store is not None:
-        try:
-            turn_task_store.set_current_turn(turn_task.id, turn.id)
-            turn_task_store.add_turn(turn_task.id, turn.id, "message")
-            turn_task_store.set_status(turn_task.id, "queued")
-        except Exception:
-            pass
     messages = conv.list_messages(user.id, session_id)
     user_message = next((message for message in messages if message.id == turn.user_message_id), None)
     if user_message is None:
@@ -1588,6 +1574,7 @@ def _query_generator(
     knowledge_scope=None,
     knowledge_scope_resolver=None,
     task_id="",
+    workspace_id="",
     turn_id="",
 ):
     params = inspect.signature(pipeline.query).parameters
@@ -1622,6 +1609,8 @@ def _query_generator(
             kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
         if "task_id" in params:
             kwargs["task_id"] = task_id
+        if "workspace_id" in params:
+            kwargs["workspace_id"] = workspace_id
         if "turn_id" in params:
             kwargs["turn_id"] = turn_id
         return pipeline.query(
@@ -1658,6 +1647,8 @@ def _query_generator(
         kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
     if "task_id" in params:
         kwargs["task_id"] = task_id
+    if "workspace_id" in params:
+        kwargs["workspace_id"] = workspace_id
     if "turn_id" in params:
         kwargs["turn_id"] = turn_id
     return pipeline.query(query, kb_name, history, ctx, **kwargs)

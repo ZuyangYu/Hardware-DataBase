@@ -233,6 +233,24 @@ def create_task(
     ):
         raise HTTPException(status_code=403, detail="read permission required")
 
+    from src.core.workspace_store import get_workspace_store
+
+    workspace_store = get_workspace_store()
+    workspace = workspace_store.get_workspace_for_session(session.id)
+    if workspace is None:
+        kind = "knowledge" if session.kb_name != GENERAL_CHAT_KB_NAME else "general"
+        workspace = workspace_store.get_or_create_for_user(
+            user_id=user.id,
+            kind=kind,
+            kb_name=session.kb_name if kind == "knowledge" else "",
+            kb_id=(
+                dict(getattr(ctx, "metadata", {}) or {}).get("kb_id")
+                if kind == "knowledge"
+                else None
+            ),
+        )
+        workspace_store.attach_session(workspace.id, session.id)
+
     task = store.create_task(
         user_id=user.id,
         session_id=session.id,

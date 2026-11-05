@@ -413,6 +413,7 @@ class _TurnPlan:
     context_fragments: list[tuple[str, str]] = field(default_factory=list)
     execution_tools: list[Any] = field(default_factory=list)
     skill_root: str | None = None
+    workspace: Any | None = None
     mcp_tool_search_enabled: bool = False
 
 
@@ -863,6 +864,7 @@ class MultiSourceAgentRunner:
         knowledge_scope: KnowledgeScopeSnapshot | None = None,
         knowledge_scope_resolver: KnowledgeScopeResolver | None = None,
         task_id: str = "",
+        workspace_id: str = "",
         turn_id: str = "",
     ) -> Generator[str, None, None]:
         """Observability wrapper: one agent span + metrics per run."""
@@ -898,6 +900,7 @@ class MultiSourceAgentRunner:
                     knowledge_scope=knowledge_scope,
                     knowledge_scope_resolver=knowledge_scope_resolver,
                     task_id=task_id,
+                    workspace_id=workspace_id,
                     turn_id=turn_id,
                 )
             except QueryCancelled:
@@ -974,6 +977,7 @@ class MultiSourceAgentRunner:
         knowledge_scope: KnowledgeScopeSnapshot | None = None,
         knowledge_scope_resolver: KnowledgeScopeResolver | None = None,
         task_id: str = "",
+        workspace_id: str = "",
     ) -> "_TurnPlan":
         """Build the synchronous part of a turn before streaming starts.
 
@@ -994,7 +998,19 @@ class MultiSourceAgentRunner:
                 knowledge_scope.actor_user_id, knowledge_scope
             )
 
+        workspace = None
+        if workspace_id:
+            try:
+                from src.core.workspace_store import get_workspace_store
+
+                workspace = get_workspace_store().get_workspace(str(workspace_id))
+            except Exception:
+                workspace = None
         kb_label = str(kb_name or "").strip()
+        if workspace is not None and workspace.kind == "general":
+            kb_label = GENERAL_CHAT_KB_NAME
+        elif workspace is not None and workspace.kind == "knowledge" and workspace.kb_name:
+            kb_label = workspace.kb_name
         is_general = (not kb_label) or kb_label == GENERAL_CHAT_KB_NAME
         requested_attachment_refs = [
             ref for ref in (attachments or []) if getattr(ref, "asset_id", "")
@@ -1380,6 +1396,7 @@ class MultiSourceAgentRunner:
             context_fragments=context_fragments,
             execution_tools=tool_bundle.execution_tools,
             skill_root=skill_root,
+            workspace=workspace,
             mcp_tool_search_enabled=tool_bundle.mcp_tool_search_enabled,
         )
 
@@ -1405,6 +1422,7 @@ class MultiSourceAgentRunner:
         knowledge_scope: KnowledgeScopeSnapshot | None = None,
         knowledge_scope_resolver: KnowledgeScopeResolver | None = None,
         task_id: str = "",
+        workspace_id: str = "",
         turn_id: str = "",
     ) -> Generator[str, None, None]:
         """Run the deep agent and stream answer deltas live.
@@ -1436,6 +1454,7 @@ class MultiSourceAgentRunner:
             knowledge_scope=knowledge_scope,
             knowledge_scope_resolver=knowledge_scope_resolver,
             task_id=task_id,
+            workspace_id=workspace_id,
         )
         record = plan.record
         emit_event = plan.emit_event
@@ -1448,6 +1467,7 @@ class MultiSourceAgentRunner:
         direct_control_answer = plan.direct_control_answer
         direct_answer_grounding = plan.direct_answer_grounding
         skill_root = plan.skill_root
+        workspace = plan.workspace
         if skill_root:
             try:
                 import os as _os
@@ -1525,6 +1545,42 @@ class MultiSourceAgentRunner:
                         },
                     }
                 )
+        elif workspace is not None:
+            # Workspace-first general agent: every session has a hidden
+            # workspace, but only explicit task APIs use task/plan tools.
+            from src.agents.tools.workspace_artifact_tools import (
+                build_workspace_artifact_tool,
+            )
+            from src.agents.tools.workspace_tools import build_workspace_tools
+            from src.core.workspace_store import get_workspace_store
+
+            tools = list(tools) + build_workspace_tools(workspace.workspace_dir, rt)
+            tools.append(
+                build_workspace_artifact_tool(
+                    workspace.id,
+                    get_workspace_store(),
+                    rt,
+                    workspace.workspace_dir,
+                    session_id=int(conversation_session_id or 0),
+                    turn_id=turn_id,
+                )
+            )
+            workspace_prompt = (
+                "\n\n## 工作区模式（通用 agent）\n"
+                "你正在一个持久工作区里工作，不是单轮问答。\n"
+                "  - workspace_* 工具用于读写/查找工作区文件；用户看不到磁盘路径。\n"
+                "  - 交付物用 workspace_publish_artifact(name, content, kind) 发布，"
+                "前端只显示文件名。\n"
+                "  - 不要在回答里提 out/、磁盘路径或下载 URL。\n"
+                "  - 简单问答直接回答，不要为了走流程而写文件。\n"
+                "  - 自行规划步骤；不要套用固定流程。\n"
+            )
+            if workspace.kind == "knowledge":
+                workspace_prompt += (
+                    "  - 本轮工作区绑定了知识库；项目事实先查知识库并用本轮证据编号，"
+                    "知识库缺失时写“待确认”。\n"
+                )
+            system_prompt = system_prompt + workspace_prompt
 
         if direct_control_answer is not None:
             record.answer = direct_control_answer
@@ -1974,6 +2030,17 @@ class MultiSourceAgentRunner:
                 evidence_count=len(rt.evidence),
                 turn_id=turn_id,
             )
+        elif workspace is not None:
+            try:
+                from src.core.workspace_store import get_workspace_store
+
+                get_workspace_store().scan_workspace_artifacts(
+                    workspace.id,
+                    session_id=int(conversation_session_id or 0),
+                    turn_id=turn_id,
+                )
+            except Exception:
+                pass
         if (
             answer_text
             and (partial_delivery or recursion_stopped)
