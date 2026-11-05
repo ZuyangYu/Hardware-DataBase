@@ -37,6 +37,7 @@ DEFAULT_LIMITS: dict[str, tuple[int, int]] = {
     "rag": (8, 4),
     "tool": (16, 0),
     "chat": (4, 0),
+    "task": (2, 0),
     "heavy_job": (4, 1),
     "ocr": (1, 0),
     "export": (4, 0),
@@ -1652,6 +1653,53 @@ class ResourceGovernor:
     def limits_for(self, resource: str) -> tuple[int, int]:
         return self.limits.get(resource, DEFAULT_LIMITS.get(resource, (1, 0)))
 
+    def reconcile_uncertain(self, *, grace_seconds: int | None = None) -> int:
+        """Release isolated uncertain permits after a bounded grace period.
+
+        Evidence is ``server_deadline_passed``: the permit lease/deadline has
+        long expired, so keeping the slot blocked only starves new work.  Every
+        release is audited by the store.
+        """
+
+        if self.scope != "deployment" or self.store is None:
+            return 0
+        import src.settings as settings
+        from datetime import datetime, timezone
+
+        grace = max(
+            60,
+            int(
+                grace_seconds
+                if grace_seconds is not None
+                else getattr(settings, "RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS", 1800)
+            ),
+        )
+        now = datetime.now(timezone.utc)
+        released = 0
+        for permit in self.store.uncertain_permits():
+            raw = str(permit.get("uncertain_since") or "")
+            if not raw:
+                continue
+            try:
+                since = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if since.tzinfo is None:
+                since = since.replace(tzinfo=timezone.utc)
+            if (now - since).total_seconds() < grace:
+                continue
+            try:
+                if self.store.release_uncertain(
+                    str(permit["permit_id"]),
+                    evidence="server_deadline_passed",
+                    reason=f"auto-released after {grace}s uncertain grace",
+                    operator="resource-governor",
+                ):
+                    released += 1
+            except Exception:
+                continue
+        return released
+
     # -- acquisition --------------------------------------------------------
 
     def acquire(
@@ -1954,6 +2002,7 @@ def _limits_from_settings() -> dict[str, tuple[int, int]]:
         "rag": _pair("RESOURCE_RAG_MAX_CONCURRENT", "RESOURCE_RAG_RESERVED_INTERACTIVE", DEFAULT_LIMITS["rag"]),
         "tool": _pair("RESOURCE_TOOL_MAX_CONCURRENT", "RESOURCE_TOOL_RESERVED_INTERACTIVE", DEFAULT_LIMITS["tool"]),
         "chat": _pair("RESOURCE_CHAT_MAX_CONCURRENT", "RESOURCE_CHAT_RESERVED_INTERACTIVE", DEFAULT_LIMITS["chat"]),
+        "task": _pair("RESOURCE_TASK_MAX_CONCURRENT", "RESOURCE_TASK_RESERVED_INTERACTIVE", DEFAULT_LIMITS["task"]),
         "heavy_job": _pair("RESOURCE_HEAVY_JOB_MAX_CONCURRENT", "RESOURCE_HEAVY_JOB_RESERVED_INTERACTIVE", DEFAULT_LIMITS["heavy_job"]),
         "ocr": _pair("RESOURCE_OCR_MAX_CONCURRENT", "RESOURCE_OCR_RESERVED_INTERACTIVE", DEFAULT_LIMITS["ocr"]),
         "export": _pair("RESOURCE_EXPORT_MAX_CONCURRENT", "RESOURCE_EXPORT_RESERVED_INTERACTIVE", DEFAULT_LIMITS["export"]),
@@ -2077,6 +2126,7 @@ def start_governor_maintenance() -> threading.Thread | None:
                         token = None
                         continue
                     governor.store.maintain(escalate)
+                    governor.reconcile_uncertain()
                 except Exception:
                     continue
             if token is not None:

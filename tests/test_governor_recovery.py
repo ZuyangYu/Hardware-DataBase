@@ -106,6 +106,23 @@ class UncertainPermitRecoveryTests(unittest.TestCase):
         permit2 = governor.acquire("tool", interactive=True, timeout=0.5)
         permit2.release()
 
+    def test_governor_reconciles_uncertain_after_grace(self):
+        from src.core.concurrency import ResourceGovernor
+
+        permit = self.store.try_acquire(
+            "llm", capacity=2, reserved_interactive=0, interactive=True, owner_id="w1", attempt_id="a1"
+        )
+        _expire(self.store, permit)
+        self.store.reap_expired(self.store._connect())
+        _age_uncertain(self.store, permit, seconds=3600)
+        governor = ResourceGovernor(
+            scope="deployment", store=self.store, limits={"llm": (2, 0)}
+        )
+        assert governor.reconcile_uncertain(grace_seconds=60) == 1
+        assert self.store.snapshot()["llm"]["uncertain"] == 0
+        fresh = governor.acquire("llm", interactive=True, timeout=0.5)
+        fresh.release()
+
     def test_finish_requires_evidence_and_is_idempotent(self):
         permit = self.store.try_acquire(
             "tool", capacity=1, reserved_interactive=0, interactive=True, owner_id="w1", attempt_id="a1"

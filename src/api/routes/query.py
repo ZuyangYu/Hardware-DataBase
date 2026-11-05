@@ -51,6 +51,13 @@ from src.api.schemas import (
 )
 
 
+def _turn_permit_resource(turn: Any) -> str:
+    """Task turns use their own admission class; chat stays interactive."""
+
+    trace = getattr(turn, "trace_context", {}) or {}
+    return "task" if str(trace.get("task_id") or "").strip() else "chat"
+
+
 def _can_read_turn(auth, user, turn, conv: ConversationService) -> bool:
     return can_read_turn(
         auth,
@@ -352,17 +359,31 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     fencing_token = int(getattr(turn, "fencing_token", 0) or 0)
     session_generation = int(getattr(turn, "session_generation", 0) or 0)
     ownership_token: int | None = fencing_token if fencing_token > 0 else None
-    # P0b: a chat turn holds one CHAT slot for its whole execution.  Queued
-    # turns wait up to the chat deadline before failing with backpressure.
-    chat_permit = None
+    # P0b: a turn holds one admission slot for its whole execution.  Task
+    # turns use the dedicated ``task`` class so long research never consumes
+    # interactive chat capacity.  Queued work still waits up to its deadline.
+    turn_task_id = str(
+        (getattr(turn, "trace_context", {}) or {}).get("task_id") or ""
+    )
+    permit_resource = _turn_permit_resource(turn)
+    permit_timeout = float(
+        getattr(
+            src.settings,
+            "CHAT_QUEUE_DEADLINE_DEEP_SECONDS"
+            if permit_resource == "task"
+            else "CHAT_QUEUE_DEADLINE_SECONDS",
+            900 if permit_resource == "task" else 600,
+        )
+    )
+    turn_permit = None
     if bool(getattr(src.settings, "RESOURCE_GOVERNOR_ENABLED", True)):
         try:
             from src.core.concurrency import get_governor
 
-            chat_permit = get_governor().acquire(
-                "chat",
-                interactive=True,
-                timeout=float(getattr(src.settings, "CHAT_QUEUE_DEADLINE_SECONDS", 600)),
+            turn_permit = get_governor().acquire(
+                permit_resource,
+                interactive=permit_resource == "chat",
+                timeout=permit_timeout,
             )
         except Exception:
             try:
@@ -819,9 +840,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         }
         # General-agent task attempts carry the durable task id; the runner
         # rebuilds plan/workspace/artifacts from it on every turn.
-        task_id = str(
-            (getattr(turn, "trace_context", {}) or {}).get("task_id") or ""
-        )
+        task_id = turn_task_id
         try:
             emit(
                 "stage",
@@ -1114,9 +1133,9 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             conv.release_turn_ownership(turn_id, worker_id, fencing_token=ownership_token)
         except Exception:
             pass
-        if chat_permit is not None:
+        if turn_permit is not None:
             try:
-                chat_permit.release()
+                turn_permit.release()
             except Exception:
                 pass
         _clear_turn_cancel_signal(turn_id)

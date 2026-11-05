@@ -313,6 +313,11 @@ RESOURCE_PERMIT_LEASE_SECONDS = int(os.getenv("RESOURCE_PERMIT_LEASE_SECONDS", "
 # P0-006: uncertain permits older than this pause new admissions for their
 # resource and raise an operations alert (never auto-release).
 RESOURCE_UNCERTAIN_ESCALATE_SECONDS = int(os.getenv("RESOURCE_UNCERTAIN_ESCALATE_SECONDS", "600"))
+# After this grace period an isolated uncertain permit is released with
+# server_deadline_passed evidence instead of blocking admission forever.
+RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS = int(
+    os.getenv("RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS", "1800")
+)
 RESOURCE_GOVERNOR_MAINTENANCE_SECONDS = float(
     os.getenv("RESOURCE_GOVERNOR_MAINTENANCE_SECONDS", "5")
 )
@@ -384,6 +389,10 @@ RESOURCE_TOOL_MAX_CONCURRENT = int(os.getenv("RESOURCE_TOOL_MAX_CONCURRENT", "16
 RESOURCE_TOOL_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_TOOL_RESERVED_INTERACTIVE", "0"))
 RESOURCE_CHAT_MAX_CONCURRENT = int(os.getenv("RESOURCE_CHAT_MAX_CONCURRENT", "4"))
 RESOURCE_CHAT_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_CHAT_RESERVED_INTERACTIVE", "0"))
+# Durable task turns get their own admission class so long-running research
+# never consumes interactive chat slots.
+RESOURCE_TASK_MAX_CONCURRENT = int(os.getenv("RESOURCE_TASK_MAX_CONCURRENT", "2"))
+RESOURCE_TASK_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_TASK_RESERVED_INTERACTIVE", "0"))
 RESOURCE_HEAVY_JOB_MAX_CONCURRENT = int(os.getenv("RESOURCE_HEAVY_JOB_MAX_CONCURRENT", "4"))
 RESOURCE_HEAVY_JOB_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_HEAVY_JOB_RESERVED_INTERACTIVE", "1"))
 RESOURCE_OCR_MAX_CONCURRENT = int(os.getenv("RESOURCE_OCR_MAX_CONCURRENT", "1"))
@@ -1348,6 +1357,11 @@ def _reload_settings():
     RESOURCE_QUEUE_MAX_DEPTH = int(os.getenv("RESOURCE_QUEUE_MAX_DEPTH", "256"))
     RESOURCE_PERMIT_LEASE_SECONDS = int(os.getenv("RESOURCE_PERMIT_LEASE_SECONDS", "300"))
     RESOURCE_UNCERTAIN_ESCALATE_SECONDS = int(os.getenv("RESOURCE_UNCERTAIN_ESCALATE_SECONDS", "600"))
+    # After this grace period an isolated uncertain permit is released with
+    # server_deadline_passed evidence instead of blocking admission forever.
+    RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS = int(
+        os.getenv("RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS", "1800")
+    )
     RESOURCE_GOVERNOR_MAINTENANCE_SECONDS = float(
         os.getenv("RESOURCE_GOVERNOR_MAINTENANCE_SECONDS", "5")
     )

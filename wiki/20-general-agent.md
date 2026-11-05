@@ -142,6 +142,10 @@ MCP 暴露需要新增一个受 token/ACL 约束的检索端点。
   上一 attempt；任务继续时 worker 会尝试按会话状态恢复。显式的"任务级
   checkpoint 快照/恢复"还需要与 attempt 隔离一起验证。
 - **HITL**：尚无审批流；等执行能力接入后再对危险动作加审批。
+- **队列隔离**：任务 turn 使用独立的 `task` 资源类（`RESOURCE_TASK_MAX_CONCURRENT`），
+  不再占用交互 chat 槽位；隔离的 uncertain permit 在宽限期后自动释放。
+- **稳定性巡检**：`uv run python scripts/check_stability.py` 检查
+  uncertain permit、非终态 turn、重复 worker 部署。
 - **任务存储**：默认 SQLite（`TASK_STORE_BACKEND=sqlite`）；多实例部署设置
   `TASK_STORE_BACKEND=postgres`，使用 `TASK_DB_URL`（空则回退
   `CONTROL_PLANE_DATABASE_URL`）。Postgres 表为 `agent_tasks` /

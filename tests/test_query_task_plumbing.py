@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from src.api.routes.query import _query_generator
+from types import SimpleNamespace
+
+from src.api.routes.query import _query_generator, _turn_permit_resource
 
 
 class _FakePipeline:
@@ -46,3 +48,9 @@ def test_query_generator_without_task_id():
         )
     )
     assert pipeline.task_id == ""
+
+
+def test_task_turn_uses_dedicated_permit_resource():
+    assert _turn_permit_resource(SimpleNamespace(trace_context={"task_id": "t1"})) == "task"
+    assert _turn_permit_resource(SimpleNamespace(trace_context={})) == "chat"
+    assert _turn_permit_resource(SimpleNamespace()) == "chat"
