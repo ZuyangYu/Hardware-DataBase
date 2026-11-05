@@ -28,7 +28,6 @@ import ChatHeader from './components/ChatHeader';
 import MessageList from './components/MessageList';
 import { useConversationArtifacts } from './useConversationArtifacts';
 import Composer from './components/Composer';
-import ExportTaskCenter from '@/components/ExportTaskCenter';
 import EditMessageDialog from './EditMessageDialog';
 import { notify } from '@/components/ui/app-toast';
 import {
@@ -663,8 +662,6 @@ export default function ChatPage({
           wikiAssist={mountedKbName ? wikiAssist : undefined}
           onWikiAssistChange={mountedKbName ? updateWikiAssist : undefined}
           wikiAvailable={mountedKbName ? wikiAvailable : undefined}
-          /* 导出任务中心嵌入页头,避免悬浮按钮遮挡右侧会话侧栏的新建按钮 */
-          actions={<ExportTaskCenter variant="embedded" />}
         />
         <MessageList
           messages={messages}
