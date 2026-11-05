@@ -47,7 +47,7 @@ export interface DegradedEvent extends AgentEventBase {
   reason: string;
 }
 
-export type ToolKind = 'retrieval' | 'mcp' | 'sandbox';
+export type ToolKind = 'retrieval' | 'mcp' | 'sandbox' | 'workspace';
 
 export interface ToolStartedEvent extends AgentEventBase {
   type: 'tool_started';
@@ -270,7 +270,7 @@ function normalizeTraceStatus(value: unknown): QueryTraceStatus {
 }
 
 function normalizeToolKind(value: unknown): ToolKind {
-  return value === 'mcp' || value === 'sandbox' ? value : 'retrieval';
+  return value === 'mcp' || value === 'sandbox' || value === 'workspace' ? value : 'retrieval';
 }
 
 function parsePlanItems(value: unknown): TurnPlanState['items'] {

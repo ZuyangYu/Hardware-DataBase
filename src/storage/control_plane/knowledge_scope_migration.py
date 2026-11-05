@@ -53,7 +53,12 @@ def inspect_postgres(conn) -> dict:
     version_row = conn.execute("SELECT value FROM control_plane_schema WHERE key = 'schema_version'").fetchone()
     version = str(version_row[0]) if version_row else ""
     protocol = conn.execute("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'chat_turns'::regclass AND conname = 'chat_turns_status_check'").fetchone()
-    protocol_ready = protocol is not None and "multi_kb_pending" in protocol[0] and "multi_kb_streaming" in protocol[0]
+    protocol_ready = (
+        protocol is not None
+        and "multi_kb_pending" in protocol[0]
+        and "multi_kb_streaming" in protocol[0]
+        and "task_pending" in protocol[0]
+    )
     return {"ready": not missing and not invalid and version == SCHEMA_VERSION and protocol_ready, "missing": missing, "invalid": invalid, "schema_version": version, "turn_protocol_ready": protocol_ready}
 
 

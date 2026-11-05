@@ -74,6 +74,13 @@ def _control_plane(dsn: str, *, provision_auxiliary: bool = True) -> str:
             if provision_auxiliary:
                 _auxiliary_control_plane(conn)
             result = f"控制面 schema 已存在（版本 {version}）"
+        # Turn-status protocol migration: add task_pending (task queue
+        # isolation) to existing databases; idempotent on new schemas.
+        from src.storage.control_plane.knowledge_scope_migration import (
+            apply_postgres as _apply_turn_status_migration,
+        )
+
+        _apply_turn_status_migration(conn)
         # 控制面外键（如 chat_sessions → users）在数据迁移路径上补挂；
         # 全新库由 apply_schema 内联建好，这里只在缺失时补齐。
         for name, table, constraint_sql in CORE_FOREIGN_KEYS:

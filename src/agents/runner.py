@@ -1446,8 +1446,11 @@ class MultiSourceAgentRunner:
                 )
                 emit_event(
                     {
-                        "type": "task_mode",
+                        "type": "stage",
                         "payload": {
+                            "key": "task_mode",
+                            "label": "任务模式",
+                            "status": "running",
                             "task_id": task.id,
                             "definition_id": task.definition_id,
                             "kb_mounted": bool(task.kb_name)

@@ -822,6 +822,19 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
         task_id = str(
             (getattr(turn, "trace_context", {}) or {}).get("task_id") or ""
         )
+        try:
+            emit(
+                "stage",
+                {
+                    "key": "task_context",
+                    "label": "任务上下文",
+                    "status": "running",
+                    "task_id": task_id,
+                    "turn_status": str(getattr(turn, "status", "") or ""),
+                },
+            )
+        except Exception:
+            pass
         gen = _query_generator(
             pipeline,
             turn.query,
@@ -1272,7 +1285,7 @@ def start_turn(
     # browser can safely call it after a refresh to ensure the turn is queued.
     # A dependency-overridden pipeline is only used by in-process API tests;
     # production never enters this branch and always relies on the worker.
-    if request.app.dependency_overrides.get(get_pipeline) is not None and turn.status in {"pending", "streaming", "cancelling"}:
+    if request.app.dependency_overrides.get(get_pipeline) is not None and turn.status in {"pending", "task_pending", "streaming", "cancelling"}:
         start_thread_with_current_context(
             _run_turn,
             turn_id=turn.id,

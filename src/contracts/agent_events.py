@@ -128,7 +128,7 @@ class ToolStartedPayload(AgentEventPayload):
 
     call_id: str = Field(min_length=1)
     tool_name: str = Field(min_length=1)
-    tool_kind: Literal["retrieval", "mcp", "sandbox"] = "retrieval"
+    tool_kind: Literal["retrieval", "mcp", "sandbox", "workspace"] = "retrieval"
     label: str = ""
     query: str = ""
     detail: str = ""
@@ -148,6 +148,8 @@ class ToolStartedPayload(AgentEventPayload):
         if not self.detail:
             if self.tool_kind == "sandbox":
                 self.detail = f"任务 {self.task_id}".strip()
+            elif self.tool_kind == "workspace":
+                self.detail = f"工作区 {self.query}".strip()
             elif self.tool_kind == "mcp":
                 self.detail = f"{self.server}/{self.tool}".strip("/")
             else:
@@ -160,7 +162,7 @@ class ToolCompletedPayload(AgentEventPayload):
 
     call_id: str = Field(min_length=1)
     tool_name: str = Field(min_length=1)
-    tool_kind: Literal["retrieval", "mcp", "sandbox"] = "retrieval"
+    tool_kind: Literal["retrieval", "mcp", "sandbox", "workspace"] = "retrieval"
     label: str = ""
     status: str = "done"
     detail: str = ""
@@ -190,6 +192,8 @@ class ToolCompletedPayload(AgentEventPayload):
         if not self.detail:
             if self.tool_kind == "sandbox":
                 detail = f"任务 {self.task_id} · {self.status}".strip()
+            elif self.tool_kind == "workspace":
+                detail = f"工作区 {self.status}"
             elif self.tool_kind == "mcp":
                 detail = f"{self.server}/{self.tool} · {self.status}".strip("/ ")
             else:
