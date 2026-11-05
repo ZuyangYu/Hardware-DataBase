@@ -28,6 +28,7 @@ class UserInfo(BaseModel):
     role: str
     department_id: int | None = None
     department_name: str | None = None
+    tenant_id: str = "default"
 
 
 class LoginResponse(BaseModel):
@@ -870,6 +871,7 @@ class AuthUserView(BaseModel):
     is_active: bool = True
     department_id: int | None = None
     department_name: str | None = None
+    tenant_id: str = "default"
 
 
 class CreateUserRequest(BaseModel):
@@ -877,6 +879,7 @@ class CreateUserRequest(BaseModel):
     password: str
     role: Literal["employee", "system_admin"] = "employee"
     department_id: int | None = None
+    tenant_id: str | None = None
 
 
 class SetUserActiveRequest(BaseModel):
@@ -903,6 +906,7 @@ class DepartmentView(BaseModel):
 
 class CreateDepartmentRequest(BaseModel):
     name: str
+    tenant_id: str | None = None
 
 
 # ---------------------------------------------------------------------------

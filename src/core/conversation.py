@@ -99,6 +99,8 @@ class ChatTurn:
 TURN_STATUS_WAITING_FOR_ATTACHMENTS = "waiting_for_attachments"
 
 # Non-terminal statuses that keep later turns of the same session queued.
+# task_pending is retained only so pre-workspace rows can still be drained.
+# New chat turns are always pending; the /tasks product no longer exists.
 TURN_STATUSES_NON_TERMINAL = ("pending", "task_pending", "streaming", "cancelling", "waiting_for_attachments")
 TURN_STATUSES_NON_TERMINAL += tuple(f"multi_kb_{status}" for status in TURN_STATUSES_NON_TERMINAL)
 
@@ -1194,9 +1196,7 @@ class ConversationService:
                 initial_status = (
                     TURN_STATUS_WAITING_FOR_ATTACHMENTS if waiting else "pending"
                 )
-                if (trace_context or {}).get("task_id"):
-                    initial_status = "task_pending"
-                elif scope:
+                if scope:
                     initial_status = f"multi_kb_{initial_status}"
                 required_ids = [ref["attachment_id"] for ref in attachment_refs]
                 conn.execute(
@@ -1791,7 +1791,7 @@ class ConversationService:
                         cursor = conn.execute(
                             """
                             UPDATE chat_turns
-                            SET status = CASE WHEN trace_context_json LIKE '%"task_id"%' THEN 'task_pending' WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END,
+                            SET status = CASE WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END,
                                 worker_id = '', worker_heartbeat_at = NULL
                             WHERE id = ? AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                             """,
@@ -2011,7 +2011,7 @@ class ConversationService:
                 conn.execute(
                     """
                     UPDATE chat_turns
-                    SET status = CASE WHEN trace_context_json LIKE '%"task_id"%' THEN 'task_pending' WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END,
+                    SET status = CASE WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END,
                         worker_id = '', worker_heartbeat_at = NULL
                     WHERE id = ? AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                       AND worker_heartbeat_at IS NOT NULL
@@ -2524,6 +2524,10 @@ class ConversationService:
         from src.result_exports.answer import normalize_export_answer
 
         answer = normalize_export_answer(answer, existing_turn.export_plan)
+        tenant_id = str(
+            (getattr(existing_turn, "trace_context", {}) or {}).get("tenant_id")
+            or "default"
+        )
         export_store = None
         if existing_turn.export_plan:
             from src.result_exports.store import ResultExportStore
@@ -2599,7 +2603,7 @@ class ConversationService:
                     export_store.enqueue_completed_turn_in_connection(
                         conn,
                         owner_user_id=user_id,
-                        tenant_id="default",
+                        tenant_id=tenant_id,
                         department_id=completed_turn.department_id,
                         knowledge_base_name=(
                             "" if completed_turn.kb_name == GENERAL_CHAT_KB_NAME else completed_turn.kb_name

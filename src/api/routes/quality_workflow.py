@@ -33,7 +33,7 @@ def _controller():
 def evaluate(version_id: str, body: DatasetEvaluationRequest, viewer=Depends(require_employee), store=Depends(_store), controller=Depends(_controller), auth=Depends(get_auth_service)):
     from src.api.admission import admission_model_name, enforce_admission
 
-    enforce_admission(viewer, viewer.department_id, resource="evaluation", model=admission_model_name())
+    enforce_admission(viewer, getattr(viewer, "tenant_id", None) or viewer.department_id, resource="evaluation", model=admission_model_name())
     state = _call(create_dataset_run, store, version_id, viewer, body, controller, auth=auth)
     _audit("quality.dataset_evaluate", viewer, state.run_id)
     _call(controller.start, state.run_id)

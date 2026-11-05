@@ -17,7 +17,7 @@ def list_departments(
     auth: AuthService = Depends(get_auth_service),
 ):
     """List departments. Account governance is system_admin-only."""
-    deps = auth.list_departments()
+    deps = auth.list_departments(tenant_id=actor.tenant_id)
     return [DepartmentView(id=d.id, name=d.name) for d in deps]
 
 
@@ -28,7 +28,7 @@ def create_department(
     auth: AuthService = Depends(get_auth_service),
 ):
     """Create a department. system_admin only."""
-    d = auth.create_department_as(actor, body.name)
+    d = auth.create_department_as(actor, body.name, tenant_id=body.tenant_id)
     return DepartmentView(id=d.id, name=d.name)
 
 

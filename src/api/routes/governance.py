@@ -81,7 +81,7 @@ def kb_summaries(
         existing = pipeline.list_all_knowledge_bases_for_admin(ctx=ctx)
     else:
         existing = pipeline.list_knowledge_bases(ctx=ctx)
-    summaries = auth.list_knowledge_base_summaries(existing)
+    summaries = auth.list_knowledge_base_summaries(existing, tenant_id=user.tenant_id)
     stats_by_key = pipeline.governance_stats(ctx=ctx) or {}
     views: list[KbSummaryView] = []
     for s in summaries:

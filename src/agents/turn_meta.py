@@ -444,6 +444,23 @@ def _agent_step_budget_answer(rt: Any, reason: str = "") -> str:
     ]
     if reason == "time_limit":
         lines = ["本轮执行时间预算已到，为避免无限等待已停止继续检索。"]
+    elif reason == "no_progress" and not evidence:
+        queries = [
+            str(item.get("query") or "").strip()
+            for item in (getattr(rt, "queries", []) or [])
+            if str(item.get("query") or "").strip()
+        ]
+        tools = [
+            str(item.get("tool_name") or "").strip()
+            for item in (getattr(rt, "diagnostics", []) or [])
+            if str(item.get("tool_name") or "").strip()
+        ]
+        lines = ["未找到足够证据回答该问题。"]
+        if queries:
+            lines.append("已查关键词：" + "、".join(dict.fromkeys(queries))[:500])
+        if tools:
+            lines.append("已用来源：" + "、".join(dict.fromkeys(tools))[:300])
+        lines.append("如果该问题本应有资料，请补充更精确的文档名、位号、表名或字段名后重试。")
     elif reason == "no_progress":
         lines = ["连续多次检索没有带来新证据，已停止继续检索。"]
     elif reason == "tool_call_limit":

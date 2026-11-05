@@ -111,7 +111,15 @@ class WorkspaceStore:
         configured = str(
             backend
             or os.getenv("WORKSPACE_STORE_BACKEND", "")
+            or os.getenv("TASK_STORE_BACKEND", "")
             or getattr(src_settings, "WORKSPACE_STORE_BACKEND", "")
+            or (
+                "postgres"
+                if str(getattr(src_settings, "CONTROL_PLANE_BACKEND", "")).lower()
+                == "postgres"
+                and not os.getenv("TASK_STORE_BACKEND", "")
+                else ""
+            )
             or getattr(src_settings, "TASK_STORE_BACKEND", "sqlite")
             or "sqlite"
         ).strip().lower()
@@ -342,10 +350,15 @@ class WorkspaceStore:
                 conn,
                 """
                 SELECT * FROM agent_workspaces
-                WHERE user_id = %s AND kind = %s AND kb_name = %s
+                WHERE tenant_id = %s AND user_id = %s AND kind = %s AND kb_name = %s
                 ORDER BY created_at LIMIT 1
                 """,
-                (int(user_id), normalized_kind, str(kb_name or "")),
+                (
+                    str(tenant_id or "default"),
+                    int(user_id),
+                    normalized_kind,
+                    str(kb_name or ""),
+                ),
             )
         if row is not None:
             return self._row_to_workspace(row)
@@ -364,35 +377,57 @@ class WorkspaceStore:
         )
 
     def get_workspace(
-        self, workspace_id: str, user_id: int | None = None
+        self,
+        workspace_id: str,
+        user_id: int | None = None,
+        tenant_id: str | None = None,
     ) -> Workspace | None:
+        clauses = ["id = %s"]
+        params: list[Any] = [str(workspace_id)]
+        if user_id is not None:
+            clauses.append("user_id = %s")
+            params.append(int(user_id))
+        if tenant_id:
+            clauses.append("tenant_id = %s")
+            params.append(str(tenant_id))
         with self._connect() as conn:
-            if user_id is None:
-                row = self._fetchone(
-                    conn,
-                    "SELECT * FROM agent_workspaces WHERE id = %s",
-                    (str(workspace_id),),
-                )
-            else:
-                row = self._fetchone(
-                    conn,
-                    "SELECT * FROM agent_workspaces WHERE id = %s AND user_id = %s",
-                    (str(workspace_id), int(user_id)),
-                )
+            row = self._fetchone(
+                conn,
+                "SELECT * FROM agent_workspaces WHERE " + " AND ".join(clauses),
+                tuple(params),
+            )
         return self._row_to_workspace(row) if row is not None else None
 
-    def list_workspaces(self, user_id: int, limit: int = 100) -> list[Workspace]:
+    def list_workspaces(
+        self, user_id: int, limit: int = 100, tenant_id: str | None = None
+    ) -> list[Workspace]:
         with self._connect() as conn:
-            rows = self._fetchall(
-                conn,
-                """
-                SELECT * FROM agent_workspaces
-                WHERE user_id = %s
-                ORDER BY updated_at DESC, id DESC
-                LIMIT %s
-                """,
-                (int(user_id), max(1, min(int(limit), 200))),
-            )
+            if tenant_id:
+                rows = self._fetchall(
+                    conn,
+                    """
+                    SELECT * FROM agent_workspaces
+                    WHERE tenant_id = %s AND user_id = %s
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (
+                        str(tenant_id),
+                        int(user_id),
+                        max(1, min(int(limit), 200)),
+                    ),
+                )
+            else:
+                rows = self._fetchall(
+                    conn,
+                    """
+                    SELECT * FROM agent_workspaces
+                    WHERE user_id = %s
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (int(user_id), max(1, min(int(limit), 200))),
+                )
         return [self._row_to_workspace(row) for row in rows]
 
     def attach_session(self, workspace_id: str, session_id: int) -> None:

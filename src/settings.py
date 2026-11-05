@@ -92,12 +92,8 @@ TASK_DB_PATH = os.getenv("TASK_DB_PATH", os.path.join(STORAGE_DIR, "tasks.db"))
 TASK_WORKSPACE_ROOT = os.getenv(
     "TASK_WORKSPACE_ROOT", os.path.join(STORAGE_DIR, "workspaces")
 )
-# Optional external task definitions (dcode-skill style).  Empty/absent means
-# the agent works in freeform mode with no predefined workflow.
-TASK_DEFINITION_DIR = os.getenv(
-    "TASK_DEFINITION_DIR", os.path.join(STORAGE_DIR, "task_definitions")
-)
-# Task store backend: "sqlite" (single host) or "postgres" (multi-instance).
+# Workspace store backend: "sqlite" (single host) or "postgres" (multi-instance).
+# Kept under the historical TASK_* env names for deployment compatibility.
 TASK_STORE_BACKEND = os.getenv("TASK_STORE_BACKEND", "sqlite").strip().lower()
 TASK_DB_URL = os.getenv("TASK_DB_URL", "").strip()
 
@@ -1159,7 +1155,8 @@ def _reload_settings():
     global RESOURCE_GOVERNOR_ENABLED, RESOURCE_GOVERNOR_SCOPE, RESOURCE_GOVERNOR_DB_PATH
     global RESOURCE_GOVERNOR_BACKEND, RESOURCE_GOVERNOR_DATABASE_URL
     global RESOURCE_QUEUE_MAX_WAIT_SECONDS, RESOURCE_QUEUE_MAX_DEPTH, RESOURCE_PERMIT_LEASE_SECONDS
-    global RESOURCE_UNCERTAIN_ESCALATE_SECONDS, RESOURCE_GOVERNOR_MAINTENANCE_SECONDS
+    global RESOURCE_UNCERTAIN_ESCALATE_SECONDS, RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS
+    global RESOURCE_GOVERNOR_MAINTENANCE_SECONDS
     global RESOURCE_GOVERNOR_DEPLOYMENT_ID, RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED
     global CONTROL_PLANE_BACKEND, CONTROL_PLANE_DATABASE_URL, CONTROL_PLANE_POOL_SIZE
     global EVALUATION_STORE_BACKEND, EVALUATION_STORE_DATABASE_URL

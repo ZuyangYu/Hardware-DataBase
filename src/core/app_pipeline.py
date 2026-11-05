@@ -220,7 +220,6 @@ class AppPipeline:
         action_scope: Any | None = None,
         knowledge_scope: Any | None = None,
         knowledge_scope_resolver: Any | None = None,
-        task_id: str = "",
         workspace_id: str = "",
         turn_id: str = "",
     ) -> Generator[str, None, None]:
@@ -249,7 +248,6 @@ class AppPipeline:
                 action_scope=action_scope,
                 knowledge_scope=knowledge_scope,
                 knowledge_scope_resolver=knowledge_scope_resolver,
-                task_id=task_id,
                 workspace_id=workspace_id,
                 turn_id=turn_id,
             )
@@ -508,6 +506,11 @@ class AppPipeline:
             if auth_service.knowledge_base_exists(scope.kb_name, department_id=scope.department_id):
                 self._audit("create_kb", ctx, target_type="knowledge_base", target_id=name, kb_name=name, success=False, error_message="知识库已存在")
                 return False, "知识库已存在"
+            if ctx is not None and auth_service.knowledge_base_name_conflict(
+                scope.kb_name, str(getattr(ctx, "tenant_id", None) or "default")
+            ):
+                self._audit("create_kb", ctx, target_type="knowledge_base", target_id=name, kb_name=name, success=False, error_message="知识库名称已被其他租户使用")
+                return False, "知识库名称已被其他租户使用，请换一个名称"
 
             self._audit_requested(
                 "create_kb",

@@ -27,6 +27,7 @@ SQLITE_NAME = "auth.db"
 PRIMARY_TABLE = "users"
 # 本次迁移的表（全部写入方的并集，顺序 = 建表顺序）。
 TABLES: tuple[str, ...] = (
+    "tenants",
     "departments",
     "users",
     "auth_sessions",

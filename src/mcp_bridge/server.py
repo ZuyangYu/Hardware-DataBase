@@ -2,7 +2,7 @@
 
 Exposes the platform to external agents (dcode/OpenCode/Claude Code) over
 MCP.  The tools are thin HTTP clients so the bridge never bypasses the
-platform's auth, knowledge-scope and task governance.
+platform's auth, knowledge-scope and turn governance.
 
 Run over stdio:
 
@@ -12,7 +12,6 @@ Run over stdio:
 
 Tools:
 - list_kbs
-- create_task / get_task / list_task_artifacts
 - ask_knowledge_base (runs one KB turn and returns the cited answer)
 - list_spreadsheets / list_circuit_designs (structured read models)
 """
@@ -82,41 +81,6 @@ def _kb_path(kb_name: str) -> str:
 def list_kbs() -> list[dict[str, Any]]:
     """List knowledge bases visible to the configured account."""
     return _request("GET", "/kbs")
-
-
-@mcp.tool()
-def create_task(
-    query: str,
-    kb_name: str = "__general__",
-    definition_id: str = "",
-    title: str = "",
-) -> dict[str, Any]:
-    """Create a durable general-agent task and return its id/status.
-
-    ``definition_id`` optionally selects an external task definition under
-    ``TASK_DEFINITION_DIR``.  Use ``get_task`` to poll and
-    ``list_task_artifacts`` to fetch deliverables.
-    """
-    payload: dict[str, Any] = {"query": query, "kb_name": kb_name}
-    if definition_id:
-        payload["definition_id"] = definition_id
-    if title:
-        payload["title"] = title
-    return _request("POST", "/tasks", json=payload)
-
-
-@mcp.tool()
-def get_task(task_id: str) -> dict[str, Any]:
-    """Get task status, current answer, plan, verification and artifacts."""
-    return _request("GET", f"/tasks/{quote(str(task_id), safe='')}")
-
-
-@mcp.tool()
-def list_task_artifacts(task_id: str) -> dict[str, Any]:
-    """List downloadable artifacts produced by a task."""
-    return _request(
-        "GET", f"/tasks/{quote(str(task_id), safe='')}/artifacts"
-    )
 
 
 @mcp.tool()

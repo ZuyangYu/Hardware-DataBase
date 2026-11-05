@@ -545,21 +545,7 @@ _OUTPUT_FORMAT_LABELS = {
 }
 
 
-def _strip_task_paths(text: str) -> str:
-    """Keep internal workspace paths out of user-visible task answers."""
-
-    return re.sub(r"(?<![\w/])out/", "", str(text or ""))
-
-
-def _export_intent_for_turn(query: str, task_id: str = "") -> bool:
-    """Task mode produces workspace artifacts, never a document-export turn.
-
-    A bare "输出" inside a task description must not bypass the agent with an
-    export-format clarification.
-    """
-
-    if task_id:
-        return False
+def _export_intent_for_turn(query: str) -> bool:
     from src.result_exports import infer_export_intent
 
     return infer_export_intent(query) is not None
@@ -600,36 +586,6 @@ def _direct_intent_clarification_answer(plan: IntentPlan | None) -> str | None:
             "PowerPoint/PPTX 或 Markdown；确认后我再提交候选文档任务。"
         )
     return None
-
-
-def _finalize_task_attempt(
-    *,
-    store: Any,
-    task: Any,
-    partial: bool,
-    answer_text: str = "",
-    evidence_count: int = 0,
-    turn_id: str = "",
-) -> None:
-    """Sync task status/artifacts/verification after one attempt."""
-
-    try:
-        from src.agents.task_verification import build_task_verification
-
-        artifacts = store.scan_workspace_artifacts(task.id, turn_id=turn_id)
-        kb_mounted = bool(getattr(task, "kb_name", "")) and task.kb_name != "__general__"
-        verification = build_task_verification(
-            artifacts=artifacts,
-            answer_text=answer_text,
-            evidence_count=evidence_count,
-            partial=partial,
-            kb_mounted=kb_mounted,
-        )
-        store.set_verification(task.id, verification)
-        store.set_status(task.id, "paused" if partial else "completed")
-    except Exception:
-        # Task bookkeeping must never fail a user-visible answer.
-        pass
 
 
 class MultiSourceAgentRunner:
@@ -863,7 +819,6 @@ class MultiSourceAgentRunner:
         action_scope: Any | None = None,
         knowledge_scope: KnowledgeScopeSnapshot | None = None,
         knowledge_scope_resolver: KnowledgeScopeResolver | None = None,
-        task_id: str = "",
         workspace_id: str = "",
         turn_id: str = "",
     ) -> Generator[str, None, None]:
@@ -899,7 +854,6 @@ class MultiSourceAgentRunner:
                     action_scope=action_scope,
                     knowledge_scope=knowledge_scope,
                     knowledge_scope_resolver=knowledge_scope_resolver,
-                    task_id=task_id,
                     workspace_id=workspace_id,
                     turn_id=turn_id,
                 )
@@ -976,7 +930,6 @@ class MultiSourceAgentRunner:
         action_scope: Any | None = None,
         knowledge_scope: KnowledgeScopeSnapshot | None = None,
         knowledge_scope_resolver: KnowledgeScopeResolver | None = None,
-        task_id: str = "",
         workspace_id: str = "",
     ) -> "_TurnPlan":
         """Build the synchronous part of a turn before streaming starts.
@@ -1003,7 +956,10 @@ class MultiSourceAgentRunner:
             try:
                 from src.core.workspace_store import get_workspace_store
 
-                workspace = get_workspace_store().get_workspace(str(workspace_id))
+                workspace = get_workspace_store().get_workspace(
+                    str(workspace_id),
+                    tenant_id=getattr(ctx, "tenant_id", None),
+                )
             except Exception:
                 workspace = None
         kb_label = str(kb_name or "").strip()
@@ -1359,20 +1315,18 @@ class MultiSourceAgentRunner:
             tool_fragments=tool_bundle.fragments,
             tool_suffix=tool_bundle.prompt_suffix,
             skill_present=bool(skill_root),
-            # Task mode produces artifacts; a bare "输出" in the task text is
-            # not a document-export request and must not bypass the agent.
-            export=_export_intent_for_turn(query, task_id),
+            # A bare "输出" in a workspace request is not a document-export
+            # request and must not bypass the agent.
+            export=_export_intent_for_turn(query),
         )
         system_prompt = turn_prompt.system_prompt
         context_fragments = turn_prompt.fragments
 
         direct_control_answer: str | None = None
         direct_answer_grounding = "intent_clarification"
-        direct_control_answer = (
-            None if task_id else _direct_intent_clarification_answer(intent_plan)
-        )
+        direct_control_answer = _direct_intent_clarification_answer(intent_plan)
 
-        if direct_control_answer is None and has_attachments and not task_id:
+        if direct_control_answer is None and has_attachments:
             # Governed two-stage section edits: the user's confirmation (or
             # cancellation) executes deterministically, never via the model.
             proposal_answer = _direct_attachment_proposal_answer(
@@ -1421,7 +1375,6 @@ class MultiSourceAgentRunner:
         action_scope: Any | None = None,
         knowledge_scope: KnowledgeScopeSnapshot | None = None,
         knowledge_scope_resolver: KnowledgeScopeResolver | None = None,
-        task_id: str = "",
         workspace_id: str = "",
         turn_id: str = "",
     ) -> Generator[str, None, None]:
@@ -1453,7 +1406,6 @@ class MultiSourceAgentRunner:
             action_scope=action_scope,
             knowledge_scope=knowledge_scope,
             knowledge_scope_resolver=knowledge_scope_resolver,
-            task_id=task_id,
             workspace_id=workspace_id,
         )
         record = plan.record
@@ -1493,61 +1445,9 @@ class MultiSourceAgentRunner:
             except Exception:
                 pass
 
-        # General-agent task mode: a durable task supplies the workspace and an
-        # *optional* external definition; there is no fixed workflow here.
-        task = None
-        task_store = None
-        if task_id:
-            from src.agents.task_definitions import build_task_prompt, resolve_definition
-            from src.agents.tools.task_tools import build_task_tools
-            from src.agents.tools.workspace_tools import build_workspace_tools
-            from src.core.task_store import get_task_store
-
-            task_store = get_task_store()
-            task = task_store.get_task(str(task_id))
-            if task is not None:
-                definition = resolve_definition(task.definition_id)
-                task_artifacts = task_store.list_artifacts(task.id)
-                tools = (
-                    list(tools)
-                    + build_workspace_tools(task.workspace_dir, rt)
-                    + build_task_tools(
-                        task.id,
-                        task_store,
-                        rt,
-                        task.workspace_dir,
-                        turn_id=turn_id,
-                    )
-                )
-                system_prompt = system_prompt + build_task_prompt(
-                    task, definition, task_artifacts
-                )
-                emit_event(
-                    {
-                        "type": "stage",
-                        "payload": {
-                            "key": "task_mode",
-                            "label": "任务模式",
-                            "status": "running",
-                            "task_id": task.id,
-                            "definition_id": task.definition_id,
-                            "kb_mounted": bool(task.kb_name)
-                            and task.kb_name != "__general__",
-                            "workspace_tools": [
-                                "workspace_list",
-                                "workspace_read",
-                                "workspace_write",
-                                "workspace_edit",
-                                "workspace_glob",
-                                "workspace_grep",
-                            ],
-                            "plan_tool": "task_plan_update",
-                        },
-                    }
-                )
-        elif workspace is not None:
+        if workspace is not None:
             # Workspace-first general agent: every session has a hidden
-            # workspace, but only explicit task APIs use task/plan tools.
+            # workspace with file tools and artifact publishing.
             from src.agents.tools.workspace_artifact_tools import (
                 build_workspace_artifact_tool,
             )
@@ -2018,19 +1918,8 @@ class MultiSourceAgentRunner:
             _current_run().answer = answer_text
             yield answer_text
         answer_text, removed_citations = _scrub_invalid_citations(answer_text, rt.evidence)
-        if task is not None:
-            answer_text = _strip_task_paths(answer_text)
         record.answer = _current_run().answer = answer_text
-        if task is not None and task_store is not None:
-            _finalize_task_attempt(
-                store=task_store,
-                task=task,
-                partial=partial_delivery,
-                answer_text=answer_text,
-                evidence_count=len(rt.evidence),
-                turn_id=turn_id,
-            )
-        elif workspace is not None:
+        if workspace is not None:
             try:
                 from src.core.workspace_store import get_workspace_store
 

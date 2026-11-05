@@ -51,19 +51,6 @@ from src.api.schemas import (
 )
 
 
-def _turn_permit_resource(turn: Any) -> str:
-    """Task turns use their own admission class; chat stays interactive."""
-
-    trace = getattr(turn, "trace_context", {}) or {}
-    if not str(trace.get("task_id") or "").strip():
-        return "chat"
-    # Chat-origin turns keep interactive chat capacity; explicit task jobs
-    # get the background task class.
-    if str(trace.get("task_origin") or "") == "chat":
-        return "chat"
-    return "task"
-
-
 def _can_read_turn(auth, user, turn, conv: ConversationService) -> bool:
     return can_read_turn(
         auth,
@@ -368,18 +355,9 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     # P0b: a turn holds one admission slot for its whole execution.  Task
     # turns use the dedicated ``task`` class so long research never consumes
     # interactive chat capacity.  Queued work still waits up to its deadline.
-    turn_task_id = str(
-        (getattr(turn, "trace_context", {}) or {}).get("task_id") or ""
-    )
-    permit_resource = _turn_permit_resource(turn)
+    permit_resource = "chat"
     permit_timeout = float(
-        getattr(
-            src.settings,
-            "CHAT_QUEUE_DEADLINE_DEEP_SECONDS"
-            if permit_resource == "task"
-            else "CHAT_QUEUE_DEADLINE_SECONDS",
-            900 if permit_resource == "task" else 600,
-        )
+        getattr(src.settings, "CHAT_QUEUE_DEADLINE_SECONDS", 600)
     )
     turn_permit = None
     if bool(getattr(src.settings, "RESOURCE_GOVERNOR_ENABLED", True)):
@@ -844,27 +822,11 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             "turn_id": turn_id,
             "plan_version": "v1",
         }
-        # Explicit task attempts carry task_id; ordinary chats carry the
-        # session workspace id instead.  The runner rebuilds the workspace
-        # tools from this id on every turn.
-        task_id = turn_task_id
+        # Ordinary chats carry the session workspace id; the runner rebuilds
+        # the workspace tools from this id on every turn.
         workspace_id = str(
             (getattr(turn, "trace_context", {}) or {}).get("workspace_id") or ""
         )
-        if task_id:
-            try:
-                emit(
-                    "stage",
-                    {
-                        "key": "task_context",
-                        "label": "任务上下文",
-                        "status": "running",
-                        "task_id": task_id,
-                        "turn_status": str(getattr(turn, "status", "") or ""),
-                    },
-                )
-            except Exception:
-                pass
         gen = _query_generator(
             pipeline,
             turn.query,
@@ -885,7 +847,6 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             action_scope=action_scope,
             knowledge_scope=knowledge_scope,
             knowledge_scope_resolver=knowledge_scope_resolver,
-            task_id=task_id,
             workspace_id=workspace_id,
             turn_id=turn_id,
         )
@@ -1206,7 +1167,7 @@ def create_turn(
     query_mode = "fast" if session.kb_name == GENERAL_CHAT_KB_NAME else "deep"
     enforce_admission(
         user,
-        session.department_id,
+        getattr(user, "tenant_id", None) or session.department_id,
         resource="deep" if query_mode == "deep" else "chat",
         model=admission_model_name(),
     )
@@ -1270,8 +1231,7 @@ def create_turn(
             )
     trace_context = inject_trace_context()
     # Workspace-first: a chat turn belongs to the session's workspace.  The
-    # workspace owns the hidden file tree and optional KB binding; there is no
-    # per-chat task anymore.  Explicit task APIs still attach task_id.
+    # workspace owns the hidden file tree and optional KB binding.
     from src.core.workspace_store import get_workspace_store
 
     workspace_store = get_workspace_store()
@@ -1283,9 +1243,14 @@ def create_turn(
             kind=kind,
             kb_name=session.kb_name if kind == "knowledge" else "",
             kb_id=getattr(session, "kb_id", None) if kind == "knowledge" else None,
+            tenant_id=user.tenant_id,
         )
         workspace_store.attach_session(workspace.id, session_id)
-    trace_context = {**trace_context, "workspace_id": workspace.id}
+    trace_context = {
+        **trace_context,
+        "workspace_id": workspace.id,
+        "tenant_id": getattr(user, "tenant_id", "default") or "default",
+    }
     try:
         turn = conv.create_turn(
             user.id,
@@ -1573,7 +1538,6 @@ def _query_generator(
     action_scope=None,
     knowledge_scope=None,
     knowledge_scope_resolver=None,
-    task_id="",
     workspace_id="",
     turn_id="",
 ):
@@ -1607,8 +1571,6 @@ def _query_generator(
             kwargs["knowledge_scope"] = knowledge_scope
         if "knowledge_scope_resolver" in params:
             kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
-        if "task_id" in params:
-            kwargs["task_id"] = task_id
         if "workspace_id" in params:
             kwargs["workspace_id"] = workspace_id
         if "turn_id" in params:
@@ -1645,8 +1607,6 @@ def _query_generator(
         kwargs["knowledge_scope"] = knowledge_scope
     if "knowledge_scope_resolver" in params:
         kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
-    if "task_id" in params:
-        kwargs["task_id"] = task_id
     if "workspace_id" in params:
         kwargs["workspace_id"] = workspace_id
     if "turn_id" in params:

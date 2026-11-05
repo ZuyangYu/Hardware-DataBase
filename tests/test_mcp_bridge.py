@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
 import httpx
 import pytest
 
@@ -23,27 +21,6 @@ def _reset(monkeypatch):
 
 def _use(handler):
     bridge._http = httpx.Client(transport=httpx.MockTransport(handler))
-
-
-def test_create_task_posts_to_tasks():
-    calls = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append((request.method, request.url.path, json.loads(request.content)))
-        assert request.headers["authorization"] == "Bearer test-token"
-        return httpx.Response(201, json={"task": {"id": "t1"}, "turn": {"id": "turn1"}})
-
-    _use(handler)
-    result = bridge.create_task("整理清单", kb_name="AAA", definition_id="review")
-    assert result["task"]["id"] == "t1"
-    method, path, body = calls[0]
-    assert method == "POST"
-    assert path == "/api/v1/tasks"
-    assert body == {
-        "query": "整理清单",
-        "kb_name": "AAA",
-        "definition_id": "review",
-    }
 
 
 def test_ask_knowledge_base_polls_until_terminal():

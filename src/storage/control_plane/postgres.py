@@ -375,8 +375,6 @@ class PostgresExecutionStore:
             ref.get("parse_status") in {"queued", "running"} for ref in attachment_refs
         )
         initial_status = "waiting_for_attachments" if waiting else "pending"
-        if (trace_context or {}).get("task_id"):
-            initial_status = "task_pending"
         required_ids = [ref["attachment_id"] for ref in attachment_refs]
 
         with self._tx() as conn:
@@ -1588,7 +1586,7 @@ class PostgresExecutionStore:
                     )
                 if not lease_valid:
                     conn.execute(
-                        "UPDATE chat_turns SET status = CASE WHEN trace_context_json::text LIKE '%%\"task_id\"%%' THEN 'task_pending' WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END, worker_id = '',"
+                        "UPDATE chat_turns SET status = CASE WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END, worker_id = '',"
                         " worker_heartbeat_at = NULL"
                         " WHERE id = %s AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')",
                         (str(turn_id),),
@@ -2089,7 +2087,7 @@ class PostgresExecutionStore:
                 cursor = conn.execute(
                     """
                     UPDATE chat_turns
-                    SET status = CASE WHEN trace_context_json::text LIKE '%%\"task_id\"%%' THEN 'task_pending' WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END,
+                    SET status = CASE WHEN knowledge_selection_hash <> '' THEN 'multi_kb_pending' ELSE 'pending' END,
                         worker_id = '', worker_heartbeat_at = NULL
                     WHERE id = %s AND status IN ('streaming', 'cancelling', 'multi_kb_streaming', 'multi_kb_cancelling')
                     """,

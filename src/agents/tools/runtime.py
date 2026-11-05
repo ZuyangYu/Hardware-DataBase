@@ -1262,7 +1262,19 @@ def timed_tool_call(
     with rt._lock:
         suppress_progress = getattr(rt, "_suppress_progress", 0) > 0
     if not suppress_progress:
-        if new_evidence or new_sources or (new_candidates and not admitted_items.budget_blocked):
+        # Empty/error SQL navigation must not reset the no-progress streak.
+        # Otherwise repeated zero-row SQL queries look like progress forever.
+        progress_neutral = bool(items) and all(
+            bool((item.metadata or {}).get("progress_neutral")) for item in items
+        )
+        if (
+            not progress_neutral
+            and (
+                new_evidence
+                or new_sources
+                or (new_candidates and not admitted_items.budget_blocked)
+            )
+        ):
             rt.note_progress()
         else:
             rt.note_no_progress()

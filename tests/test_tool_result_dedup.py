@@ -308,3 +308,28 @@ class ToolFailureMessageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NavigationProgressTests(unittest.TestCase):
+    def test_navigation_only_results_do_not_reset_no_progress(self):
+        rt = ToolRuntime(kb_name="kb", ctx=None)
+        nav = Evidence(
+            id="xlsx-sql:empty:1",
+            content="SQL 执行成功, 但结果为空(0 行)。",
+            source_name="覆盖表.xlsx",
+            content_kind="spreadsheet_sql_result",
+            processor_kind="spreadsheet_table",
+            score=0.0,
+            locator={},
+            metadata={
+                "evidence_role": "navigation",
+                "row_count": 0,
+                "progress_neutral": True,
+            },
+        )
+        timed_tool_call(
+            rt, "spreadsheet_sql_query", "SELECT * FROM t WHERE 1=0", None, lambda: [nav]
+        )
+        self.assertEqual(rt.evidence, [])
+        self.assertEqual(rt.no_progress_streak, 1)
+        self.assertFalse(rt.should_stop_for_no_progress())

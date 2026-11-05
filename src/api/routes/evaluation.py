@@ -198,7 +198,7 @@ def _admin_kb_summaries(
     # listing checks the role before returning backend names.
     ctx = RequestContext(user_id=actor.username, roles=[actor.role])
     existing = pipeline.list_all_knowledge_bases_for_admin(ctx=ctx)
-    return auth.list_knowledge_base_summaries(existing)
+    return auth.list_knowledge_base_summaries(existing, tenant_id=actor.tenant_id)
 
 
 def _validate_data_owner(binding: KnowledgeBaseBinding, auth: AuthService) -> str:
@@ -851,7 +851,7 @@ def preflight_run(
 
     enforce_admission(
         _actor,
-        getattr(_actor, "department_id", None),
+        getattr(_actor, "tenant_id", None) or getattr(_actor, "department_id", None),
         resource="evaluation",
         model=admission_model_name(),
     )
