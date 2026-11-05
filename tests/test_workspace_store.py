@@ -83,14 +83,3 @@ def test_workspace_scan_registers_new_out_files_once(tmp_path):
     assert second == []
     assert store.list_artifacts(workspace.id)[0].turn_id == "turn-a"
 
-
-def test_workspace_queries_are_tenant_scoped(tmp_path):
-    store = _store(tmp_path)
-    a = store.get_or_create_for_user(user_id=7, kind="general", tenant_id="tenant-a")
-    b = store.get_or_create_for_user(user_id=7, kind="general", tenant_id="tenant-b")
-
-    assert a.id != b.id
-    assert [item.id for item in store.list_workspaces(7, tenant_id="tenant-a")] == [a.id]
-    assert [item.id for item in store.list_workspaces(7, tenant_id="tenant-b")] == [b.id]
-    assert store.get_workspace(a.id, 7, tenant_id="tenant-a").id == a.id
-    assert store.get_workspace(a.id, 7, tenant_id="tenant-b") is None

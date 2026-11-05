@@ -55,11 +55,7 @@ def list_conversation_artifacts(
     if session is None:
         raise HTTPException(status_code=404, detail="session not found")
     workspace = workspace_store.get_workspace_for_session(session_id)
-    if (
-        workspace is None
-        or workspace.user_id != user.id
-        or workspace.tenant_id != getattr(user, "tenant_id", "default")
-    ):
+    if workspace is None or workspace.user_id != user.id:
         return {"items": []}
     items = [
         _artifact_view(artifact)
@@ -83,7 +79,6 @@ def download_artifact(
     workspace = workspace_store.get_workspace(
         artifact.workspace_id,
         user.id,
-        tenant_id=getattr(user, "tenant_id", "default"),
     )
     if workspace is None:
         raise HTTPException(status_code=404, detail="artifact not found")

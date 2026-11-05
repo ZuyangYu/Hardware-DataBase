@@ -31,7 +31,6 @@ def _user_view(u: AuthUser) -> AuthUserView:
         is_active=u.is_active,
         department_id=u.department_id,
         department_name=u.department_name,
-        tenant_id=u.tenant_id,
     )
 
 
@@ -61,7 +60,6 @@ def create_user(
         body.password,
         role=body.role,
         department_id=body.department_id,
-        tenant_id=body.tenant_id,
     )
     return _user_view(user)
 

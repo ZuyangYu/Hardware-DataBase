@@ -342,7 +342,6 @@ class WorkspaceStore:
         kind: str,
         kb_name: str = "",
         kb_id: int | None = None,
-        tenant_id: str = "default",
     ) -> Workspace:
         normalized_kind = "knowledge" if str(kind) == "knowledge" else "general"
         with self._connect() as conn:
@@ -350,15 +349,10 @@ class WorkspaceStore:
                 conn,
                 """
                 SELECT * FROM agent_workspaces
-                WHERE tenant_id = %s AND user_id = %s AND kind = %s AND kb_name = %s
+                WHERE user_id = %s AND kind = %s AND kb_name = %s
                 ORDER BY created_at LIMIT 1
                 """,
-                (
-                    str(tenant_id or "default"),
-                    int(user_id),
-                    normalized_kind,
-                    str(kb_name or ""),
-                ),
+                (int(user_id), normalized_kind, str(kb_name or "")),
             )
         if row is not None:
             return self._row_to_workspace(row)
@@ -373,23 +367,18 @@ class WorkspaceStore:
             name=name,
             kb_name=kb_name,
             kb_id=kb_id,
-            tenant_id=tenant_id,
         )
 
     def get_workspace(
         self,
         workspace_id: str,
         user_id: int | None = None,
-        tenant_id: str | None = None,
     ) -> Workspace | None:
         clauses = ["id = %s"]
         params: list[Any] = [str(workspace_id)]
         if user_id is not None:
             clauses.append("user_id = %s")
             params.append(int(user_id))
-        if tenant_id:
-            clauses.append("tenant_id = %s")
-            params.append(str(tenant_id))
         with self._connect() as conn:
             row = self._fetchone(
                 conn,
@@ -399,35 +388,19 @@ class WorkspaceStore:
         return self._row_to_workspace(row) if row is not None else None
 
     def list_workspaces(
-        self, user_id: int, limit: int = 100, tenant_id: str | None = None
+        self, user_id: int, limit: int = 100
     ) -> list[Workspace]:
         with self._connect() as conn:
-            if tenant_id:
-                rows = self._fetchall(
-                    conn,
-                    """
-                    SELECT * FROM agent_workspaces
-                    WHERE tenant_id = %s AND user_id = %s
-                    ORDER BY updated_at DESC, id DESC
-                    LIMIT %s
-                    """,
-                    (
-                        str(tenant_id),
-                        int(user_id),
-                        max(1, min(int(limit), 200)),
-                    ),
-                )
-            else:
-                rows = self._fetchall(
-                    conn,
-                    """
-                    SELECT * FROM agent_workspaces
-                    WHERE user_id = %s
-                    ORDER BY updated_at DESC, id DESC
-                    LIMIT %s
-                    """,
-                    (int(user_id), max(1, min(int(limit), 200))),
-                )
+            rows = self._fetchall(
+                conn,
+                """
+                SELECT * FROM agent_workspaces
+                WHERE user_id = %s
+                ORDER BY updated_at DESC, id DESC
+                LIMIT %s
+                """,
+                (int(user_id), max(1, min(int(limit), 200))),
+            )
         return [self._row_to_workspace(row) for row in rows]
 
     def attach_session(self, workspace_id: str, session_id: int) -> None:

@@ -25,7 +25,7 @@ def _kb_views(user: AuthUser, kbs: list[str], auth: AuthService) -> list[KbView]
     私有库(未共享)对其他员工必须连名字都不可见；system_admin 走治理视图，
     保留全部登记信息(无内容权限)。
     """
-    summaries = auth.list_knowledge_base_summaries(kbs, tenant_id=user.tenant_id)
+    summaries = auth.list_knowledge_base_summaries(kbs)
     perms = auth.get_kb_permissions_for_user(user)
     sysadmin = user.role == ROLE_SYSTEM_ADMIN
     views: list[KbView] = []

@@ -958,7 +958,6 @@ class MultiSourceAgentRunner:
 
                 workspace = get_workspace_store().get_workspace(
                     str(workspace_id),
-                    tenant_id=getattr(ctx, "tenant_id", None),
                 )
             except Exception:
                 workspace = None

@@ -281,7 +281,7 @@ def create_exports(
 
     enforce_admission(
         user,
-        getattr(user, "tenant_id", None) or getattr(user, "department_id", None),
+        getattr(user, "department_id", None),
         resource="export",
         model=admission_model_name(),
     )

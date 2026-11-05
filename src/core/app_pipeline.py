@@ -506,11 +506,7 @@ class AppPipeline:
             if auth_service.knowledge_base_exists(scope.kb_name, department_id=scope.department_id):
                 self._audit("create_kb", ctx, target_type="knowledge_base", target_id=name, kb_name=name, success=False, error_message="知识库已存在")
                 return False, "知识库已存在"
-            if ctx is not None and auth_service.knowledge_base_name_conflict(
-                scope.kb_name, str(getattr(ctx, "tenant_id", None) or "default")
-            ):
-                self._audit("create_kb", ctx, target_type="knowledge_base", target_id=name, kb_name=name, success=False, error_message="知识库名称已被其他租户使用")
-                return False, "知识库名称已被其他租户使用，请换一个名称"
+
 
             self._audit_requested(
                 "create_kb",

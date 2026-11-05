@@ -103,12 +103,13 @@ uv run python -m src.mcp_bridge.server
 外部 agent 通过 `ask_knowledge_base` 使用知识库。原始检索的 MCP 暴露需要
 新增一个受 token/ACL 约束的检索端点。
 
-## 多租户边界
+## 隔离边界
 
-- `tenants` 是租户根；`users / departments / knowledge_bases / workspaces`
-  都带 `tenant_id`。
-- 登录响应和 `RequestContext` 带 `tenant_id`；会话/工作区/KB 查询按租户过滤。
-- 平台管理员可创建租户、跨租户创建部门和账号；租户管理员只能操作本租户。
+- 本产品按 **用户** 隔离：`user_id` 是数据归属和权限边界。
+- 部门只是共享/可见性分组，不是租户容器。
+- 会话、workspace、artifact、KB 归属用户；部门共享是显式策略。
+- `RequestContext.tenant_id` 兼容字段使用 `str(user.id)`，供附件/导出/资源
+  governor 复用，不引入独立租户管理。
 - `WorkspaceStore` 默认跟随控制面：控制面是 PostgreSQL 时也用 PostgreSQL，
   避免多实例下 SQLite 分裂。
 - 解析文件与 workspace 派生文件是两套数据：解析文件只通过 KB 检索/引用访问，
@@ -121,10 +122,10 @@ uv run python -m src.mcp_bridge.server
 - **Workspace UI**：后端已有 workspace/session 映射；前端仍是知识库会话列表，
   下一阶段增加 workspace 切换和文件视图。
 - **对象存储**：解析文件/workspace 产物仍可能落本地；多副本 SaaS 需要接
-  S3/MinIO，并按 `tenant_id/workspace_id` 前缀隔离。
-- **KB 物理命名**：当前数据库按租户/部门隔离登记，但 RAGFlow 物理数据集名
-  仍需租户前缀或租户级命名空间，避免不同租户同名 KB 冲突。
-- **租户配额**：admission 已接收 tenant_id；per-tenant 并发/存储/token 配额
+  S3/MinIO，并按 `user_id/workspace_id` 前缀隔离。
+- **KB 物理命名**：当前数据库按部门隔离登记，但 RAGFlow 物理数据集名
+  仍需命名空间，避免同名 KB 冲突。
+- **并发配额**：admission 已接收 user id；per-user 并发/存储/token 配额
   仍需配置化。
 - **HITL**：尚无审批流；等执行能力接入后再对危险动作加审批。
 - **队列隔离**：显式 task 产品已移除；聊天 turn 使用交互 chat 资源类。

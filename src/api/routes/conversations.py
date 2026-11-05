@@ -250,9 +250,7 @@ def list_sessions(
         from src.core.workspace_store import get_workspace_store
 
         workspace_store = get_workspace_store()
-        workspace = workspace_store.get_workspace(
-            workspace_id, user.id, tenant_id=user.tenant_id
-        )
+        workspace = workspace_store.get_workspace(workspace_id, user.id)
         if workspace is None:
             raise HTTPException(status_code=404, detail="workspace not found")
         allowed = set(workspace_store.list_session_ids(workspace.id))
@@ -280,9 +278,7 @@ def create_session(
     workspace_store = get_workspace_store()
     workspace = None
     if body.workspace_id:
-        workspace = workspace_store.get_workspace(
-            body.workspace_id, user.id, tenant_id=user.tenant_id
-        )
+        workspace = workspace_store.get_workspace(body.workspace_id, user.id)
         if workspace is None:
             raise HTTPException(status_code=404, detail="workspace not found")
         kb_name = workspace.kb_name if workspace.kind == "knowledge" else GENERAL_CHAT_KB_NAME
@@ -316,7 +312,6 @@ def create_session(
             kind=kind,
             kb_name=kb_name if kind == "knowledge" else "",
             kb_id=ctx.metadata.get("kb_id") if kind == "knowledge" else None,
-            tenant_id=user.tenant_id,
         )
     workspace_store.attach_session(workspace.id, s.id)
     return _session_view(s, scope=scope, workspace_id=workspace.id)

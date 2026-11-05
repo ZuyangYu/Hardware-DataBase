@@ -64,7 +64,6 @@ def build_context_for_user(
     session_state = _SessionState(
         {
             "username": user.username,
-            "tenant_id": user.tenant_id,
             "department_id": user.department_id,
             # Resource scope defaults to the user's own department; AuthService
             # only ever grants permissions on KBs in that department.
@@ -74,9 +73,7 @@ def build_context_for_user(
     )
     if kb_name:
         session_state["current_kb_id"] = auth.get_knowledge_base_id(
-            kb_name,
-            department_id=user.department_id,
-            tenant_id=user.tenant_id,
+            kb_name, department_id=user.department_id
         )
     # Reuse the Streamlit path verbatim: it re-fetches the user from the DB
     # (picking up live role / active state) and assembles allowed_kbs /

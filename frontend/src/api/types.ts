@@ -8,7 +8,6 @@ export interface UserInfo {
   role: Role;
   department_id: number | null;
   department_name: string | null;
-  tenant_id?: string;
 }
 
 export interface LoginResponse {

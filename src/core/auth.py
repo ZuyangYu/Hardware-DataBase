@@ -2,7 +2,6 @@ import base64
 import hashlib
 import hmac
 import os
-import re
 import secrets
 import sqlite3
 import threading
@@ -42,15 +41,6 @@ class AuthUser:
     is_active: bool
     department_id: int | None = None
     department_name: str | None = None
-    tenant_id: str = "default"
-
-
-@dataclass
-class Tenant:
-    id: str
-    name: str
-    slug: str
-    created_at: str = ""
 
 
 @dataclass
@@ -128,7 +118,6 @@ class AuthService:
             with _AUTH_INIT_LOCK:
                 if init_key in _AUTH_INITIALIZED_DBS:
                     return
-                self._ensure_tenant_schema()
                 with closing(self._connect()) as conn:
                     self._ensure_default_department(conn)
                 self._ensure_default_admin()
@@ -148,55 +137,6 @@ class AuthService:
             self._init_db()
             self._ensure_default_admin()
             _AUTH_INITIALIZED_DBS.add(init_key)
-
-    def _ensure_tenant_schema(self) -> None:
-        """Add tenant columns to an existing auth domain (idempotent)."""
-
-        if getattr(self, "_backend", "sqlite") == "postgres":
-            with closing(self._connect()) as conn:
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS tenants (
-                        id TEXT PRIMARY KEY,
-                        name TEXT NOT NULL,
-                        slug TEXT NOT NULL UNIQUE,
-                        created_at TEXT NOT NULL
-                    )
-                    """
-                )
-                conn.execute(
-                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'"
-                )
-                conn.execute(
-                    "ALTER TABLE departments ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'"
-                )
-                conn.execute(
-                    "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'"
-                )
-                conn.execute(
-                    "INSERT INTO tenants (id, name, slug, created_at) VALUES ('default', 'Default Tenant', 'default', %s) "
-                    "ON CONFLICT (id) DO NOTHING",
-                    (utc_now(),),
-                )
-            return
-        with closing(self._connect()) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS tenants (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    slug TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            self._ensure_column(conn, "users", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
-            self._ensure_column(conn, "departments", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
-            self._ensure_column(conn, "knowledge_bases", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
-            conn.execute(
-                "INSERT OR IGNORE INTO tenants (id, name, slug, created_at) VALUES ('default', 'Default Tenant', 'default', ?)",
-                (utc_now(),),
-            )
 
     def _connect(self):
         if getattr(self, "_backend", "sqlite") == "postgres":
@@ -310,17 +250,8 @@ class AuthService:
     def _init_db(self):
         with closing(self._connect()) as conn:
             conn.execute("""
-                CREATE TABLE IF NOT EXISTS tenants (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    slug TEXT NOT NULL UNIQUE,
-                    created_at TEXT NOT NULL
-                )
-            """)
-            conn.execute("""
                 CREATE TABLE IF NOT EXISTS departments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tenant_id TEXT NOT NULL DEFAULT 'default',
                     name TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 )
@@ -328,7 +259,6 @@ class AuthService:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tenant_id TEXT NOT NULL DEFAULT 'default',
                     username TEXT NOT NULL UNIQUE,
                     password_hash TEXT NOT NULL,
                     role TEXT NOT NULL DEFAULT 'employee',
@@ -340,8 +270,6 @@ class AuthService:
                     FOREIGN KEY(department_id) REFERENCES departments(id)
                 )
             """)
-            self._ensure_column(conn, "users", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
-            self._ensure_column(conn, "departments", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
             self._ensure_column(conn, "users", "department_id", "INTEGER")
             self._ensure_column(conn, "users", "managed_by_env", "INTEGER NOT NULL DEFAULT 0")
             conn.execute(
@@ -378,7 +306,6 @@ class AuthService:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS knowledge_bases (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tenant_id TEXT NOT NULL DEFAULT 'default',
                     name TEXT NOT NULL,
                     department_id INTEGER,
                     owner_user_id INTEGER,
@@ -389,11 +316,6 @@ class AuthService:
                     FOREIGN KEY(owner_user_id) REFERENCES users(id)
                 )
             """)
-            self._ensure_column(conn, "knowledge_bases", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
-            conn.execute(
-                "INSERT OR IGNORE INTO tenants (id, name, slug, created_at) VALUES ('default', 'Default Tenant', 'default', ?)",
-                (utc_now(),),
-            )
             self._ensure_default_department(conn)
             self._ensure_column(conn, "knowledge_bases", "is_shared", "INTEGER NOT NULL DEFAULT 0")
             self._migrate_kb_scope_schema(conn)
@@ -406,7 +328,7 @@ class AuthService:
     def _ensure_default_department(self, conn):
         now = utc_now()
         conn.execute(
-            "INSERT OR IGNORE INTO departments (tenant_id, name, created_at) VALUES ('default', 'system', ?)",
+            "INSERT OR IGNORE INTO departments (name, created_at) VALUES ('system', ?)",
             (now,),
         )
 
@@ -431,7 +353,6 @@ class AuthService:
             conn.execute("""
                 CREATE TABLE knowledge_bases (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tenant_id TEXT NOT NULL DEFAULT 'default',
                     name TEXT NOT NULL,
                     department_id INTEGER,
                     owner_user_id INTEGER,
@@ -444,7 +365,6 @@ class AuthService:
             """)
             select_columns = [
                 "id",
-                "tenant_id" if "tenant_id" in kb_columns else "'default' AS tenant_id",
                 "name",
                 "department_id" if "department_id" in kb_columns else "NULL AS department_id",
                 "owner_user_id" if "owner_user_id" in kb_columns else "NULL AS owner_user_id",
@@ -452,7 +372,7 @@ class AuthService:
                 "created_at" if "created_at" in kb_columns else "'' AS created_at",
             ]
             conn.execute(f"""
-                INSERT OR IGNORE INTO knowledge_bases (id, tenant_id, name, department_id, owner_user_id, is_shared, created_at)
+                INSERT OR IGNORE INTO knowledge_bases (id, name, department_id, owner_user_id, is_shared, created_at)
                 SELECT {', '.join(select_columns)}
                 FROM knowledge_bases_old
             """)
@@ -489,8 +409,8 @@ class AuthService:
             try:
                 conn.execute(
                     """
-                    INSERT INTO users (username, tenant_id, password_hash, role, department_id, is_active, managed_by_env, created_at, updated_at)
-                    VALUES (?, 'default', ?, ?, ?, 1, 1, ?, ?)
+                    INSERT INTO users (username, password_hash, role, department_id, is_active, managed_by_env, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 1, 1, ?, ?)
                     """,
                     (username, hash_password(password), ROLE_SYSTEM_ADMIN, department_id, now, now),
                 )
@@ -515,7 +435,6 @@ class AuthService:
         password: str,
         role: str = ROLE_EMPLOYEE,
         department_id: int | None = None,
-        tenant_id: str | None = None,
     ) -> AuthUser:
         """Active administrators can create staff or additional administrators.
 
@@ -529,29 +448,8 @@ class AuthService:
                 raise PermissionError("只有启用的系统管理员可以创建账号。")
             if role not in VALID_ROLES:
                 raise ValueError("角色必须为 system_admin 或 employee")
-            target_tenant = str(tenant_id or actor.tenant_id or "default")
-            if target_tenant != actor.tenant_id and actor.username != src.settings.AUTH_DEFAULT_ADMIN_USERNAME:
-                raise PermissionError("只有平台管理员可以跨租户创建账号。")
-            with closing(self._connect()) as _conn:
-                tenant_row = _conn.execute(
-                    "SELECT 1 FROM tenants WHERE id = ?", (target_tenant,)
-                ).fetchone()
-            if tenant_row is None:
-                raise ValueError("租户不存在")
             system_department_id = self._system_department_id()
-            if department_id is not None:
-                with closing(self._connect()) as _conn:
-                    dept_row = _conn.execute(
-                        "SELECT tenant_id FROM departments WHERE id = ?",
-                        (int(department_id),),
-                    ).fetchone()
-                if dept_row is None:
-                    raise ValueError("部门不存在")
-                if str(dept_row["tenant_id"] or "default") != target_tenant:
-                    raise ValueError("部门不属于目标租户")
             if role == ROLE_SYSTEM_ADMIN:
-                if target_tenant != "default":
-                    raise ValueError("跨租户系统管理员初始化尚未支持，请先创建租户员工")
                 if department_id is not None and department_id != system_department_id:
                     raise ValueError("系统管理员不能归属业务部门")
                 department_id = system_department_id
@@ -565,9 +463,7 @@ class AuthService:
                 target_id=username.strip(),
                 metadata={"role": role, "scope": scope},
             )
-            created = self._create_user_record(
-                username, password, role, department_id, tenant_id=target_tenant
-            )
+            created = self._create_user_record(username, password, role, department_id)
         except Exception as exc:
             self._audit(
                 "create_user",
@@ -593,15 +489,7 @@ class AuthService:
             dept = conn.execute("SELECT id FROM departments WHERE name = 'system'").fetchone()
         return dept["id"] if dept else None
 
-    def _create_user_record(
-        self,
-        username: str,
-        password: str,
-        role: str = ROLE_EMPLOYEE,
-        department_id: int | None = None,
-        *,
-        tenant_id: str = "default",
-    ) -> AuthUser:
+    def _create_user_record(self, username: str, password: str, role: str = ROLE_EMPLOYEE, department_id: int | None = None) -> AuthUser:
         username = username.strip()
         if not username:
             raise ValueError("用户名不能为空")
@@ -619,11 +507,11 @@ class AuthService:
                 department_id = dept["id"] if dept else None
             inserted = conn.execute(
                 """
-                INSERT INTO users (username, tenant_id, password_hash, role, department_id, is_active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+                INSERT INTO users (username, password_hash, role, department_id, is_active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 1, ?, ?)
                 ON CONFLICT(username) DO NOTHING RETURNING id
                 """,
-                (username, str(tenant_id or "default"), hash_password(password), role, department_id, now, now),
+                (username, hash_password(password), role, department_id, now, now),
             ).fetchone()
             if inserted is None:
                 raise ValueError("用户名已存在")
@@ -837,42 +725,24 @@ class AuthService:
             target_id=actor.username if actor else "",
         )
 
-    def list_users(self, tenant_id: str | None = None) -> list[AuthUser]:
+    def list_users(self) -> list[AuthUser]:
         with closing(self._connect()) as conn:
-            if tenant_id:
-                rows = conn.execute(
-                    """
-                    SELECT u.*, d.name AS department_name
-                    FROM users u
-                    LEFT JOIN departments d ON d.id = u.department_id
-                    WHERE u.tenant_id = ?
-                    ORDER BY u.id
-                    """,
-                    (str(tenant_id),),
-                ).fetchall()
-            else:
-                rows = conn.execute("""
-                    SELECT u.*, d.name AS department_name
-                    FROM users u
-                    LEFT JOIN departments d ON d.id = u.department_id
-                    ORDER BY u.id
-                """).fetchall()
+            rows = conn.execute("""
+                SELECT u.*, d.name AS department_name
+                FROM users u
+                LEFT JOIN departments d ON d.id = u.department_id
+                ORDER BY u.id
+            """).fetchall()
         return [row_to_user(row) for row in rows]
 
     def list_users_as(self, actor: AuthUser) -> list[AuthUser]:
         if actor.role == ROLE_SYSTEM_ADMIN:
-            return self.list_users(tenant_id=actor.tenant_id)
+            return self.list_users()
         raise PermissionError("User listing requires the system administrator role.")
 
-    def list_departments(self, tenant_id: str | None = None) -> list[Department]:
+    def list_departments(self) -> list[Department]:
         with closing(self._connect()) as conn:
-            if tenant_id:
-                rows = conn.execute(
-                    "SELECT * FROM departments WHERE tenant_id = ? ORDER BY id",
-                    (str(tenant_id),),
-                ).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM departments ORDER BY id").fetchall()
+            rows = conn.execute("SELECT * FROM departments ORDER BY id").fetchall()
         return [Department(id=int(row["id"]), name=row["name"]) for row in rows]
 
     def set_user_active(self, user_id: int, is_active: bool):
@@ -1052,85 +922,30 @@ class AuthService:
             target_id=user.username,
         )
 
-    def create_tenant(self, name: str, slug: str | None = None) -> Tenant:
-        """Create an isolation boundary. Intended for platform operators."""
-
-        safe_name = str(name or "").strip()
-        if not safe_name:
-            raise ValueError("tenant name cannot be empty")
-        tenant_id = uuid.uuid4().hex
-        safe_slug = str(slug or safe_name).strip().lower()
-        safe_slug = re.sub(r"[^a-z0-9_-]+", "-", safe_slug).strip("-") or tenant_id[:12]
-        now = utc_now()
-        with closing(self._connect()) as conn:
-            try:
-                conn.execute(
-                    "INSERT INTO tenants (id, name, slug, created_at) VALUES (?, ?, ?, ?)",
-                    (tenant_id, safe_name, safe_slug, now),
-                )
-            except Exception:
-                # Keep tenant provisioning idempotent by slug.
-                row = conn.execute(
-                    "SELECT * FROM tenants WHERE slug = ?", (safe_slug,)
-                ).fetchone()
-                if row is None:
-                    raise
-                return Tenant(
-                    id=str(row["id"]),
-                    name=str(row["name"]),
-                    slug=str(row["slug"]),
-                    created_at=str(row["created_at"]),
-                )
-        return Tenant(id=tenant_id, name=safe_name, slug=safe_slug, created_at=now)
-
-    def list_tenants(self) -> list[Tenant]:
-        with closing(self._connect()) as conn:
-            rows = conn.execute("SELECT * FROM tenants ORDER BY created_at").fetchall()
-        return [
-            Tenant(
-                id=str(row["id"]),
-                name=str(row["name"]),
-                slug=str(row["slug"]),
-                created_at=str(row["created_at"]),
-            )
-            for row in rows
-        ]
-
-    def create_department(self, name: str, tenant_id: str = "default") -> Department:
+    def create_department(self, name: str) -> Department:
         name = name.strip()
         if not name:
             raise ValueError("部门名称不能为空")
         with closing(self._connect()) as conn:
             conn.execute(
-                "INSERT INTO departments (tenant_id, name, created_at) VALUES (?, ?, ?)",
-                (str(tenant_id or "default"), name, utc_now()),
+                "INSERT INTO departments (name, created_at) VALUES (?, ?)",
+                (name, utc_now()),
             )
-            row = conn.execute(
-                "SELECT * FROM departments WHERE tenant_id = ? AND name = ?",
-                (str(tenant_id or "default"), name),
-            ).fetchone()
+            row = conn.execute("SELECT * FROM departments WHERE name = ?", (name,)).fetchone()
         self._mirror_control_plane_row("departments", int(row["id"]))
         return Department(id=int(row["id"]), name=row["name"])
 
-    def create_department_as(
-        self, actor: AuthUser, name: str, tenant_id: str | None = None
-    ) -> Department:
+    def create_department_as(self, actor: AuthUser, name: str) -> Department:
         try:
             if actor.role != ROLE_SYSTEM_ADMIN:
                 raise PermissionError("Department creation requires a system administrator role.")
-            target_tenant = str(tenant_id or actor.tenant_id or "default")
-            if (
-                target_tenant != actor.tenant_id
-                and actor.username != src.settings.AUTH_DEFAULT_ADMIN_USERNAME
-            ):
-                raise PermissionError("只有平台管理员可以跨租户创建部门。")
             self._audit_requested(
                 "create_department",
                 actor=actor,
                 target_type="department",
                 target_id=name.strip(),
             )
-            dept = self.create_department(name, tenant_id=target_tenant)
+            dept = self.create_department(name)
         except Exception as exc:
             self._audit(
                 "create_department",
@@ -1205,28 +1020,18 @@ class AuthService:
         kb_name: str | None = None,
         department_id: int | str | None = None,
         kb_id: int | None = None,
-        tenant_id: str | None = None,
     ):
-        tenant_filter = " AND tenant_id = ?" if tenant_id else ""
-        tenant_params = (str(tenant_id),) if tenant_id else ()
         if kb_id is not None:
-            return conn.execute(
-                "SELECT * FROM knowledge_bases WHERE id = ?" + tenant_filter,
-                (kb_id, *tenant_params),
-            ).fetchone()
+            return conn.execute("SELECT * FROM knowledge_bases WHERE id = ?", (kb_id,)).fetchone()
         if kb_name is None:
             return None
         kb_name = kb_name.strip()
         if department_id not in (None, ""):
             return conn.execute(
-                "SELECT * FROM knowledge_bases WHERE name = ? AND department_id = ?"
-                + tenant_filter,
-                (kb_name, int(department_id), *tenant_params),
+                "SELECT * FROM knowledge_bases WHERE name = ? AND department_id = ?",
+                (kb_name, int(department_id)),
             ).fetchone()
-        rows = conn.execute(
-            "SELECT * FROM knowledge_bases WHERE name = ?" + tenant_filter,
-            (kb_name, *tenant_params),
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM knowledge_bases WHERE name = ?", (kb_name,)).fetchall()
         if len(rows) > 1:
             raise ValueError(f"Ambiguous knowledge base name without department scope: {kb_name}")
         return rows[0] if rows else None
@@ -1236,28 +1041,14 @@ class AuthService:
         kb_name = kb_name.strip()
         department_id = owner.department_id if owner else None
         owner_id = owner.id if owner else None
-        tenant_id = owner.tenant_id if owner is not None else "default"
         with closing(self._connect()) as conn:
             conn.execute(
                 """
-                INSERT OR IGNORE INTO knowledge_bases (tenant_id, name, department_id, owner_user_id, is_shared, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO knowledge_bases (name, department_id, owner_user_id, is_shared, created_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (tenant_id, kb_name, department_id, owner_id, 1 if is_shared else 0, utc_now()),
+                (kb_name, department_id, owner_id, 1 if is_shared else 0, utc_now()),
             )
-
-    def knowledge_base_name_conflict(self, kb_name: str, tenant_id: str) -> bool:
-        """Return whether another tenant already owns this physical KB name.
-
-        RAGFlow datasets are still keyed by ``name`` globally.  Until physical
-        namespacing lands, reject cross-tenant reuse instead of colliding.
-        """
-        with closing(self._connect()) as conn:
-            row = conn.execute(
-                "SELECT 1 FROM knowledge_bases WHERE name = ? AND tenant_id <> ? LIMIT 1",
-                (str(kb_name), str(tenant_id or "default")),
-            ).fetchone()
-        return row is not None
 
     def knowledge_base_exists(
         self,
@@ -1273,10 +1064,9 @@ class AuthService:
         kb_name: str,
         department_id: int | str | None = None,
         kb_id: int | None = None,
-        tenant_id: str | None = None,
     ) -> int | None:
         with closing(self._connect()) as conn:
-            row = self._get_kb_row(conn, kb_name, department_id, kb_id, tenant_id)
+            row = self._get_kb_row(conn, kb_name, department_id, kb_id)
         return int(row["id"]) if row else None
 
     def get_knowledge_base_identity(self, kb_id: int) -> KnowledgeBaseIdentity | None:
@@ -1396,9 +1186,7 @@ class AuthService:
             rows = conn.execute("SELECT name FROM knowledge_bases ORDER BY name").fetchall()
         return [row["name"] for row in rows]
 
-    def list_knowledge_base_summaries(
-        self, existing_kbs: list[str], tenant_id: str | None = None
-    ) -> list[KnowledgeBaseSummary]:
+    def list_knowledge_base_summaries(self, existing_kbs: list[str]) -> list[KnowledgeBaseSummary]:
         existing = set(existing_kbs)
         summaries: dict[str, KnowledgeBaseSummary] = {}
         with closing(self._connect()) as conn:
@@ -1414,10 +1202,8 @@ class AuthService:
                     (ROLE_EMPLOYEE,),
                 ).fetchall()
             }
-            where = "WHERE kb.tenant_id = ?" if tenant_id else ""
-            params = (str(tenant_id),) if tenant_id else ()
             rows = conn.execute(
-                f"""
+                """
                 SELECT
                     kb.id,
                     kb.name,
@@ -1430,10 +1216,8 @@ class AuthService:
                 FROM knowledge_bases kb
                 LEFT JOIN departments d ON d.id = kb.department_id
                 LEFT JOIN users owner ON owner.id = kb.owner_user_id
-                {where}
                 ORDER BY d.name, kb.name
-                """,
-                params,
+                """
             ).fetchall()
 
         for row in rows:
@@ -1571,10 +1355,10 @@ class AuthService:
             rows = conn.execute(
                 """
                 SELECT name FROM knowledge_bases
-                WHERE department_id = ? AND tenant_id = ?
+                WHERE department_id = ?
                   AND (is_shared = 1 OR owner_user_id IS NULL OR owner_user_id = ?)
                 """,
-                (user.department_id, user.tenant_id, user.id),
+                (user.department_id, user.id),
             ).fetchall()
         allowed = {row["name"] for row in rows}
         return [kb for kb in existing_kbs if kb in allowed]
@@ -1597,10 +1381,10 @@ class AuthService:
             rows = conn.execute(
                 """
                 SELECT name, department_id FROM knowledge_bases
-                WHERE department_id = ? AND tenant_id = ?
+                WHERE department_id = ?
                   AND (is_shared = 1 OR owner_user_id IS NULL OR owner_user_id = ?)
                 """,
-                (user.department_id, user.tenant_id, user.id),
+                (user.department_id, user.id),
             ).fetchall()
         for row in rows:
             if existing_filter is not None and row["name"] not in existing_filter:
@@ -1681,11 +1465,6 @@ def row_to_user(row) -> AuthUser:
         is_active=bool(row["is_active"]),
         department_id=row["department_id"] if "department_id" in row.keys() else None,
         department_name=row["department_name"] if "department_name" in row.keys() else None,
-        tenant_id=(
-            str(row["tenant_id"] or "default")
-            if "tenant_id" in row.keys()
-            else "default"
-        ),
     )
 
 
@@ -1703,7 +1482,6 @@ def anonymous_user_id(session_id: str) -> str:
 def build_request_context(session_state) -> RequestContext:
     session_id = ensure_session_id(session_state)
     username = session_state.get("username")
-    tenant_id = session_state.get("tenant_id")
     department_id = session_state.get("department_id")
     kb_id = session_state.get("current_kb_id")
     resource_department_id = session_state.get("current_kb_department_id")
@@ -1727,9 +1505,7 @@ def build_request_context(session_state) -> RequestContext:
             roles=[user.role],
             allowed_kbs=sorted(key for key in kb_permissions if ":" not in key),
             kb_permissions=kb_permissions,
-            tenant_id=str(user.tenant_id or tenant_id or "default"),
             metadata={
-                "tenant_id": str(user.tenant_id or tenant_id or "default"),
                 "actor_department_id": department_id,
                 "resource_department_id": resource_department_id,
                 "department_id": resource_department_id,

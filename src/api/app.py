@@ -44,7 +44,6 @@ from src.api.routes import (
     status,
     sandbox,
     structured,
-    tenants,
     upload,
     users,
     wiki,
@@ -334,7 +333,6 @@ def create_app() -> FastAPI:
     app.include_router(attachments.router, prefix=api_v1)
     app.include_router(conversations.router, prefix=api_v1)
     app.include_router(workspaces.router, prefix=api_v1)
-    app.include_router(tenants.router, prefix=api_v1)
     app.include_router(kbs.router, prefix=api_v1)
     app.include_router(files.router, prefix=api_v1)
     app.include_router(parse_tasks.router, prefix=api_v1)

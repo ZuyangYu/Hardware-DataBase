@@ -28,7 +28,6 @@ def login(
             role=u.role,
             department_id=u.department_id,
             department_name=u.department_name,
-            tenant_id=u.tenant_id,
         ),
     )
 
@@ -40,7 +39,6 @@ def whoami(user=Depends(current_user)) -> UserInfo:
         role=user.role,
         department_id=user.department_id,
         department_name=user.department_name,
-        tenant_id=user.tenant_id,
     )
 
 

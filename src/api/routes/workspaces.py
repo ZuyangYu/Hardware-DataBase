@@ -29,7 +29,6 @@ class CreateWorkspaceRequest(BaseModel):
 
 class WorkspaceView(BaseModel):
     id: str
-    tenant_id: str
     user_id: int
     kind: str
     name: str
@@ -43,7 +42,6 @@ class WorkspaceView(BaseModel):
 def _workspace_view(store: WorkspaceStore, workspace) -> WorkspaceView:
     return WorkspaceView(
         id=workspace.id,
-        tenant_id=workspace.tenant_id,
         user_id=workspace.user_id,
         kind=workspace.kind,
         name=workspace.name,
@@ -64,10 +62,7 @@ def list_workspaces(
     user: AuthUser = Depends(current_user),
     store: WorkspaceStore = Depends(get_workspace_store),
 ) -> list[WorkspaceView]:
-    return [
-        _workspace_view(store, item)
-        for item in store.list_workspaces(user.id, tenant_id=user.tenant_id)
-    ]
+    return [_workspace_view(store, item) for item in store.list_workspaces(user.id)]
 
 
 @router.post("/workspaces", response_model=WorkspaceView, status_code=201)
@@ -96,7 +91,6 @@ def create_workspace(
         name=body.name,
         kb_name=kb_name,
         kb_id=kb_id,
-        tenant_id=user.tenant_id,
     )
     return _workspace_view(store, workspace)
 
@@ -107,9 +101,7 @@ def get_workspace(
     user: AuthUser = Depends(current_user),
     store: WorkspaceStore = Depends(get_workspace_store),
 ) -> WorkspaceView:
-    workspace = store.get_workspace(
-        workspace_id, user.id, tenant_id=user.tenant_id
-    )
+    workspace = store.get_workspace(workspace_id, user.id)
     if workspace is None:
         raise HTTPException(status_code=404, detail="workspace not found")
     return _workspace_view(store, workspace)
@@ -123,9 +115,7 @@ def list_workspace_sessions(
     store: WorkspaceStore = Depends(get_workspace_store),
     conv: ConversationService = Depends(_conv_service),
 ):
-    workspace = store.get_workspace(
-        workspace_id, user.id, tenant_id=user.tenant_id
-    )
+    workspace = store.get_workspace(workspace_id, user.id)
     if workspace is None:
         raise HTTPException(status_code=404, detail="workspace not found")
     sessions = []

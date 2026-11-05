@@ -1167,7 +1167,7 @@ def create_turn(
     query_mode = "fast" if session.kb_name == GENERAL_CHAT_KB_NAME else "deep"
     enforce_admission(
         user,
-        getattr(user, "tenant_id", None) or session.department_id,
+        str(user.id),
         resource="deep" if query_mode == "deep" else "chat",
         model=admission_model_name(),
     )
@@ -1243,13 +1243,12 @@ def create_turn(
             kind=kind,
             kb_name=session.kb_name if kind == "knowledge" else "",
             kb_id=getattr(session, "kb_id", None) if kind == "knowledge" else None,
-            tenant_id=user.tenant_id,
         )
         workspace_store.attach_session(workspace.id, session_id)
     trace_context = {
         **trace_context,
         "workspace_id": workspace.id,
-        "tenant_id": getattr(user, "tenant_id", "default") or "default",
+        "tenant_id": str(user.id),
     }
     try:
         turn = conv.create_turn(

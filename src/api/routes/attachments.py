@@ -133,7 +133,7 @@ async def upload_attachment(
             service,
             session_id=session_id,
             user_id=user.id,
-            tenant_id=user.tenant_id,
+            tenant_id=str(user.id),
             file=file,
             client_request_id=client_request_id,
             usage_hint=usage_hint,
