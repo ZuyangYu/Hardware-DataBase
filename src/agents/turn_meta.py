@@ -393,7 +393,11 @@ def _agent_recursion_limit(
 
 
 def _research_subagent_spec(
-    *, tools: list[Any], model: Any, skill_root: str | None = None
+    *,
+    tools: list[Any],
+    model: Any,
+    skill_root: str | None = None,
+    skill_read_observer: Callable[..., None] | None = None,
 ) -> dict[str, Any] | None:
     """Build a read-only research subagent for delegated source exploration."""
 
@@ -419,7 +423,10 @@ def _research_subagent_spec(
         "model": model,
         "middleware": [
             # Subagents inherit the backend; keep read_file gated the same way.
-            SkillReadGateMiddleware(enabled=bool(skill_root))
+            SkillReadGateMiddleware(
+                enabled=bool(skill_root),
+                observer=skill_read_observer,
+            )
         ],
     }
 

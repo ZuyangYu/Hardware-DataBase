@@ -86,3 +86,47 @@ def test_read_file_reads_materialized_skill_in_real_agent_graph(tmp_path):
     assert tool_messages
     assert "PROBE_SKILL_BODY" in str(tool_messages[0].content)
     assert result["messages"][-1].content == "skill read complete"
+
+
+def test_read_file_observer_reports_skill_body_read(tmp_path):
+    skill_root = tmp_path / "skills"
+    skill_dir = skill_root / "skill-hw-review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: skill-hw-review\ndescription: Review hardware\n---\n\n"
+        "PROBE_SKILL_BODY: check power, clock and storage.\n",
+        encoding="utf-8",
+    )
+    model = _ToolFakeModel(
+        messages=iter(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "read_file",
+                            "args": {"file_path": "/skill-hw-review/SKILL.md"},
+                            "id": "read-skill-1",
+                        }
+                    ],
+                ),
+                AIMessage(content="skill read complete"),
+            ]
+        )
+    )
+    events: list[dict] = []
+    agent = build_agent(
+        model=model,
+        tools=[],
+        system_prompt="You are a hardware assistant.",
+        skill_root=str(skill_root),
+        skill_read_observer=lambda **event: events.append(event),
+    )
+
+    agent.invoke({"messages": [{"role": "user", "content": "read the skill"}]})
+
+    assert [event["phase"] for event in events] == ["started", "finished"]
+    assert events[0]["call_id"] == "read-skill-1"
+    assert events[0]["path"] == "/skill-hw-review/SKILL.md"
+    assert events[1]["status"] == "done"
+    assert events[1]["result_bytes"] > 0

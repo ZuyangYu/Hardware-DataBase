@@ -1448,6 +1448,30 @@ class MultiSourceAgentRunner:
         direct_control_answer = plan.direct_control_answer
         direct_answer_grounding = plan.direct_answer_grounding
         skill_root = plan.skill_root
+        if skill_root:
+            try:
+                import os as _os
+                from pathlib import Path as _Path
+
+                skill_names = sorted(
+                    item.name
+                    for item in _Path(skill_root).iterdir()
+                    if item.is_dir()
+                )
+                emit_event(
+                    {
+                        "type": "stage",
+                        "payload": {
+                            "key": "skill_loaded",
+                            "label": "Skill 已挂载",
+                            "status": "running",
+                            "root": _os.path.basename(skill_root),
+                            "skills": skill_names,
+                        },
+                    }
+                )
+            except Exception:
+                pass
 
         # General-agent task mode: a durable task supplies the workspace and an
         # *optional* external definition; there is no fixed workflow here.
@@ -1577,6 +1601,41 @@ class MultiSourceAgentRunner:
         if show_turn_meta:
             emit_event({"type": "budget", "payload": dict(budget_state)})
 
+        def _observe_skill_read(
+            *,
+            phase: str,
+            call_id: str,
+            path: str,
+            status: str = "done",
+            result_bytes: int = 0,
+            error: str = "",
+        ) -> None:
+            parts = [part for part in str(path or "").split("/") if part]
+            skill_ref = ""
+            if parts and parts[0].startswith("skill-"):
+                # The materializer maps ``skill/foo`` to the directory
+                # ``skill-foo``.  Restore the catalog ref for the audit trail.
+                # This also covers supporting files under the same Skill.
+                skill_ref = f"skill/{parts[0][len('skill-'):]}"
+            if phase == "started":
+                rt.tool_started(
+                    call_id=call_id or "read_file",
+                    tool_name="read_file",
+                    tool_kind="workspace",
+                    query=path,
+                    skill_ref=skill_ref,
+                )
+                return
+            rt.tool_result(
+                call_id=call_id or "read_file",
+                tool_name="read_file",
+                tool_kind="workspace",
+                status=status or "done",
+                result_bytes=result_bytes,
+                error=error,
+                skill_ref=skill_ref,
+            )
+
         agent_subagents: list[dict[str, Any]] | None = None
         if (
             RESEARCH_SUBAGENT_ENABLED
@@ -1584,7 +1643,10 @@ class MultiSourceAgentRunner:
             and str(budget_state["complexity"].get("level") or "simple") == "complex"
         ):
             research = _research_subagent_spec(
-                tools=plan.execution_tools, model=model, skill_root=skill_root
+                tools=plan.execution_tools,
+                model=model,
+                skill_root=skill_root,
+                skill_read_observer=_observe_skill_read,
             )
             if research is not None:
                 agent_subagents = [research]
@@ -1648,6 +1710,7 @@ class MultiSourceAgentRunner:
             subagents=agent_subagents,
             session_state_text=getattr(rt, "session_state_text", ""),
             skill_root=skill_root,
+            skill_read_observer=_observe_skill_read,
             middleware=agent_middleware,
             factory=create_deep_agent,
         )

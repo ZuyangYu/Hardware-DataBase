@@ -26,6 +26,7 @@ def build_agent(
     subagents: Sequence[Any] | None = None,
     session_state_text: str = "",
     skill_root: str | None = None,
+    skill_read_observer: Callable[..., None] | None = None,
     middleware: Sequence[Any] | None = None,
     factory: Callable[..., Any] = default_create_deep_agent,
 ) -> Any:
@@ -40,7 +41,12 @@ def build_agent(
     stack = list(middleware or [])
     # The official SkillsMiddleware reads SKILL.md through read_file.  Keep
     # that tool only on turns with a materialized, read-only skill root.
-    stack.append(SkillReadGateMiddleware(enabled=bool(skill_root)))
+    stack.append(
+        SkillReadGateMiddleware(
+            enabled=bool(skill_root),
+            observer=skill_read_observer,
+        )
+    )
     if session_state_text:
         # Innermost: append after any other middleware that rewrites the
         # system message, so the continuity block is never lost.

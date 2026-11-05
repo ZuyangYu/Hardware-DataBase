@@ -31,10 +31,27 @@ def _skill_name(skill_ref: str) -> str:
 
 
 def _description(content: str, skill_ref: str) -> str:
-    for line in str(content or "").splitlines():
-        text = line.strip().lstrip("#").strip()
-        if text and not text.startswith("---"):
-            return text[:200]
+    """Return the skill's real description, not a YAML metadata key."""
+
+    text = str(content or "")
+    if text.startswith("---"):
+        parts = text.split("---", 2)
+        if len(parts) == 3:
+            for line in parts[1].splitlines():
+                key, _, value = line.partition(":")
+                if key.strip().lower() == "description":
+                    value = value.strip().strip("\"'")
+                    if value:
+                        return value[:200]
+            text = parts[2]
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("---"):
+            continue
+        # Skip any remaining YAML metadata keys (name:, version:, ...).
+        if re.match(r"^[A-Za-z0-9_-]+:", line):
+            continue
+        return line[:200]
     return f"Hardware knowledge skill {skill_ref}"[:200]
 
 
@@ -135,8 +152,13 @@ def materialize_text_skills(
             )
         if not entries:
             return None
+        # Include the rendered markdown in the cache key: a metadata-only
+        # change (e.g. a fixed description) must invalidate the cached copy.
         fingerprint = hashlib.sha256(
-            "|".join(f"{name}:{digest}" for name, _, digest in sorted(entries)).encode()
+            "|".join(
+                f"{name}:{digest}:{hashlib.sha256(markdown.encode('utf-8')).hexdigest()}"
+                for name, markdown, digest in sorted(entries)
+            ).encode()
         ).hexdigest()[:20]
         target = root or os.path.join(
             str(settings.STORAGE_DIR), "skill_materialized", fingerprint
