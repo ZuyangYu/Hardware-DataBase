@@ -7,10 +7,12 @@ import {
   downloadTaskArtifact,
   getTask,
   listTaskDefinitions,
+  listTaskEvents,
   listTasks,
   stopTask,
   type TaskArtifactView,
   type TaskDefinitionView,
+  type TaskEventView,
   type TaskView,
 } from '../api/tasks';
 import AppHeader from '@/components/AppHeader';
@@ -75,6 +77,7 @@ export default function TasksPage({ kbs }: Props) {
   const [definitions, setDefinitions] = useState<TaskDefinitionView[]>([]);
   const [selectedId, setSelectedId] = useState('');
   const [task, setTask] = useState<TaskView | null>(null);
+  const [events, setEvents] = useState<TaskEventView[]>([]);
   const [query, setQuery] = useState('');
   const [kbName, setKbName] = useState('__general__');
   const [definitionId, setDefinitionId] = useState('');
@@ -86,6 +89,12 @@ export default function TasksPage({ kbs }: Props) {
     try {
       const next = await getTask(taskId);
       setTask(next);
+      try {
+        const timeline = await listTaskEvents(taskId, 100);
+        setEvents(timeline.items);
+      } catch {
+        // Timeline is supplementary; task detail is still useful without it.
+      }
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '加载任务失败');
     }
@@ -310,6 +319,41 @@ export default function TasksPage({ kbs }: Props) {
                     </div>
                   ))}
                 </div>
+              ) : null}
+
+              {task.verification?.checks?.length ? (
+                <div>
+                  <div className="mb-[6px] text-[12px] font-medium text-[#4d5872]">验收</div>
+                  <div className="space-y-[4px] rounded-[10px] bg-[#f7f8fb] p-[10px]">
+                    {task.verification.checks.map((check) => (
+                      <div key={check.id} className="flex items-center justify-between gap-[8px] text-[12px]">
+                        <span className="text-[#4d5872]">{check.label}</span>
+                        <span className={check.status === 'pass' ? 'text-[#28784f]' : 'text-[#99620b]'}>
+                          {check.status === 'pass' ? '通过' : '注意'} · {check.detail}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              {events.length > 0 ? (
+                <details className="rounded-[10px] border border-[#eef1f7] p-[10px]">
+                  <summary className="cursor-pointer text-[12px] font-medium text-[#4d5872]">
+                    执行记录（{events.length}）
+                  </summary>
+                  <div className="mt-[6px] max-h-[200px] space-y-[3px] overflow-auto">
+                    {events.slice(-30).map((event, index) => (
+                      <div
+                        key={`${event.turn_id}-${event.seq}-${index}`}
+                        className="truncate text-[11px] text-[#7b849c]"
+                      >
+                        {event.type}
+                        {typeof event.payload?.tool_name === 'string' ? ` · ${event.payload.tool_name}` : ''}
+                      </div>
+                    ))}
+                  </div>
+                </details>
               ) : null}
 
               {turn ? (

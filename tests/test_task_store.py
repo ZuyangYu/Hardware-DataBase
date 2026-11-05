@@ -91,3 +91,17 @@ def test_artifact_version_and_path_guard(store, tmp_path):
     outside.write_text("secret", encoding="utf-8")
     with pytest.raises(ValueError):
         store.register_artifact(task.id, str(outside))
+
+
+def test_verification_roundtrip(store):
+    task = store.create_task(
+        user_id=1,
+        session_id=2,
+        kb_name="AAA",
+        title="verify",
+        definition_id="",
+        query="q",
+    )
+    payload = {"status": "warn", "checks": [{"id": "citations", "status": "warn"}]}
+    store.set_verification(task.id, payload)
+    assert store.get_task(task.id).verification == payload

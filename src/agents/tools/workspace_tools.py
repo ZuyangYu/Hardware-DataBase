@@ -57,10 +57,58 @@ def build_workspace_tools(workspace_dir: str, rt: Any = None) -> list[Any]:
         except WorkspaceError as exc:
             return _json({"error": str(exc)})
 
+    def workspace_edit(
+        path: str,
+        old_text: str,
+        new_text: str,
+        replace_all: bool = False,
+    ) -> str:
+        """精确替换文件中的一段文本（类似 apply_patch）。
+
+        默认只允许唯一匹配；出现多次时必须显式 replace_all=true，避免误改。
+        """
+        _check()
+        try:
+            return _json(
+                workspace.edit(
+                    path, old_text, new_text, replace_all=bool(replace_all)
+                )
+            )
+        except WorkspaceError as exc:
+            return _json({"error": str(exc)})
+
+    def workspace_glob(pattern: str, path: str = ".") -> str:
+        """按 glob 模式列出工作区中的文件，例如 **/*.md 或 out/*.csv。"""
+        _check()
+        try:
+            return _json(workspace.glob(pattern, path))
+        except WorkspaceError as exc:
+            return _json({"error": str(exc)})
+
+    def workspace_grep(pattern: str, path: str = ".", max_results: int = 100) -> str:
+        """在工作区文本文件中按正则搜索，返回路径、行号和该行内容。"""
+        _check()
+        try:
+            return _json(
+                workspace.grep(pattern, path, max_results=max_results)
+            )
+        except WorkspaceError as exc:
+            return _json({"error": str(exc)})
+
     workspace_list.__name__ = "workspace_list"
     workspace_read.__name__ = "workspace_read"
     workspace_write.__name__ = "workspace_write"
-    return [workspace_list, workspace_read, workspace_write]
+    workspace_edit.__name__ = "workspace_edit"
+    workspace_glob.__name__ = "workspace_glob"
+    workspace_grep.__name__ = "workspace_grep"
+    return [
+        workspace_list,
+        workspace_read,
+        workspace_write,
+        workspace_edit,
+        workspace_glob,
+        workspace_grep,
+    ]
 
 
 __all__ = ["build_workspace_tools"]

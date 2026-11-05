@@ -49,3 +49,33 @@ def test_workspace_tools_return_json(workspace):
     assert listing["type"] == "dir"
     missing = json.loads(tools["workspace_read"]("nope.md"))
     assert "error" in missing
+
+
+def test_edit_requires_unique_match(workspace):
+    workspace.write("out/a.md", "alpha beta alpha")
+    with pytest.raises(WorkspaceError):
+        workspace.edit("out/a.md", "alpha", "gamma")
+    result = workspace.edit("out/a.md", "alpha", "gamma", replace_all=True)
+    assert result["replaced"] == 2
+    assert workspace.read("out/a.md")["content"] == "gamma beta gamma"
+
+
+def test_glob_and_grep(workspace):
+    workspace.write("out/a.md", "# 清单\nMCU: SAK-TC377\n")
+    workspace.write("out/b.csv", "refdes,model\nU1800,TPS62872\n")
+    globbed = workspace.glob("**/*.md")
+    assert globbed["matches"] == ["out/a.md"]
+    found = workspace.grep("SAK-TC377")
+    assert found["matches"][0]["path"] == "out/a.md"
+    assert found["matches"][0]["line"] == 2
+
+
+def test_workspace_tools_include_edit_glob_grep(workspace):
+    tools = {item.__name__: item for item in build_workspace_tools(str(workspace.root))}
+    assert {"workspace_edit", "workspace_glob", "workspace_grep"} <= set(tools)
+    json.loads(tools["workspace_write"]("out/a.md", "hello world"))
+    edited = json.loads(tools["workspace_edit"]("out/a.md", "world", "agent"))
+    assert edited["replaced"] == 1
+    assert json.loads(tools["workspace_read"]("out/a.md"))["content"] == "hello agent"
+    assert json.loads(tools["workspace_glob"]("**/*.md"))["matches"] == ["out/a.md"]
+    assert json.loads(tools["workspace_grep"]("agent"))["matches"][0]["line"] == 1

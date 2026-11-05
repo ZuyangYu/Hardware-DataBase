@@ -30,6 +30,28 @@ export type TaskPlanItem = {
   status?: string;
 };
 
+export type TaskVerificationCheck = {
+  id: string;
+  label: string;
+  status: string;
+  detail: string;
+};
+
+export type TaskVerification = {
+  status?: string;
+  checks?: TaskVerificationCheck[];
+  artifact_count?: number;
+  evidence_count?: number;
+  answer_chars?: number;
+};
+
+export type TaskEventView = {
+  turn_id: string;
+  seq: number;
+  type: string;
+  payload: Record<string, unknown>;
+};
+
 export type TaskView = {
   id: string;
   title: string;
@@ -39,6 +61,7 @@ export type TaskView = {
   status: string;
   query: string;
   plan: TaskPlanItem[];
+  verification?: TaskVerification;
   error_message: string;
   created_at: string;
   updated_at: string;
@@ -80,6 +103,15 @@ export function createTask(body: {
 
 export function getTask(taskId: string): Promise<TaskView> {
   return api.get<TaskView>(`/api/v1/tasks/${encodeURIComponent(taskId)}`);
+}
+
+export function listTaskEvents(
+  taskId: string,
+  limit = 200,
+): Promise<{ items: TaskEventView[] }> {
+  return api.get<{ items: TaskEventView[] }>(
+    `/api/v1/tasks/${encodeURIComponent(taskId)}/events?limit=${limit}`,
+  );
 }
 
 export function continueTask(

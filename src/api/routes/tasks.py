@@ -136,6 +136,7 @@ def _task_projection(
         "status": effective_status,
         "query": task.query,
         "plan": list(task.plan or []),
+        "verification": dict(task.verification or {}),
         "error_message": task.error_message,
         "created_at": task.created_at,
         "updated_at": task.updated_at,
@@ -342,6 +343,41 @@ def stop_task(
     store.set_status(task.id, "cancelled", finished=True)
     refreshed = store.get_task(task.id, user.id) or task
     return {"task": _task_projection(refreshed, conv=conv, store=store)}
+
+
+@router.get("/tasks/{task_id}/events")
+def list_task_events(
+    task_id: str,
+    limit: int = 200,
+    user: AuthUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
+    conv: ConversationService = Depends(_conv_service),
+    store: TaskStore = Depends(_task_store),
+) -> dict:
+    """Aggregate turn events across the task for the workbench timeline."""
+
+    task = store.get_task(task_id, user.id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    _ensure_task_readable(task, user=user, auth=auth, conv=conv)
+    items: list[dict] = []
+    for entry in store.list_turns(task.id)[-10:]:
+        turn_id = str(entry["turn_id"])
+        try:
+            events = conv.list_turn_events(task.session_id, turn_id)
+        except Exception:
+            continue
+        for event in events:
+            items.append(
+                {
+                    "turn_id": turn_id,
+                    "seq": int(getattr(event, "seq", 0) or 0),
+                    "type": str(getattr(event, "event_type", "") or ""),
+                    "payload": dict(getattr(event, "payload", {}) or {}),
+                }
+            )
+    bounded = max(1, min(int(limit), 1000))
+    return {"items": items[-bounded:]}
 
 
 @router.get("/tasks/{task_id}/artifacts")

@@ -151,7 +151,8 @@ def build_task_prompt(
         "\n\n## 工作区模式（通用 agent 会话）",
         "你是一个通用 agent，正在一个持久工作区里完成用户的目标；不是单轮问答。",
         "工作区规则：",
-        "  - 用 workspace_list / workspace_read / workspace_write 读写任务工作区。",
+        "  - 用 workspace_list / workspace_read / workspace_write 读写任务工作区；",
+        "    用 workspace_edit / workspace_glob / workspace_grep 修改和查找文件。",
         "  - 交付物写入 out/ 下的相对路径；本轮结束时会自动登记为可下载产物。",
         "  - 不要使用绝对路径，不要访问工作区以外的文件。",
     ]

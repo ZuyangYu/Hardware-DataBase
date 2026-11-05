@@ -51,6 +51,16 @@ class FakeConv:
         self.cancelled.append(turn_id)
         return self.turns.get(turn_id)
 
+    def list_turn_events(self, session_id: int, turn_id: str):
+        return [
+            SimpleNamespace(seq=1, event_type="turn_start", payload={}),
+            SimpleNamespace(
+                seq=2,
+                event_type="tool_started",
+                payload={"tool_name": "workspace_write"},
+            ),
+        ]
+
 
 @pytest.fixture()
 def client(monkeypatch, tmp_path):
@@ -173,3 +183,27 @@ def test_external_task_definitions_endpoint(client, monkeypatch, tmp_path):
     items = response.json()["items"]
     assert items[0]["id"] == "review"
     assert items[0]["title"] == "审阅"
+
+
+def test_task_projection_includes_verification(client):
+    http, _conv, store = client
+    created = http.post(
+        "/api/v1/tasks", json={"query": "做点什么", "kb_name": "AAA"}
+    ).json()
+    task_id = created["task"]["id"]
+    store.set_verification(task_id, {"status": "pass", "checks": []})
+    fetched = http.get(f"/api/v1/tasks/{task_id}").json()
+    assert fetched["verification"]["status"] == "pass"
+
+
+def test_task_events_endpoint(client):
+    http, _conv, _store = client
+    created = http.post(
+        "/api/v1/tasks", json={"query": "做点什么", "kb_name": "AAA"}
+    ).json()
+    task_id = created["task"]["id"]
+    response = http.get(f"/api/v1/tasks/{task_id}/events")
+    assert response.status_code == 200, response.text
+    items = response.json()["items"]
+    assert [item["type"] for item in items] == ["turn_start", "tool_started"]
+    assert items[1]["payload"]["tool_name"] == "workspace_write"

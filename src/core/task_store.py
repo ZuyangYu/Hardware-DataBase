@@ -96,6 +96,7 @@ class Task:
     status: str
     query: str
     plan: list[dict[str, Any]] = field(default_factory=list)
+    verification: dict[str, Any] = field(default_factory=dict)
     workspace_dir: str = ""
     current_turn_id: str = ""
     error_message: str = ""
@@ -171,6 +172,7 @@ class TaskStore:
                     status TEXT NOT NULL,
                     query TEXT NOT NULL,
                     plan_json TEXT NOT NULL DEFAULT '[]',
+                    verification_json TEXT NOT NULL DEFAULT '{}',
                     workspace_dir TEXT NOT NULL DEFAULT '',
                     current_turn_id TEXT NOT NULL DEFAULT '',
                     error_message TEXT NOT NULL DEFAULT '',
@@ -206,6 +208,13 @@ class TaskStore:
                     ON task_artifacts(task_id, created_at);
                 """
             )
+            columns = {
+                str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)")
+            }
+            if "verification_json" not in columns:
+                conn.execute(
+                    "ALTER TABLE tasks ADD COLUMN verification_json TEXT NOT NULL DEFAULT '{}'"
+                )
             conn.commit()
 
     # -- workspace ----------------------------------------------------------
@@ -375,6 +384,18 @@ class TaskStore:
             )
             conn.commit()
 
+    def set_verification(self, task_id: str, verification: dict[str, Any]) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE tasks SET verification_json = ?, updated_at = ? WHERE id = ?",
+                (
+                    json.dumps(verification or {}, ensure_ascii=False),
+                    _now(),
+                    str(task_id),
+                ),
+            )
+            conn.commit()
+
     # -- artifacts ----------------------------------------------------------
     def register_artifact(
         self,
@@ -511,6 +532,12 @@ class TaskStore:
             plan = json.loads(row["plan_json"] or "[]")
         except Exception:
             plan = []
+        try:
+            verification = json.loads(
+                row["verification_json"] if "verification_json" in row.keys() else "{}"
+            )
+        except Exception:
+            verification = {}
         return Task(
             id=str(row["id"]),
             user_id=int(row["user_id"]),
@@ -521,6 +548,7 @@ class TaskStore:
             status=str(row["status"]),
             query=str(row["query"]),
             plan=plan if isinstance(plan, list) else [],
+            verification=verification if isinstance(verification, dict) else {},
             workspace_dir=str(row["workspace_dir"]),
             current_turn_id=str(row["current_turn_id"]),
             error_message=str(row["error_message"]),

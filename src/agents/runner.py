@@ -581,11 +581,29 @@ def _direct_intent_clarification_answer(plan: IntentPlan | None) -> str | None:
     return None
 
 
-def _finalize_task_attempt(*, store: Any, task: Any, partial: bool) -> None:
-    """Sync task status/artifacts after one attempt; never break the turn."""
+def _finalize_task_attempt(
+    *,
+    store: Any,
+    task: Any,
+    partial: bool,
+    answer_text: str = "",
+    evidence_count: int = 0,
+) -> None:
+    """Sync task status/artifacts/verification after one attempt."""
 
     try:
-        store.scan_workspace_artifacts(task.id)
+        from src.agents.task_verification import build_task_verification
+
+        artifacts = store.scan_workspace_artifacts(task.id)
+        kb_mounted = bool(getattr(task, "kb_name", "")) and task.kb_name != "__general__"
+        verification = build_task_verification(
+            artifacts=artifacts,
+            answer_text=answer_text,
+            evidence_count=evidence_count,
+            partial=partial,
+            kb_mounted=kb_mounted,
+        )
+        store.set_verification(task.id, verification)
         store.set_status(task.id, "paused" if partial else "completed")
     except Exception:
         # Task bookkeeping must never fail a user-visible answer.
@@ -1409,6 +1427,7 @@ class MultiSourceAgentRunner:
         task_store = None
         if task_id:
             from src.agents.task_definitions import build_task_prompt, resolve_definition
+            from src.agents.tools.task_tools import build_task_tools
             from src.agents.tools.workspace_tools import build_workspace_tools
             from src.core.task_store import TaskStore
 
@@ -1417,7 +1436,11 @@ class MultiSourceAgentRunner:
             if task is not None:
                 definition = resolve_definition(task.definition_id)
                 task_artifacts = task_store.list_artifacts(task.id)
-                tools = list(tools) + build_workspace_tools(task.workspace_dir, rt)
+                tools = (
+                    list(tools)
+                    + build_workspace_tools(task.workspace_dir, rt)
+                    + build_task_tools(task.id, task_store, rt)
+                )
                 system_prompt = system_prompt + build_task_prompt(
                     task, definition, task_artifacts
                 )
@@ -1822,7 +1845,11 @@ class MultiSourceAgentRunner:
         record.answer = _current_run().answer = answer_text
         if task is not None and task_store is not None:
             _finalize_task_attempt(
-                store=task_store, task=task, partial=partial_delivery
+                store=task_store,
+                task=task,
+                partial=partial_delivery,
+                answer_text=answer_text,
+                evidence_count=len(rt.evidence),
             )
         if (
             answer_text
