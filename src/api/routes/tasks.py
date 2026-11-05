@@ -23,7 +23,7 @@ from src.api.deps import (
 )
 from src.core.auth import AuthService, AuthUser
 from src.core.conversation import GENERAL_CHAT_KB_NAME, ConversationService
-from src.core.task_store import Task, TaskArtifact, TaskStore
+from src.core.task_store import Task, TaskArtifact, TaskStore, get_task_store
 
 router = APIRouter(tags=["tasks"])
 
@@ -39,8 +39,8 @@ def _conv_service() -> ConversationService:
     return ConversationService()
 
 
-def _task_store() -> TaskStore:
-    return TaskStore()
+def _task_store():
+    return get_task_store()
 
 
 class CreateTaskRequest(BaseModel):

@@ -109,6 +109,9 @@ cd frontend && npm run build
 - **续跑**：任务可继续（history + workspace + artifacts），但新 turn 不恢复上一轮
   graph checkpoint；checkpoint 级续跑需要和 attempt 隔离一起设计。
 - **HITL**：尚无审批流；等执行能力接入后再对危险动作加审批。
-- **任务存储**：SQLite；多实例部署前迁移到控制面 Postgres。
+- **任务存储**：默认 SQLite（`TASK_STORE_BACKEND=sqlite`）；多实例部署设置
+  `TASK_STORE_BACKEND=postgres`，使用 `TASK_DB_URL`（空则回退
+  `CONTROL_PLANE_DATABASE_URL`）。Postgres 表为 `agent_tasks` /
+  `agent_task_turns` / `agent_task_artifacts`。
 - **MCP**：尚未把 KB 工具包成 MCP 服务给外部 agent。
 

@@ -97,6 +97,9 @@ TASK_WORKSPACE_ROOT = os.getenv(
 TASK_DEFINITION_DIR = os.getenv(
     "TASK_DEFINITION_DIR", os.path.join(STORAGE_DIR, "task_definitions")
 )
+# Task store backend: "sqlite" (single host) or "postgres" (multi-instance).
+TASK_STORE_BACKEND = os.getenv("TASK_STORE_BACKEND", "sqlite").strip().lower()
+TASK_DB_URL = os.getenv("TASK_DB_URL", "").strip()
 
 
 def _resolve_storage_path(raw_path: str | None, default_name: str) -> str:

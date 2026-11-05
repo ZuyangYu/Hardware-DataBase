@@ -1429,9 +1429,9 @@ class MultiSourceAgentRunner:
             from src.agents.task_definitions import build_task_prompt, resolve_definition
             from src.agents.tools.task_tools import build_task_tools
             from src.agents.tools.workspace_tools import build_workspace_tools
-            from src.core.task_store import TaskStore
+            from src.core.task_store import get_task_store
 
-            task_store = TaskStore()
+            task_store = get_task_store()
             task = task_store.get_task(str(task_id))
             if task is not None:
                 definition = resolve_definition(task.definition_id)

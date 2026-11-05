@@ -578,4 +578,31 @@ class TaskStore:
         )
 
 
-__all__ = ["Task", "TaskArtifact", "TaskStore", "TASK_STATUSES"]
+def get_task_store():
+    """Return the configured task store (SQLite default, Postgres optional)."""
+
+    backend = str(getattr(src.settings, "TASK_STORE_BACKEND", "sqlite") or "sqlite").strip().lower()
+    if backend == "postgres":
+        dsn = str(getattr(src.settings, "TASK_DB_URL", "") or "").strip()
+        if not dsn:
+            dsn = str(
+                getattr(src.settings, "CONTROL_PLANE_DATABASE_URL", "") or ""
+            ).strip()
+        if not dsn:
+            raise RuntimeError(
+                "TASK_STORE_BACKEND=postgres requires TASK_DB_URL or "
+                "CONTROL_PLANE_DATABASE_URL"
+            )
+        from src.core.task_store_pg import PostgresTaskStore
+
+        return PostgresTaskStore(dsn)
+    return TaskStore()
+
+
+__all__ = [
+    "Task",
+    "TaskArtifact",
+    "TaskStore",
+    "TASK_STATUSES",
+    "get_task_store",
+]
