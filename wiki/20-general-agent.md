@@ -102,16 +102,38 @@ uv run pytest \
 cd frontend && npm run build
 ```
 
+## MCP 桥
+
+外部 agent（dcode/OpenCode/Claude Code）可以通过 MCP 使用平台：
+
+```bash
+HDB_API_BASE=http://127.0.0.1:8002/api/v1 \
+HDB_API_TOKEN=<token> \
+uv run python -m src.mcp_bridge.server
+```
+
+工具：
+
+- `list_kbs`
+- `create_task` / `get_task` / `list_task_artifacts`
+- `ask_knowledge_base`（走受治理的 turn，返回带引用的回答）
+- `list_spreadsheets` / `list_circuit_designs`
+
+说明：第一版 MCP 桥没有直接暴露 `knowledge_search`/`evidence_read` 原始检索
+工具；外部 agent 通过 `ask_knowledge_base` 或任务使用知识库。原始检索的
+MCP 暴露需要新增一个受 token/ACL 约束的检索端点。
+
 ## 当前边界（下一阶段）
 
 - **执行能力**：尚未接入任意 shell/代码执行；现有 Sandbox Runner 是 bundle 制，
   需要注册通用执行 bundle 后才能提供 `run_script` 类能力。
-- **续跑**：任务可继续（history + workspace + artifacts），但新 turn 不恢复上一轮
-  graph checkpoint；checkpoint 级续跑需要和 attempt 隔离一起设计。
+- **续跑**：`prepare_attempt` 已支持从 `resume_ref`/committed pointer fork
+  上一 attempt；任务继续时 worker 会尝试按会话状态恢复。显式的"任务级
+  checkpoint 快照/恢复"还需要与 attempt 隔离一起验证。
 - **HITL**：尚无审批流；等执行能力接入后再对危险动作加审批。
 - **任务存储**：默认 SQLite（`TASK_STORE_BACKEND=sqlite`）；多实例部署设置
   `TASK_STORE_BACKEND=postgres`，使用 `TASK_DB_URL`（空则回退
   `CONTROL_PLANE_DATABASE_URL`）。Postgres 表为 `agent_tasks` /
   `agent_task_turns` / `agent_task_artifacts`。
-- **MCP**：尚未把 KB 工具包成 MCP 服务给外部 agent。
+- **MCP**：已有任务/KB 问答/结构化查询桥；原始检索工具尚未直接暴露。
 
