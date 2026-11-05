@@ -50,7 +50,11 @@ function formatBytes(value: number): string {
 
 function ArtifactRow({ artifact }: { artifact: TaskArtifactView }) {
   return (
-    <div className="flex items-center justify-between gap-3 border-b border-[#eef1f7] py-[8px] last:border-b-0">
+    <div
+      className="flex items-center justify-between gap-3 border-b border-[#eef1f7] py-[8px] last:border-b-0"
+      data-testid="task-artifact"
+      data-artifact-name={artifact.name}
+    >
       <div className="min-w-0">
         <div className="truncate text-[13px] font-medium text-[#28324a]">{artifact.name}</div>
         <div className="text-[11px] text-[#7b849c]">
@@ -279,7 +283,10 @@ export default function TasksPage({ kbs }: Props) {
           </div>
         </section>
 
-        <section className="min-h-[420px] rounded-[14px] border border-[#e3e7f1] bg-white p-[16px]">
+        <section
+          data-testid="task-detail"
+          className="min-h-[420px] rounded-[14px] border border-[#e3e7f1] bg-white p-[16px]"
+        >
           {!task ? (
             <div className="flex h-full items-center justify-center text-[13px] text-[#7b849c]">
               选择或创建一个任务
@@ -295,7 +302,10 @@ export default function TasksPage({ kbs }: Props) {
                   </div>
                 </div>
                 <div className="flex items-center gap-[8px]">
-                  <span className={`rounded-full px-[10px] py-[3px] text-[12px] ${statusClass(task.status)}`}>
+                  <span
+                    data-testid="task-detail-status"
+                    className={`rounded-full px-[10px] py-[3px] text-[12px] ${statusClass(task.status)}`}
+                  >
                     {STATUS_LABEL[task.status] || task.status}
                   </span>
                   {canStop ? (
@@ -364,7 +374,10 @@ export default function TasksPage({ kbs }: Props) {
                       {turn.error_message}
                     </div>
                   ) : null}
-                  <pre className="max-h-[340px] overflow-auto whitespace-pre-wrap rounded-[10px] bg-[#f7f8fb] p-[12px] text-[13px] leading-6 text-[#28324a]">
+                  <pre
+                    data-testid="task-answer"
+                    className="max-h-[340px] overflow-auto whitespace-pre-wrap rounded-[10px] bg-[#f7f8fb] p-[12px] text-[13px] leading-6 text-[#28324a]"
+                  >
                     {turn.answer || (turn.status === 'streaming' ? '生成中…' : '暂无输出')}
                   </pre>
                 </div>
