@@ -12,6 +12,7 @@ from src.agents.runner import (
     MultiSourceAgentRunner,
     _agent_evidence_budget,
     _agent_recursion_limit,
+    _export_intent_for_turn,
     _build_turn_verification,
     _normalize_citation_labels,
     _research_subagent_spec,
@@ -770,3 +771,10 @@ def test_tool_call_cap_recorded_in_budget_state():
     )
     assert budget.get("tool_call_cap") == 8
     assert budget.get("tool_call_cap_source") == "user_query"
+
+
+def test_task_mode_suppresses_export_intent():
+    # In task mode a document-export phrase must not bypass the agent.
+    assert _export_intent_for_turn("导出为 PDF", "task-1") is False
+    assert _export_intent_for_turn("导出为 PDF", "") is True
+    assert _export_intent_for_turn("输出(running)", "") is False

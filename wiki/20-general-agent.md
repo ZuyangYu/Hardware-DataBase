@@ -96,6 +96,17 @@ uv run pytest \
   tests/test_query_task_plumbing.py -q
 ```
 
+实机功能矩阵（需要服务运行）：
+
+```bash
+HDB_E2E_USERNAME=aaa_admin HDB_E2E_PASSWORD=... \
+uv run python scripts/functional_tasks.py
+```
+
+覆盖：写入+编辑、继续修改/产物版本、计划工具、停止、外部定义、
+执行记录、挂载知识库+引用验收、MCP 桥。结果写入
+`HDB_FUNCTIONAL_RESULTS`（默认 `/tmp/functional_tasks.json`）。
+
 前端：
 
 ```bash

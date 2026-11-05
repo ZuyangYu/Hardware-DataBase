@@ -544,6 +544,20 @@ _OUTPUT_FORMAT_LABELS = {
 }
 
 
+def _export_intent_for_turn(query: str, task_id: str = "") -> bool:
+    """Task mode produces workspace artifacts, never a document-export turn.
+
+    A bare "输出" inside a task description must not bypass the agent with an
+    export-format clarification.
+    """
+
+    if task_id:
+        return False
+    from src.result_exports import infer_export_intent
+
+    return infer_export_intent(query) is not None
+
+
 def _direct_intent_clarification_answer(plan: IntentPlan | None) -> str | None:
     """Return a safe clarification for an underspecified export request.
 
@@ -950,6 +964,7 @@ class MultiSourceAgentRunner:
         action_scope: Any | None = None,
         knowledge_scope: KnowledgeScopeSnapshot | None = None,
         knowledge_scope_resolver: KnowledgeScopeResolver | None = None,
+        task_id: str = "",
     ) -> "_TurnPlan":
         """Build the synchronous part of a turn before streaming starts.
 
@@ -1308,8 +1323,6 @@ class MultiSourceAgentRunner:
             emit_event=emit_event,
         )
         tools = tool_bundle.tools
-        from src.result_exports import infer_export_intent
-
         turn_prompt = build_turn_prompt(
             kb_name=scope_kb,
             workflow=workflow,
@@ -1321,16 +1334,20 @@ class MultiSourceAgentRunner:
             tool_fragments=tool_bundle.fragments,
             tool_suffix=tool_bundle.prompt_suffix,
             skill_present=bool(skill_root),
-            export=infer_export_intent(query) is not None,
+            # Task mode produces artifacts; a bare "输出" in the task text is
+            # not a document-export request and must not bypass the agent.
+            export=_export_intent_for_turn(query, task_id),
         )
         system_prompt = turn_prompt.system_prompt
         context_fragments = turn_prompt.fragments
 
         direct_control_answer: str | None = None
         direct_answer_grounding = "intent_clarification"
-        direct_control_answer = _direct_intent_clarification_answer(intent_plan)
+        direct_control_answer = (
+            None if task_id else _direct_intent_clarification_answer(intent_plan)
+        )
 
-        if direct_control_answer is None and has_attachments:
+        if direct_control_answer is None and has_attachments and not task_id:
             # Governed two-stage section edits: the user's confirmation (or
             # cancellation) executes deterministically, never via the model.
             proposal_answer = _direct_attachment_proposal_answer(
@@ -1408,6 +1425,7 @@ class MultiSourceAgentRunner:
             action_scope=action_scope,
             knowledge_scope=knowledge_scope,
             knowledge_scope_resolver=knowledge_scope_resolver,
+            task_id=task_id,
         )
         record = plan.record
         emit_event = plan.emit_event
