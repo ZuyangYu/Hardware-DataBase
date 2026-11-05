@@ -20,9 +20,11 @@ import type {
 } from '@/api/types';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
+import { notify } from '@/components/ui/app-toast';
 import { MarkdownMessage, citationDisplayTitle } from '../chatHelpers';
 import ExportMenu, { exportJobStatusLabel } from './ExportMenu';
 import FeedbackActions from './FeedbackActions';
+import { downloadConversationArtifact, type ConversationArtifactView } from '@/api/artifacts';
 import { exportFormatLabel } from '../exportResultModel';
 import {
   CHAT_CITATION_HEADING_CLASS,
@@ -64,6 +66,8 @@ type Props = {
   exportJobs?: ExportJobView[];
   exportPreviews?: Record<string, ExportArtifactView>;
   exportFormats?: ExportFormat[];
+  /** 本轮会话产物；显示在"回答有帮助"反馈上方，仅文件名。 */
+  artifacts?: ConversationArtifactView[];
 };
 
 function CollapsibleSection({
@@ -546,6 +550,7 @@ function MessageBubble({
   exportJobs = [],
   exportPreviews = {},
   exportFormats,
+  artifacts = [],
 }: Props) {
   const resolvedSubagents = subagents.length > 0 ? subagents : (msg.subagents ?? []);
   // 流式临时气泡
@@ -587,6 +592,29 @@ function MessageBubble({
                 <StepGroup steps={traceSteps} defaultOpen={false} />
               )}
               <MarkdownMessage content={msg.content} />
+              {artifacts.length > 0 ? (
+                <div
+                  className="flex flex-wrap items-center gap-x-[12px] gap-y-[2px]"
+                  data-testid="message-artifacts"
+                >
+                  {artifacts.map((artifact) => (
+                    <button
+                      key={artifact.id}
+                      type="button"
+                      className="text-[12px] text-[#2b5cb8] hover:underline"
+                      onClick={() => {
+                        void downloadConversationArtifact(artifact).catch((error: unknown) => {
+                          notify.error(
+                            error instanceof Error ? error.message : '下载失败',
+                          );
+                        });
+                      }}
+                    >
+                      {artifact.name}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
               <FeedbackActions msg={msg} />
               {msg.memory_context && msg.memory_context.length > 0 && (
                 <MemoryContextBlock memories={msg.memory_context} />
