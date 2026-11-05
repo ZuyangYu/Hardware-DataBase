@@ -57,7 +57,7 @@ def test_publish_artifact_writes_and_registers(store, tmp_path):
     tools = {
         item.__name__: item
         for item in build_task_tools(
-            task.id, store, workspace_dir=task.workspace_dir
+            task.id, store, workspace_dir=task.workspace_dir, turn_id="turn-1"
         )
     }
     result = json.loads(
@@ -68,5 +68,6 @@ def test_publish_artifact_writes_and_registers(store, tmp_path):
     artifacts = store.list_artifacts(task.id)
     assert len(artifacts) == 1
     assert artifacts[0].name == "report.md"
+    assert artifacts[0].turn_id == "turn-1"
     # Finalize scan must not create a duplicate version of the same content.
     assert store.scan_workspace_artifacts(task.id) == []

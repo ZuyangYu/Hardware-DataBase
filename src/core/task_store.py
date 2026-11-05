@@ -109,6 +109,7 @@ class Task:
 class TaskArtifact:
     id: str
     task_id: str
+    turn_id: str
     name: str
     kind: str
     mime: str
@@ -194,6 +195,7 @@ class TaskStore:
                 CREATE TABLE IF NOT EXISTS task_artifacts (
                     id TEXT PRIMARY KEY,
                     task_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL DEFAULT '',
                     name TEXT NOT NULL,
                     kind TEXT NOT NULL,
                     mime TEXT NOT NULL,
@@ -208,6 +210,14 @@ class TaskStore:
                     ON task_artifacts(task_id, created_at);
                 """
             )
+            artifact_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(task_artifacts)")
+            }
+            if "turn_id" not in artifact_columns:
+                conn.execute(
+                    "ALTER TABLE task_artifacts ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''"
+                )
             columns = {
                 str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)")
             }
@@ -437,6 +447,7 @@ class TaskStore:
         task_id: str,
         path: str,
         *,
+        turn_id: str = "",
         name: str | None = None,
         kind: str | None = None,
         mime: str | None = None,
@@ -470,6 +481,7 @@ class TaskStore:
             artifact = TaskArtifact(
                 id=uuid.uuid4().hex,
                 task_id=str(task_id),
+                turn_id=str(turn_id or ""),
                 name=artifact_name,
                 kind=str(kind or _KIND_BY_SUFFIX.get(suffix, "file")),
                 mime=str(mime or _MIME_BY_SUFFIX.get(suffix, "application/octet-stream")),
@@ -483,13 +495,14 @@ class TaskStore:
             conn.execute(
                 """
                 INSERT INTO task_artifacts (
-                    id, task_id, name, kind, mime, path, size_bytes, sha256,
-                    version, metadata_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, task_id, turn_id, name, kind, mime, path, size_bytes,
+                    sha256, version, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artifact.id,
                     artifact.task_id,
+                    artifact.turn_id,
                     artifact.name,
                     artifact.kind,
                     artifact.mime,
@@ -504,7 +517,9 @@ class TaskStore:
             conn.commit()
         return artifact
 
-    def scan_workspace_artifacts(self, task_id: str) -> list[TaskArtifact]:
+    def scan_workspace_artifacts(
+        self, task_id: str, *, turn_id: str = ""
+    ) -> list[TaskArtifact]:
         """Register new files under ``<workspace>/out`` (idempotent by name)."""
         task = self.get_task(task_id)
         if task is None:
@@ -535,6 +550,7 @@ class TaskStore:
                     self.register_artifact(
                         task_id,
                         abs_path,
+                        turn_id=turn_id,
                         name=name,
                         metadata={"size_bytes": size},
                     )
@@ -601,6 +617,7 @@ class TaskStore:
         return TaskArtifact(
             id=str(row["id"]),
             task_id=str(row["task_id"]),
+            turn_id=str(row["turn_id"]) if "turn_id" in row.keys() else "",
             name=str(row["name"]),
             kind=str(row["kind"]),
             mime=str(row["mime"]),

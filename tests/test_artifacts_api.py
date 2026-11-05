@@ -35,7 +35,7 @@ def client(tmp_path):
     path = os.path.join(out, "result.md")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write("# result\n")
-    store.register_artifact(task.id, path)
+    store.register_artifact(task.id, path, turn_id="turn-1")
     app = FastAPI()
     app.include_router(artifacts_route.router, prefix="/api/v1")
     app.dependency_overrides[artifacts_route.current_user] = lambda: SimpleNamespace(id=1)
@@ -51,6 +51,7 @@ def test_list_conversation_artifacts(client):
     items = response.json()["items"]
     assert len(items) == 1
     assert items[0]["name"] == "result.md"
+    assert items[0]["turn_id"] == "turn-1"
     assert items[0]["task_id"] == task.id
     assert items[0]["download_url"].startswith("/api/v1/artifacts/")
 

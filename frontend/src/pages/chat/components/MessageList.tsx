@@ -13,6 +13,8 @@ import type {
   QueryTraceStep,
   TurnSubagent,
 } from '@/api/types';
+import { downloadConversationArtifact, type ConversationArtifactView } from '@/api/artifacts';
+import { notify } from '@/components/ui/app-toast';
 import { Skeleton } from '@/components/ui/skeleton';
 import { CHAT_MESSAGES_CLASS, CHAT_MESSAGE_STACK_CLASS } from '../chatPageStyles';
 import MessageBubble from './MessageBubble';
@@ -43,6 +45,7 @@ type Props = {
   exportJobsByMessageId?: Record<number, ExportJobView[]>;
   exportPreviewsByJobId?: Record<string, ExportArtifactView>;
   exportFormats?: ExportFormat[];
+  artifactsByTurnId?: Record<string, ConversationArtifactView[]>;
 };
 
 export default function MessageList({
@@ -68,6 +71,7 @@ export default function MessageList({
   exportJobsByMessageId = {},
   exportPreviewsByJobId = {},
   exportFormats,
+  artifactsByTurnId = {},
 }: Props) {
   // 个人记忆的授权来源是本轮问答(提问 + 输出),缺失输出时不提供入口。
   const turnMessageIds = useMemo(() => {
@@ -151,6 +155,29 @@ export default function MessageList({
             .map((card, index) => (
               <AttachmentRevisionCardView key={`${msg.id}-card-${index}`} card={card} />
             ))}
+          {msg.role === 'assistant' &&
+          msg.turn_id &&
+          (artifactsByTurnId[msg.turn_id] ?? []).length > 0 ? (
+            <div
+              className="flex flex-wrap items-center gap-x-[12px] gap-y-[2px] pb-[6px]"
+              data-testid="message-artifacts"
+            >
+              {(artifactsByTurnId[msg.turn_id] ?? []).map((artifact) => (
+                <button
+                  key={artifact.id}
+                  type="button"
+                  className="text-[12px] text-[#2b5cb8] hover:underline"
+                  onClick={() => {
+                    void downloadConversationArtifact(artifact).catch((error: unknown) => {
+                      notify.error(error instanceof Error ? error.message : '下载失败');
+                    });
+                  }}
+                >
+                  {artifact.name}
+                </button>
+              ))}
+            </div>
+          ) : null}
           </Fragment>
         ))}
         {streaming && (

@@ -31,6 +31,7 @@ def _task_store():
 def _artifact_view(artifact) -> dict:
     return {
         "id": artifact.id,
+        "turn_id": artifact.turn_id,
         "name": artifact.name,
         "kind": artifact.kind,
         "mime": artifact.mime,

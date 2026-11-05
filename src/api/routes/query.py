@@ -881,6 +881,7 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             knowledge_scope=knowledge_scope,
             knowledge_scope_resolver=knowledge_scope_resolver,
             task_id=task_id,
+            turn_id=turn_id,
         )
         try:
             for chunk in gen:
@@ -1587,6 +1588,7 @@ def _query_generator(
     knowledge_scope=None,
     knowledge_scope_resolver=None,
     task_id="",
+    turn_id="",
 ):
     params = inspect.signature(pipeline.query).parameters
     if "event_callback" in params:
@@ -1620,6 +1622,8 @@ def _query_generator(
             kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
         if "task_id" in params:
             kwargs["task_id"] = task_id
+        if "turn_id" in params:
+            kwargs["turn_id"] = turn_id
         return pipeline.query(
             query,
             kb_name,
@@ -1654,6 +1658,8 @@ def _query_generator(
         kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
     if "task_id" in params:
         kwargs["task_id"] = task_id
+    if "turn_id" in params:
+        kwargs["turn_id"] = turn_id
     return pipeline.query(query, kb_name, history, ctx, **kwargs)
 
 

@@ -2,6 +2,7 @@ import { api, apiDownload } from './client';
 
 export type ConversationArtifactView = {
   id: string;
+  turn_id?: string;
   name: string;
   kind: string;
   mime: string;

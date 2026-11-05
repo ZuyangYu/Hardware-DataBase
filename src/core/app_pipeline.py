@@ -221,6 +221,7 @@ class AppPipeline:
         knowledge_scope: Any | None = None,
         knowledge_scope_resolver: Any | None = None,
         task_id: str = "",
+        turn_id: str = "",
     ) -> Generator[str, None, None]:
         self.clear_last_token_usage_summary()
         if not msg.strip():
@@ -248,6 +249,7 @@ class AppPipeline:
                 knowledge_scope=knowledge_scope,
                 knowledge_scope_resolver=knowledge_scope_resolver,
                 task_id=task_id,
+                turn_id=turn_id,
             )
         except QueryCancelled:
             return

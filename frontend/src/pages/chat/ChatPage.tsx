@@ -24,9 +24,9 @@ import { CHAT_MAIN_CLASS, chatBubbleClass, chatRowClass } from './chatPageStyles
 import { useKbChat } from './useKbChat';
 import McpWriteProposalCard from './components/McpWriteProposalCard';
 import ChatSessionSidebar from './components/ChatSessionSidebar';
-import ConversationArtifacts from '@/components/ConversationArtifacts';
 import ChatHeader from './components/ChatHeader';
 import MessageList from './components/MessageList';
+import { useConversationArtifacts } from './useConversationArtifacts';
 import Composer from './components/Composer';
 import ExportTaskCenter from '@/components/ExportTaskCenter';
 import EditMessageDialog from './EditMessageDialog';
@@ -643,6 +643,10 @@ export default function ChatPage({
 
   const sidebarProviderStyle = { '--sidebar-width': '220px', '--sidebar-width-icon': '72px' } as CSSProperties;
   const showEmpty = activeSession == null && sessionsLoaded && !streaming;
+  const { byTurnId: artifactsByTurnId } = useConversationArtifacts(
+    activeSessionId,
+    `${messages.length}:${streaming}`,
+  );
 
   return (
     <div className="flex h-full min-h-0 bg-[#fcfcfc] text-[#18181a]" style={sidebarProviderStyle}>
@@ -687,6 +691,7 @@ export default function ChatPage({
           exportJobsByMessageId={exportJobsByMessageId}
           exportPreviewsByJobId={exportPreviewsByJobId}
           exportFormats={exportFormats}
+          artifactsByTurnId={artifactsByTurnId}
         />
         {turnQueueNotice && (
           <div className="shrink-0 px-[24px] pb-[6px]" data-testid="turn-queue-notice">
@@ -720,10 +725,6 @@ export default function ChatPage({
             </div>
           </div>
         )}
-        <ConversationArtifacts
-          sessionId={activeSessionId}
-          refreshKey={`${messages.length}:${streaming}`}
-        />
         <Composer
           kbName={mountedKbName}
           availableKbs={visibleKbs}

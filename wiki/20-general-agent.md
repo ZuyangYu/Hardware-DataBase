@@ -34,6 +34,7 @@ task (durable session)
 | GET | `/api/v1/tasks/{id}/events` | 任务执行记录（聚合 turn 事件） |
 | GET | `/api/v1/conversations/{id}/artifacts` | 会话产物（前端对话页使用） |
 | GET | `/api/v1/artifacts/{id}/download` | 按产物 id 下载（不暴露磁盘路径） |
+| — | `artifact.turn_id` | 产物归属哪一轮，前端据此挂到 assistant 消息下 |
 | GET | `/api/v1/tasks/{id}/artifacts` | 任务维度产物列表 |
 | GET | `/api/v1/tasks/{id}/artifacts/{aid}/download` | 下载产物 |
 | GET | `/api/v1/task-definitions` | 列出外部任务定义 |
@@ -88,7 +89,8 @@ instructions: 不要展开完整 BOM
 
 ## 前端
 
-- 对话页直接展示"会话产物"条（`ConversationArtifacts`），可下载；
+- 产物按 `turn_id` 归属到对应的 assistant 消息，文件名直接显示在消息下方
+  （无独立区域/背景），点击下载；
 - `/tasks` 保留为历史/深链接，不再是主导航入口；
 - 页面：新建任务（选知识库/外部定义）、任务列表、当前输出、产物下载、继续修改、停止；
 - 轮询任务详情；终态后停止轮询。

@@ -107,6 +107,7 @@ class PostgresTaskStore:
                 CREATE TABLE IF NOT EXISTS agent_task_artifacts (
                     id TEXT PRIMARY KEY,
                     task_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL DEFAULT '',
                     name TEXT NOT NULL,
                     kind TEXT NOT NULL,
                     mime TEXT NOT NULL,
@@ -118,6 +119,10 @@ class PostgresTaskStore:
                     created_at TEXT NOT NULL
                 )
                 """
+            )
+            conn.execute(
+                "ALTER TABLE agent_task_artifacts "
+                "ADD COLUMN IF NOT EXISTS turn_id TEXT NOT NULL DEFAULT ''"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_agent_artifacts_task "
@@ -326,6 +331,7 @@ class PostgresTaskStore:
         task_id: str,
         path: str,
         *,
+        turn_id: str = "",
         name: str | None = None,
         kind: str | None = None,
         mime: str | None = None,
@@ -359,6 +365,7 @@ class PostgresTaskStore:
             artifact = TaskArtifact(
                 id=uuid.uuid4().hex,
                 task_id=str(task_id),
+                turn_id=str(turn_id or ""),
                 name=artifact_name,
                 kind=str(kind or _KIND_BY_SUFFIX.get(suffix, "file")),
                 mime=str(
@@ -374,13 +381,14 @@ class PostgresTaskStore:
             conn.execute(
                 """
                 INSERT INTO agent_task_artifacts (
-                    id, task_id, name, kind, mime, path, size_bytes, sha256,
-                    version, metadata_json, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    id, task_id, turn_id, name, kind, mime, path, size_bytes,
+                    sha256, version, metadata_json, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     artifact.id,
                     artifact.task_id,
+                    artifact.turn_id,
                     artifact.name,
                     artifact.kind,
                     artifact.mime,
@@ -394,7 +402,9 @@ class PostgresTaskStore:
             )
         return artifact
 
-    def scan_workspace_artifacts(self, task_id: str) -> list[TaskArtifact]:
+    def scan_workspace_artifacts(
+        self, task_id: str, *, turn_id: str = ""
+    ) -> list[TaskArtifact]:
         task = self.get_task(task_id)
         if task is None:
             return []
@@ -422,6 +432,7 @@ class PostgresTaskStore:
                     self.register_artifact(
                         task_id,
                         abs_path,
+                        turn_id=turn_id,
                         name=name,
                         metadata={"size_bytes": size},
                     )
@@ -490,6 +501,7 @@ class PostgresTaskStore:
         return TaskArtifact(
             id=str(row["id"]),
             task_id=str(row["task_id"]),
+            turn_id=str(row.get("turn_id") or ""),
             name=str(row["name"]),
             kind=str(row["kind"]),
             mime=str(row["mime"]),

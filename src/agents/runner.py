@@ -608,13 +608,14 @@ def _finalize_task_attempt(
     partial: bool,
     answer_text: str = "",
     evidence_count: int = 0,
+    turn_id: str = "",
 ) -> None:
     """Sync task status/artifacts/verification after one attempt."""
 
     try:
         from src.agents.task_verification import build_task_verification
 
-        artifacts = store.scan_workspace_artifacts(task.id)
+        artifacts = store.scan_workspace_artifacts(task.id, turn_id=turn_id)
         kb_mounted = bool(getattr(task, "kb_name", "")) and task.kb_name != "__general__"
         verification = build_task_verification(
             artifacts=artifacts,
@@ -862,6 +863,7 @@ class MultiSourceAgentRunner:
         knowledge_scope: KnowledgeScopeSnapshot | None = None,
         knowledge_scope_resolver: KnowledgeScopeResolver | None = None,
         task_id: str = "",
+        turn_id: str = "",
     ) -> Generator[str, None, None]:
         """Observability wrapper: one agent span + metrics per run."""
         started = time.monotonic()
@@ -896,6 +898,7 @@ class MultiSourceAgentRunner:
                     knowledge_scope=knowledge_scope,
                     knowledge_scope_resolver=knowledge_scope_resolver,
                     task_id=task_id,
+                    turn_id=turn_id,
                 )
             except QueryCancelled:
                 status = "cancelled"
@@ -1402,6 +1405,7 @@ class MultiSourceAgentRunner:
         knowledge_scope: KnowledgeScopeSnapshot | None = None,
         knowledge_scope_resolver: KnowledgeScopeResolver | None = None,
         task_id: str = "",
+        turn_id: str = "",
     ) -> Generator[str, None, None]:
         """Run the deep agent and stream answer deltas live.
 
@@ -1464,7 +1468,11 @@ class MultiSourceAgentRunner:
                     list(tools)
                     + build_workspace_tools(task.workspace_dir, rt)
                     + build_task_tools(
-                        task.id, task_store, rt, task.workspace_dir
+                        task.id,
+                        task_store,
+                        rt,
+                        task.workspace_dir,
+                        turn_id=turn_id,
                     )
                 )
                 system_prompt = system_prompt + build_task_prompt(
@@ -1901,6 +1909,7 @@ class MultiSourceAgentRunner:
                 partial=partial_delivery,
                 answer_text=answer_text,
                 evidence_count=len(rt.evidence),
+                turn_id=turn_id,
             )
         if (
             answer_text

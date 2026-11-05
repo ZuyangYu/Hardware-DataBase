@@ -19,6 +19,7 @@ def build_task_tools(
     store: Any,
     rt: Any = None,
     workspace_dir: str = "",
+    turn_id: str = "",
 ) -> list[Any]:
     def task_plan_update(plan_json: str) -> str:
         """更新当前任务的执行计划（由你自己规划，不是固定流程）。
@@ -91,6 +92,7 @@ def build_task_tools(
             artifact = store.register_artifact(
                 task_id,
                 str(workspace.resolve(relative)),
+                turn_id=turn_id,
                 name=safe,
                 kind=(str(kind).strip() or None) if kind else None,
             )
