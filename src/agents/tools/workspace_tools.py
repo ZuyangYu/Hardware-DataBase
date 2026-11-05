@@ -29,11 +29,40 @@ def build_workspace_tools(workspace_dir: str, rt: Any = None) -> list[Any]:
             except Exception:
                 raise
 
+    def _run(name: str, query: str, fn):
+        if rt is None:
+            return fn()
+        call_id = rt.next_invocation_id()
+        rt.tool_started(
+            call_id=call_id,
+            tool_name=name,
+            tool_kind="workspace",
+            query=str(query or "")[:200],
+        )
+        try:
+            result = fn()
+        except Exception as exc:
+            rt.tool_result(
+                call_id=call_id,
+                tool_name=name,
+                status="failed",
+                tool_kind="workspace",
+                empty_reason=str(exc)[:200],
+            )
+            raise
+        rt.tool_result(
+            call_id=call_id,
+            tool_name=name,
+            status="success",
+            tool_kind="workspace",
+        )
+        return result
+
     def workspace_list(path: str = ".") -> str:
         """列出任务工作区中的文件和目录。path 是相对路径，默认当前目录。"""
         _check()
         try:
-            return _json(workspace.list(path))
+            return _run("workspace_list", path, lambda: _json(workspace.list(path)))
         except WorkspaceError as exc:
             return _json({"error": str(exc)})
 
@@ -41,7 +70,7 @@ def build_workspace_tools(workspace_dir: str, rt: Any = None) -> list[Any]:
         """读取任务工作区中的一个 UTF-8 文本文件。path 是相对路径。"""
         _check()
         try:
-            return _json(workspace.read(path))
+            return _run("workspace_read", path, lambda: _json(workspace.read(path)))
         except WorkspaceError as exc:
             return _json({"error": str(exc)})
 
@@ -53,7 +82,11 @@ def build_workspace_tools(workspace_dir: str, rt: Any = None) -> list[Any]:
         """
         _check()
         try:
-            return _json(workspace.write(path, content))
+            return _run(
+                "workspace_write",
+                path,
+                lambda: _json(workspace.write(path, content)),
+            )
         except WorkspaceError as exc:
             return _json({"error": str(exc)})
 
@@ -69,10 +102,14 @@ def build_workspace_tools(workspace_dir: str, rt: Any = None) -> list[Any]:
         """
         _check()
         try:
-            return _json(
-                workspace.edit(
-                    path, old_text, new_text, replace_all=bool(replace_all)
-                )
+            return _run(
+                "workspace_edit",
+                path,
+                lambda: _json(
+                    workspace.edit(
+                        path, old_text, new_text, replace_all=bool(replace_all)
+                    )
+                ),
             )
         except WorkspaceError as exc:
             return _json({"error": str(exc)})
@@ -81,7 +118,11 @@ def build_workspace_tools(workspace_dir: str, rt: Any = None) -> list[Any]:
         """按 glob 模式列出工作区中的文件，例如 **/*.md 或 out/*.csv。"""
         _check()
         try:
-            return _json(workspace.glob(pattern, path))
+            return _run(
+                "workspace_glob",
+                pattern,
+                lambda: _json(workspace.glob(pattern, path)),
+            )
         except WorkspaceError as exc:
             return _json({"error": str(exc)})
 
@@ -89,8 +130,10 @@ def build_workspace_tools(workspace_dir: str, rt: Any = None) -> list[Any]:
         """在工作区文本文件中按正则搜索，返回路径、行号和该行内容。"""
         _check()
         try:
-            return _json(
-                workspace.grep(pattern, path, max_results=max_results)
+            return _run(
+                "workspace_grep",
+                pattern,
+                lambda: _json(workspace.grep(pattern, path, max_results=max_results)),
             )
         except WorkspaceError as exc:
             return _json({"error": str(exc)})

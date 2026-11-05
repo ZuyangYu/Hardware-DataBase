@@ -30,6 +30,7 @@ task (durable session)
 | GET | `/api/v1/tasks/{id}` | 任务详情（当前 turn、产物、turns） |
 | POST | `/api/v1/tasks/{id}/messages` | 继续/修改：同一任务新建 turn |
 | POST | `/api/v1/tasks/{id}/stop` | 请求取消当前 turn |
+| GET | `/api/v1/tasks/{id}/events` | 任务执行记录（聚合 turn 事件） |
 | GET | `/api/v1/tasks/{id}/artifacts` | 产物列表 |
 | GET | `/api/v1/tasks/{id}/artifacts/{aid}/download` | 下载产物 |
 | GET | `/api/v1/task-definitions` | 列出外部任务定义 |
@@ -67,10 +68,18 @@ instructions: 不要展开完整 BOM
 
 ## 工作区与产物
 
-- 工具：`workspace_list` / `workspace_read` / `workspace_write`；
+- 工具：`workspace_list` / `workspace_read` / `workspace_write` /
+  `workspace_edit`（唯一匹配保护）/ `workspace_glob` / `workspace_grep`；
+- 计划：`task_plan_update` 由 agent 维护（pending/running/done/blocked）；
 - 路径必须是工作区内的相对路径，拒绝 `..`、绝对路径和越界符号链接；
 - 交付物写入 `out/`；turn 结束时扫描并登记 artifact（同名文件自动递增版本）；
 - 下载接口会再次校验产物路径必须在任务工作区内。
+
+## 验收与执行记录
+
+- 每次任务尝试结束生成确定性验收：产物、回答、引用、证据、部分交付；
+- `GET /tasks/{id}/events` 返回跨 turn 的执行记录，工作台展示最近事件；
+- 验收是"可用性下限"，不是质量评分；语义质量仍需人工/评测集。
 
 ## 前端
 
@@ -93,9 +102,13 @@ uv run pytest \
 cd frontend && npm run build
 ```
 
-## 当前边界
+## 当前边界（下一阶段）
 
-- 沙箱执行走既有 bundle 制 Skill（`SKILLS_ENABLED` + `make_skill_tools`），
-  不提供任意 shell；需要时按现有 Sandbox Runner 的审核流程注册 bundle。
-- 任务存储当前是 SQLite（`TASK_DB_PATH`），多实例部署前应迁移到控制面 Postgres。
-- 计划（plan）默认空；后续可由 agent 通过工具更新，前端已支持展示。
+- **执行能力**：尚未接入任意 shell/代码执行；现有 Sandbox Runner 是 bundle 制，
+  需要注册通用执行 bundle 后才能提供 `run_script` 类能力。
+- **续跑**：任务可继续（history + workspace + artifacts），但新 turn 不恢复上一轮
+  graph checkpoint；checkpoint 级续跑需要和 attempt 隔离一起设计。
+- **HITL**：尚无审批流；等执行能力接入后再对危险动作加审批。
+- **任务存储**：SQLite；多实例部署前迁移到控制面 Postgres。
+- **MCP**：尚未把 KB 工具包成 MCP 服务给外部 agent。
+

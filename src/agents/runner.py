@@ -1444,6 +1444,26 @@ class MultiSourceAgentRunner:
                 system_prompt = system_prompt + build_task_prompt(
                     task, definition, task_artifacts
                 )
+                emit_event(
+                    {
+                        "type": "task_mode",
+                        "payload": {
+                            "task_id": task.id,
+                            "definition_id": task.definition_id,
+                            "kb_mounted": bool(task.kb_name)
+                            and task.kb_name != "__general__",
+                            "workspace_tools": [
+                                "workspace_list",
+                                "workspace_read",
+                                "workspace_write",
+                                "workspace_edit",
+                                "workspace_glob",
+                                "workspace_grep",
+                            ],
+                            "plan_tool": "task_plan_update",
+                        },
+                    }
+                )
 
         if direct_control_answer is not None:
             record.answer = direct_control_answer

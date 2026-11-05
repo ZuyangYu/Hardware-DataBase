@@ -79,3 +79,35 @@ def test_workspace_tools_include_edit_glob_grep(workspace):
     assert json.loads(tools["workspace_read"]("out/a.md"))["content"] == "hello agent"
     assert json.loads(tools["workspace_glob"]("**/*.md"))["matches"] == ["out/a.md"]
     assert json.loads(tools["workspace_grep"]("agent"))["matches"][0]["line"] == 1
+
+
+class _FakeRuntime:
+    def __init__(self):
+        self.started = []
+        self.finished = []
+        self._seq = 0
+
+    def check_cancel(self):
+        return None
+
+    def next_invocation_id(self):
+        self._seq += 1
+        return f"call-{self._seq}"
+
+    def tool_started(self, **kwargs):
+        self.started.append(kwargs)
+
+    def tool_result(self, **kwargs):
+        self.finished.append(kwargs)
+
+
+def test_workspace_tools_emit_tool_events(tmp_path):
+    rt = _FakeRuntime()
+    tools = {
+        item.__name__: item
+        for item in build_workspace_tools(str(tmp_path / "ws"), rt)
+    }
+    json.loads(tools["workspace_write"]("out/a.md", "hello"))
+    assert rt.started[0]["tool_name"] == "workspace_write"
+    assert rt.started[0]["tool_kind"] == "workspace"
+    assert rt.finished[0]["status"] == "success"
