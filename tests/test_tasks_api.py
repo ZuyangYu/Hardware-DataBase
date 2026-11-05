@@ -9,6 +9,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from src.api.routes import artifacts as artifacts_route
 from src.api.routes import tasks as tasks_route
 from src.core.task_store import TaskStore
 
@@ -71,10 +72,14 @@ def client(monkeypatch, tmp_path):
     )
     app = FastAPI()
     app.include_router(tasks_route.router, prefix="/api/v1")
+    app.include_router(artifacts_route.router, prefix="/api/v1")
     app.dependency_overrides[tasks_route.current_user] = lambda: SimpleNamespace(id=1)
     app.dependency_overrides[tasks_route.get_auth_service] = lambda: SimpleNamespace()
     app.dependency_overrides[tasks_route._conv_service] = lambda: conv
     app.dependency_overrides[tasks_route._task_store] = lambda: store
+    app.dependency_overrides[artifacts_route.current_user] = lambda: SimpleNamespace(id=1)
+    app.dependency_overrides[artifacts_route._conv_service] = lambda: conv
+    app.dependency_overrides[artifacts_route._task_store] = lambda: store
     monkeypatch.setattr(
         tasks_route,
         "build_context_for_user",
@@ -100,7 +105,10 @@ def test_create_continue_and_get_task(client):
     assert task["definition_id"] == ""
     assert payload["turn"]["id"] == "turn-1"
     # The turn carries the task id so the worker can rebuild task context.
-    assert conv.created[0][1]["trace_context"] == {"task_id": task["id"]}
+    assert conv.created[0][1]["trace_context"] == {
+        "task_id": task["id"],
+        "task_origin": "task",
+    }
     assert conv.created[0][1]["query_mode"] == "deep"
 
     fetched = http.get(f"/api/v1/tasks/{task['id']}")
@@ -113,7 +121,10 @@ def test_create_continue_and_get_task(client):
     )
     assert continued.status_code == 201, continued.text
     assert continued.json()["turn"]["id"] == "turn-2"
-    assert conv.created[1][1]["trace_context"] == {"task_id": task["id"]}
+    assert conv.created[1][1]["trace_context"] == {
+        "task_id": task["id"],
+        "task_origin": "task",
+    }
     assert len(store.list_turns(task["id"])) == 2
 
 

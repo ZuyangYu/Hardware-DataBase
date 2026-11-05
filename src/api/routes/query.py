@@ -55,7 +55,13 @@ def _turn_permit_resource(turn: Any) -> str:
     """Task turns use their own admission class; chat stays interactive."""
 
     trace = getattr(turn, "trace_context", {}) or {}
-    return "task" if str(trace.get("task_id") or "").strip() else "chat"
+    if not str(trace.get("task_id") or "").strip():
+        return "chat"
+    # Chat-origin turns keep interactive chat capacity; explicit task jobs
+    # get the background task class.
+    if str(trace.get("task_origin") or "") == "chat":
+        return "chat"
+    return "task"
 
 
 def _can_read_turn(auth, user, turn, conv: ConversationService) -> bool:
@@ -1256,6 +1262,36 @@ def create_turn(
                 },
             )
     trace_context = inject_trace_context()
+    # Convergence: a chat turn is an execution attempt of the session's
+    # durable task, so it gets the same workspace/artifacts/plan.  A clear
+    # document-export request keeps the deterministic export path.
+    turn_task = None
+    turn_task_store = None
+    try:
+        from src.result_exports import infer_export_intent
+
+        if infer_export_intent(body.query) is None:
+            from src.core.task_store import get_task_store
+
+            turn_task_store = get_task_store()
+            turn_task = turn_task_store.get_or_create_task_for_session(
+                user_id=user.id,
+                session_id=session_id,
+                kb_name=session.kb_name,
+                title=(
+                    session.title
+                    if session.title and session.title != "新对话"
+                    else body.query[:40]
+                ),
+                query=body.query,
+            )
+            trace_context = {
+                **trace_context,
+                "task_id": turn_task.id,
+                "task_origin": "chat",
+            }
+    except Exception:
+        turn_task = None
     try:
         turn = conv.create_turn(
         user.id,
@@ -1273,6 +1309,13 @@ def create_turn(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except KnowledgeScopeInvalid as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if turn_task is not None and turn_task_store is not None:
+        try:
+            turn_task_store.set_current_turn(turn_task.id, turn.id)
+            turn_task_store.add_turn(turn_task.id, turn.id, "message")
+            turn_task_store.set_status(turn_task.id, "queued")
+        except Exception:
+            pass
     messages = conv.list_messages(user.id, session_id)
     user_message = next((message for message in messages if message.id == turn.user_message_id), None)
     if user_message is None:

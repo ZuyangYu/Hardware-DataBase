@@ -544,6 +544,12 @@ _OUTPUT_FORMAT_LABELS = {
 }
 
 
+def _strip_task_paths(text: str) -> str:
+    """Keep internal workspace paths out of user-visible task answers."""
+
+    return re.sub(r"(?<![\w/])out/", "", str(text or ""))
+
+
 def _export_intent_for_turn(query: str, task_id: str = "") -> bool:
     """Task mode produces workspace artifacts, never a document-export turn.
 
@@ -1457,7 +1463,9 @@ class MultiSourceAgentRunner:
                 tools = (
                     list(tools)
                     + build_workspace_tools(task.workspace_dir, rt)
-                    + build_task_tools(task.id, task_store, rt)
+                    + build_task_tools(
+                        task.id, task_store, rt, task.workspace_dir
+                    )
                 )
                 system_prompt = system_prompt + build_task_prompt(
                     task, definition, task_artifacts
@@ -1883,6 +1891,8 @@ class MultiSourceAgentRunner:
             _current_run().answer = answer_text
             yield answer_text
         answer_text, removed_citations = _scrub_invalid_citations(answer_text, rt.evidence)
+        if task is not None:
+            answer_text = _strip_task_paths(answer_text)
         record.answer = _current_run().answer = answer_text
         if task is not None and task_store is not None:
             _finalize_task_attempt(

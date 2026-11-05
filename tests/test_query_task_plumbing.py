@@ -54,3 +54,16 @@ def test_task_turn_uses_dedicated_permit_resource():
     assert _turn_permit_resource(SimpleNamespace(trace_context={"task_id": "t1"})) == "task"
     assert _turn_permit_resource(SimpleNamespace(trace_context={})) == "chat"
     assert _turn_permit_resource(SimpleNamespace()) == "chat"
+    # Chat-origin turns share the session task but stay interactive.
+    assert (
+        _turn_permit_resource(
+            SimpleNamespace(trace_context={"task_id": "t1", "task_origin": "chat"})
+        )
+        == "chat"
+    )
+    assert (
+        _turn_permit_resource(
+            SimpleNamespace(trace_context={"task_id": "t1", "task_origin": "task"})
+        )
+        == "task"
+    )

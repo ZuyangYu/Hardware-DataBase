@@ -13,6 +13,7 @@ from src.agents.runner import (
     _agent_evidence_budget,
     _agent_recursion_limit,
     _export_intent_for_turn,
+    _strip_task_paths,
     _build_turn_verification,
     _normalize_citation_labels,
     _research_subagent_spec,
@@ -778,3 +779,9 @@ def test_task_mode_suppresses_export_intent():
     assert _export_intent_for_turn("导出为 PDF", "task-1") is False
     assert _export_intent_for_turn("导出为 PDF", "") is True
     assert _export_intent_for_turn("输出(running)", "") is False
+
+
+def test_task_answers_do_not_expose_internal_paths():
+    assert _strip_task_paths("已写入 out/a.md，见 out/b.md") == "已写入 a.md，见 b.md"
+    assert _strip_task_paths("see out/x") == "see x"
+    assert _strip_task_paths("no path here") == "no path here"

@@ -105,3 +105,34 @@ def test_verification_roundtrip(store):
     payload = {"status": "warn", "checks": [{"id": "citations", "status": "warn"}]}
     store.set_verification(task.id, payload)
     assert store.get_task(task.id).verification == payload
+
+
+def test_list_tasks_for_session(store):
+    first = store.create_task(
+        user_id=1, session_id=7, kb_name="AAA", title="a",
+        definition_id="", query="a",
+    )
+    second = store.create_task(
+        user_id=1, session_id=7, kb_name="AAA", title="b",
+        definition_id="", query="b",
+    )
+    store.create_task(
+        user_id=1, session_id=8, kb_name="AAA", title="c",
+        definition_id="", query="c",
+    )
+    rows = store.list_tasks_for_session(1, 7)
+    assert {item.id for item in rows} == {first.id, second.id}
+
+
+def test_get_or_create_task_for_session(store):
+    first = store.get_or_create_task_for_session(
+        user_id=1, session_id=9, kb_name="AAA", title="t", query="q"
+    )
+    second = store.get_or_create_task_for_session(
+        user_id=1, session_id=9, kb_name="AAA", title="t", query="q2"
+    )
+    other = store.get_or_create_task_for_session(
+        user_id=1, session_id=10, kb_name="AAA", title="t", query="q"
+    )
+    assert first.id == second.id
+    assert other.id != first.id

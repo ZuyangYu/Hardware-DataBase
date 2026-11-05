@@ -103,7 +103,7 @@ def _artifact_projection(artifact: TaskArtifact) -> dict:
         "sha256": artifact.sha256,
         "version": artifact.version,
         "created_at": artifact.created_at,
-        "download_url": f"/api/v1/tasks/{artifact.task_id}/artifacts/{artifact.id}/download",
+        "download_url": f"/api/v1/artifacts/{artifact.id}/download",
     }
 
 
@@ -168,7 +168,7 @@ def _create_turn_for_task(
         query,
         query_mode="deep",
         source_scope=source_scope,
-        trace_context={"task_id": task.id},
+        trace_context={"task_id": task.id, "task_origin": "task"},
     )
     return turn
 

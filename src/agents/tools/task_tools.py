@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from src.agents.workspace import Workspace, WorkspaceError
+
 _ALLOWED_STATUS = {"pending", "running", "done", "blocked"}
 
 
@@ -12,7 +14,12 @@ def _json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-def build_task_tools(task_id: str, store: Any, rt: Any = None) -> list[Any]:
+def build_task_tools(
+    task_id: str,
+    store: Any,
+    rt: Any = None,
+    workspace_dir: str = "",
+) -> list[Any]:
     def task_plan_update(plan_json: str) -> str:
         """更新当前任务的执行计划（由你自己规划，不是固定流程）。
 
@@ -57,8 +64,51 @@ def build_task_tools(task_id: str, store: Any, rt: Any = None) -> list[Any]:
         except Exception as exc:
             return _json({"error": str(exc)})
 
+    def task_publish_artifact(name: str, content: str, kind: str = "") -> str:
+        """发布一个交付物到当前会话，用户可直接在前端预览/下载。
+
+        name 是展示名称（如 关键器件清单.md），content 是文本内容，
+        kind 可选 document / table / spreadsheet / data / image。
+        不要在回答里提 out/、磁盘路径或下载 URL，只描述产物名称。
+        """
+        if rt is not None:
+            try:
+                rt.check_cancel()
+            except Exception:
+                raise
+        try:
+            safe = str(name or "").strip().replace("\\", "/")
+            if (
+                not safe
+                or safe.startswith("/")
+                or ".." in safe.split("/")
+                or not workspace_dir
+            ):
+                raise ValueError("invalid artifact name or workspace")
+            workspace = Workspace(workspace_dir)
+            relative = f"out/{safe}"
+            workspace.write(relative, str(content or ""))
+            artifact = store.register_artifact(
+                task_id,
+                str(workspace.resolve(relative)),
+                name=safe,
+                kind=(str(kind).strip() or None) if kind else None,
+            )
+            return _json(
+                {
+                    "artifact_id": artifact.id,
+                    "name": artifact.name,
+                    "kind": artifact.kind,
+                    "version": artifact.version,
+                    "download_url": f"/api/v1/artifacts/{artifact.id}/download",
+                }
+            )
+        except (WorkspaceError, ValueError, OSError) as exc:
+            return _json({"error": str(exc)})
+
     task_plan_update.__name__ = "task_plan_update"
-    return [task_plan_update]
+    task_publish_artifact.__name__ = "task_publish_artifact"
+    return [task_plan_update, task_publish_artifact]
 
 
 __all__ = ["build_task_tools"]

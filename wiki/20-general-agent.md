@@ -18,8 +18,9 @@ task (durable session)
  └─ artifacts      # 版本化产物，可下载
 ```
 
-`chat_turns.trace_context` 携带 `{"task_id": ...}`；worker 每次执行时由 task store 重建：
-工作区路径、可选外部定义、已有产物列表。
+聊天回合会自动关联当前会话的任务（`trace_context={"task_id": ..., "task_origin": "chat"}`），
+因此每一轮都复用同一个 workspace / plan / artifacts；短问答一轮结束，长任务多轮继续。
+`task_origin=chat` 的回合使用交互 chat 资源类，显式任务使用 `task` 资源类。
 
 ## API
 
@@ -31,7 +32,9 @@ task (durable session)
 | POST | `/api/v1/tasks/{id}/messages` | 继续/修改：同一任务新建 turn |
 | POST | `/api/v1/tasks/{id}/stop` | 请求取消当前 turn |
 | GET | `/api/v1/tasks/{id}/events` | 任务执行记录（聚合 turn 事件） |
-| GET | `/api/v1/tasks/{id}/artifacts` | 产物列表 |
+| GET | `/api/v1/conversations/{id}/artifacts` | 会话产物（前端对话页使用） |
+| GET | `/api/v1/artifacts/{id}/download` | 按产物 id 下载（不暴露磁盘路径） |
+| GET | `/api/v1/tasks/{id}/artifacts` | 任务维度产物列表 |
 | GET | `/api/v1/tasks/{id}/artifacts/{aid}/download` | 下载产物 |
 | GET | `/api/v1/task-definitions` | 列出外部任务定义 |
 
@@ -72,7 +75,9 @@ instructions: 不要展开完整 BOM
   `workspace_edit`（唯一匹配保护）/ `workspace_glob` / `workspace_grep`；
 - 计划：`task_plan_update` 由 agent 维护（pending/running/done/blocked）；
 - 路径必须是工作区内的相对路径，拒绝 `..`、绝对路径和越界符号链接；
-- 交付物写入 `out/`；turn 结束时扫描并登记 artifact（同名文件自动递增版本）；
+- agent 用 `task_publish_artifact(name, content, kind)` 发布交付物；内部仍写入工作区，
+  但回答和前端不暴露 `out/` 或磁盘路径；
+- turn 结束时也会扫描内部目录兜底登记 artifact（同名文件自动递增版本）；
 - 下载接口会再次校验产物路径必须在任务工作区内。
 
 ## 验收与执行记录
@@ -83,7 +88,8 @@ instructions: 不要展开完整 BOM
 
 ## 前端
 
-- 路由：`/tasks`（导航"工作区 → 任务"）；
+- 对话页直接展示"会话产物"条（`ConversationArtifacts`），可下载；
+- `/tasks` 保留为历史/深链接，不再是主导航入口；
 - 页面：新建任务（选知识库/外部定义）、任务列表、当前输出、产物下载、继续修改、停止；
 - 轮询任务详情；终态后停止轮询。
 

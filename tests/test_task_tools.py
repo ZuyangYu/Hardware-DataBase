@@ -50,3 +50,23 @@ def test_plan_update_rejects_invalid_input(store):
     assert "error" in json.loads(tool("not json"))
     assert "error" in json.loads(tool("[]"))
     assert store.get_task(task.id).plan == []
+
+
+def test_publish_artifact_writes_and_registers(store, tmp_path):
+    task = _task(store)
+    tools = {
+        item.__name__: item
+        for item in build_task_tools(
+            task.id, store, workspace_dir=task.workspace_dir
+        )
+    }
+    result = json.loads(
+        tools["task_publish_artifact"]("report.md", "# report\n", "document")
+    )
+    assert result["name"] == "report.md"
+    assert result["download_url"].endswith("/download")
+    artifacts = store.list_artifacts(task.id)
+    assert len(artifacts) == 1
+    assert artifacts[0].name == "report.md"
+    # Finalize scan must not create a duplicate version of the same content.
+    assert store.scan_workspace_artifacts(task.id) == []

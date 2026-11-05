@@ -293,6 +293,41 @@ class TaskStore:
                 ).fetchone()
         return self._row_to_task(row) if row else None
 
+    def get_or_create_task_for_session(
+        self,
+        *,
+        user_id: int,
+        session_id: int,
+        kb_name: str,
+        title: str,
+        query: str,
+        definition_id: str = "",
+    ) -> Task:
+        existing = self.list_tasks_for_session(user_id, session_id, limit=1)
+        if existing:
+            return existing[0]
+        return self.create_task(
+            user_id=user_id,
+            session_id=session_id,
+            kb_name=kb_name,
+            title=title,
+            definition_id=definition_id,
+            query=query,
+        )
+
+    def list_tasks_for_session(
+        self, user_id: int, session_id: int, limit: int = 50
+    ) -> list[Task]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM tasks WHERE user_id = ? AND session_id = ?
+                ORDER BY created_at DESC LIMIT ?
+                """,
+                (int(user_id), int(session_id), max(1, min(int(limit), 200))),
+            ).fetchall()
+        return [self._row_to_task(row) for row in rows]
+
     def list_tasks(self, user_id: int, limit: int = 50) -> list[Task]:
         with closing(self._connect()) as conn:
             rows = conn.execute(

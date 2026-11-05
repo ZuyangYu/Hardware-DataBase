@@ -24,6 +24,7 @@ import { CHAT_MAIN_CLASS, chatBubbleClass, chatRowClass } from './chatPageStyles
 import { useKbChat } from './useKbChat';
 import McpWriteProposalCard from './components/McpWriteProposalCard';
 import ChatSessionSidebar from './components/ChatSessionSidebar';
+import ConversationArtifacts from '@/components/ConversationArtifacts';
 import ChatHeader from './components/ChatHeader';
 import MessageList from './components/MessageList';
 import Composer from './components/Composer';
@@ -719,6 +720,10 @@ export default function ChatPage({
             </div>
           </div>
         )}
+        <ConversationArtifacts
+          sessionId={activeSessionId}
+          refreshKey={`${messages.length}:${streaming}`}
+        />
         <Composer
           kbName={mountedKbName}
           availableKbs={visibleKbs}

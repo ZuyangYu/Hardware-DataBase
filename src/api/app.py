@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.errors import install_error_handlers
 from src.api.deps import require_system_admin
 from src.api.routes import (
+    artifacts,
     assets,
     attachments,
     auth,
@@ -336,6 +337,7 @@ def create_app() -> FastAPI:
     app.include_router(parse_tasks.router, prefix=api_v1)
     app.include_router(query.router, prefix=api_v1)
     app.include_router(tasks.router, prefix=api_v1)
+    app.include_router(artifacts.router, prefix=api_v1)
     app.include_router(quality.router, prefix=api_v1)
     app.include_router(costs.router, prefix=api_v1)
     app.include_router(quality_workflow.router, prefix=api_v1)
