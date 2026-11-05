@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api, ApiError, isForbiddenError, sseGetStream } from '@/api/client';
 import {
+  isHiddenChatTraceStep,
   mergeMcpWriteProposal,
   parseAgentEvent,
   traceStepFromToolEvent,
@@ -441,8 +442,11 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         // 合并而非覆盖：并发的活跃 turn 实时轨迹不会被历史投影清掉。
         const restoredTraces: Record<number, QueryTraceStep[]> = {};
         for (const row of rows) {
-          if (row.role === 'assistant' && row.trace_steps?.length) {
-            restoredTraces[row.id] = row.trace_steps;
+          const visibleSteps = (row.trace_steps ?? []).filter(
+            (step) => !isHiddenChatTraceStep(step),
+          );
+          if (row.role === 'assistant' && visibleSteps.length) {
+            restoredTraces[row.id] = visibleSteps;
           }
         }
         if (Object.keys(restoredTraces).length > 0) {
@@ -631,7 +635,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   }, [clearTraceTimer]);
 
   const upsertTraceStep = useCallback((next: QueryTraceStep) => {
-    if (next.key === 'permission' || next.key === 'generate') return;
+    if (isHiddenChatTraceStep(next)) return;
     setTraceSteps((prev) => {
       let updated: QueryTraceStep[];
       if (prev.length === 0) {

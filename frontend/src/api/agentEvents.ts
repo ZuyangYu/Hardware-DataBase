@@ -535,6 +535,22 @@ function toolStatus(value: string): QueryTraceStatus {
   return 'error';
 }
 
+/**
+ * Runtime orchestration stages that must not leak into the chat "处理过程".
+ * They remain in the durable turn events (task workbench / audit / replay).
+ */
+export const HIDDEN_CHAT_TRACE_KEYS: ReadonlySet<string> = new Set([
+  'permission',
+  'generate',
+  'task_context',
+  'task_mode',
+  'skill_loaded',
+]);
+
+export function isHiddenChatTraceStep(step: Pick<QueryTraceStep, 'key'>): boolean {
+  return HIDDEN_CHAT_TRACE_KEYS.has(step.key);
+}
+
 export function traceStepFromToolEvent(
   event: ToolStartedEvent | ToolCompletedEvent,
 ): QueryTraceStep {

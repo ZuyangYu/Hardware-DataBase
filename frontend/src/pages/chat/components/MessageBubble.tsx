@@ -113,7 +113,7 @@ function AssistantIdentity({ live = false }: { live?: boolean }) {
         <AppIcon name="database" size={11} />
       </span>
       <span className="text-[10px] font-medium uppercase tracking-[0.08em] text-[#9aa1b1]">
-        {live ? '正在检索' : '知识库回答'}
+        {live ? '正在处理' : '知识库回答'}
       </span>
       <span className="h-px flex-1 bg-[linear-gradient(90deg,#eceef3,transparent)]" aria-hidden />
     </div>

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  isHiddenChatTraceStep,
   mergeMcpWriteProposal,
   parseAgentEvent,
   traceStepFromToolEvent,
@@ -15,6 +16,14 @@ const envelope = {
 };
 
 describe('typed agent events', () => {
+  it('hides runtime orchestration stages from the chat process panel', () => {
+    for (const key of ['permission', 'generate', 'task_context', 'task_mode', 'skill_loaded']) {
+      expect(isHiddenChatTraceStep({ key })).toBe(true);
+    }
+    expect(isHiddenChatTraceStep({ key: 'inv-1' })).toBe(false);
+    expect(isHiddenChatTraceStep({ key: 'balanced_route_retry' })).toBe(false);
+  });
+
   it('parses tool started/results with a stable call_id', () => {
     const started = parseAgentEvent('tool_started', JSON.stringify({
       ...envelope,

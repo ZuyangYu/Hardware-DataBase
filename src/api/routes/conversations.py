@@ -110,7 +110,11 @@ def _message_view(
     )
 
 
-_TRACE_STEP_IGNORED_KEYS = frozenset({"permission", "generate"})
+# Chat 的「处理过程」只展示用户能理解的动作。任务上下文/任务模式/Skill 挂载
+# 属于运行时编排事件，保留在 turn 事件与任务工作台里，不进入聊天轨迹。
+_TRACE_STEP_IGNORED_KEYS = frozenset(
+    {"permission", "generate", "task_context", "task_mode", "skill_loaded"}
+)
 
 
 def _trace_steps_from_events(events) -> list[dict]:
