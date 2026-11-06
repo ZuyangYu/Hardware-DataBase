@@ -1,6 +1,6 @@
 # MCP 取数纪律（mcp-probe）
 
-> 状态：2026-11-06 初稿，依据 AAA/ADAS 项目"100% MCP 溯源"实测成败复盘沉淀；owner 校订后删除本行。
+> 状态：2026-11-06 初稿（2026-11-06 晚 P0 修复后更新快照），依据 AAA/ADAS 项目"100% MCP 溯源"实测成败复盘沉淀；owner 校订后删除本行。
 > 适用环节：任何交付物的"必需输入"取数阶段（01~07 全部）。与 SKILL.md 四-1"数值三源"配套——三源纪律管"数值从哪来"，本文件管"MCP 路径探到了什么程度才允许放弃"。
 
 ## 一、探边纪律（探完才许放弃）
@@ -12,12 +12,13 @@
 
 ## 二、探边 checklist（逐工具，2026-11-06 版）
 
-| 工具 | 默认参数坑 | 显式探法 | 已知真实缺陷（ offres 记录） |
+| 工具 | 默认参数坑 | 显式探法 | 已知真实缺陷（2026-11-06 晚修复后快照） |
 |---|---|---|---|
-| `hdb_read_file_chunks` | max_chunks=20 只能拿文件头 | `max_chunks=100`（上限即 100）——须确认预期内容落在前 100 chunk；不在则登记缺陷 | 无 `start_index`/无关键词搜索；API 侧其实已返回全部 chunks，是 bridge 层在裁 |
-| `hdb_query_circuit` | 无 include_summary 参数，每次拖全量 summary | 直接用，靠逐条点查闭环；limit 参数只对结果条目生效 | 检索面窄（MPN 不进索引：查 TC377 无果，实际是 TC367）；summary 噪音大 |
-| `hdb_ask_knowledge_base` | timeout 300s 太长；宽问句更易超时 | timeout ≤150s + 窄问句 + 相隔重试 ≥2 次才判死 | 额度/超时交替；超时不返回部分证据；每次提问新建 conversation |
-| `hdb_download_kb_file` | — | 直接可用即用；报错即登记 | `cannot resolve the configured user for file download`（用户解析 bug） |
+| `hdb_read_file_chunks` | 新增 `start_index`（可在 100 chunk 之后继续）与 `query` 关键词过滤 | 先 `max_chunks=100` 粗扫定位 chunk 区间，再用 `start_index` 翻页；关键词过滤可直接命中 | API 侧一次返回全部 chunks，bridge 侧切片——分页噪声便宜了 |
+| `hdb_query_circuit` | 新增 `include_summary/include_modules`（默认 off）与 `mode`=both/nets/instances | 重复点查务必保持默认 off；需要看电源网/时钟网清单时再开 `include_summary=True` | MPN 仍不进索引：查 TC377 无果（实际是 TC367），需改用 TC367 或依赖 value/part_number 字段 |
+| `hdb_search_knowledge_base`（**新**） | 检索是 lexical 评分（中文 bigram），非向量召回 | 返回 chunk locator（file/chunk_index/rag_id）+ score+snippet；配合 `read_file_chunks(start_index)` 精读；chunk 索引 15min TTL，`refresh=True` 可强制重建 | 仍建议对"结果证据"做一次精读核验，避免只信 snippet |
+| `hdb_ask_knowledge_base` | **已降出 MCP 默认面**：每次调用真实创建 conversation+turn，走 admission+模型管线（1-5min、吃配额）；仅当需要平台代写带引用答案时使用 | 通用 agent 取素材一律改用 `hdb_search_knowledge_base`；仍用 ask 时保持 timeout ≤150s+窄问句 | 额度/超时交替问题不修（除非转正为人机对话场景再修） |
+| `hdb_download_kb_file` | — | 直接可用；以 API_KEY 方式运行的用户解析现回退到 KB 的 `owner_user_id`✔ | 修复后可用；若 owner 失效仍会报错，需换身份或补 owner |
 | `hdb_query_table` | 表格语义层有列错位/连接器混排 | 先看 `列样本` 与实际数据列对齐（正文列常在 col_5，表头声明在 col_7）；同一 sheet 多连接器要按"在控制器上编号"行分段 | 需要靠 describe 类辅助工具（排队中） |
 
 > 表中"已登记缺陷"是 2026-11-06 快照，tool 修复落地后要重新实测并更新本表；**禁止拿旧快照当永久限制**。

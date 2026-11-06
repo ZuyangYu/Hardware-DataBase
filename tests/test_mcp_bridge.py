@@ -327,3 +327,191 @@ def test_delete_file_is_dry_run_until_confirmed():
     result = bridge.delete_file("AAA", "note.txt", confirm=True)
     assert result["ok"] is True
     assert seen == [("DELETE", "/api/v1/kbs/AAA/files/note.txt")]
+
+
+def test_query_circuit_mode_filters_and_summary_off():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/kbs/AAA/structured/circuit-designs":
+            return httpx.Response(
+                200,
+                json={"designs": [{"design_id": "design-1"}], "failed_logs": []},
+            )
+        if request.url.path == "/api/v1/kbs/AAA/structured/circuit-designs/design-1":
+            seen["params"] = dict(request.url.params)
+            return httpx.Response(
+                200,
+                json={
+                    "summary": {"design_id": "design-1"},
+                    "modules": [{"module_id": "m1"}],
+                    "instances": [{"refdes": "U1800"}],
+                    "nets": [{"name": "VCC0V75"}],
+                    "cross_references": [],
+                },
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    _use(handler)
+    result = bridge.query_circuit(
+        "AAA",
+        "X1900",
+        mode="nets",
+        include_summary=False,
+        include_modules=False,
+    )
+    assert seen["params"] == {"net_query": "X1900"}
+    assert result["summary"] == {}
+    assert result["modules"] == []
+    assert result["nets"][0]["name"] == "VCC0V75"
+    assert result["mode"] == "nets"
+
+    result_all = bridge.query_circuit(
+        "AAA",
+        "X1900",
+        include_summary=True,
+        include_modules=True,
+    )
+    assert seen["params"] == {"net_query": "X1900", "instance_query": "X1900"}
+    assert result_all["summary"]["design_id"] == "design-1"
+    assert result_all["modules"] and result_all["instances"]
+
+
+def test_read_file_chunks_start_and_query_filter():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/kbs/AAA/files/f9/chunks"
+        return httpx.Response(
+            200,
+            json={
+                "document_id": "d1",
+                "file_name": "a.pdf",
+                "chunk_count": 5,
+                "backend": "ragflow",
+                "chunks": [
+                    {"index": i, "content": f"chunk alpha {i}", "metadata": {}}
+                    for i in range(5)
+                ],
+            },
+        )
+
+    _use(handler)
+    result = bridge.read_file_chunks("AAA", "f9", start_index=2, query="alpha")
+    assert result["chunk_count"] == 5
+    assert result["start_index"] == 2
+    assert [row["index"] for row in result["chunks"]] == [2, 3, 4]
+
+    filtered = bridge.read_file_chunks("AAA", "f9", query="alpha")
+    assert [row["index"] for row in filtered["chunks"]] == [0, 1, 2, 3, 4]
+
+    missing = bridge.read_file_chunks("AAA", "f9", query="beta")
+    assert missing["chunks"] == []
+
+
+def test_search_knowledge_base_locators_and_cache():
+    calls = {"chunks": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/kbs/AAA/files":
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": "f1", "name": "ICD.xlsx", "status": "indexed"},
+                    {"id": "f2", "name": "HSI.docx", "status": "parsed"},
+                ],
+            )
+        if request.url.path.startswith("/api/v1/kbs/AAA/files/f1/chunks"):
+            calls["chunks"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "document_id": "f1",
+                    "file_name": "ICD.xlsx",
+                    "chunk_count": 2,
+                    "backend": "ragflow",
+                    "chunks": [
+                        {"index": 15, "content": "X1900 pin14 UBD 供电 9~16V", "metadata": {"ragflow_chunk_id": "aaa-15"}},
+                        {"index": 16, "content": "无关内容", "metadata": {"ragflow_chunk_id": "aaa-16"}},
+                    ],
+                },
+            )
+        if request.url.path.startswith("/api/v1/kbs/AAA/files/f2/chunks"):
+            calls["chunks"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "document_id": "f2",
+                    "file_name": "HSI.docx",
+                    "chunk_count": 1,
+                    "backend": "ragflow",
+                    "chunks": [
+                        {"index": 43, "content": "HSI chunk 提到 UBD 供电", "metadata": {"ragflow_chunk_id": "hsi-43"}}
+                    ],
+                },
+            )
+        raise AssertionError(f"unexpected path {path}")
+
+    _use(handler)
+    first = bridge.search_knowledge_base("AAA", "UBD 供电", top_k=5)
+    assert calls["chunks"] == 2
+    assert first["files_searched"] == 2
+    assert first["chunks_searched"] == 3
+    top = first["results"][0]
+    assert top["file_id"] == "f1"
+    assert top["chunk_index"] == 15
+    assert top["rag_id"] == "aaa-15"
+    assert top["score"] > 0
+
+    second = bridge.search_knowledge_base("AAA", "UBD 供电", top_k=5)
+    assert calls["chunks"] == 2  # cache reuse, no extra fetch
+    assert second["result_count"] == len(first["results"])
+
+    narrowed = bridge.search_knowledge_base("AAA", "UBD", file_id="f2", top_k=5)
+    assert calls["chunks"] == 2
+    assert all(row["file_id"] == "f2" for row in narrowed["results"])
+
+    bridge._CHUNK_CACHE.clear()
+
+
+def test_download_kb_file_falls_back_to_kb_owner(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        bridge,
+        "_visible_kb",
+        lambda _name: {
+            "name": "AAA",
+            "department_id": "1739",
+            "permission": "read",
+            "owner_user_id": 4,
+        },
+    )
+    monkeypatch.setattr(bridge, "_USERNAME", "")  # no user creds in this deployment
+    monkeypatch.setattr(bridge, "_LOGIN_USER", {})
+
+    archive = tmp_path / "pipeline_archives" / "departments" / "1739" / "kbs" / "AAA"
+    target = archive / "docs" / "b.txt"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"owner-fallback")
+
+    import src.settings as settings
+
+    monkeypatch.setattr(settings, "STORAGE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "src.core.auth.AuthService.get_user_by_username",
+        lambda self, _username: None,
+    )
+    monkeypatch.setattr(
+        "src.core.auth.AuthService.get_user_by_id",
+        lambda self, _user_id: SimpleNamespace(id=4, username="owner", department_id="1739"),
+    )
+    monkeypatch.setattr(
+        "src.api.context.build_context_for_user",
+        lambda user, kb_name, auth=None: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "src.core.app_pipeline.AppPipeline.list_file_infos",
+        lambda self, kb_name, ctx=None: [
+            SimpleNamespace(id="f2", name="b.txt", local_path="docs/b.txt")
+        ],
+    )
+    result = bridge.download_kb_file("AAA", "f2")
+    assert base64.b64decode(result["content_base64"]) == b"owner-fallback"
