@@ -37,7 +37,14 @@ def _can_read_turn(auth, user, turn, conv: ConversationService) -> bool:
     )
 
 
-def _session_view(s, *, user=None, auth=None, scope=None) -> SessionView:
+def _session_view(
+    s,
+    *,
+    user=None,
+    auth=None,
+    scope=None,
+    workspace_id: str = "",
+) -> SessionView:
     restricted = False
     if scope is None and getattr(s, "knowledge_selection", None) and user is not None:
         try:
@@ -54,6 +61,7 @@ def _session_view(s, *, user=None, auth=None, scope=None) -> SessionView:
         knowledge_scope=scope,
         knowledge_selection_hash=getattr(s, "knowledge_selection_hash", ""),
         source_access_restricted=restricted,
+        workspace_id=workspace_id,
     )
 
 
@@ -76,7 +84,7 @@ def _message_view(
     m,
     cards: list[dict] | None = None,
     trace_steps: list[dict] | None = None,
-    plan: dict | None = None,
+    mcp_write_cards: list[dict] | None = None,
     budget: dict | None = None,
     verification: dict | None = None,
     subagents: list[dict] | None = None,
@@ -103,14 +111,18 @@ def _message_view(
         citations=getattr(m, "citations", []) or [],
         cards=list(cards or []),
         trace_steps=list(trace_steps or []),
-        plan=plan,
+        mcp_write_cards=list(mcp_write_cards or []),
         budget=budget,
         verification=verification,
         subagents=list(subagents or []),
     )
 
 
-_TRACE_STEP_IGNORED_KEYS = frozenset({"permission", "generate"})
+# Chat 的「处理过程」只展示用户能理解的动作。权限/生成/Skill 挂载属于
+# 运行时编排事件，保留在 turn 事件里，不进入聊天轨迹。
+_TRACE_STEP_IGNORED_KEYS = frozenset(
+    {"permission", "generate", "skill_loaded"}
+)
 
 
 def _trace_steps_from_events(events) -> list[dict]:
@@ -205,6 +217,45 @@ def _trace_steps_from_events(events) -> list[dict]:
     return steps
 
 
+def _mcp_write_cards_from_events(
+    events, proposals_by_id: dict[str, dict], *, turn_id: str
+) -> list[dict]:
+    """Rebuild chat-inline write cards from persisted turn events.
+
+    The event stores the original proposal card; the proposal store owns the
+    latest status/artifact fields after the user confirms or rejects it.  Merge
+    the two so a refresh shows the current card instead of the initial
+    ``proposed`` snapshot.
+    """
+
+    cards: list[dict] = []
+    for event in events:
+        if str(getattr(event, "event_type", "") or "") != "mcp_write_proposal":
+            continue
+        payload = getattr(event, "payload", None)
+        if not isinstance(payload, dict):
+            continue
+        card = dict(payload.get("card") or {})
+        proposal_id = str(card.get("proposal_id") or "").strip()
+        if not proposal_id:
+            continue
+        current = proposals_by_id.get(proposal_id) or {}
+        for key in (
+            "status",
+            "artifact_ref",
+            "artifact_filename",
+            "artifact_sha256",
+            "error_code",
+            "expires_at",
+            "updated_at",
+        ):
+            if key in current:
+                card[key] = current[key]
+        card["proposal_id"] = proposal_id
+        card["turn_id"] = str(turn_id)
+        cards.append(card)
+    return cards
+
 
 def _ensure_kb_read(user: AuthUser, kb_name: str, auth: AuthService) -> None:
     ctx = build_context_for_user(user, kb_name, auth=auth)
@@ -227,12 +278,37 @@ def _ensure_history_access(user: AuthUser, auth: AuthService) -> None:
 @router.get("/conversations", response_model=list[SessionView])
 def list_sessions(
     kb_name: str | None = None,
+    workspace_id: str | None = None,
     user: AuthUser = Depends(current_user),
     auth: AuthService = Depends(get_auth_service),
     conv: ConversationService = Depends(_conv_service),
 ):
     _ensure_history_access(user, auth)
-    return [_session_view(s, user=user, auth=auth) for s in conv.list_sessions(user.id, kb_name)]
+    sessions = conv.list_sessions(user.id, kb_name)
+    if workspace_id:
+        from src.core.workspace_store import get_workspace_store
+
+        workspace_store = get_workspace_store()
+        workspace = workspace_store.get_workspace(workspace_id, user.id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="workspace not found")
+        allowed = set(workspace_store.list_session_ids(workspace.id))
+        sessions = [session for session in sessions if session.id in allowed]
+    from src.core.workspace_store import get_workspace_store
+
+    workspace_store = get_workspace_store()
+    views: list[SessionView] = []
+    for session in sessions:
+        attached = workspace_store.get_workspace_for_session(session.id)
+        views.append(
+            _session_view(
+                session,
+                user=user,
+                auth=auth,
+                workspace_id=(workspace_id or (attached.id if attached else "")),
+            )
+        )
+    return views
 
 
 @router.post("/conversations", response_model=SessionView)
@@ -242,28 +318,48 @@ def create_session(
     auth: AuthService = Depends(get_auth_service),
     conv: ConversationService = Depends(_conv_service),
 ):
+    from src.core.workspace_store import get_workspace_store
+
+    workspace_store = get_workspace_store()
+    workspace = None
+    if body.workspace_id:
+        workspace = workspace_store.get_workspace(body.workspace_id, user.id)
+        if workspace is None:
+            raise HTTPException(status_code=404, detail="workspace not found")
+        kb_name = workspace.kb_name if workspace.kind == "knowledge" else GENERAL_CHAT_KB_NAME
+    else:
+        kb_name = body.kb_name
     scope = None
     if body.knowledge_scope is not None:
         from types import SimpleNamespace
         try:
-            scope = resolve_session_scope(auth, user, SimpleNamespace(kb_name=body.kb_name, knowledge_selection=None), body.knowledge_scope)
+            scope = resolve_session_scope(auth, user, SimpleNamespace(kb_name=kb_name, knowledge_selection=None), body.knowledge_scope)
         except KnowledgeScopeDenied as exc:
             raise HTTPException(status_code=403, detail="knowledge_scope_denied") from exc
         except KnowledgeScopeInvalid as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except MultiKnowledgeRetrievalUnavailable as exc:
             raise HTTPException(status_code=409, detail="feature_unavailable") from exc
-    _ensure_kb_read(user, body.kb_name, auth)
-    ctx = build_context_for_user(user, body.kb_name, auth=auth)
+    _ensure_kb_read(user, kb_name, auth)
+    ctx = build_context_for_user(user, kb_name, auth=auth)
     s = conv.create_session(
         user.id,
-        body.kb_name,
+        kb_name,
         body.title,
         department_id=ctx.metadata.get("resource_department_id") or ctx.metadata.get("department_id"),
         kb_id=ctx.metadata.get("kb_id"),
         **({"knowledge_selection": body.knowledge_scope} if scope is not None else {}),
     )
-    return _session_view(s, scope=scope)
+    if workspace is None:
+        kind = "knowledge" if kb_name != GENERAL_CHAT_KB_NAME else "general"
+        workspace = workspace_store.get_or_create_for_user(
+            user_id=user.id,
+            kind=kind,
+            kb_name=kb_name if kind == "knowledge" else "",
+            kb_id=ctx.metadata.get("kb_id") if kind == "knowledge" else None,
+        )
+    workspace_store.attach_session(workspace.id, s.id)
+    return _session_view(s, scope=scope, workspace_id=workspace.id)
 
 
 @router.get("/conversations/{session_id}", response_model=SessionView)
@@ -277,7 +373,12 @@ def get_session(
     if s is None:
         raise HTTPException(status_code=404, detail="session not found")
     _ensure_history_access(user, auth)
-    return _session_view(s, user=user, auth=auth)
+    from src.core.workspace_store import get_workspace_store
+
+    attached = get_workspace_store().get_workspace_for_session(s.id)
+    return _session_view(
+        s, user=user, auth=auth, workspace_id=attached.id if attached else ""
+    )
 
 
 @router.delete("/conversations/{session_id}", response_model=OkResponse)
@@ -319,16 +420,34 @@ def list_messages(
     assistant_turns = {
         str(m.turn_id) for m in messages if m.role == "assistant" and m.turn_id
     }
-    trace_by_turn: dict[str, list[dict]] = {}
+    events_by_turn: dict[str, list] = {}
     for turn_id in assistant_turns:
         try:
-            trace_by_turn[turn_id] = _trace_steps_from_events(
-                conv.list_turn_events(user.id, turn_id)
-            )
+            events_by_turn[turn_id] = conv.list_turn_events(user.id, turn_id)
         except Exception:
-            # Trace rehydration is best-effort: a projection failure must
+            # History rehydration is best-effort: a projection failure must
             # never break the message list itself.
-            trace_by_turn[turn_id] = []
+            events_by_turn[turn_id] = []
+    trace_by_turn: dict[str, list[dict]] = {
+        turn_id: _trace_steps_from_events(events)
+        for turn_id, events in events_by_turn.items()
+    }
+    proposals_by_id: dict[str, dict] = {}
+    try:
+        from src.agents.mcp.service import McpPluginService
+
+        proposals_by_id = {
+            proposal.proposal_id: proposal.to_dict()
+            for proposal in McpPluginService().list_write_proposals(user.id)
+        }
+    except Exception:
+        proposals_by_id = {}
+    mcp_cards_by_turn: dict[str, list[dict]] = {
+        turn_id: _mcp_write_cards_from_events(
+            events, proposals_by_id, turn_id=turn_id
+        )
+        for turn_id, events in events_by_turn.items()
+    }
     views: list[MessageView] = []
     for m in messages:
         owning_turn = None
@@ -344,6 +463,9 @@ def list_messages(
         if turn_id and (m.role == "assistant" or turn_id not in assistant_turns):
             cards = cards_by_turn.get(turn_id, [])
         trace_steps = trace_by_turn.get(turn_id, []) if m.role == "assistant" else []
+        mcp_write_cards = (
+            mcp_cards_by_turn.get(turn_id, []) if m.role == "assistant" else []
+        )
         summary = getattr(owning_turn, "summary", None) if m.role == "assistant" else None
         summary = summary if isinstance(summary, dict) else {}
         views.append(
@@ -351,7 +473,7 @@ def list_messages(
                 m,
                 cards=cards,
                 trace_steps=trace_steps,
-                plan=summary.get("plan") if isinstance(summary.get("plan"), dict) else None,
+                mcp_write_cards=mcp_write_cards,
                 budget=summary.get("budget") if isinstance(summary.get("budget"), dict) else None,
                 verification=(
                     summary.get("verification")

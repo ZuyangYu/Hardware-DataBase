@@ -86,6 +86,17 @@ STORAGE_DIR = os.getenv("STORAGE_DIR") or os.path.join(BASE_DIR, "storage")
 PIPELINE_ARCHIVE_ROOT = os.getenv("PIPELINE_ARCHIVE_ROOT", os.path.join(STORAGE_DIR, "pipeline_archives"))
 RAGFLOW_FILE_ROOT = os.getenv("RAGFLOW_FILE_ROOT", PIPELINE_ARCHIVE_ROOT)
 LOG_DIR = os.path.join(STORAGE_DIR, "logs")
+# Workspace-first agent storage.  A workspace owns the hidden file tree and
+# artifacts for a session/user; there is no task product behind it.
+WORKSPACE_DB_PATH = os.getenv(
+    "WORKSPACE_DB_PATH", os.path.join(STORAGE_DIR, "workspaces.db")
+)
+WORKSPACE_ROOT = os.getenv(
+    "WORKSPACE_ROOT", os.path.join(STORAGE_DIR, "workspaces")
+)
+# Workspace store backend: "" follows CONTROL_PLANE_BACKEND; or sqlite/postgres.
+WORKSPACE_STORE_BACKEND = os.getenv("WORKSPACE_STORE_BACKEND", "").strip().lower()
+WORKSPACE_DB_URL = os.getenv("WORKSPACE_DB_URL", "").strip()
 
 
 def _resolve_storage_path(raw_path: str | None, default_name: str) -> str:
@@ -170,6 +181,9 @@ AGENT_CHECKPOINT_POOL_SIZE = int(os.getenv("AGENT_CHECKPOINT_POOL_SIZE", "4"))
 AUTH_DEFAULT_ADMIN_USERNAME = os.getenv("AUTH_DEFAULT_ADMIN_USERNAME", "admin")
 AUTH_DEFAULT_ADMIN_PASSWORD = os.getenv("AUTH_DEFAULT_ADMIN_PASSWORD", "")
 AUTH_SESSION_TTL_HOURS = int(os.getenv("AUTH_SESSION_TTL_HOURS", "24"))
+# Long-lived personal MCP token, exchanged for a short session token by the bridge.
+MCP_TOKEN_TTL_DAYS = int(os.getenv("MCP_TOKEN_TTL_DAYS", "365"))
+MCP_SESSION_TTL_HOURS = int(os.getenv("MCP_SESSION_TTL_HOURS", "24"))
 
 
 class Provider(Enum):
@@ -189,6 +203,10 @@ AGENT_CUSTOM_API_KEY = os.getenv("AGENT_CUSTOM_API_KEY", "")
 AGENT_CUSTOM_BASE_URL = os.getenv("AGENT_CUSTOM_BASE_URL", "")
 AGENT_CUSTOM_MODEL = os.getenv("AGENT_CUSTOM_MODEL", "")
 AGENT_CUSTOM_MAX_TOKENS = int(os.getenv("AGENT_CUSTOM_MAX_TOKENS", "4096"))
+# Optional OpenAI-compatible reasoning effort (low/high/max). Reasoning models
+# count hidden reasoning tokens against max_tokens, so a low effort avoids
+# spending the whole output budget before any visible answer is emitted.
+AGENT_REASONING_EFFORT = os.getenv("AGENT_REASONING_EFFORT", "").strip().lower()
 # 声明模型上下文窗口（输入侧），激活 deepagents SummarizationMiddleware 的
 # 主动压缩（85% 触发 / 保留 10%）。OpenAI 兼容中转（OpenRouter/DeepSeek/
 # SiliconFlow）不暴露模型 profile，需要部署方显式给出；模型自带已知 profile
@@ -299,6 +317,11 @@ RESOURCE_PERMIT_LEASE_SECONDS = int(os.getenv("RESOURCE_PERMIT_LEASE_SECONDS", "
 # P0-006: uncertain permits older than this pause new admissions for their
 # resource and raise an operations alert (never auto-release).
 RESOURCE_UNCERTAIN_ESCALATE_SECONDS = int(os.getenv("RESOURCE_UNCERTAIN_ESCALATE_SECONDS", "600"))
+# After this grace period an isolated uncertain permit is released with
+# server_deadline_passed evidence instead of blocking admission forever.
+RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS = int(
+    os.getenv("RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS", "1800")
+)
 RESOURCE_GOVERNOR_MAINTENANCE_SECONDS = float(
     os.getenv("RESOURCE_GOVERNOR_MAINTENANCE_SECONDS", "5")
 )
@@ -357,6 +380,11 @@ RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED = _env_bool(
     "RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED", False
 )
 CHAT_QUEUE_DEADLINE_SECONDS = int(os.getenv("CHAT_QUEUE_DEADLINE_SECONDS", "600"))
+# Deep（知识库复杂任务）回合的硬看门狗：未声明调用上限时完整性优先，
+# 允许更长的探索时间；声明了上限的回合仍受普通 600s 预算约束。
+CHAT_QUEUE_DEADLINE_DEEP_SECONDS = int(
+    os.getenv("CHAT_QUEUE_DEADLINE_DEEP_SECONDS", "900")
+)
 RESOURCE_LLM_MAX_CONCURRENT = int(os.getenv("RESOURCE_LLM_MAX_CONCURRENT", "4"))
 RESOURCE_LLM_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_LLM_RESERVED_INTERACTIVE", "2"))
 RESOURCE_RAG_MAX_CONCURRENT = int(os.getenv("RESOURCE_RAG_MAX_CONCURRENT", "8"))
@@ -365,6 +393,10 @@ RESOURCE_TOOL_MAX_CONCURRENT = int(os.getenv("RESOURCE_TOOL_MAX_CONCURRENT", "16
 RESOURCE_TOOL_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_TOOL_RESERVED_INTERACTIVE", "0"))
 RESOURCE_CHAT_MAX_CONCURRENT = int(os.getenv("RESOURCE_CHAT_MAX_CONCURRENT", "4"))
 RESOURCE_CHAT_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_CHAT_RESERVED_INTERACTIVE", "0"))
+# Durable task turns get their own admission class so long-running research
+# never consumes interactive chat slots.
+RESOURCE_TASK_MAX_CONCURRENT = int(os.getenv("RESOURCE_TASK_MAX_CONCURRENT", "2"))
+RESOURCE_TASK_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_TASK_RESERVED_INTERACTIVE", "0"))
 RESOURCE_HEAVY_JOB_MAX_CONCURRENT = int(os.getenv("RESOURCE_HEAVY_JOB_MAX_CONCURRENT", "4"))
 RESOURCE_HEAVY_JOB_RESERVED_INTERACTIVE = int(os.getenv("RESOURCE_HEAVY_JOB_RESERVED_INTERACTIVE", "1"))
 RESOURCE_OCR_MAX_CONCURRENT = int(os.getenv("RESOURCE_OCR_MAX_CONCURRENT", "1"))
@@ -404,7 +436,7 @@ MCP_WRITE_ENABLED = _env_bool("MCP_WRITE_ENABLED", False)
 MCP_WRITE_CONFIRM_TTL_SECONDS = int(os.getenv("MCP_WRITE_CONFIRM_TTL_SECONDS", "1800"))
 MCP_MAX_ARTIFACT_BYTES = int(os.getenv("MCP_MAX_ARTIFACT_BYTES", str(50 * 1024 * 1024)))
 MCP_ARTIFACT_ALLOWED_EXTENSIONS = os.getenv(
-    "MCP_ARTIFACT_ALLOWED_EXTENSIONS", "kicad_sch,kicad_pcb,kicad_pro,zip,json,csv"
+    "MCP_ARTIFACT_ALLOWED_EXTENSIONS", "kicad_sch,kicad_pcb,kicad_pro,drawio,zip,json,csv"
 )
 # Phase 2 candidate artifacts: validated (extension/size/hash) and stored here
 # before any download link exists; originals are never touched.
@@ -693,19 +725,9 @@ OBS_DEPENDENCY_TIMEOUT_SECONDS = float(os.getenv("OBS_DEPENDENCY_TIMEOUT_SECONDS
 # 1 秒既能把探针风暴收敛成一次真实检查，又能在 ~1 秒内暴露真实故障。
 OBS_READINESS_CACHE_SECONDS = float(os.getenv("OBS_READINESS_CACHE_SECONDS", "1"))
 
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", (
-    "你是一个专业的硬件技术助手。请严格基于检索到的【参考资料】回答用户问题。\n"
-    "规则：\n"
-    "1. 如果【参考资料】包含答案，请详细回答，并在关键结论后标注证据来源编号，如 [1][2]（编号见证据片段前的 [n] 标记）。\n"
-    "2. 回答前自查：证据是否已覆盖问题的全部要点？若仍有缺口，先继续检索补证，不要凭当前片段草率收敛。\n"
-    "3. 如果【参考资料】内容不足或无关，请明确说明知识库中未找到相关信息，不要编造。\n"
-    "4. 多次检索时不要用完全相同的查询原样重复调用；重复前先确认已有证据是否覆盖问题，需要新信息时换关键词或换检索工具。\n"
-    "5. 回答必须使用中文。\n"
-    "6. 用户要求导出为 Markdown、Excel、Word、PDF 或 PowerPoint 时，文件由服务器异步生成；只输出结构化 Markdown，不要生成 HTML、浏览器打印步骤或声称无法输出文件。"
-    "7. 引用必须实质支撑：引用的证据片段必须实际包含所陈述的具体要素（人名、日期、数值、阈值、引脚等）；"
-    "仅主题相关但不含该要素的片段不得作为具体结论的依据，此时应如实说明证据不足。"
-    "表格行、总结性结论同样需要有证据支撑，不得无引用断言。"
-))
+# Optional business/domain addendum.  The built-in workspace-agent behavior
+# lives in ``src/agents/turn_prompt.py`` and is not editable from the UI.
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", "")
 
 NO_CONTEXT_PROMPT = os.getenv(
     "NO_CONTEXT_PROMPT",
@@ -806,6 +828,8 @@ DEFAULT_VALUES = {
     "AUTH_DEFAULT_ADMIN_USERNAME": "admin",
     "AUTH_DEFAULT_ADMIN_PASSWORD": "",
     "AUTH_SESSION_TTL_HOURS": "24",
+    "MCP_TOKEN_TTL_DAYS": "365",
+    "MCP_SESSION_TTL_HOURS": "24",
     "AGENT_LLM_PROVIDER": "ollama",
     "AGENT_OLLAMA_BASE_URL": "http://localhost:11434",
     "AGENT_OLLAMA_MODEL": "qwen2.5:32b",
@@ -813,6 +837,7 @@ DEFAULT_VALUES = {
     "AGENT_CUSTOM_BASE_URL": "",
     "AGENT_CUSTOM_MODEL": "",
     "AGENT_CUSTOM_MAX_TOKENS": "4096",
+    "AGENT_REASONING_EFFORT": "",
     "AGENT_MODEL_MAX_INPUT_TOKENS": "65536",
     "AGENT_TEMPERATURE": "0.2",
     "AGENT_TIMEOUT_SECONDS": "120",
@@ -941,7 +966,7 @@ DEFAULT_VALUES = {
     "MCP_WRITE_ENABLED": "false",
     "MCP_WRITE_CONFIRM_TTL_SECONDS": "1800",
     "MCP_MAX_ARTIFACT_BYTES": str(50 * 1024 * 1024),
-    "MCP_ARTIFACT_ALLOWED_EXTENSIONS": "kicad_sch,kicad_pcb,kicad_pro,zip,json,csv",
+    "MCP_ARTIFACT_ALLOWED_EXTENSIONS": "kicad_sch,kicad_pcb,kicad_pro,drawio,zip,json,csv",
     "MCP_ARTIFACT_STORAGE_DIR": os.path.join(STORAGE_DIR, "mcp_artifacts"),
     "MCP_WRITE_MAX_ATTEMPTS": "3",
     "RESOURCE_MCP_MAX_CONCURRENT": "4",
@@ -1108,6 +1133,7 @@ def _reload_settings():
     global RAGFLOW_RETRIEVAL_DOC_SCOPE_ENABLED, RAGFLOW_RETRIEVAL_DOC_IDS_MAX
     global RAGFLOW_METADATA_WRITE_BEST_EFFORT
     global AUTH_DB_PATH, AUTH_DEFAULT_ADMIN_USERNAME, AUTH_DEFAULT_ADMIN_PASSWORD, AUTH_SESSION_TTL_HOURS
+    global MCP_TOKEN_TTL_DAYS, MCP_SESSION_TTL_HOURS
     global AGENT_CHECKPOINT_DB_PATH, AGENT_CHECKPOINT_BACKEND, AGENT_CHECKPOINT_DATABASE_URL
     global AGENT_CHECKPOINT_POOL_SIZE
     global PIPELINE_ARCHIVE_ROOT, RAGFLOW_FILE_ROOT
@@ -1118,7 +1144,7 @@ def _reload_settings():
     global AGENT_LLM_PROVIDER
     global AGENT_OLLAMA_BASE_URL, AGENT_OLLAMA_MODEL
     global AGENT_CUSTOM_API_KEY, AGENT_CUSTOM_BASE_URL, AGENT_CUSTOM_MODEL
-    global AGENT_CUSTOM_MAX_TOKENS, AGENT_TEMPERATURE, AGENT_TIMEOUT_SECONDS
+    global AGENT_CUSTOM_MAX_TOKENS, AGENT_REASONING_EFFORT, AGENT_TEMPERATURE, AGENT_TIMEOUT_SECONDS
     global AGENT_MODEL_MAX_INPUT_TOKENS
     global AGENT_RATE_LIMIT_MAX_RETRIES, AGENT_RATE_LIMIT_INITIAL_DELAY_SECONDS
     global AGENT_RATE_LIMIT_MAX_DELAY_SECONDS
@@ -1131,7 +1157,8 @@ def _reload_settings():
     global RESOURCE_GOVERNOR_ENABLED, RESOURCE_GOVERNOR_SCOPE, RESOURCE_GOVERNOR_DB_PATH
     global RESOURCE_GOVERNOR_BACKEND, RESOURCE_GOVERNOR_DATABASE_URL
     global RESOURCE_QUEUE_MAX_WAIT_SECONDS, RESOURCE_QUEUE_MAX_DEPTH, RESOURCE_PERMIT_LEASE_SECONDS
-    global RESOURCE_UNCERTAIN_ESCALATE_SECONDS, RESOURCE_GOVERNOR_MAINTENANCE_SECONDS
+    global RESOURCE_UNCERTAIN_ESCALATE_SECONDS, RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS
+    global RESOURCE_GOVERNOR_MAINTENANCE_SECONDS
     global RESOURCE_GOVERNOR_DEPLOYMENT_ID, RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED
     global CONTROL_PLANE_BACKEND, CONTROL_PLANE_DATABASE_URL, CONTROL_PLANE_POOL_SIZE
     global EVALUATION_STORE_BACKEND, EVALUATION_STORE_DATABASE_URL
@@ -1288,6 +1315,8 @@ def _reload_settings():
     AUTH_DEFAULT_ADMIN_USERNAME = os.getenv("AUTH_DEFAULT_ADMIN_USERNAME", "admin")
     AUTH_DEFAULT_ADMIN_PASSWORD = os.getenv("AUTH_DEFAULT_ADMIN_PASSWORD", "")
     AUTH_SESSION_TTL_HOURS = int(os.getenv("AUTH_SESSION_TTL_HOURS", "24"))
+    MCP_TOKEN_TTL_DAYS = int(os.getenv("MCP_TOKEN_TTL_DAYS", "365"))
+    MCP_SESSION_TTL_HOURS = int(os.getenv("MCP_SESSION_TTL_HOURS", "24"))
 
     AGENT_LLM_PROVIDER = Provider(os.getenv("AGENT_LLM_PROVIDER", "ollama").lower())
     AGENT_OLLAMA_BASE_URL = os.getenv("AGENT_OLLAMA_BASE_URL", "http://localhost:11434")
@@ -1296,6 +1325,10 @@ def _reload_settings():
     AGENT_CUSTOM_BASE_URL = os.getenv("AGENT_CUSTOM_BASE_URL", "")
     AGENT_CUSTOM_MODEL = os.getenv("AGENT_CUSTOM_MODEL", "")
     AGENT_CUSTOM_MAX_TOKENS = int(os.getenv("AGENT_CUSTOM_MAX_TOKENS", "4096"))
+    # Optional OpenAI-compatible reasoning effort (low/high/max). Reasoning
+    # models count hidden reasoning tokens against max_tokens, so a low effort
+    # avoids spending the whole output budget before any visible answer.
+    AGENT_REASONING_EFFORT = os.getenv("AGENT_REASONING_EFFORT", "").strip().lower()
     AGENT_MODEL_MAX_INPUT_TOKENS = int(os.getenv("AGENT_MODEL_MAX_INPUT_TOKENS", "65536"))
     AGENT_TEMPERATURE = float(os.getenv("AGENT_TEMPERATURE", "0.2"))
     AGENT_TIMEOUT_SECONDS = int(os.getenv("AGENT_TIMEOUT_SECONDS", "120"))
@@ -1329,6 +1362,11 @@ def _reload_settings():
     RESOURCE_QUEUE_MAX_DEPTH = int(os.getenv("RESOURCE_QUEUE_MAX_DEPTH", "256"))
     RESOURCE_PERMIT_LEASE_SECONDS = int(os.getenv("RESOURCE_PERMIT_LEASE_SECONDS", "300"))
     RESOURCE_UNCERTAIN_ESCALATE_SECONDS = int(os.getenv("RESOURCE_UNCERTAIN_ESCALATE_SECONDS", "600"))
+    # After this grace period an isolated uncertain permit is released with
+    # server_deadline_passed evidence instead of blocking admission forever.
+    RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS = int(
+        os.getenv("RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS", "1800")
+    )
     RESOURCE_GOVERNOR_MAINTENANCE_SECONDS = float(
         os.getenv("RESOURCE_GOVERNOR_MAINTENANCE_SECONDS", "5")
     )
@@ -1407,7 +1445,7 @@ def _reload_settings():
     MCP_WRITE_CONFIRM_TTL_SECONDS = int(os.getenv("MCP_WRITE_CONFIRM_TTL_SECONDS", "1800"))
     MCP_MAX_ARTIFACT_BYTES = int(os.getenv("MCP_MAX_ARTIFACT_BYTES", str(50 * 1024 * 1024)))
     MCP_ARTIFACT_ALLOWED_EXTENSIONS = os.getenv(
-        "MCP_ARTIFACT_ALLOWED_EXTENSIONS", "kicad_sch,kicad_pcb,kicad_pro,zip,json,csv"
+        "MCP_ARTIFACT_ALLOWED_EXTENSIONS", "kicad_sch,kicad_pcb,kicad_pro,drawio,zip,json,csv"
     )
     MCP_ARTIFACT_STORAGE_DIR = _resolve_storage_path(
         os.getenv("MCP_ARTIFACT_STORAGE_DIR"), "mcp_artifacts"

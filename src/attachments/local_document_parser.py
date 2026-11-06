@@ -161,7 +161,7 @@ class LocalDocumentParser:
                 return self._parse_pdf(asset, source_path)
             if ext == ".docx":
                 return self._parse_docx(asset, source_path)
-            if ext in {".txt", ".md"}:
+            if ext in {".txt", ".md", ".drawio"}:
                 return self._parse_plaintext(asset, source_path, ext)
             return ParseOutcome(
                 ok=False,

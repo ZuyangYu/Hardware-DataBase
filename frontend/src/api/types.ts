@@ -335,12 +335,14 @@ export interface SessionView {
   knowledge_scope?: KnowledgeScopeSnapshot | null;
   knowledge_selection_hash?: string;
   source_access_restricted?: boolean;
+  workspace_id?: string;
 }
 
 export interface CreateSessionRequest {
   kb_name: string;
   title?: string;
   knowledge_scope?: KnowledgeSelectionInput | null;
+  workspace_id?: string;
 }
 
 export interface MemoryContextItem {
@@ -386,6 +388,8 @@ export interface AttachmentRevisionCard {
 export interface McpWriteProposalCard {
   kind: 'mcp_write_proposal';
   proposal_id: string;
+  /** Owning chat turn; absent for legacy cards. */
+  turn_id?: string;
   server: string;
   server_name: string;
   tool: string;
@@ -418,27 +422,14 @@ export interface MessageView {
   cards?: AttachmentRevisionCard[];
   /** 该 turn 持久化的执行轨迹步骤（刷新后轨迹面板回填）。 */
   trace_steps?: QueryTraceStep[];
-  /** 历史消息的执行计划数据；前端不再渲染计划卡片。 */
-  plan?: TurnPlanState | null;
+  /** 该 turn 的外部插件写入提案卡（刷新后仍显示在对应 assistant 消息下）。 */
+  mcp_write_cards?: McpWriteProposalCard[];
   /** 本轮 agent 循环预算与复杂度。 */
   budget?: TurnBudget | null;
   /** 系统校验结果（确定性检查 + 可选独立模型校验）。 */
   verification?: TurnVerification | null;
   /** 检索子 agent 摘要（不含原始上下文）。 */
   subagents?: TurnSubagent[];
-}
-
-export type TurnPlanStatus = 'pending' | 'in_progress' | 'completed';
-
-export interface TurnPlanItem {
-  content: string;
-  status: TurnPlanStatus;
-}
-
-export interface TurnPlanState {
-  items: TurnPlanItem[];
-  revision: number;
-  source?: string;
 }
 
 export interface TurnBudget {

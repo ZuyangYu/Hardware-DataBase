@@ -220,6 +220,8 @@ class AppPipeline:
         action_scope: Any | None = None,
         knowledge_scope: Any | None = None,
         knowledge_scope_resolver: Any | None = None,
+        workspace_id: str = "",
+        turn_id: str = "",
     ) -> Generator[str, None, None]:
         self.clear_last_token_usage_summary()
         if not msg.strip():
@@ -246,6 +248,8 @@ class AppPipeline:
                 action_scope=action_scope,
                 knowledge_scope=knowledge_scope,
                 knowledge_scope_resolver=knowledge_scope_resolver,
+                workspace_id=workspace_id,
+                turn_id=turn_id,
             )
         except QueryCancelled:
             return
@@ -502,6 +506,7 @@ class AppPipeline:
             if auth_service.knowledge_base_exists(scope.kb_name, department_id=scope.department_id):
                 self._audit("create_kb", ctx, target_type="knowledge_base", target_id=name, kb_name=name, success=False, error_message="知识库已存在")
                 return False, "知识库已存在"
+
 
             self._audit_requested(
                 "create_kb",

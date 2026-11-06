@@ -49,6 +49,35 @@ def test_stream_wrapper_emits_deltas_and_records_answer(monkeypatch):
     assert record_agent.call_args.kwargs["mode"] == "deep"
 
 
+def test_general_chat_without_answer_does_not_use_kb_no_context_prompt(monkeypatch):
+    """No-KB chat must not tell the user the knowledge base has no context."""
+
+    from src.agents import runner as runner_mod
+    import src.settings as settings
+
+    fake_agent = type("F", (), {})()
+    fake_agent.stream = lambda *args, **kwargs: iter(())
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: fake_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+    monkeypatch.setattr(settings, "NO_CONTEXT_PROMPT", "KB_NO_CONTEXT_SENTINEL")
+
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    deltas = list(
+        runner.stream(
+            query="能不能优化一下",
+            kb_name="__general__",
+            history=[],
+            thread_id="t-general-empty",
+        )
+    )
+
+    answer = "".join(deltas)
+    assert "KB_NO_CONTEXT_SENTINEL" not in answer
+    assert "本轮没有生成有效回答" in answer
+
+
 def test_stream_emits_real_compaction_and_context_manifest(monkeypatch):
     from langchain_core.messages import HumanMessage
 

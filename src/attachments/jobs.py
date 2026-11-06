@@ -205,6 +205,7 @@ def default_router() -> AttachmentProcessorRouter:
             ".docx": LocalDocumentProcessor(),
             ".txt": LocalDocumentProcessor(),
             ".md": LocalDocumentProcessor(),
+            ".drawio": LocalDocumentProcessor(),
             ".xlsx": SpreadsheetProcessor(),
             ".xlsm": SpreadsheetProcessor(),
             ".edf": CircuitProcessor(),

@@ -352,17 +352,22 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     fencing_token = int(getattr(turn, "fencing_token", 0) or 0)
     session_generation = int(getattr(turn, "session_generation", 0) or 0)
     ownership_token: int | None = fencing_token if fencing_token > 0 else None
-    # P0b: a chat turn holds one CHAT slot for its whole execution.  Queued
-    # turns wait up to the chat deadline before failing with backpressure.
-    chat_permit = None
+    # P0b: a turn holds one admission slot for its whole execution.  Task
+    # turns use the dedicated ``task`` class so long research never consumes
+    # interactive chat capacity.  Queued work still waits up to its deadline.
+    permit_resource = "chat"
+    permit_timeout = float(
+        getattr(src.settings, "CHAT_QUEUE_DEADLINE_SECONDS", 600)
+    )
+    turn_permit = None
     if bool(getattr(src.settings, "RESOURCE_GOVERNOR_ENABLED", True)):
         try:
             from src.core.concurrency import get_governor
 
-            chat_permit = get_governor().acquire(
-                "chat",
-                interactive=True,
-                timeout=float(getattr(src.settings, "CHAT_QUEUE_DEADLINE_SECONDS", 600)),
+            turn_permit = get_governor().acquire(
+                permit_resource,
+                interactive=permit_resource == "chat",
+                timeout=permit_timeout,
             )
         except Exception:
             try:
@@ -537,6 +542,35 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             return None
 
     def _fail_owned(message: str, *, cancelled_turn: bool = False) -> None:
+        # 看门狗/取消掐断时主线程可能仍堵在下游调用里；能拿到多少就抢救
+        # 多少：已流出的部分答案 + 本轮已登记的证据摘要。runner 若已
+        # 产出权威答案（可能带引用清洗）则优先于流式拼接的文本。
+        rescued_answer = ""
+        rescued_summary: dict | None = None
+        try:
+            get_agent_answer = getattr(pipeline, "get_last_agent_answer", None)
+            authoritative = (
+                str(get_agent_answer() or "").strip()
+                if callable(get_agent_answer)
+                else ""
+            )
+            streamed = strip_narration_segments(
+                "".join(answer_parts), narrated
+            ).strip()
+            rescued_answer = (authoritative or streamed).strip()
+        except Exception:
+            rescued_answer = ""
+        try:
+            raw_summary = (
+                pipeline.get_last_retrieval_summary()
+                if pipeline is not None
+                else None
+            )
+            if isinstance(raw_summary, dict) and raw_summary.get("evidence"):
+                rescued_summary = raw_summary
+        except Exception:
+            rescued_summary = None
+
         def _final_events(_final: ChatTurn) -> list[tuple[str, dict]]:
             if cancelled_turn:
                 return [
@@ -549,15 +583,33 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             ]
 
         try:
-            finalization = conv.fail_turn_result(
-                user.id,
-                turn_id,
-                message,
-                cancelled=cancelled_turn,
-                worker_id=worker_id,
-                fencing_token=ownership_token,
-                terminal_events_builder=_final_events,
-            )
+            try:
+                finalization = conv.fail_turn_result(
+                    user.id,
+                    turn_id,
+                    message,
+                    cancelled=cancelled_turn,
+                    worker_id=worker_id,
+                    fencing_token=ownership_token,
+                    terminal_events_builder=_final_events,
+                    partial_answer=rescued_answer or None,
+                    summary=rescued_summary,
+                )
+            except TypeError as exc:
+                # 抢救参数是新增能力：若某个 ConversationService 实现尚未
+                # 跟上签名，绝不能把轮次留在中间态——退回最小终态调用，
+                # 至少保证看门狗能给出明确的 failed/cancelled。
+                if "partial_answer" not in str(exc) and "summary" not in str(exc):
+                    raise
+                finalization = conv.fail_turn_result(
+                    user.id,
+                    turn_id,
+                    message,
+                    cancelled=cancelled_turn,
+                    worker_id=worker_id,
+                    fencing_token=ownership_token,
+                    terminal_events_builder=_final_events,
+                )
         except StaleTurnOwner:
             # A newer attempt owns the turn; it will finalise it.
             return
@@ -571,14 +623,20 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
     deadline_event = threading.Event()
     # Cap by the provider's own retry budget as well: a single turn should not
     # outlive ``timeout × (retries + 2)`` even if the queue deadline is larger.
-    deadline_seconds = max(
-        60,
-        min(
-            int(getattr(src.settings, "CHAT_QUEUE_DEADLINE_SECONDS", 600)),
-            int(getattr(src.settings, "AGENT_TIMEOUT_SECONDS", 120))
-            * (int(getattr(src.settings, "AGENT_RATE_LIMIT_MAX_RETRIES", 4)) + 2),
-        ),
+    provider_retry_budget = int(getattr(src.settings, "AGENT_TIMEOUT_SECONDS", 120)) * (
+        int(getattr(src.settings, "AGENT_RATE_LIMIT_MAX_RETRIES", 4)) + 2
     )
+    queue_deadline = int(getattr(src.settings, "CHAT_QUEUE_DEADLINE_SECONDS", 600))
+    # 未声明调用上限的 deep 回合以完整性优先，看门狗放宽到 deep 预算；
+    # 其余回合保持普通 600s 预算。
+    deep_deadline = max(
+        queue_deadline,
+        int(getattr(src.settings, "CHAT_QUEUE_DEADLINE_DEEP_SECONDS", 900)),
+    )
+    if str(getattr(turn, "query_mode", "") or "") == "deep":
+        deadline_seconds = max(60, deep_deadline)
+    else:
+        deadline_seconds = max(60, min(queue_deadline, provider_retry_budget))
 
     def _deadline_exceeded() -> None:
         deadline_event.set()
@@ -764,6 +822,11 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             "turn_id": turn_id,
             "plan_version": "v1",
         }
+        # Ordinary chats carry the session workspace id; the runner rebuilds
+        # the workspace tools from this id on every turn.
+        workspace_id = str(
+            (getattr(turn, "trace_context", {}) or {}).get("workspace_id") or ""
+        )
         gen = _query_generator(
             pipeline,
             turn.query,
@@ -784,6 +847,8 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             action_scope=action_scope,
             knowledge_scope=knowledge_scope,
             knowledge_scope_resolver=knowledge_scope_resolver,
+            workspace_id=workspace_id,
+            turn_id=turn_id,
         )
         try:
             for chunk in gen:
@@ -1042,9 +1107,9 @@ def _run_turn(*, turn_id: str, user: AuthUser, ctx, pipeline: AppPipeline | None
             conv.release_turn_ownership(turn_id, worker_id, fencing_token=ownership_token)
         except Exception:
             pass
-        if chat_permit is not None:
+        if turn_permit is not None:
             try:
-                chat_permit.release()
+                turn_permit.release()
             except Exception:
                 pass
         _clear_turn_cancel_signal(turn_id)
@@ -1102,7 +1167,7 @@ def create_turn(
     query_mode = "fast" if session.kb_name == GENERAL_CHAT_KB_NAME else "deep"
     enforce_admission(
         user,
-        session.department_id,
+        str(user.id),
         resource="deep" if query_mode == "deep" else "chat",
         model=admission_model_name(),
     )
@@ -1165,16 +1230,36 @@ def create_turn(
                 },
             )
     trace_context = inject_trace_context()
+    # Workspace-first: a chat turn belongs to the session's workspace.  The
+    # workspace owns the hidden file tree and optional KB binding.
+    from src.core.workspace_store import get_workspace_store
+
+    workspace_store = get_workspace_store()
+    workspace = workspace_store.get_workspace_for_session(session_id)
+    if workspace is None:
+        kind = "knowledge" if session.kb_name != GENERAL_CHAT_KB_NAME else "general"
+        workspace = workspace_store.get_or_create_for_user(
+            user_id=user.id,
+            kind=kind,
+            kb_name=session.kb_name if kind == "knowledge" else "",
+            kb_id=getattr(session, "kb_id", None) if kind == "knowledge" else None,
+        )
+        workspace_store.attach_session(workspace.id, session_id)
+    trace_context = {
+        **trace_context,
+        "workspace_id": workspace.id,
+        "tenant_id": str(user.id),
+    }
     try:
         turn = conv.create_turn(
-        user.id,
-        session_id,
-        body.query,
-        body.client_request_id,
-        query_mode,
-        trace_context=trace_context,
-        wiki_assist=body.wiki_assist,
-        attachment_ids=[ref.attachment_id for ref in attachment_refs],
+            user.id,
+            session_id,
+            body.query,
+            body.client_request_id,
+            query_mode,
+            trace_context=trace_context,
+            wiki_assist=body.wiki_assist,
+            attachment_ids=[ref.attachment_id for ref in attachment_refs],
             source_scope=effective_scope,
             **({"knowledge_scope": knowledge_scope} if knowledge_scope is not None else {}),
         )
@@ -1452,6 +1537,8 @@ def _query_generator(
     action_scope=None,
     knowledge_scope=None,
     knowledge_scope_resolver=None,
+    workspace_id="",
+    turn_id="",
 ):
     params = inspect.signature(pipeline.query).parameters
     if "event_callback" in params:
@@ -1483,6 +1570,10 @@ def _query_generator(
             kwargs["knowledge_scope"] = knowledge_scope
         if "knowledge_scope_resolver" in params:
             kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
+        if "workspace_id" in params:
+            kwargs["workspace_id"] = workspace_id
+        if "turn_id" in params:
+            kwargs["turn_id"] = turn_id
         return pipeline.query(
             query,
             kb_name,
@@ -1515,6 +1606,10 @@ def _query_generator(
         kwargs["knowledge_scope"] = knowledge_scope
     if "knowledge_scope_resolver" in params:
         kwargs["knowledge_scope_resolver"] = knowledge_scope_resolver
+    if "workspace_id" in params:
+        kwargs["workspace_id"] = workspace_id
+    if "turn_id" in params:
+        kwargs["turn_id"] = turn_id
     return pipeline.query(query, kb_name, history, ctx, **kwargs)
 
 

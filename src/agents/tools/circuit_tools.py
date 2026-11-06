@@ -88,6 +88,9 @@ def make_circuit_search(rt, circuit_service: CircuitIndexService):
         ):
             text += (
                 "\n本次未命中任何电路事实（知识库也可能没有电路资料）。"
+                "电路索引以位号（如 U1800）、信号/网络名为主锚点；"
+                "用文档名、项目名或型号直接查网表经常 0 命中——"
+                "请先从文档/表格/测试覆盖表拿到候选位号，再用位号重查。"
                 "若问题同时涉及表格页面（如 Page2）、表内数值/位号/容值，"
                 "请改用 spreadsheet_row_search / spreadsheet_sql_query 在表格中查证，"
                 "不要据此判定问题不可答。"

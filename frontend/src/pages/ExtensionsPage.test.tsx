@@ -124,20 +124,10 @@ describe('ExtensionsView', () => {
     expect(markup).not.toContain('JSON 参数');
   });
 
-  it('keeps actionable write proposals in the MCP section without an empty proposals panel', () => {
-    const empty = view();
-    expect(empty).not.toContain('data-mcp-write-proposals');
-    const markup = view({
-      proposals: [{ proposal_id: 'proposal-1', slug: 'kicad', tool_name: 'generate',
-        arguments_digest: 'abc012345678', artifact_hint: 'draft.net', status: 'proposed',
-        artifact_ref: '', artifact_sha256: '', artifact_filename: '', error_code: '',
-        attempts: 0, created_at: '', expires_at: '', updated_at: '' }],
-      onConfirmProposal: () => undefined,
-      onRejectProposal: () => undefined,
-    });
-    expect(markup).toContain('data-mcp-write-proposal="proposal-1"');
-    expect(markup).toContain('确认生成');
-    expect(markup).toContain('拒绝');
+  it('does not render write proposals inside personal extensions', () => {
+    const markup = view();
+    expect(markup).not.toContain('data-mcp-write-proposals');
+    expect(markup).not.toContain('写入提案');
   });
 
   it('shows personal review state and offers department sharing only after approval', () => {

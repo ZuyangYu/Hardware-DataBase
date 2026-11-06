@@ -64,6 +64,16 @@ class UsageLedgerTests(unittest.TestCase):
         self.assertEqual(snapshot["total_tokens"], 50)
         self.assertEqual(snapshot["by_channel"]["batch"]["calls"], 1)
 
+    def test_governed_model_passes_reasoning_effort(self) -> None:
+        from src.core.model_gateway import build_governed_model
+
+        model = build_governed_model(
+            provider="custom", model="reasoning-model",
+            base_url="http://127.0.0.1:1/v1", api_key="test-key",
+            reasoning_effort="low",
+        )
+        self.assertEqual(model.reasoning_effort, "low")
+
     def test_governed_model_reports_to_ledger(self) -> None:
         from src.core.model_gateway import build_governed_model
 

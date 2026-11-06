@@ -63,3 +63,14 @@ def test_empty_query_is_general_qa():
     plan = classify_intent("   ")
     assert plan.intent == "general_qa"
     assert plan.confidence == 1.0
+
+
+def test_drawio_request_with_markdown_reference_is_not_an_export():
+    plan = classify_intent(
+        "读取 references/02-block-diagram.md 后生成 aaa_tcn2_block.drawio",
+        has_kb=True,
+    )
+    assert plan.intent == "knowledge_base_qa"
+    assert plan.action == "answer"
+    assert plan.export_requested is False
+    assert plan.reason_codes == ("drawio_file_request",)

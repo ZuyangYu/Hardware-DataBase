@@ -74,6 +74,13 @@ def _control_plane(dsn: str, *, provision_auxiliary: bool = True) -> str:
             if provision_auxiliary:
                 _auxiliary_control_plane(conn)
             result = f"控制面 schema 已存在（版本 {version}）"
+        # Turn-status protocol migration: retire legacy task_pending rows and
+        # align the check constraint with the workspace-only turn protocol.
+        from src.storage.control_plane.knowledge_scope_migration import (
+            apply_postgres as _apply_turn_status_migration,
+        )
+
+        _apply_turn_status_migration(conn)
         # 控制面外键（如 chat_sessions → users）在数据迁移路径上补挂；
         # 全新库由 apply_schema 内联建好，这里只在缺失时补齐。
         for name, table, constraint_sql in CORE_FOREIGN_KEYS:
@@ -299,6 +306,20 @@ def _bootstrap() -> int:
         print("[bootstrap] evaluation: 共享执行 schema 已就绪（版本 1）")
     except Exception as exc:
         print(f"[bootstrap] evaluation: {type(exc).__name__}: {exc}", file=sys.stderr)
+        failed += 1
+
+    # Drop the retired task workbench and standalone tenant layer.  The
+    # workspace-first model keeps user_id as the only isolation boundary.
+    try:
+        from src.storage.legacy_cleanup import cleanup_configured
+
+        cleanup = cleanup_configured()
+        if cleanup["changed"]:
+            print("[bootstrap] legacy: 已清理旧 task/tenant 表与列")
+        else:
+            print("[bootstrap] legacy: 无旧 task/tenant 结构")
+    except Exception as exc:  # noqa: BLE001 - 清理失败必须可见
+        print(f"[bootstrap] legacy: {type(exc).__name__}: {exc}", file=sys.stderr)
         failed += 1
 
     if failed:

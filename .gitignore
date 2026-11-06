@@ -112,6 +112,9 @@ htmlcov/
 # Claude Code local settings
 .claude/settings.local.json
 
+# OpenCode local state
+.opencode/
+
 # Local diagnostic scripts and output (may contain secrets)
 /_diag_auth.py
 /_diag_out.txt
@@ -140,3 +143,6 @@ storage.pre-restore-*/
 *.tar.gz
 *.dump
 .tmp_dbg/
+
+# draw.io MCP local dependencies
+/deploy/drawio-mcp/node_modules/

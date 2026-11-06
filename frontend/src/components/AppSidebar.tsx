@@ -25,6 +25,7 @@ import {
 } from '@/components/ui/sheet';
 import { cn } from '@/lib/utils';
 import AccountSettingsDialog from '@/components/AccountSettingsDialog';
+import McpSettingsDialog from '@/components/McpSettingsDialog';
 import AppIcon from '@/components/AppIcon';
 import BrandLogo from './BrandLogo';
 import { isEmployee, ROLE_LABELS, type AuthSession } from '../auth';
@@ -105,6 +106,7 @@ export default function AppSidebar({ auth, onLogout }: Props) {
   const location = useLocation();
   const { toggleSidebar, state, isMobile, openMobile, setOpenMobile } = useSidebar();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mcpOpen, setMcpOpen] = useState(false);
   const primaryItems = primaryNavigationItems(auth.user);
   const initial = auth.user.username.slice(0, 1).toUpperCase();
   const collapsed = !isMobile && state === 'collapsed';
@@ -236,6 +238,15 @@ export default function AppSidebar({ auth, onLogout }: Props) {
                 </DropdownMenuItem>
                 {isEmployee(auth.user) && (
                   <DropdownMenuItem
+                    onSelect={() => setMcpOpen(true)}
+                    className="h-[36px] cursor-pointer gap-2 rounded-[10px] px-[12px] text-[14px] text-[#464C5E]"
+                  >
+                    <AppIcon name="tool" size={16} />
+                    MCP 接入
+                  </DropdownMenuItem>
+                )}
+                {isEmployee(auth.user) && (
+                  <DropdownMenuItem
                     onSelect={() => navigateAndClose('/memory')}
                     className="h-[36px] cursor-pointer gap-2 rounded-[10px] px-[12px] text-[14px] text-[#464C5E]"
                   >
@@ -263,6 +274,11 @@ export default function AppSidebar({ auth, onLogout }: Props) {
         onOpenChange={setSettingsOpen}
         auth={auth}
         onLogout={onLogout}
+      />
+      <McpSettingsDialog
+        open={mcpOpen}
+        onOpenChange={setMcpOpen}
+        auth={auth}
       />
 
       {isMobile ? (

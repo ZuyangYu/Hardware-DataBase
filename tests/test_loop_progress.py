@@ -93,3 +93,15 @@ def test_failed_tool_counts_as_no_progress():
         timed_tool_call(rt, "document_search", "电源", None, _fail)
 
     assert rt.should_stop_for_no_progress()
+
+
+def test_no_progress_without_evidence_reports_not_found_not_budget_jargon():
+    from src.agents.turn_meta import _agent_step_budget_answer
+
+    rt = ToolRuntime(kb_name="AAA", ctx=None)
+    rt.queries = [{"tool_name": "knowledge_search", "query": "U9999"}]
+    rt.diagnostics = [{"tool_name": "knowledge_search", "hit_count": 0}]
+    text = _agent_step_budget_answer(rt, "no_progress")
+    assert "未找到" in text
+    assert "U9999" in text
+    assert "连续多次检索没有带来新证据" not in text

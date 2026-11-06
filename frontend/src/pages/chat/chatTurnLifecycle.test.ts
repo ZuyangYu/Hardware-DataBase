@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
-import { shouldCancelServerTurn, type ChatStreamDetachReason } from './chatTaskLifecycle';
+import { shouldCancelServerTurn, type ChatStreamDetachReason } from './chatTurnLifecycle';
 
-describe('chat task lifecycle', () => {
+describe('chat turn lifecycle', () => {
   it.each([
     ['component_unmount', false],
     ['route_navigation', false],

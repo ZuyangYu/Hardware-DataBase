@@ -522,6 +522,24 @@ class JobTests(AttachmentDomainTestBase):
         # No pending work the second time.
         self.assertFalse(worker.run_once())
 
+    def test_drawio_attachment_is_indexed_as_text(self):
+        drawio = (
+            '<mxfile><diagram name="Login"><mxGraphModel><root>'
+            '<mxCell id="0"/><mxCell id="1" parent="0"/>'
+            '<mxCell id="2" value="Login flow" vertex="1" parent="1"/>'
+            '</root></mxGraphModel></diagram></mxfile>'
+        )
+        record = self._upload("login.drawio", drawio.encode())
+        self.assertEqual(record.media_type, "application/vnd.jgraph.mxfile")
+        worker = AttachmentWorker(store=self.store, worker_id="w1")
+        self.assertTrue(worker.run_once())
+        asset = self.store.get_asset(record.asset_id)
+        self.assertEqual(asset.parse_status, PARSE_STATUS_READY)
+        self.assertIn(
+            "Login flow",
+            "\n".join(p.text_content for p in self.store.list_parts(record.asset_id)),
+        )
+
     def test_rejected_extension_fails_closed(self):
         with self.assertRaises(Exception):
             self._upload("legacy.xls", b"binary")

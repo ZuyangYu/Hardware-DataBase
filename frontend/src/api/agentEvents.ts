@@ -13,7 +13,6 @@ import type {
   QueryTraceStatus,
   QueryTraceStep,
   TurnBudget,
-  TurnPlanState,
   TurnSubagent,
   TurnVerification,
 } from './types';
@@ -47,7 +46,7 @@ export interface DegradedEvent extends AgentEventBase {
   reason: string;
 }
 
-export type ToolKind = 'retrieval' | 'mcp' | 'sandbox';
+export type ToolKind = 'retrieval' | 'mcp' | 'sandbox' | 'workspace';
 
 export interface ToolStartedEvent extends AgentEventBase {
   type: 'tool_started';
@@ -87,13 +86,6 @@ export interface ToolCompletedEvent extends AgentEventBase {
   skill_ref: string;
   task_id: string;
   automatic: boolean;
-}
-
-export interface PlanEvent extends AgentEventBase {
-  type: 'plan_created' | 'plan_updated';
-  items: TurnPlanState['items'];
-  revision: number;
-  source?: string;
 }
 
 export type BudgetEvent = AgentEventBase & {
@@ -209,7 +201,6 @@ export type AgentEvent =
   | DegradedEvent
   | ToolStartedEvent
   | ToolCompletedEvent
-  | PlanEvent
   | BudgetEvent
   | VerificationEvent
   | PartialResultEvent
@@ -270,33 +261,7 @@ function normalizeTraceStatus(value: unknown): QueryTraceStatus {
 }
 
 function normalizeToolKind(value: unknown): ToolKind {
-  return value === 'mcp' || value === 'sandbox' ? value : 'retrieval';
-}
-
-function parsePlanItems(value: unknown): TurnPlanState['items'] {
-  const rawItems = Array.isArray(value) ? value : [];
-  return rawItems
-    .filter((item): item is JsonRecord => Boolean(item) && typeof item === 'object')
-    .map((item) => {
-      const status = text(item.status, 'pending');
-      return {
-        content: text(item.content).trim(),
-        status: status === 'completed' || status === 'in_progress' ? status : 'pending',
-      } as const;
-    })
-    .filter((item) => item.content);
-}
-
-function parsePlan(record: JsonRecord): PlanEvent | null {
-  const items = parsePlanItems(record.items);
-  if (items.length === 0) return null;
-  return {
-    ...base(record),
-    type: record.type === 'plan_updated' ? 'plan_updated' : 'plan_created',
-    items,
-    revision: integer(record.revision, 1),
-    source: typeof record.source === 'string' ? record.source : undefined,
-  };
+  return value === 'mcp' || value === 'sandbox' || value === 'workspace' ? value : 'retrieval';
 }
 
 function parseVerification(record: JsonRecord): VerificationEvent | null {
@@ -410,9 +375,6 @@ export function parseAgentEvent(eventType: string, raw: string): AgentEvent | nu
         automatic: bool(record.automatic),
       };
     }
-    case 'plan_created':
-    case 'plan_updated':
-      return parsePlan({ ...record, type: eventType });
     case 'budget':
     case 'budget_exhausted':
       return {
@@ -533,6 +495,20 @@ function toolStatus(value: string): QueryTraceStatus {
   if (value === 'done' || value === 'succeeded') return 'done';
   if (value === 'proposed' || value === 'queued' || value === 'running') return 'running';
   return 'error';
+}
+
+/**
+ * Runtime orchestration stages that must not leak into the chat "处理过程".
+ * They remain in the durable turn events (task workbench / audit / replay).
+ */
+export const HIDDEN_CHAT_TRACE_KEYS: ReadonlySet<string> = new Set([
+  'permission',
+  'generate',
+  'skill_loaded',
+]);
+
+export function isHiddenChatTraceStep(step: Pick<QueryTraceStep, 'key'>): boolean {
+  return HIDDEN_CHAT_TRACE_KEYS.has(step.key);
 }
 
 export function traceStepFromToolEvent(

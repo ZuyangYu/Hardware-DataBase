@@ -13,6 +13,7 @@ import type {
   ExportArtifactView,
   ExportFormat,
   ExportJobView,
+  McpWriteProposalCard as McpWriteProposalCardType,
   MemoryContextItem,
   MessageView,
   QueryTraceStep,
@@ -20,9 +21,12 @@ import type {
 } from '@/api/types';
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
+import { notify } from '@/components/ui/app-toast';
 import { MarkdownMessage, citationDisplayTitle } from '../chatHelpers';
 import ExportMenu, { exportJobStatusLabel } from './ExportMenu';
 import FeedbackActions from './FeedbackActions';
+import McpWriteProposalCard from './McpWriteProposalCard';
+import { downloadConversationArtifact, type ConversationArtifactView } from '@/api/artifacts';
 import { exportFormatLabel } from '../exportResultModel';
 import {
   CHAT_CITATION_HEADING_CLASS,
@@ -64,6 +68,13 @@ type Props = {
   exportJobs?: ExportJobView[];
   exportPreviews?: Record<string, ExportArtifactView>;
   exportFormats?: ExportFormat[];
+  /** 本轮会话产物；显示在"回答有帮助"反馈上方，仅文件名。 */
+  artifacts?: ConversationArtifactView[];
+  /** 外部插件写入提案卡；刷新后仍挂在对应 assistant 消息下。 */
+  mcpWriteCards?: McpWriteProposalCardType[];
+  onConfirmMcpWrite?: (card: McpWriteProposalCardType) => void;
+  onRejectMcpWrite?: (card: McpWriteProposalCardType) => void;
+  onDownloadMcpWrite?: (card: McpWriteProposalCardType) => void;
 };
 
 function CollapsibleSection({
@@ -109,7 +120,7 @@ function AssistantIdentity({ live = false }: { live?: boolean }) {
         <AppIcon name="database" size={11} />
       </span>
       <span className="text-[10px] font-medium uppercase tracking-[0.08em] text-[#9aa1b1]">
-        {live ? '正在检索' : '知识库回答'}
+        {live ? '正在处理' : '知识库回答'}
       </span>
       <span className="h-px flex-1 bg-[linear-gradient(90deg,#eceef3,transparent)]" aria-hidden />
     </div>
@@ -546,6 +557,11 @@ function MessageBubble({
   exportJobs = [],
   exportPreviews = {},
   exportFormats,
+  artifacts = [],
+  mcpWriteCards = [],
+  onConfirmMcpWrite,
+  onRejectMcpWrite,
+  onDownloadMcpWrite,
 }: Props) {
   const resolvedSubagents = subagents.length > 0 ? subagents : (msg.subagents ?? []);
   // 流式临时气泡
@@ -587,6 +603,42 @@ function MessageBubble({
                 <StepGroup steps={traceSteps} defaultOpen={false} />
               )}
               <MarkdownMessage content={msg.content} />
+              {artifacts.length > 0 ? (
+                <div
+                  className="flex flex-wrap items-center gap-x-[12px] gap-y-[2px]"
+                  data-testid="message-artifacts"
+                >
+                  {artifacts.map((artifact) => (
+                    <button
+                      key={artifact.id}
+                      type="button"
+                      className="text-[12px] text-[#2b5cb8] hover:underline"
+                      onClick={() => {
+                        void downloadConversationArtifact(artifact).catch((error: unknown) => {
+                          notify.error(
+                            error instanceof Error ? error.message : '下载失败',
+                          );
+                        });
+                      }}
+                    >
+                      {artifact.name}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              {mcpWriteCards.length > 0 ? (
+                <div className="grid gap-[8px]" data-testid="message-mcp-write-cards">
+                  {mcpWriteCards.map((card) => (
+                    <McpWriteProposalCard
+                      key={card.proposal_id}
+                      card={card}
+                      onConfirm={onConfirmMcpWrite}
+                      onReject={onRejectMcpWrite}
+                      onDownload={onDownloadMcpWrite}
+                    />
+                  ))}
+                </div>
+              ) : null}
               <FeedbackActions msg={msg} />
               {msg.memory_context && msg.memory_context.length > 0 && (
                 <MemoryContextBlock memories={msg.memory_context} />

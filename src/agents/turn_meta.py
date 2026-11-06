@@ -323,6 +323,34 @@ def _turn_complexity(
     }
 
 
+# 用户在问题里声明的检索工具调用上限："最多 8 次检索工具调用" → 8。
+# 关键词 lookahead 保证只在检索/调用语境匹配，避免"最多列出三行"这类误伤。
+_USER_TOOL_CALL_CAP_RE = re.compile(
+    r"(?:最多|不超过|至多|不要超过)\s*(\d{1,3})\s*次"
+    r"(?=[^\n。!？;；]{0,12}(?:检索|工具|调用|查询))"
+)
+
+
+def parse_user_tool_call_cap(query: str) -> int | None:
+    """Parse the per-turn tool-call cap declared by the user, if any.
+
+    Returns ``None`` when the query does not declare a usable cap. Caps below
+    1 are ignored and caps at or above the deep-mode base (72) are treated as
+    "no extra constraint" so the regular budget stays authoritative.
+    """
+
+    match = _USER_TOOL_CALL_CAP_RE.search(str(query or ""))
+    if match is None:
+        return None
+    try:
+        cap = int(match.group(1))
+    except ValueError:
+        return None
+    if cap < 1 or cap >= 72:
+        return None
+    return cap
+
+
 def _agent_recursion_limit(
     *,
     query: str,
@@ -350,17 +378,26 @@ def _agent_recursion_limit(
         limit = min(max_limit, base + int(complexity["score"]) * multiplier)
     else:
         limit = base
-    return limit, {
+    budget: dict[str, Any] = {
         "mode": query_mode,
         "base_recursion_limit": base,
         "recursion_limit": limit,
         "complexity": complexity,
         "enabled": enabled,
     }
+    cap = parse_user_tool_call_cap(query)
+    if cap is not None:
+        budget["tool_call_cap"] = cap
+        budget["tool_call_cap_source"] = "user_query"
+    return limit, budget
 
 
 def _research_subagent_spec(
-    *, tools: list[Any], model: Any, skill_root: str | None = None
+    *,
+    tools: list[Any],
+    model: Any,
+    skill_root: str | None = None,
+    skill_read_observer: Callable[..., None] | None = None,
 ) -> dict[str, Any] | None:
     """Build a read-only research subagent for delegated source exploration."""
 
@@ -386,13 +423,56 @@ def _research_subagent_spec(
         "model": model,
         "middleware": [
             # Subagents inherit the backend; keep read_file gated the same way.
-            SkillReadGateMiddleware(enabled=bool(skill_root))
+            SkillReadGateMiddleware(
+                enabled=bool(skill_root),
+                observer=skill_read_observer,
+            )
         ],
     }
 
 
-def _agent_step_budget_answer(rt: Any) -> str:
-    """Explain a clean stop after the agent loop exhausted its step budget."""
+def _general_subagent_spec(
+    *,
+    tools: list[Any],
+    model: Any,
+    skill_root: str | None = None,
+    skill_read_observer: Callable[..., None] | None = None,
+) -> dict[str, Any] | None:
+    """Build a general-purpose subagent for complex, non-code workspace tasks."""
+
+    if not tools:
+        return None
+    return {
+        "name": "general-purpose",
+        "description": (
+            "General hardware workspace specialist. Delegate self-contained "
+            "multi-step tasks that need file/workspace tools, attachments, "
+            "knowledge-base retrieval, spreadsheets, or MCP tools. Do not "
+            "delegate tasks that require user confirmation or shell/code."
+        ),
+        "system_prompt": (
+            "You are a general-purpose hardware workspace subagent. Complete "
+            "the delegated task end-to-end using only the provided tools. Do "
+            "not run shell or arbitrary code, and do not access paths outside "
+            "the workspace. Read attachments/workspace files before editing "
+            "them. If a write tool returns proposed, report that it is pending "
+            "user confirmation; never claim a file was created. Return a "
+            "concise result with facts, filenames, and any remaining gaps; do "
+            "not invent tool results."
+        ),
+        "tools": list(tools),
+        "model": model,
+        "middleware": [
+            SkillReadGateMiddleware(
+                enabled=bool(skill_root),
+                observer=skill_read_observer,
+            )
+        ],
+    }
+
+
+def _agent_step_budget_answer(rt: Any, reason: str = "") -> str:
+    """Explain a clean stop after a budgeted agent loop ended."""
 
     evidence = list(getattr(rt, "evidence", []) or [])
     sources = [
@@ -402,7 +482,31 @@ def _agent_step_budget_answer(rt: Any) -> str:
         )
         if name
     ]
-    lines = ["本轮工具调用已达到单轮步数上限，为避免无限循环已停止继续检索。"]
+    if reason == "time_limit":
+        lines = ["本轮执行时间预算已到，为避免无限等待已停止继续检索。"]
+    elif reason == "no_progress" and not evidence:
+        queries = [
+            str(item.get("query") or "").strip()
+            for item in (getattr(rt, "queries", []) or [])
+            if str(item.get("query") or "").strip()
+        ]
+        tools = [
+            str(item.get("tool_name") or "").strip()
+            for item in (getattr(rt, "diagnostics", []) or [])
+            if str(item.get("tool_name") or "").strip()
+        ]
+        lines = ["未找到足够证据回答该问题。"]
+        if queries:
+            lines.append("已查关键词：" + "、".join(dict.fromkeys(queries))[:500])
+        if tools:
+            lines.append("已用来源：" + "、".join(dict.fromkeys(tools))[:300])
+        lines.append("如果该问题本应有资料，请补充更精确的文档名、位号、表名或字段名后重试。")
+    elif reason == "no_progress":
+        lines = ["连续多次检索没有带来新证据，已停止继续检索。"]
+    elif reason == "tool_call_limit":
+        lines = ["本轮工具调用已达到你指定的次数上限，已停止继续检索。"]
+    else:
+        lines = ["本轮工具调用已达到单轮步数上限，为避免无限循环已停止继续检索。"]
     if evidence and sources:
         listed = "、".join(sources[:5]) + (" 等" if len(sources) > 5 else "")
         lines.append(f"已登记 {len(evidence)} 条证据（来源：{listed}），但尚未完成全部任务。")
@@ -421,7 +525,6 @@ def _is_incomplete_answer(
     answer_text: str,
     *,
     show_turn_meta: bool,
-    has_plan: bool,
 ) -> bool:
     """Detect a complex turn whose final text is only an intro/prefix.
 
@@ -433,7 +536,7 @@ def _is_incomplete_answer(
     text = str(answer_text or "").strip()
     return bool(
         text
-        and (show_turn_meta or has_plan)
+        and show_turn_meta
         and len(text) < 600
         and not _CITATION_RE.search(text)
     )

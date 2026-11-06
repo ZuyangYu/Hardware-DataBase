@@ -499,14 +499,14 @@ export function SkillsPanelView({ skills, bundles, departments, busy, skillRef, 
 
           {dialog === 'text' && (
             <div data-skill-text-draft className="space-y-[16px]">
-              <p className="text-[12px] leading-[1.6] text-[#697084]">上传包含 SKILL.md 的文件夹 ZIP；可附带 references/*.md。系统从 YAML 中读取名称、说明与可选版本，生成待审核草稿。</p>
+              <p className="text-[12px] leading-[1.6] text-[#697084]">上传包含 SKILL.md 的文件夹 ZIP；可附带 references/、scripts/ 等 UTF-8 文本资源。系统从 YAML 中读取名称、说明与可选版本，生成待审核草稿。</p>
               <SkillDepartmentSelect id="text-skill-department" value={textDepartmentId} departments={departments} onChange={onTextDepartmentId} />
               <div data-text-skill-import className="rounded-[10px] border border-dashed border-[#ccd4e0] bg-[#f8fafc] p-[14px]">
                 <Label htmlFor="text-skill-package">文本 Skill ZIP <span className="font-normal text-[#858b9c]">· 最大 8 MiB</span></Label>
                 <Input id="text-skill-package" className="mt-[8px] bg-white" type="file" accept=".zip,application/zip" onChange={(event) => onTextPackageFile?.(event.target.files?.[0] ?? null)} />
-                <p className="mt-[7px] break-all text-[11px] text-[#697084]">{textPackageFile ? `已选择：${textPackageFile.name}` : 'SKILL.md 需包含 YAML name / description；可直接打包内容或打包单个同名文件夹。仅接收 Markdown 和许可文本。'}</p>
+                <p className="mt-[7px] break-all text-[11px] text-[#697084]">{textPackageFile ? `已选择：${textPackageFile.name}` : 'SKILL.md 需包含 YAML name / description；可直接打包内容或打包单个同名文件夹。支持 UTF-8 文本资源。'}</p>
               </div>
-              <p className="text-[11px] text-[#858b9c]">随附 Markdown 会按文件路径合并为审核文本，最多 16 KiB；脚本、其他资产及工具权限声明不会被导入。</p>
+              <p className="text-[11px] text-[#858b9c]">随附文件按原路径保留，审核后只读挂载、按需读取；脚本作为文本参考保存，不会被执行。</p>
               <div className="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-[8px] border-t border-[#edf0f4] bg-white/95 pt-[14px] backdrop-blur-sm">
                 <Button variant="ghost" disabled={busy} onClick={() => setDialog('text-manual')}>没有 ZIP？快速创建</Button>
                 <div className="flex gap-[8px]">

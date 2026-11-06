@@ -128,7 +128,7 @@ class ToolStartedPayload(AgentEventPayload):
 
     call_id: str = Field(min_length=1)
     tool_name: str = Field(min_length=1)
-    tool_kind: Literal["retrieval", "mcp", "sandbox"] = "retrieval"
+    tool_kind: Literal["retrieval", "mcp", "sandbox", "workspace"] = "retrieval"
     label: str = ""
     query: str = ""
     detail: str = ""
@@ -148,6 +148,8 @@ class ToolStartedPayload(AgentEventPayload):
         if not self.detail:
             if self.tool_kind == "sandbox":
                 self.detail = f"任务 {self.task_id}".strip()
+            elif self.tool_kind == "workspace":
+                self.detail = f"工作区 {self.query}".strip()
             elif self.tool_kind == "mcp":
                 self.detail = f"{self.server}/{self.tool}".strip("/")
             else:
@@ -160,7 +162,7 @@ class ToolCompletedPayload(AgentEventPayload):
 
     call_id: str = Field(min_length=1)
     tool_name: str = Field(min_length=1)
-    tool_kind: Literal["retrieval", "mcp", "sandbox"] = "retrieval"
+    tool_kind: Literal["retrieval", "mcp", "sandbox", "workspace"] = "retrieval"
     label: str = ""
     status: str = "done"
     detail: str = ""
@@ -190,6 +192,8 @@ class ToolCompletedPayload(AgentEventPayload):
         if not self.detail:
             if self.tool_kind == "sandbox":
                 detail = f"任务 {self.task_id} · {self.status}".strip()
+            elif self.tool_kind == "workspace":
+                detail = f"工作区 {self.status}"
             elif self.tool_kind == "mcp":
                 detail = f"{self.server}/{self.tool} · {self.status}".strip("/ ")
             else:
@@ -197,25 +201,6 @@ class ToolCompletedPayload(AgentEventPayload):
             if self.latency_ms is not None:
                 detail += f" · {int(self.latency_ms)}ms"
             self.detail = detail
-        return self
-
-
-class PlanItemPayload(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    content: str = ""
-    status: Literal["pending", "in_progress", "completed"] = "pending"
-
-
-class PlanPayload(AgentEventPayload):
-    items: list[PlanItemPayload] = Field(default_factory=list)
-    revision: int = 1
-    source: str = ""
-
-    @model_validator(mode="after")
-    def _fill_identity(self) -> "PlanPayload":
-        if not self.item_id:
-            self.item_id = "plan"
         return self
 
 
@@ -490,8 +475,6 @@ EVENT_MODELS: dict[str, type[AgentEventPayload]] = {
     "degraded": DegradedPayload,
     "tool_started": ToolStartedPayload,
     "tool_result": ToolCompletedPayload,
-    "plan_created": PlanPayload,
-    "plan_updated": PlanPayload,
     "budget": BudgetPayload,
     "budget_exhausted": BudgetPayload,
     "verification": VerificationPayload,

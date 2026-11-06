@@ -1237,7 +1237,13 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
                         processor_kind="spreadsheet_table",
                         score=0.0,
                         locator={},
-                        metadata={"tool": "spreadsheet_sql_query", "sql": sql, "status": "invalid"},
+                        metadata={
+                            "tool": "spreadsheet_sql_query",
+                            "sql": sql,
+                            "status": "invalid",
+                            "evidence_role": "navigation",
+                            "progress_neutral": True,
+                        },
                     )
                 ]
             table_names = sorted({table.name for table in ast.find_all(__import__("sqlglot").exp.Table)})
@@ -1257,7 +1263,36 @@ def make_spreadsheet_sql_tools(rt, spreadsheet_service):
                         processor_kind="spreadsheet_table",
                         score=0.0,
                         locator={"tables": ", ".join(table_names)},
-                        metadata={"tool": "spreadsheet_sql_query", "sql": sql, "status": "error"},
+                        metadata={
+                            "tool": "spreadsheet_sql_query",
+                            "sql": sql,
+                            "status": "error",
+                            "evidence_role": "navigation",
+                            "progress_neutral": True,
+                        },
+                    )
+                ]
+            if not records:
+                # A successful zero-row query is navigation, not evidence.  In
+                # particular it must not be stashed as a candidate and promoted
+                # by evidence_read: that would count as progress forever and
+                # let a model explore 40+ empty queries until recursion_limit.
+                return [
+                    Evidence(
+                        id=_sql_evidence_id(sql, "empty"),
+                        content=_format_sql_result(records),
+                        source_name=source_names[0] if source_names else "spreadsheet_sql",
+                        content_kind="spreadsheet_sql_result",
+                        processor_kind="spreadsheet_table",
+                        score=0.0,
+                        locator={"tables": ", ".join(table_names)},
+                        metadata={
+                            "tool": "spreadsheet_sql_query",
+                            "sql": sql,
+                            "row_count": 0,
+                            "evidence_role": "navigation",
+                            "progress_neutral": True,
+                        },
                     )
                 ]
             return [

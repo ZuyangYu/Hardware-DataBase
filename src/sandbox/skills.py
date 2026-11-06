@@ -44,7 +44,9 @@ _REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_MAX_CONTENT_BYTES = 128 * 1024
+# Skill bodies are reviewed source, not injected prompt text.  Keep a generous
+# ceiling for multi-file reference packs (the archive itself is capped at 8 MiB).
+_MAX_CONTENT_BYTES = 4 * 1024 * 1024
 ALL_DEPARTMENTS = "*"
 SKILL_STATES = frozenset({"draft", "reviewed", "tested", "enabled", "revoked"})
 _STATE_TRANSITIONS = {
@@ -854,47 +856,6 @@ class SkillCatalog:
             f"{safe}\n"
             "</untrusted_skill>"
         )
-
-    def prompt_blocks(
-        self,
-        skill_refs: Any,
-        *,
-        principal_id: str | int = "",
-        department_id: str | int = "",
-        is_admin: bool = False,
-        limit: int = 8,
-    ) -> list[str]:
-        """Load a bounded set of scoped prompt-data blocks.
-
-        Invalid, disabled, or unauthorized refs are omitted rather than
-        converted into a prompt-level error that could influence tool policy.
-        The caller can emit a separate diagnostic event if desired.
-        """
-
-        if not bool(getattr(settings, "SKILLS_ENABLED", False)):
-            return []
-        refs: list[str] = []
-        for raw in skill_refs or ():
-            ref = str(raw or "").strip()
-            if ref and ref not in refs:
-                refs.append(ref)
-            if len(refs) >= max(1, min(int(limit), 32)):
-                break
-        blocks: list[str] = []
-        for ref in refs:
-            try:
-                blocks.append(
-                    self.prompt_block(
-                        ref,
-                        principal_id=principal_id,
-                        department_id=department_id,
-                        is_admin=is_admin,
-                    )
-                )
-            except (SkillCatalogError, SkillNotFound, SkillNotAuthorized, SkillStateConflict):
-                continue
-        return blocks
-
 
 __all__ = [
     "SKILL_STATES",

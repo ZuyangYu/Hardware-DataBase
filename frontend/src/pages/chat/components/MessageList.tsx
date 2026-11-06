@@ -9,10 +9,12 @@ import type {
   ExportArtifactView,
   ExportFormat,
   ExportJobView,
+  McpWriteProposalCard,
   MessageView,
   QueryTraceStep,
   TurnSubagent,
 } from '@/api/types';
+import type { ConversationArtifactView } from '@/api/artifacts';
 import { Skeleton } from '@/components/ui/skeleton';
 import { CHAT_MESSAGES_CLASS, CHAT_MESSAGE_STACK_CLASS } from '../chatPageStyles';
 import MessageBubble from './MessageBubble';
@@ -43,6 +45,12 @@ type Props = {
   exportJobsByMessageId?: Record<number, ExportJobView[]>;
   exportPreviewsByJobId?: Record<string, ExportArtifactView>;
   exportFormats?: ExportFormat[];
+  artifactsByTurnId?: Record<string, ConversationArtifactView[]>;
+  /** 本会话实时/已恢复的 MCP 写入提案卡，按 turn_id 挂到 assistant 消息下。 */
+  mcpWriteCards?: McpWriteProposalCard[];
+  onConfirmMcpWrite?: (proposal: McpWriteProposalCard) => void;
+  onRejectMcpWrite?: (proposal: McpWriteProposalCard) => void;
+  onDownloadMcpWrite?: (proposal: McpWriteProposalCard) => void;
 };
 
 export default function MessageList({
@@ -68,6 +76,11 @@ export default function MessageList({
   exportJobsByMessageId = {},
   exportPreviewsByJobId = {},
   exportFormats,
+  artifactsByTurnId = {},
+  mcpWriteCards = [],
+  onConfirmMcpWrite,
+  onRejectMcpWrite,
+  onDownloadMcpWrite,
 }: Props) {
   // 个人记忆的授权来源是本轮问答(提问 + 输出),缺失输出时不提供入口。
   const turnMessageIds = useMemo(() => {
@@ -87,6 +100,19 @@ export default function MessageList({
     const entry = turnMessageIds.get(msg.turn_id);
     if (!entry?.assistant) return undefined;
     return [entry.user, entry.assistant].filter((value): value is number => typeof value === 'number');
+  }
+
+  function mcpCardsFor(msg: MessageView): McpWriteProposalCard[] {
+    const persisted = msg.mcp_write_cards ?? [];
+    const live = msg.turn_id
+      ? mcpWriteCards.filter((card) => card.turn_id === msg.turn_id)
+      : [];
+    if (persisted.length === 0 && live.length === 0) return [];
+    const byId = new Map(persisted.map((card) => [card.proposal_id, card]));
+    for (const card of live) {
+      byId.set(card.proposal_id, { ...byId.get(card.proposal_id), ...card });
+    }
+    return [...byId.values()];
   }
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -143,8 +169,17 @@ export default function MessageList({
             exportJobs={msg.role === 'assistant' ? (exportJobsByMessageId[msg.id] ?? []) : []}
             exportPreviews={exportPreviewsByJobId}
             exportFormats={exportFormats}
+            artifacts={
+              msg.role === 'assistant' && msg.turn_id
+                ? (artifactsByTurnId[msg.turn_id] ?? [])
+                : []
+            }
             showDiagnostics={showDiagnostics}
             traceSteps={msg.role === 'assistant' && showDiagnostics ? (traceByMessageId[msg.id] ?? []) : []}
+            mcpWriteCards={msg.role === 'assistant' ? mcpCardsFor(msg) : []}
+            onConfirmMcpWrite={onConfirmMcpWrite}
+            onRejectMcpWrite={onRejectMcpWrite}
+            onDownloadMcpWrite={onDownloadMcpWrite}
           />
           {(msg.cards ?? [])
             .filter((card) => card.kind === 'attachment_revision')

@@ -42,6 +42,7 @@ _MIME_BY_EXTENSION = {
     ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
     ".edf": "application/x-edif",
     ".edif": "application/x-edif",
+    ".drawio": "application/vnd.jgraph.mxfile",
 }
 
 

@@ -1949,6 +1949,8 @@ class PostgresExecutionStore:
         fencing_token: int | None = None,
         terminal_events_builder: Callable[[ChatTurn], Sequence[tuple[str, dict]]] | None = None,
         domain_writer: Callable[[Any, ChatTurn], None] | None = None,
+        partial_answer: str | None = None,
+        summary: dict | None = None,
     ) -> TurnFinalization:
         status = "cancelled" if cancelled else "failed"
         with self._tx() as conn:
@@ -1979,7 +1981,33 @@ class PostgresExecutionStore:
             ).fetchone()
             if updated is None:
                 return TurnFinalization(turn=None)
-            placeholder = "已停止生成" if cancelled else f"生成失败：{str(message)[:500]}"
+            # 看门狗/上游失败时，被流式冲刷出的部分答案不应随之蒸发：
+            # 回填 answer 与 summary（仅在原本为空时），绝不覆盖更完整的内容。
+            rescued = str((partial_answer or "").strip())
+            if rescued:
+                conn.execute(
+                    """
+                    UPDATE chat_turns SET answer = %s
+                    WHERE id = %s AND COALESCE(answer, '') = ''
+                    """,
+                    (rescued, str(turn_id)),
+                )
+            if summary:
+                conn.execute(
+                    """
+                    UPDATE chat_turns SET summary_json = %s
+                    WHERE id = %s AND COALESCE(summary_json::text, '{}') = '{}'
+                    """,
+                    (Jsonb(summary), str(turn_id)),
+                )
+            if rescued or summary:
+                updated = conn.execute(
+                    "SELECT * FROM chat_turns WHERE id = %s", (str(turn_id),)
+                ).fetchone()
+            placeholder = (
+                rescued
+                or ("已停止生成" if cancelled else f"生成失败：{str(message)[:500]}")
+            )
             conn.execute(
                 "UPDATE chat_messages SET content = %s WHERE id = %s AND content = ''",
                 (placeholder, int(located["assistant_message_id"])),

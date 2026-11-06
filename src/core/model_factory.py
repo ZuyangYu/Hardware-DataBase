@@ -43,6 +43,7 @@ class ChatModelConfig:
     require_structured_tools: bool = False
     max_input_tokens: int = 0
     priority: str = PRIORITY_INTERACTIVE
+    reasoning_effort: str = ""
 
 
 def settings_generation() -> int:
@@ -170,6 +171,7 @@ def resolve_chat_model_config(
         endpoint=endpoint,
         api_key=api_key,
         max_tokens=int(getattr(settings_source, "AGENT_CUSTOM_MAX_TOKENS", 4096)),
+        reasoning_effort=str(getattr(settings_source, "AGENT_REASONING_EFFORT", "") or "").strip().lower(),
         timeout=max(1, int(timeout)),
         temperature=float(getattr(settings_source, "AGENT_TEMPERATURE", 0.2)),
         max_retries=max(0, int(default_retries)),
@@ -237,6 +239,7 @@ def _build_cached_chat_model(generation: int, config: ChatModelConfig) -> object
             base_url=config.endpoint,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
+            reasoning_effort=config.reasoning_effort,
             timeout=config.timeout,
             priority=config.priority,
         )
@@ -250,6 +253,7 @@ def _build_cached_chat_model(generation: int, config: ChatModelConfig) -> object
         api_key=config.api_key,
         temperature=config.temperature,
         max_tokens=config.max_tokens,
+        reasoning_effort=config.reasoning_effort,
         max_retries=config.max_retries,
         timeout=config.timeout,
         default_headers=opencode_extra_headers(config.endpoint) or None,

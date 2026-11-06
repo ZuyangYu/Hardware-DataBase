@@ -25,7 +25,6 @@ from src.sandbox.dependencies import close_service_client, configure_service_cli
 from src.sandbox.models import SandboxTaskSpec
 from src.sandbox.protocol import RequestEnvelope, RunnerObservation
 from src.sandbox.service import SandboxExecutionAdapter, SandboxExecutionError
-from src.sandbox.skills import SkillCatalog, SkillNotAuthorized
 from src.sandbox.task_store import SandboxTaskStore
 
 
@@ -423,35 +422,6 @@ def test_gateway_discovery_only_returns_reviewed_tools(monkeypatch, tmp_path):
                 ]
             },
         )
-
-
-def test_skill_prompt_blocks_respect_scope(monkeypatch, tmp_path):
-    monkeypatch.setattr(settings, "SKILLS_ENABLED", True)
-    catalog = SkillCatalog(str(tmp_path / "skills.db"))
-    skill = catalog.register(
-        skill_ref="skill/scoped",
-        version="v1",
-        content="reviewed reference text",
-        owner_id="user-1",
-        department_id="dept-1",
-    )
-    catalog.review(skill.skill_ref)
-    catalog.mark_tested(skill.skill_ref)
-    catalog.enable(skill.skill_ref)
-
-    with pytest.raises(SkillNotAuthorized):
-        catalog.prompt_block(skill.skill_ref, principal_id="user-2", department_id="dept-1")
-    assert catalog.prompt_blocks(
-        [skill.skill_ref],
-        principal_id="user-2",
-        department_id="dept-1",
-    ) == []
-    blocks = catalog.prompt_blocks(
-        [skill.skill_ref],
-        principal_id="user-1",
-        department_id="dept-1",
-    )
-    assert len(blocks) == 1 and "<untrusted_skill>" in blocks[0]
 
 
 def test_dispatcher_advances_admitted_task_to_success(tmp_path, monkeypatch):

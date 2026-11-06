@@ -144,6 +144,7 @@ class TraceStepProjectionTests(unittest.TestCase):
                 ),
                 event("stage", {"key": "generate", "label": "生成回答", "status": "done"}),
                 event("stage", {"key": "permission", "label": "权限检查", "status": "done"}),
+                event("stage", {"key": "skill_loaded", "label": "Skill 已挂载", "status": "running"}),
             ]
         )
         self.assertEqual(len(steps), 1)

@@ -20,14 +20,13 @@ import type { AttachmentView, ExportArtifactView, ExportBatchResponse, ExportFor
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
-import { CHAT_MAIN_CLASS, chatBubbleClass, chatRowClass } from './chatPageStyles';
+import { CHAT_MAIN_CLASS } from './chatPageStyles';
 import { useKbChat } from './useKbChat';
-import McpWriteProposalCard from './components/McpWriteProposalCard';
 import ChatSessionSidebar from './components/ChatSessionSidebar';
 import ChatHeader from './components/ChatHeader';
 import MessageList from './components/MessageList';
+import { useConversationArtifacts } from './useConversationArtifacts';
 import Composer from './components/Composer';
-import ExportTaskCenter from '@/components/ExportTaskCenter';
 import EditMessageDialog from './EditMessageDialog';
 import { notify } from '@/components/ui/app-toast';
 import {
@@ -642,6 +641,10 @@ export default function ChatPage({
 
   const sidebarProviderStyle = { '--sidebar-width': '220px', '--sidebar-width-icon': '72px' } as CSSProperties;
   const showEmpty = activeSession == null && sessionsLoaded && !streaming;
+  const { byTurnId: artifactsByTurnId } = useConversationArtifacts(
+    activeSessionId,
+    `${messages.length}:${streaming}`,
+  );
 
   return (
     <div className="flex h-full min-h-0 bg-[#fcfcfc] text-[#18181a]" style={sidebarProviderStyle}>
@@ -658,8 +661,6 @@ export default function ChatPage({
           wikiAssist={mountedKbName ? wikiAssist : undefined}
           onWikiAssistChange={mountedKbName ? updateWikiAssist : undefined}
           wikiAvailable={mountedKbName ? wikiAvailable : undefined}
-          /* 导出任务中心嵌入页头,避免悬浮按钮遮挡右侧会话侧栏的新建按钮 */
-          actions={<ExportTaskCenter variant="embedded" />}
         />
         <MessageList
           messages={messages}
@@ -686,6 +687,11 @@ export default function ChatPage({
           exportJobsByMessageId={exportJobsByMessageId}
           exportPreviewsByJobId={exportPreviewsByJobId}
           exportFormats={exportFormats}
+          artifactsByTurnId={artifactsByTurnId}
+          mcpWriteCards={mcpWriteCards}
+          onConfirmMcpWrite={(card) => void confirmMcpWriteCard(card)}
+          onRejectMcpWrite={(card) => void rejectMcpWriteCard(card)}
+          onDownloadMcpWrite={(card) => void downloadMcpWriteCard(card)}
         />
         {turnQueueNotice && (
           <div className="shrink-0 px-[24px] pb-[6px]" data-testid="turn-queue-notice">
@@ -698,24 +704,6 @@ export default function ChatPage({
                   ? `（截止 ${new Date(turnQueueNotice.waitDeadline).toLocaleTimeString()}）`
                   : ''}
               </span>
-            </div>
-          </div>
-        )}
-        {mcpWriteCards.length > 0 && (
-          <div className="shrink-0 px-[24px] pb-[6px]">
-            <div className="mx-auto flex w-full max-w-[820px] flex-col gap-[10px]">
-              {mcpWriteCards.map((card) => (
-                <div key={card.proposal_id} className={chatRowClass('assistant')}>
-                  <div className={chatBubbleClass('assistant')}>
-                    <McpWriteProposalCard
-                      card={card}
-                      onConfirm={(target) => void confirmMcpWriteCard(target)}
-                      onReject={(target) => void rejectMcpWriteCard(target)}
-                      onDownload={(target) => void downloadMcpWriteCard(target)}
-                    />
-                  </div>
-                </div>
-              ))}
             </div>
           </div>
         )}

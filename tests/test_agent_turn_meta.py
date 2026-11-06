@@ -1,4 +1,4 @@
-"""Budget, plan, partial synthesis and verification projections for one turn."""
+"""Budget, partial synthesis and verification projections for one turn."""
 
 from __future__ import annotations
 
@@ -12,12 +12,14 @@ from src.agents.runner import (
     MultiSourceAgentRunner,
     _agent_evidence_budget,
     _agent_recursion_limit,
+    _export_intent_for_turn,
     _build_turn_verification,
     _normalize_citation_labels,
     _research_subagent_spec,
     _scrub_invalid_citations,
     _synthesize_partial_answer,
 )
+from src.agents.turn_meta import parse_user_tool_call_cap
 from src.agents.turn_meta import _semantic_verification
 from src.agents.schemas import Evidence
 
@@ -321,7 +323,7 @@ def test_turn_verification_marks_partial_and_detects_source_separation():
     assert result["budget_exhausted"] is True
 
 
-def test_complex_deep_turn_does_not_offer_a_planner_but_keeps_research_subagent(monkeypatch):
+def test_complex_deep_turn_offers_deepagent_planning_and_research_subagent(monkeypatch):
     captured: dict = {}
 
     class _Agent:
@@ -354,13 +356,16 @@ def test_complex_deep_turn_does_not_offer_a_planner_but_keeps_research_subagent(
     middleware_names = {
         type(item).__name__.lower() for item in captured.get("middleware") or []
     }
-    assert not any("plan" in name or "todo" in name for name in middleware_names)
+    # Deep-Agent-style internal planning is enabled; the retired task
+    # workbench planner is not.
+    assert "todolistmiddleware" in middleware_names
     assert "loopbudgetmiddleware" in middleware_names
     subagents = captured.get("subagents") or []
-    assert [item["name"] for item in subagents] == ["research"]
+    assert [item["name"] for item in subagents] == ["general-purpose", "research"]
+    research = next(item for item in subagents if item["name"] == "research")
     tool_names = {
         getattr(tool, "name", None) or getattr(tool, "__name__", "")
-        for tool in subagents[0]["tools"]
+        for tool in research["tools"]
     }
     assert "document_search" in tool_names
     assert "knowledge_search" in tool_names
@@ -714,12 +719,10 @@ def test_message_view_projects_persisted_turn_metadata():
     )
     view = _message_view(
         message,
-        plan={"items": [{"content": "step", "status": "completed"}], "revision": 1},
         budget={"status": "ok", "exhausted": False},
         verification={"status": "pass", "checks": []},
         subagents=[{"name": "research", "status": "completed"}],
     )
-    assert view.plan["revision"] == 1
     assert view.budget["status"] == "ok"
     assert view.verification["status"] == "pass"
     assert view.subagents[0]["name"] == "research"
@@ -744,3 +747,33 @@ def test_runner_recursion_stop_without_model_synthesis_keeps_notice(monkeypatch)
     assert "单轮步数上限" in deltas[0]
     assert runner.get_last_retrieval_summary()["budget"]["exhausted"] is True
     assert any(event["type"] == "partial_result" for event in events)
+
+
+def test_user_tool_call_cap_parsed_from_query():
+    assert parse_user_tool_call_cap("最多 8 次检索工具调用。") == 8
+    assert parse_user_tool_call_cap("不要超过 5 次调用") == 5
+    assert parse_user_tool_call_cap("至多3次检索") == 3
+    # 无检索/调用语境的“最多 N 次”不生效
+    assert parse_user_tool_call_cap("每种失效模式最多列出 5 次") is None
+    assert parse_user_tool_call_cap("最多 10 次修改意见") is None
+    # 空值/超大值不作为上限
+    assert parse_user_tool_call_cap("最多 0 次检索") is None
+    assert parse_user_tool_call_cap("最多 999 次检索") is None
+    assert parse_user_tool_call_cap("帮我查一下 U1800 的型号") is None
+
+
+def test_tool_call_cap_recorded_in_budget_state():
+    query = "关键器件清单草稿,最多 8 次检索工具调用,固定五列。"
+    limit, budget = _agent_recursion_limit(
+        query=query,
+        query_mode="deep",
+        attachment_refs=[],
+        knowledge_scope=None,
+    )
+    assert budget.get("tool_call_cap") == 8
+    assert budget.get("tool_call_cap_source") == "user_query"
+
+
+def test_export_intent_detection():
+    assert _export_intent_for_turn("导出为 PDF") is True
+    assert _export_intent_for_turn("输出(running)") is False

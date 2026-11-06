@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.errors import install_error_handlers
 from src.api.deps import require_system_admin
 from src.api.routes import (
+    artifacts,
     assets,
     attachments,
     auth,
@@ -32,6 +33,7 @@ from src.api.routes import (
     kbs,
     logs,
     memories,
+    mcp_tokens,
     notifications,
     parse_tasks,
     plugins,
@@ -46,6 +48,7 @@ from src.api.routes import (
     upload,
     users,
     wiki,
+    workspaces,
 )
 from src.observability import (
     attach_log_handler,
@@ -330,10 +333,12 @@ def create_app() -> FastAPI:
     app.include_router(wiki.router, prefix=api_v1)
     app.include_router(attachments.router, prefix=api_v1)
     app.include_router(conversations.router, prefix=api_v1)
+    app.include_router(workspaces.router, prefix=api_v1)
     app.include_router(kbs.router, prefix=api_v1)
     app.include_router(files.router, prefix=api_v1)
     app.include_router(parse_tasks.router, prefix=api_v1)
     app.include_router(query.router, prefix=api_v1)
+    app.include_router(artifacts.router, prefix=api_v1)
     app.include_router(quality.router, prefix=api_v1)
     app.include_router(costs.router, prefix=api_v1)
     app.include_router(quality_workflow.router, prefix=api_v1)
@@ -347,6 +352,7 @@ def create_app() -> FastAPI:
     app.include_router(config.router, prefix=api_v1)
     app.include_router(logs.router, prefix=api_v1)
     app.include_router(memories.router, prefix=api_v1)
+    app.include_router(mcp_tokens.router, prefix=api_v1)
     app.include_router(notifications.router, prefix=api_v1)
     app.include_router(plugins.router, prefix=api_v1)
     app.include_router(status.router, prefix=api_v1)

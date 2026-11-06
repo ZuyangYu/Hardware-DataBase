@@ -375,6 +375,13 @@ class ConversationService:
                 "CREATE INDEX IF NOT EXISTS idx_turn_attachments_asset "
                 "ON turn_attachments(asset_id)"
             )
+            conn.execute(
+                "UPDATE chat_turns SET status = 'cancelled', "
+                "error_message = COALESCE(NULLIF(error_message, ''), '任务工作台已下线'), "
+                "finished_at = COALESCE(finished_at, ?) "
+                "WHERE status = 'task_pending'",
+                (utc_now(),),
+            )
             self._ensure_column(conn, "chat_sessions", "department_id", "INTEGER")
             self._ensure_column(conn, "chat_sessions", "kb_id", "INTEGER")
             from src.storage.control_plane.knowledge_scope_migration import apply_sqlite as migrate_scope
@@ -2522,6 +2529,10 @@ class ConversationService:
         from src.result_exports.answer import normalize_export_answer
 
         answer = normalize_export_answer(answer, existing_turn.export_plan)
+        tenant_id = str(
+            (getattr(existing_turn, "trace_context", {}) or {}).get("tenant_id")
+            or "default"
+        )
         export_store = None
         if existing_turn.export_plan:
             from src.result_exports.store import ResultExportStore
@@ -2597,7 +2608,7 @@ class ConversationService:
                     export_store.enqueue_completed_turn_in_connection(
                         conn,
                         owner_user_id=user_id,
-                        tenant_id="default",
+                        tenant_id=tenant_id,
                         department_id=completed_turn.department_id,
                         knowledge_base_name=(
                             "" if completed_turn.kb_name == GENERAL_CHAT_KB_NAME else completed_turn.kb_name
@@ -2692,6 +2703,8 @@ class ConversationService:
         fencing_token: int | None = None,
         terminal_events_builder: Callable[[ChatTurn], Sequence[tuple[str, dict]]] | None = None,
         domain_writer: Callable[[sqlite3.Connection, ChatTurn], None] | None = None,
+        partial_answer: str | None = None,
+        summary: dict | None = None,
     ) -> TurnFinalization:
         now = utc_now()
         status = "cancelled" if cancelled else "failed"
@@ -2727,7 +2740,31 @@ class ConversationService:
                 if cursor.rowcount == 0:
                     conn.execute("COMMIT")
                     return TurnFinalization(turn=None)
-                placeholder = "已停止生成" if cancelled else f"生成失败：{message[:500]}"
+                # 守门狗/上游失败时，被流式冲刷出的部分答案不应随之蒸发：
+                # 回填 answer 列与 assistant 消息正文，让用户留住已生成的
+                # 部分结果（如止损合成的草稿表）。answer/summary 只在原本
+                # 为空时回填，绝不覆盖更完整的内容。
+                rescued = str((partial_answer or "").strip())
+                if rescued:
+                    conn.execute(
+                        """
+                        UPDATE chat_turns SET answer = ?
+                        WHERE id = ? AND COALESCE(answer, '') = ''
+                        """,
+                        (rescued, turn_id),
+                    )
+                if summary:
+                    conn.execute(
+                        """
+                        UPDATE chat_turns SET summary_json = ?
+                        WHERE id = ? AND COALESCE(summary_json, '{}') = '{}'
+                        """,
+                        (json.dumps(summary, ensure_ascii=False, default=str), turn_id),
+                    )
+                placeholder = (
+                    rescued
+                    or ("已停止生成" if cancelled else f"生成失败：{message[:500]}")
+                )
                 conn.execute(
                     "UPDATE chat_messages SET content = ? WHERE id = ? AND content = ''",
                     (placeholder, row["assistant_message_id"]),

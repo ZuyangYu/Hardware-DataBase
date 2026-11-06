@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api, ApiError, isForbiddenError, sseGetStream } from '@/api/client';
 import {
+  isHiddenChatTraceStep,
   mergeMcpWriteProposal,
   parseAgentEvent,
   traceStepFromToolEvent,
@@ -40,7 +41,7 @@ import type {
 } from '@/api/types';
 import { notify } from '@/components/ui/app-toast';
 import { createClientRequestId } from '@/api/clientRequestId';
-import { shouldCancelServerTurn, type ChatStreamDetachReason } from './chatTaskLifecycle';
+import { shouldCancelServerTurn, type ChatStreamDetachReason } from './chatTurnLifecycle';
 
 const GENERAL_CHAT_KB_NAME = '__general__';
 const QUERY_TRACE_HIDE_DELAY_MS = 5000;
@@ -441,8 +442,11 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         // 合并而非覆盖：并发的活跃 turn 实时轨迹不会被历史投影清掉。
         const restoredTraces: Record<number, QueryTraceStep[]> = {};
         for (const row of rows) {
-          if (row.role === 'assistant' && row.trace_steps?.length) {
-            restoredTraces[row.id] = row.trace_steps;
+          const visibleSteps = (row.trace_steps ?? []).filter(
+            (step) => !isHiddenChatTraceStep(step),
+          );
+          if (row.role === 'assistant' && visibleSteps.length) {
+            restoredTraces[row.id] = visibleSteps;
           }
         }
         if (Object.keys(restoredTraces).length > 0) {
@@ -631,7 +635,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   }, [clearTraceTimer]);
 
   const upsertTraceStep = useCallback((next: QueryTraceStep) => {
-    if (next.key === 'permission' || next.key === 'generate') return;
+    if (isHiddenChatTraceStep(next)) return;
     setTraceSteps((prev) => {
       let updated: QueryTraceStep[];
       if (prev.length === 0) {
@@ -672,6 +676,21 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   useEffect(() => {
     setMcpWriteCards([]);
   }, [activeSessionId]);
+
+  // 刷新/重开会话后从消息投影恢复写入提案卡；实时卡优先覆盖同 id 的旧状态。
+  useEffect(() => {
+    const persisted = messages
+      .filter((message) => message.session_id === activeSessionId)
+      .flatMap((message) => message.mcp_write_cards ?? []);
+    if (persisted.length === 0) return;
+    setMcpWriteCards((previous) => {
+      const byId = new Map(persisted.map((card) => [card.proposal_id, card]));
+      for (const card of previous) {
+        byId.set(card.proposal_id, { ...byId.get(card.proposal_id), ...card });
+      }
+      return [...byId.values()];
+    });
+  }, [messages, activeSessionId]);
 
   // 刷新或重新打开会话时，接回后端仍在执行的持久化 turn。
   useEffect(() => {
@@ -740,7 +759,10 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
               applyTurnMetaEvent(event);
               break;
             case 'mcp_write_proposal':
-              setMcpWriteCards((prev) => mergeMcpWriteProposal(prev, event));
+              setMcpWriteCards((prev) => mergeMcpWriteProposal(prev, {
+                ...event,
+                card: { ...event.card, turn_id: currentTurnRef.current || '' },
+              }));
               break;
             case 'done': {
               if (!ownsStream(turn.id, turn.session_id)) break;
@@ -757,7 +779,6 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
                   footer: (event.footer ?? '').trim(),
                   memory_context: summary.memory_context ?? [],
                   created_at: turn.created_at,
-                  plan: null,
                   budget: (summary.budget as TurnBudget | undefined) ?? null,
                   verification: (summary.verification as TurnVerification | undefined) ?? null,
                   subagents: (summary.subagents as TurnSubagent[] | undefined) ?? [],
@@ -1074,7 +1095,10 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
             applyTurnMetaEvent(event);
             break;
           case 'mcp_write_proposal':
-            setMcpWriteCards((prev) => mergeMcpWriteProposal(prev, event));
+            setMcpWriteCards((prev) => mergeMcpWriteProposal(prev, {
+              ...event,
+              card: { ...event.card, turn_id: currentTurnRef.current || '' },
+            }));
             break;
           case 'done':
             finalPayload = event;
@@ -1105,7 +1129,6 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
           footer: (payload.footer ?? '').trim(),
           memory_context: summary.memory_context ?? [],
           created_at: new Date().toISOString(),
-          plan: null,
           budget: (summary.budget as TurnBudget | undefined) ?? null,
           verification: (summary.verification as TurnVerification | undefined) ?? null,
           subagents: (summary.subagents as TurnSubagent[] | undefined) ?? [],

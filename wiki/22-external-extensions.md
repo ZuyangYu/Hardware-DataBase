@@ -79,6 +79,12 @@ shell、任意命令、宿主路径、容器参数或任意环境快照。认证
 - 管理员发布的目录项可限定一个部门或 `*`（全部部门）；员工个人 Skill 绑定上传者的部门，只有上传者和管理员可见，启用后上传者可选择向同部门共享。
 - 部门共享不会替员工自动订阅；退订或撤销会阻止新的提示注入/任务提交。
 - 文本 Skill 不要求沙箱执行能力，但仍受 `SKILLS_ENABLED`、审核、部门范围和订阅约束。
+- 文本 Skill 使用渐进式披露：每轮只把已订阅 Skill 的 `name`/`description` 索引放进 prompt；
+  模型判断需要时才通过受门禁的 `read_file` 读取 `/skill-*/SKILL.md` 正文。没有物化 Skill 的
+  回合 `read_file` 对模型不可见。
+- Skill 正文读取会写入当前 turn 的 `tool_started` / `tool_result` 事件（`tool_kind=workspace`，
+  带 `skill_ref` 和 `result_bytes`），可用于审计和加载验收；只有 `skill_loaded` 事件不等于
+  模型真的读了正文。
 - 执行型 Skill 除订阅外，还要通过 bundle/profile、运行时策略和当前部署能力检查；所需能力必须同时在部署 allowlist 与用户授权快照内。
 - Skill 文本中的 `command`、hooks、权限声明或 prompt injection 文字都是不可信数据，不会成为执行参数或能力授予。
 
@@ -143,6 +149,9 @@ bundle，或上传执行型 Skill ZIP。
   工具回合中调用。页面显示任务状态，成功且 commit 的产物才可下载。
 - 执行权限按调用身份和部门重新计算；订阅不能代替能力授权。缺少 Runner、运行档位不匹配或授权撤销
   时，请求会被拒绝，而不是退回本地执行。
+- 加载验收可运行 `uv run python scripts/functional_skills.py`（需 `HDB_E2E_USERNAME` /
+  `HDB_E2E_PASSWORD`）：覆盖目录启用、订阅、描述解析、可执行 Skill 登记、真实对话读取
+  `SKILL.md` 正文，以及普通知识库问题不读取正文的控制组。
 
 ## 5. Sandbox 任务、账本与产物
 

@@ -75,3 +75,28 @@ def test_build_agent_wires_official_skills_backend(tmp_path):
     gate = captured["middleware"][0]
     assert isinstance(gate, SkillReadGateMiddleware)
     assert gate.enabled is True
+
+
+def test_build_agent_passes_skill_read_observer(tmp_path):
+    captured = {}
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    def observer(**event):
+        _ = event
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return "agent"
+
+    build_agent(
+        model="model",
+        tools=[],
+        system_prompt="prompt",
+        skill_root=str(skill_root),
+        skill_read_observer=observer,
+        factory=factory,
+    )
+
+    gate = captured["middleware"][0]
+    assert isinstance(gate, SkillReadGateMiddleware)
+    assert gate.observer is observer

@@ -14,28 +14,31 @@ describe('complex turn meta panels', () => {
     created_at: '2026-10-26T00:00:00Z',
   };
 
-  it('does not render a plan panel', () => {
+  it('renders an MCP write proposal inline in the assistant message', () => {
     const html = renderToStaticMarkup(
       <MessageBubble
-        msg={{
-          ...baseMessage,
-          content: '',
-          plan: {
-            revision: 1,
-            items: [
-              { content: '读取上一代 BOM', status: 'completed' },
-              { content: '检索知识库约束', status: 'in_progress' },
-              { content: '输出推荐表', status: 'pending' },
-            ],
-          },
-        }}
-        streaming
-        streamingText="候选 BOM [1]"
+        msg={baseMessage}
+        mcpWriteCards={[{
+          kind: 'mcp_write_proposal',
+          proposal_id: 'proposal-1',
+          turn_id: 'turn-42',
+          server: 'drawio',
+          server_name: 'draw.io 图表',
+          tool: 'create_drawio_file',
+          arguments_digest: 'abcdef123456',
+          artifact_hint: 'content,filename',
+          status: 'proposed',
+          expires_at: '2026-11-05T12:00:00Z',
+        }]}
+        onConfirmMcpWrite={() => undefined}
+        onRejectMcpWrite={() => undefined}
       />,
     );
-    expect(html).not.toContain('执行计划');
-    expect(html).not.toContain('读取上一代 BOM');
-    expect(html).not.toContain('进行中');
+    expect(html).toContain('data-mcp-write-card="proposal-1"');
+    expect(html).toContain('需要你确认：生成外部文件');
+    expect(html).toContain('draw.io 图表');
+    expect(html).toContain('确认生成文件');
+    expect(html).toContain('暂不生成');
   });
 
   it('does not render a budget-exhausted card', () => {

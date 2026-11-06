@@ -129,8 +129,15 @@ async def upload_attachment(
         },
     )
     try:
-        record = await run_upload(service, session_id=session_id, user_id=user.id, file=file,
-                                  client_request_id=client_request_id, usage_hint=usage_hint)
+        record = await run_upload(
+            service,
+            session_id=session_id,
+            user_id=user.id,
+            tenant_id=str(user.id),
+            file=file,
+            client_request_id=client_request_id,
+            usage_hint=usage_hint,
+        )
     except AttachmentError as exc:
         finish_attachment_audit(
             attempt,
@@ -166,6 +173,7 @@ async def run_upload(
     *,
     session_id: int,
     user_id: int,
+    tenant_id: str = "default",
     file: UploadFile,
     client_request_id: str,
     usage_hint: str,
@@ -179,6 +187,7 @@ async def run_upload(
             service.upload,
             session_id=session_id,
             user_id=user_id,
+            tenant_id=tenant_id,
             filename=file.filename or "attachment",
             stream=file.file,
             client_request_id=client_request_id,
