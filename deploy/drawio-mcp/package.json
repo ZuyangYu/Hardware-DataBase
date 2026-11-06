@@ -1,0 +1,16 @@
+{
+  "name": "hdb-drawio-mcp",
+  "version": "1.0.0",
+  "description": "Streamable HTTP bridge for the official draw.io MCP server",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.mjs",
+    "smoke": "node smoke.mjs"
+  },
+  "dependencies": {
+    "@drawio/mcp": "1.6.1",
+    "@modelcontextprotocol/sdk": "1.27.1"
+  },
+  "license": "Apache-2.0"
+}

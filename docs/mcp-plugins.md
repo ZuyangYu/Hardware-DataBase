@@ -56,6 +56,11 @@ Sandbox Runner/Gateway 的部署要求见 [`deploy/mcp-sandbox/README.md`](../de
 > 候选产物写工具、Dockerfile（非 root/只读 rootfs/`--cap-drop ALL`）和全链路联调脚本
 > `smoke.py`。生产镜像按 §4.12 用固定 argv 调用 `kicad-cli` 替换内置生成器即可。
 
+> 另一个可直接部署的示例是 `deploy/drawio-mcp/`：把官方 `@drawio/mcp` stdio 服务
+> 包装为 streamable_http，提供 XML / CSV / Mermaid / 图形搜索四个只读工具，以及一个
+> 返回可下载 `.drawio` 候选产物的写工具 `create_drawio_file`；同时过滤掉本地文件读写
+> 工具。登记 URL 为 `http://<host>:8091/mcp`，详见该目录 README。
+
 ```python
 # plugin_server.py —— 依赖：pip install "mcp>=1.30"
 import base64
@@ -154,7 +159,7 @@ curl -OJ $BASE/write-proposals/<proposal_id>/artifact -H "Authorization: Bearer 
 
 | 类型 | 内容 | 使用方式 | 是否运行代码 |
 |---|---|---|---|
-| 文本 Skill | 提示文本，或只含 Markdown/许可文本的 ZIP | 订阅后在本人对话中作为受限参考文本 | 否 |
+| 文本 Skill | 提示文本，或含 Markdown、脚本等 UTF-8 文本资源的 ZIP | 订阅后按需读取只读挂载的文件 | 否 |
 | 固定任务 Skill | 管理员绑定到已审核固定 bundle 的文本 Skill | 订阅后按固定 bundle 的 schema 提交任务 | 是，在独立 Runner 中运行固定 bundle |
 | 上传执行型 Skill | 含 `SKILL.md` 与 `entrypoint.py` 的 ZIP，经 Runner 固定模板构建 | 订阅后在扩展页测试运行，或由 Agent 调用 | 是，仅在审核启用后由独立 Runner 执行 |
 
@@ -165,8 +170,8 @@ curl -OJ $BASE/write-proposals/<proposal_id>/artifact -H "Authorization: Bearer 
 1. 打开侧边栏「扩展」→「Skill 库」→「上传个人 Skill」，选择文本型或执行型并提交 ZIP。
    账号必须有部门；上传后记录归属于提交者的私有草稿，不会立即对其他员工可见。
 2. 文本 ZIP 必须包含且只包含一个 `SKILL.md`，其中 YAML frontmatter 至少有 `name` 和
-   `description`；可附带 Markdown 参考资料以及 `LICENSE.txt` / `NOTICE.txt`。其他资产、脚本
-   和权限声明不会导入。所有 Markdown 会合并为不超过 16 KiB 的审核文本。
+   `description`；可附带 `references/`、`scripts/` 等 UTF-8 文本资源。文件按原路径保留，
+   审核后只读挂载、按需读取；脚本仅作为文本参考，不会被执行。
 3. 执行型 ZIP 的根目录须包含 `SKILL.md` 与 `entrypoint.py`；入口读取
    `/work/in/parameters.json`，把候选产物写入 `/work/out`。可选 `requirements.lock` 必须
    固定版本并提供 wheel SHA-256。上传动作只保存源码，不会构建或运行代码。
