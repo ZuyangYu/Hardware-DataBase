@@ -431,6 +431,46 @@ def _research_subagent_spec(
     }
 
 
+def _general_subagent_spec(
+    *,
+    tools: list[Any],
+    model: Any,
+    skill_root: str | None = None,
+    skill_read_observer: Callable[..., None] | None = None,
+) -> dict[str, Any] | None:
+    """Build a general-purpose subagent for complex, non-code workspace tasks."""
+
+    if not tools:
+        return None
+    return {
+        "name": "general-purpose",
+        "description": (
+            "General hardware workspace specialist. Delegate self-contained "
+            "multi-step tasks that need file/workspace tools, attachments, "
+            "knowledge-base retrieval, spreadsheets, or MCP tools. Do not "
+            "delegate tasks that require user confirmation or shell/code."
+        ),
+        "system_prompt": (
+            "You are a general-purpose hardware workspace subagent. Complete "
+            "the delegated task end-to-end using only the provided tools. Do "
+            "not run shell or arbitrary code, and do not access paths outside "
+            "the workspace. Read attachments/workspace files before editing "
+            "them. If a write tool returns proposed, report that it is pending "
+            "user confirmation; never claim a file was created. Return a "
+            "concise result with facts, filenames, and any remaining gaps; do "
+            "not invent tool results."
+        ),
+        "tools": list(tools),
+        "model": model,
+        "middleware": [
+            SkillReadGateMiddleware(
+                enabled=bool(skill_root),
+                observer=skill_read_observer,
+            )
+        ],
+    }
+
+
 def _agent_step_budget_answer(rt: Any, reason: str = "") -> str:
     """Explain a clean stop after a budgeted agent loop ended."""
 
@@ -485,7 +525,6 @@ def _is_incomplete_answer(
     answer_text: str,
     *,
     show_turn_meta: bool,
-    has_plan: bool,
 ) -> bool:
     """Detect a complex turn whose final text is only an intro/prefix.
 
@@ -497,7 +536,7 @@ def _is_incomplete_answer(
     text = str(answer_text or "").strip()
     return bool(
         text
-        and (show_turn_meta or has_plan)
+        and show_turn_meta
         and len(text) < 600
         and not _CITATION_RE.search(text)
     )

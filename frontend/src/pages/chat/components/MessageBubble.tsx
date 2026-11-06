@@ -13,6 +13,7 @@ import type {
   ExportArtifactView,
   ExportFormat,
   ExportJobView,
+  McpWriteProposalCard as McpWriteProposalCardType,
   MemoryContextItem,
   MessageView,
   QueryTraceStep,
@@ -24,6 +25,7 @@ import { notify } from '@/components/ui/app-toast';
 import { MarkdownMessage, citationDisplayTitle } from '../chatHelpers';
 import ExportMenu, { exportJobStatusLabel } from './ExportMenu';
 import FeedbackActions from './FeedbackActions';
+import McpWriteProposalCard from './McpWriteProposalCard';
 import { downloadConversationArtifact, type ConversationArtifactView } from '@/api/artifacts';
 import { exportFormatLabel } from '../exportResultModel';
 import {
@@ -68,6 +70,11 @@ type Props = {
   exportFormats?: ExportFormat[];
   /** 本轮会话产物；显示在"回答有帮助"反馈上方，仅文件名。 */
   artifacts?: ConversationArtifactView[];
+  /** 外部插件写入提案卡；刷新后仍挂在对应 assistant 消息下。 */
+  mcpWriteCards?: McpWriteProposalCardType[];
+  onConfirmMcpWrite?: (card: McpWriteProposalCardType) => void;
+  onRejectMcpWrite?: (card: McpWriteProposalCardType) => void;
+  onDownloadMcpWrite?: (card: McpWriteProposalCardType) => void;
 };
 
 function CollapsibleSection({
@@ -551,6 +558,10 @@ function MessageBubble({
   exportPreviews = {},
   exportFormats,
   artifacts = [],
+  mcpWriteCards = [],
+  onConfirmMcpWrite,
+  onRejectMcpWrite,
+  onDownloadMcpWrite,
 }: Props) {
   const resolvedSubagents = subagents.length > 0 ? subagents : (msg.subagents ?? []);
   // 流式临时气泡
@@ -612,6 +623,19 @@ function MessageBubble({
                     >
                       {artifact.name}
                     </button>
+                  ))}
+                </div>
+              ) : null}
+              {mcpWriteCards.length > 0 ? (
+                <div className="grid gap-[8px]" data-testid="message-mcp-write-cards">
+                  {mcpWriteCards.map((card) => (
+                    <McpWriteProposalCard
+                      key={card.proposal_id}
+                      card={card}
+                      onConfirm={onConfirmMcpWrite}
+                      onReject={onRejectMcpWrite}
+                      onDownload={onDownloadMcpWrite}
+                    />
                   ))}
                 </div>
               ) : null}

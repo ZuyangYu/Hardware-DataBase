@@ -686,6 +686,44 @@ class AuthService:
         )
         return AuthSession(token=token, user=user, expires_at=expires_dt.isoformat()), ""
 
+    def create_session_for_user(
+        self,
+        user_id: int | None,
+        *,
+        ttl_hours: int | None = None,
+        actor: AuthUser | None = None,
+    ) -> tuple[str, str] | None:
+        """Issue a normal session token for an already-authenticated user.
+
+        Used by the MCP token exchange: the long-lived personal token is not a
+        session and never reaches internal routes; it is exchanged for this
+        short-lived bearer token.
+        """
+        user = self.get_user_by_id(user_id)
+        if user is None or not user.is_active:
+            return None
+        token = secrets.token_urlsafe(32)
+        now_dt = datetime.now(timezone.utc)
+        expires_dt = now_dt + timedelta(
+            hours=max(1, int(ttl_hours or src.settings.MCP_SESSION_TTL_HOURS))
+        )
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO auth_sessions (token_hash, user_id, created_at, expires_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (hash_token(token), user.id, now_dt.isoformat(), expires_dt.isoformat()),
+            )
+        self._audit(
+            "mcp_session_issued",
+            actor=actor or user,
+            target_type="mcp_session",
+            target_id=str(user.id),
+            success=True,
+        )
+        return token, expires_dt.isoformat()
+
     def get_user_by_token(self, token: str | None) -> AuthUser | None:
         if not token:
             return None

@@ -60,9 +60,16 @@ def test_text_skill_zip_imports_multiple_markdown_files_without_execution():
         "SKILL.md": "---\nname: bom-guide\ndescription: Check BOM\n---\n# Guide",
         "notes.md": "extra material",
     })).files == ("SKILL.md", "notes.md")
-    for extra in ({"bom-guide/entrypoint.py": "print('unsafe')"},
-                  {"bom-guide/scripts/run.sh": "echo no"},
-                  {"../escape.md": "bad"},
+    with_scripts = validate_text_skill_package(archive({
+        "bom-guide/SKILL.md": "---\nname: bom-guide\ndescription: Check BOM\n---\n# Guide",
+        "bom-guide/references/checks.md": "Check voltage ratings.\n",
+        "bom-guide/scripts/check.py": "print('check')\n",
+        "bom-guide/scripts/run.sh": "echo check\n",
+    }))
+    assert "scripts/check.py" in with_scripts.files
+    assert ("scripts/run.sh", "echo check\n") in with_scripts.resources
+    assert "print('check')" in with_scripts.content
+    for extra in ({"../escape.md": "bad"},
                   {"other/NOTE.md": "outside folder"}):
         with pytest.raises(SkillPackageError):
             validate_text_skill_package(archive({
@@ -71,11 +78,12 @@ def test_text_skill_zip_imports_multiple_markdown_files_without_execution():
             }))
     with pytest.raises(SkillPackageError):
         validate_text_skill_package(archive({"SKILL.md": "# Missing frontmatter"}))
-    with pytest.raises(SkillPackageError, match="16 KiB"):
-        validate_text_skill_package(archive({
-            "SKILL.md": "---\nname: bom-guide\ndescription: Check BOM\n---\n# Guide",
-            "references/long.md": "X" * 17_000,
-        }))
+    large = validate_text_skill_package(archive({
+        "SKILL.md": "---\nname: bom-guide\ndescription: Check BOM\n---\n# Guide",
+        "references/long.md": "X" * 17_000,
+    }))
+    assert len(large.content) > 17_000
+    assert "references/long.md" in large.files
     with pytest.raises(SkillPackageError, match="folder name"):
         validate_text_skill_package(archive({
             "wrong/SKILL.md": "---\nname: bom-guide\ndescription: Check BOM\n---\n# Guide",
@@ -362,9 +370,11 @@ def test_employee_text_skill_upload_review_and_department_share(tmp_path, monkey
         assert client.post("/sandbox/skills/personal/text-packages", json={
             "package_base64": base64.b64encode(raw).decode(),
         }).status_code == 409
-        assert client.post("/sandbox/skills/personal/text-packages", json={
-            "package_base64": base64.b64encode(archive({"SKILL.md": "---\nname: script\ndescription: Unsafe\n---\n# script", "entrypoint.py": "print(1)"})).decode(),
-        }).status_code == 400
+        script_upload = client.post("/sandbox/skills/personal/text-packages", json={
+            "package_base64": base64.b64encode(archive({"SKILL.md": "---\nname: script\ndescription: Inert script resource\n---\n# script", "entrypoint.py": "print(1)"})).decode(),
+        })
+        assert script_upload.status_code == 201, script_upload.text
+        assert "entrypoint.py" in catalog.require("skill/personal/71/script").text_files
         assert client.get(path + "/source").status_code == 403
         assert client.post(path + "/review").status_code == 403
         assert client.post("/sandbox/skills/packages", json={}).status_code == 403

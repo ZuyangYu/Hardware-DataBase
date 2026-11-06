@@ -59,7 +59,7 @@ def new_session(
     return int(r.json()["id"])
 
 
-def run_turn(c: httpx.Client, h: dict, session_id: int, query: str, cap: int = 180) -> dict:
+def run_turn(c: httpx.Client, h: dict, session_id: int, query: str, cap: int = 600) -> dict:
     r = c.post(
         f"{BASE}/conversations/{session_id}/turns",
         json={"query": query, "source_scope": "knowledge_base_only"},

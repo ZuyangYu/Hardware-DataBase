@@ -6,8 +6,6 @@ import type {
   McpCatalogItem,
   McpCatalogResponse,
   McpListFlags,
-  McpWriteProposal,
-  McpWriteProposalListResponse,
 } from '../api/types';
 import type { AuthSession } from '../auth';
 import AppHeader from '@/components/AppHeader';
@@ -68,11 +66,6 @@ export type ExtensionsViewProps = {
   onSubscribe: (item: McpCatalogItem) => void;
   onUnsubscribe: (item: McpCatalogItem) => void;
   onToggleWrite: (item: McpCatalogItem, allow: boolean) => void;
-  proposals?: McpWriteProposal[];
-  proposalBusyId?: string | null;
-  onConfirmProposal?: (proposal: McpWriteProposal) => void;
-  onRejectProposal?: (proposal: McpWriteProposal) => void;
-  onDownloadProposal?: (proposal: McpWriteProposal) => void;
   skills?: ExecutableSkill[];
   personalSkills?: PersonalSkill[];
   personalLoaded?: boolean;
@@ -114,11 +107,6 @@ export function ExtensionsView({
   onSubscribe,
   onUnsubscribe,
   onToggleWrite,
-  proposals = [],
-  proposalBusyId = null,
-  onConfirmProposal,
-  onRejectProposal,
-  onDownloadProposal,
   skills = [],
   personalSkills = [],
   personalLoaded = true,
@@ -399,28 +387,6 @@ export function ExtensionsView({
           </div>
         )}
 
-        {proposals.length > 0 && (
-          <section data-mcp-write-proposals className="mt-[24px] rounded-[16px] border border-[#e6eaf1] bg-white p-[20px]">
-            <div className="flex flex-wrap items-center justify-between gap-[10px]"><div><h3 className="text-[15px] font-semibold text-[#1d2a40]">写入提案</h3><p className="mt-[4px] text-[12px] text-[#858b9c]">候选产物必须先确认；确认前不会调用外部写工具，也不会修改原件。</p></div><Badge variant="secondary">{proposals.length} 条</Badge></div>
-            <div className="mt-[14px] grid gap-[10px]">
-              {proposals.map((proposal) => {
-                const busy = proposalBusyId === proposal.proposal_id;
-                return (
-                  <div key={proposal.proposal_id} data-mcp-write-proposal={proposal.proposal_id} className="rounded-[12px] border border-[#e7eaf1] p-[14px]">
-                    <div className="flex flex-wrap items-center justify-between gap-[8px]"><div className="break-all text-[13px] font-medium text-[#1d2a40]">{proposal.slug} / {proposal.tool_name}</div><Badge variant="outline">{proposal.status}</Badge></div>
-                    <div className="mt-[7px] break-all text-[12px] text-[#858b9c]">产物提示：{proposal.artifact_hint || '未声明'} · 参数摘要：{proposal.arguments_digest.slice(0, 12)}…</div>
-                    {proposal.error_code && <div className="mt-[6px] text-[12px] text-[#b5352d]">错误：{proposal.error_code}</div>}
-                    <div className="mt-[11px] flex flex-wrap gap-[8px]">
-                      {proposal.status === 'proposed' && onConfirmProposal && <Button disabled={busy || !flags.write_enabled} onClick={() => onConfirmProposal(proposal)}>确认生成</Button>}
-                      {proposal.status === 'proposed' && onRejectProposal && <Button variant="outline" disabled={busy} onClick={() => onRejectProposal(proposal)}>拒绝</Button>}
-                      {proposal.status === 'completed' && proposal.artifact_filename && onDownloadProposal && <Button variant="outline" disabled={busy} onClick={() => onDownloadProposal(proposal)}><Download className="size-[14px]" />下载候选产物</Button>}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </section>
-        )}
       </section>
 
       <Dialog open={uploadOpen} onOpenChange={(open) => { if (!open && !personalBusy) { setUploadOpen(false); setPersonalFile(null); } }}>
@@ -481,8 +447,6 @@ export default function ExtensionsPage({ auth }: Props) {
   const [loaded, setLoaded] = useState(false);
   const [skillsLoaded, setSkillsLoaded] = useState(false);
   const [busySlug, setBusySlug] = useState<string | null>(null);
-  const [proposals, setProposals] = useState<McpWriteProposal[]>([]);
-  const [proposalBusyId, setProposalBusyId] = useState<string | null>(null);
   const [skills, setSkills] = useState<ExecutableSkill[]>([]);
   const [personalSkills, setPersonalSkills] = useState<PersonalSkill[]>([]);
   const [personalLoaded, setPersonalLoaded] = useState(false);
@@ -515,14 +479,6 @@ export default function ExtensionsPage({ auth }: Props) {
       })
       .finally(() => {
         if (!cancelled) setLoaded(true);
-      });
-    api
-      .get<McpWriteProposalListResponse>('/api/v1/plugins/mcp/write-proposals')
-      .then((payload) => {
-        if (!cancelled) setProposals(payload.items);
-      })
-      .catch(() => {
-        if (!cancelled) setProposals([]);
       });
     api.get<{ items: ExecutableSkill[] }>('/api/v1/sandbox/skills/available')
       .then((payload) => { if (!cancelled) setSkills(payload.items); })
@@ -574,17 +530,6 @@ export default function ExtensionsPage({ auth }: Props) {
       .finally(() => setBusySlug(null));
   }
 
-  function runProposal(proposal: McpWriteProposal, action: () => Promise<unknown>, message: string) {
-    setProposalBusyId(proposal.proposal_id);
-    action()
-      .then(() => {
-        notify.success(message);
-        void load();
-      })
-      .catch((error) => notify.error(error instanceof Error ? error.message : '操作失败'))
-      .finally(() => setProposalBusyId(null));
-  }
-
   return (
     <ExtensionsView
       flags={flags}
@@ -602,32 +547,6 @@ export default function ExtensionsPage({ auth }: Props) {
           item.slug,
           () => api.post(path(item.slug) + '/write-consent', { allow_write: allow }),
           allow ? '已允许写操作' : '已撤销写操作同意',
-        )
-      }
-      proposals={proposals}
-      proposalBusyId={proposalBusyId}
-      onConfirmProposal={(proposal) =>
-        runProposal(
-          proposal,
-          () => api.post(`/api/v1/plugins/mcp/write-proposals/${encodeURIComponent(proposal.proposal_id)}/confirm`),
-          '已确认，候选产物将由 worker 生成',
-        )
-      }
-      onRejectProposal={(proposal) =>
-        runProposal(
-          proposal,
-          () => api.post(`/api/v1/plugins/mcp/write-proposals/${encodeURIComponent(proposal.proposal_id)}/reject`),
-          '已拒绝写入提案',
-        )
-      }
-      onDownloadProposal={(proposal) =>
-        runProposal(
-          proposal,
-          () => apiDownload.blob(
-            `/api/v1/plugins/mcp/write-proposals/${encodeURIComponent(proposal.proposal_id)}/artifact`,
-            proposal.artifact_filename || `${proposal.proposal_id}.artifact`,
-          ),
-          '下载已开始',
         )
       }
       skills={skills}

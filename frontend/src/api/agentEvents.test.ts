@@ -17,7 +17,7 @@ const envelope = {
 
 describe('typed agent events', () => {
   it('hides runtime orchestration stages from the chat process panel', () => {
-    for (const key of ['permission', 'generate', 'task_context', 'task_mode', 'skill_loaded']) {
+    for (const key of ['permission', 'generate', 'skill_loaded']) {
       expect(isHiddenChatTraceStep({ key })).toBe(true);
     }
     expect(isHiddenChatTraceStep({ key: 'inv-1' })).toBe(false);
@@ -88,24 +88,6 @@ describe('typed agent events', () => {
       status: 'rejected',
     })) as ToolCompletedEvent | null;
     expect(traceStepFromToolEvent(rejected!).status).toBe('error');
-  });
-
-  it('normalizes plan items and drops empty entries', () => {
-    const event = parseAgentEvent('plan_updated', JSON.stringify({
-      schema_version: 1,
-      item_id: 'plan',
-      revision: 2,
-      items: [
-        { content: '读取 BOM', status: 'completed' },
-        { content: '', status: 'pending' },
-        { content: '输出表格', status: 'unexpected' },
-      ],
-    }));
-    expect(event?.type).toBe('plan_updated');
-    expect(event && 'items' in event ? event.items : []).toEqual([
-      { content: '读取 BOM', status: 'completed' },
-      { content: '输出表格', status: 'pending' },
-    ]);
   });
 
   it('parses budget, verification, subagent and compaction payloads', () => {
@@ -186,7 +168,6 @@ describe('typed agent events', () => {
 
   it('rejects malformed events instead of leaking untyped payloads', () => {
     expect(parseAgentEvent('verification', '{"status":"weird"}')).toBeNull();
-    expect(parseAgentEvent('plan_created', 'not-json')).toBeNull();
     expect(parseAgentEvent('tool_started', '{"tool_name":"document_search"}')).toBeNull();
     expect(parseAgentEvent('made_up_event', '{}')).toBeNull();
   });

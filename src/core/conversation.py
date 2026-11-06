@@ -99,9 +99,7 @@ class ChatTurn:
 TURN_STATUS_WAITING_FOR_ATTACHMENTS = "waiting_for_attachments"
 
 # Non-terminal statuses that keep later turns of the same session queued.
-# task_pending is retained only so pre-workspace rows can still be drained.
-# New chat turns are always pending; the /tasks product no longer exists.
-TURN_STATUSES_NON_TERMINAL = ("pending", "task_pending", "streaming", "cancelling", "waiting_for_attachments")
+TURN_STATUSES_NON_TERMINAL = ("pending", "streaming", "cancelling", "waiting_for_attachments")
 TURN_STATUSES_NON_TERMINAL += tuple(f"multi_kb_{status}" for status in TURN_STATUSES_NON_TERMINAL)
 
 def canonical_turn_status(status: str) -> str:
@@ -376,6 +374,13 @@ class ConversationService:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_turn_attachments_asset "
                 "ON turn_attachments(asset_id)"
+            )
+            conn.execute(
+                "UPDATE chat_turns SET status = 'cancelled', "
+                "error_message = COALESCE(NULLIF(error_message, ''), '任务工作台已下线'), "
+                "finished_at = COALESCE(finished_at, ?) "
+                "WHERE status = 'task_pending'",
+                (utc_now(),),
             )
             self._ensure_column(conn, "chat_sessions", "department_id", "INTEGER")
             self._ensure_column(conn, "chat_sessions", "kb_id", "INTEGER")
@@ -1314,7 +1319,7 @@ class ConversationService:
                     SELECT COUNT(*) AS total FROM chat_turns t
                     JOIN chat_sessions s ON s.id = t.session_id
                     WHERE s.user_id = ? AND t.session_id = ?
-                      AND t.status IN ('pending', 'task_pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
+                      AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                     """,
                     (int(user_id), int(session_id)),
                 ).fetchone()
@@ -1324,7 +1329,7 @@ class ConversationService:
                     SELECT COUNT(*) AS total FROM chat_turns t
                     JOIN chat_sessions s ON s.id = t.session_id
                     WHERE s.user_id = ?
-                      AND t.status IN ('pending', 'task_pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
+                      AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                     """,
                     (int(user_id),),
                 ).fetchone()
@@ -1349,7 +1354,7 @@ class ConversationService:
                 SELECT t.* FROM chat_turns t
                 JOIN chat_sessions s ON s.id = t.session_id
                 WHERE t.session_id = ? AND s.user_id = ?
-                  AND t.status IN ('pending', 'task_pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
+                  AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                 ORDER BY t.created_at
                 """,
                 (session_id, user_id),
@@ -1555,7 +1560,7 @@ class ConversationService:
             rows = conn.execute(
                 """
                 SELECT id FROM chat_turns
-                WHERE status IN ('pending', 'multi_kb_pending', 'task_pending') AND cancel_requested = 0
+                WHERE status IN ('pending', 'multi_kb_pending') AND cancel_requested = 0
                   AND datetime(created_at) < datetime('now', ?)
                 ORDER BY created_at, id
                 LIMIT ?
@@ -1574,7 +1579,7 @@ class ConversationService:
                         SET status = 'failed',
                             error_message = '排队等待超时，本轮请求未执行；请稍后重试。',
                             finished_at = ?
-                        WHERE id = ? AND status IN ('pending', 'multi_kb_pending', 'task_pending')
+                        WHERE id = ? AND status IN ('pending', 'multi_kb_pending')
                         """,
                         (now, turn_id),
                     )
@@ -1634,7 +1639,7 @@ class ConversationService:
                 """
                 SELECT prior.id, prior.status FROM chat_turns prior
                 WHERE prior.session_id = ? AND prior.turn_sequence < ?
-                  AND prior.status IN ('pending', 'task_pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
+                  AND prior.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                 ORDER BY prior.turn_sequence DESC
                 LIMIT 1
                 """,
@@ -1861,7 +1866,7 @@ class ConversationService:
                   AND NOT EXISTS (
                       SELECT 1 FROM chat_turns prior
                       WHERE prior.session_id = t.session_id
-                        AND prior.status IN ('pending', 'task_pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
+                        AND prior.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                         AND prior.turn_sequence < t.turn_sequence
                   )
             """
@@ -1875,7 +1880,7 @@ class ConversationService:
                 FROM chat_turns t
                 JOIN chat_sessions s ON s.id = t.session_id
                 JOIN users u ON u.id = s.user_id
-                WHERE t.status IN ('pending', 'multi_kb_pending', 'task_pending') AND t.cancel_requested = 0
+                WHERE t.status IN ('pending', 'multi_kb_pending') AND t.cancel_requested = 0
                   AND u.is_active = 1
                   {head_filter}
                 ORDER BY t.created_at, t.id
@@ -1893,7 +1898,7 @@ class ConversationService:
                 """
                 SELECT COUNT(*) AS depth, MIN(created_at) AS oldest_at
                 FROM chat_turns
-                WHERE status IN ('pending', 'multi_kb_pending', 'task_pending') AND cancel_requested = 0
+                WHERE status IN ('pending', 'multi_kb_pending') AND cancel_requested = 0
                 """
             ).fetchone()
         depth = int(row["depth"] or 0)
@@ -2026,7 +2031,7 @@ class ConversationService:
                     """,
                     (turn_id, user_id),
                 ).fetchone()
-                if row is None or row["status"] not in {"pending", "task_pending", "multi_kb_pending"}:
+                if row is None or row["status"] not in {"pending", "multi_kb_pending"}:
                     if row is not None and int(row["cancel_requested"] or 0) == 1 and row["status"] == "cancelled":
                         conn.execute("COMMIT")
                         _done("cancelled")
@@ -2044,7 +2049,7 @@ class ConversationService:
                         SET status = 'cancelled',
                             error_message = COALESCE(NULLIF(error_message, ''), '已停止生成'),
                             finished_at = ?, worker_id = '', worker_heartbeat_at = NULL
-                        WHERE id = ? AND status IN ('pending', 'multi_kb_pending', 'task_pending')
+                        WHERE id = ? AND status IN ('pending', 'multi_kb_pending')
                         """,
                         (now, turn_id),
                     )
@@ -2080,7 +2085,7 @@ class ConversationService:
                         """
                         SELECT id FROM chat_turns
                         WHERE session_id = ? AND id <> ?
-                          AND status IN ('pending', 'task_pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
+                          AND status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                           AND turn_sequence < ?
                         ORDER BY turn_sequence
                         LIMIT 1
@@ -2120,7 +2125,7 @@ class ConversationService:
                     SET status = CASE WHEN knowledge_selection_hash <> '' THEN 'multi_kb_streaming' ELSE 'streaming' END,
                         started_at = ?, worker_id = ?, worker_heartbeat_at = ?,
                         retry_count = retry_count + 1
-                    WHERE id = ? AND status IN ('pending', 'multi_kb_pending', 'task_pending') AND retry_count < 3
+                    WHERE id = ? AND status IN ('pending', 'multi_kb_pending') AND retry_count < 3
                     """,
                     (now, worker_id, now, turn_id),
                 )
@@ -2839,7 +2844,7 @@ class ConversationService:
                         SELECT id FROM chat_sessions
                         WHERE user_id = ?
                     )
-                      AND status IN ('pending', 'task_pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
+                      AND status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                     """,
                     (now, turn_id, user_id),
                 )

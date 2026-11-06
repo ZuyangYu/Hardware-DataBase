@@ -399,7 +399,7 @@ class PostgresExecutionStore:
                 if existing is not None:
                     require_replay_fingerprint(existing["knowledge_request_fingerprint"], fingerprint)
                     return _turn_from_row(existing)
-            if scope and initial_status != "task_pending":
+            if scope:
                 initial_status = f"multi_kb_{initial_status}"
                 selection = {"version": scope["version"], "purpose": scope["purpose"], "sources": [{"kb_id": s["kb_id"], "role": s["role"]} for s in scope["sources"]]}
                 conn.execute("UPDATE chat_sessions SET knowledge_selection_json = %s, knowledge_selection_hash = %s WHERE id = %s", (Jsonb(selection), scope["selection_hash"], int(session_id)))
@@ -616,7 +616,7 @@ class PostgresExecutionStore:
                 SELECT t.* FROM chat_turns t
                 JOIN chat_sessions s ON s.id = t.session_id
                 WHERE t.session_id = %s AND s.user_id = %s
-                  AND t.status IN ('pending', 'task_pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
+                  AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                 ORDER BY t.created_at
                 """,
                 (int(session_id), int(user_id)),
@@ -672,7 +672,7 @@ class PostgresExecutionStore:
                 """
                 SELECT COUNT(*) AS depth, MIN(created_at) AS oldest_at,
                        EXTRACT(EPOCH FROM (now() - MIN(created_at))) AS oldest_age
-                FROM chat_turns WHERE status IN ('pending', 'multi_kb_pending', 'task_pending') AND cancel_requested = FALSE
+                FROM chat_turns WHERE status IN ('pending', 'multi_kb_pending') AND cancel_requested = FALSE
                 """
             ).fetchone()
         depth = int(row["depth"] or 0)
@@ -688,7 +688,7 @@ class PostgresExecutionStore:
               AND NOT EXISTS (
                   SELECT 1 FROM chat_turns prior
                   WHERE prior.session_id = t.session_id
-                    AND prior.status IN ('pending', 'task_pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
+                    AND prior.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                     AND prior.turn_sequence < t.turn_sequence
               )
             """
@@ -701,7 +701,7 @@ class PostgresExecutionStore:
                 SELECT t.*, s.user_id FROM chat_turns t
                 JOIN chat_sessions s ON s.id = t.session_id
                 JOIN users u ON u.id = s.user_id
-                WHERE t.status IN ('pending', 'multi_kb_pending', 'task_pending') AND t.cancel_requested = FALSE
+                WHERE t.status IN ('pending', 'multi_kb_pending') AND t.cancel_requested = FALSE
                   AND u.is_active = 1
                   {head_filter}
                 ORDER BY t.created_at, t.id
@@ -1004,7 +1004,7 @@ class PostgresExecutionStore:
                 SELECT COUNT(*) AS total FROM chat_turns t
                 JOIN chat_sessions s ON s.id = t.session_id
                 WHERE s.user_id = %s {scope}
-                  AND t.status IN ('pending', 'task_pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
+                  AND t.status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                 """,
                 params,
             ).fetchone()
@@ -1215,7 +1215,7 @@ class PostgresExecutionStore:
             rows = conn.execute(
                 """
                 SELECT id FROM chat_turns
-                WHERE status IN ('pending', 'multi_kb_pending', 'task_pending') AND cancel_requested = FALSE
+                WHERE status IN ('pending', 'multi_kb_pending') AND cancel_requested = FALSE
                   AND created_at < now() - make_interval(secs => %s)
                 ORDER BY created_at, id
                 LIMIT %s
@@ -1230,7 +1230,7 @@ class PostgresExecutionStore:
                     UPDATE chat_turns
                     SET status = 'failed', error_message = %s,
                         finished_at = clock_timestamp()
-                    WHERE id = %s AND status IN ('pending', 'multi_kb_pending', 'task_pending')
+                    WHERE id = %s AND status IN ('pending', 'multi_kb_pending')
                     """,
                     (message, turn_id),
                 )
@@ -1596,7 +1596,7 @@ class PostgresExecutionStore:
                         " assistant_message_id FROM chat_turns WHERE id = %s FOR UPDATE",
                         (str(turn_id),),
                     ).fetchone()
-            if current is None or str(current["status"]) not in {"pending", "task_pending", "multi_kb_pending"}:
+            if current is None or str(current["status"]) not in {"pending", "multi_kb_pending"}:
                 if (
                     current is not None
                     and bool(current["cancel_requested"])
@@ -1614,7 +1614,7 @@ class PostgresExecutionStore:
                     """
                     SELECT id FROM chat_turns
                     WHERE session_id = %s AND id <> %s
-                      AND status IN ('pending', 'task_pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
+                      AND status IN ('pending', 'streaming', 'cancelling', 'waiting_for_attachments', 'multi_kb_pending', 'multi_kb_streaming', 'multi_kb_cancelling', 'multi_kb_waiting_for_attachments')
                       AND turn_sequence < %s
                     ORDER BY turn_sequence LIMIT 1
                     """,
@@ -1652,7 +1652,7 @@ class PostgresExecutionStore:
                     SET status = 'failed', finished_at = clock_timestamp(),
                         error_message = 'Exceeded maximum chat retries',
                         worker_id = '', worker_heartbeat_at = NULL
-                    WHERE id = %s AND status IN ('pending', 'multi_kb_pending', 'task_pending')
+                    WHERE id = %s AND status IN ('pending', 'multi_kb_pending')
                     """,
                     (str(turn_id),),
                 )
@@ -1677,7 +1677,7 @@ class PostgresExecutionStore:
                 SET status = CASE WHEN knowledge_selection_hash <> '' THEN 'multi_kb_streaming' ELSE 'streaming' END,
                     worker_id = %s, started_at = clock_timestamp(),
                     worker_heartbeat_at = clock_timestamp(), retry_count = retry_count + 1
-                WHERE id = %s AND status IN ('pending', 'multi_kb_pending', 'task_pending') AND cancel_requested = FALSE
+                WHERE id = %s AND status IN ('pending', 'multi_kb_pending') AND cancel_requested = FALSE
                 """,
                 (str(worker_id), str(turn_id)),
             )

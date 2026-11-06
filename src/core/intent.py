@@ -76,6 +76,10 @@ _UNSUPPORTED_OUTPUT_FORMAT_PATTERN = re.compile(
     r"纯文本|网页文件|文本文件",
     re.IGNORECASE,
 )
+# draw.io files are produced by the MCP tool, not by the document-export
+# pipeline.  A request such as “生成 .drawio XML” must reach the agent instead
+# of being classified as an unsupported document output format.
+_DRAWIO_FILE_PATTERN = re.compile(r"\.drawio\b|draw\.io|\bdrawio\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,18 @@ def classify_intent(
 
     formats = extract_requested_formats(text)
     target = _target_for(text, has_attachments=has_attachments, has_kb=has_kb)
+    # draw.io is produced by the MCP tool, never by the document-export
+    # pipeline.  Incidental format-shaped text (for example a reference path
+    # such as references/02-block-diagram.md) must not turn the request into
+    # an unsupported-export clarification.
+    if _DRAWIO_FILE_PATTERN.search(text):
+        return IntentPlan(
+            intent="knowledge_base_qa" if has_kb else "general_qa",
+            action="answer",
+            target=target,
+            confidence=0.82,
+            reason_codes=("drawio_file_request",),
+        )
 
     if is_document_comparison_query(text):
         return IntentPlan(

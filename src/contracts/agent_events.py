@@ -204,25 +204,6 @@ class ToolCompletedPayload(AgentEventPayload):
         return self
 
 
-class PlanItemPayload(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    content: str = ""
-    status: Literal["pending", "in_progress", "completed"] = "pending"
-
-
-class PlanPayload(AgentEventPayload):
-    items: list[PlanItemPayload] = Field(default_factory=list)
-    revision: int = 1
-    source: str = ""
-
-    @model_validator(mode="after")
-    def _fill_identity(self) -> "PlanPayload":
-        if not self.item_id:
-            self.item_id = "plan"
-        return self
-
-
 class BudgetPayload(AgentEventPayload):
     status: str = ""
     exhausted: bool = False
@@ -494,8 +475,6 @@ EVENT_MODELS: dict[str, type[AgentEventPayload]] = {
     "degraded": DegradedPayload,
     "tool_started": ToolStartedPayload,
     "tool_result": ToolCompletedPayload,
-    "plan_created": PlanPayload,
-    "plan_updated": PlanPayload,
     "budget": BudgetPayload,
     "budget_exhausted": BudgetPayload,
     "verification": VerificationPayload,

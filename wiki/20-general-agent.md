@@ -91,17 +91,31 @@ cd frontend && npm run build
 HDB_API_BASE=http://127.0.0.1:8002/api/v1 \
 HDB_API_TOKEN=<token> \
 uv run python -m src.mcp_bridge.server
+
+# 也可以使用 HDB_USERNAME/HDB_PASSWORD。HDB_API_KEY（X-HDB-API-Key）
+# 已预留给 external-api-service 分支；当前主线的 API 仍以 Session Token 为准。
 ```
 
 工具：
 
 - `list_kbs`
-- `ask_knowledge_base`（走受治理的 turn，返回带引用的回答）
+- `list_kb_files` / `read_file_chunks` / `download_kb_file`
+- `ask_knowledge_base`（走受治理的 turn，返回带引用的回答和证据摘要）
+- `get_evidence`（读取本桥进程内缓存的证据；跨进程/重启需重新提问）
+- `list_tables` / `query_table`（表格物化表的 schema 与只读 SQL）
 - `list_spreadsheets` / `list_circuit_designs`
+- `query_circuit`（按实例/位号或网络名查询电路设计）
+- `list_assets` / `get_asset` / `list_doc_assets` / `get_doc_asset`
+- `upload_file`（真实写入；需要 KB write 权限，平台会审计并触发解析）
+- `delete_file`（默认 dry-run，必须显式 `confirm=true` 才删除）
+- `create_drawio_file`（接收 blocks/edges/zones/labels 紧凑 spec，生成原生
+  `.drawio` XML；不直接写宿主文件，由调用方保存）
 
 说明：MCP 桥没有直接暴露 `knowledge_search`/`evidence_read` 原始检索工具；
 外部 agent 通过 `ask_knowledge_base` 使用知识库。原始检索的 MCP 暴露需要
-新增一个受 token/ACL 约束的检索端点。
+新增一个受 token/ACL 约束的检索端点。`create_drawio_file` 会根据块两侧自动
+选择锚点并补齐正交拐点，同一侧多条边会自动错开锚点；复杂布局仍应显式传
+`points` 和独立 `labels`，并用 Skill 的六个几何检查脚本验收。
 
 ## 隔离边界
 
@@ -112,6 +126,9 @@ uv run python -m src.mcp_bridge.server
   governor 复用，不引入独立租户管理。
 - `WorkspaceStore` 默认跟随控制面：控制面是 PostgreSQL 时也用 PostgreSQL，
   避免多实例下 SQLite 分裂。
+- 启动迁移会删除旧 task 表（`tasks*` / `agent_tasks*`）、独立 `tenants` 表，
+  以及 `users` / `departments` / `knowledge_bases` / workspace 表上的
+  `tenant_id` 死列；附件、导出等兼容字段保留，其值统一来自 `user.id`。
 - 解析文件与 workspace 派生文件是两套数据：解析文件只通过 KB 检索/引用访问，
   workspace 只存 Agent 生成的草稿和交付物。
 

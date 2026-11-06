@@ -57,7 +57,7 @@ def inspect_postgres(conn) -> dict:
         protocol is not None
         and "multi_kb_pending" in protocol[0]
         and "multi_kb_streaming" in protocol[0]
-        and "task_pending" in protocol[0]
+        and "task_pending" not in protocol[0]
     )
     return {"ready": not missing and not invalid and version == SCHEMA_VERSION and protocol_ready, "missing": missing, "invalid": invalid, "schema_version": version, "turn_protocol_ready": protocol_ready}
 
@@ -76,6 +76,12 @@ def apply_postgres(conn) -> dict:
             declaration = "JSONB NOT NULL DEFAULT '{}'::jsonb" if name.endswith("_json") else "TEXT NOT NULL DEFAULT ''"
             conn.execute(f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS "{name}" {declaration}')
     if not report["turn_protocol_ready"]:
+        conn.execute(
+            "UPDATE chat_turns SET status = 'cancelled', "
+            "error_message = COALESCE(NULLIF(error_message, ''), '任务工作台已下线'), "
+            "finished_at = COALESCE(finished_at, clock_timestamp()) "
+            "WHERE status = 'task_pending'"
+        )
         conn.execute("ALTER TABLE chat_turns DROP CONSTRAINT IF EXISTS chat_turns_status_check")
         conn.execute(f"ALTER TABLE chat_turns ADD CONSTRAINT chat_turns_status_check CHECK (status IN {tuple(TURN_STATUSES)})")
     if report["schema_version"] != SCHEMA_VERSION:

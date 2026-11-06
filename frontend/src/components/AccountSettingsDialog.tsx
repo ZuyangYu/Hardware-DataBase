@@ -132,6 +132,7 @@ export default function AccountSettingsDialog({ open, onOpenChange, auth, onLogo
             </div>
           </section>
 
+
        </div>
 
         <div className="flex items-center justify-between gap-[8px] border-t border-[#eef1f6] px-[24px] py-[14px]">

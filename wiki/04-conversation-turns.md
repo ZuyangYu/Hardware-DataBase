@@ -216,7 +216,6 @@ list_turn_events(user_id, turn_id, after_seq=0)
 | `tool_started` | `{call_id, tool_name, tool_kind, label, detail, query?, ...}` | 用 `call_id` 插入活动轨迹项 |
 | `tool_result` | `{call_id, tool_name, tool_kind, status, label, detail, hit_count, evidence_count, sources?, citation_numbers?, empty_reason?, latency_ms?, ...}` | 用 `call_id` 结束同一轨迹项；展示来源/证据条数/零命中原因；失败/拒绝标红 |
 | `degraded` | `{stage, reason, item_id}` | 降级横幅 |
-| `plan_created` / `plan_updated` | `{items, revision, source?, item_id="plan"}` | 历史事件兼容；计划模式已移除，当前不再产生 |
 | `budget` / `budget_exhausted` | `{status, exhausted, stopped_reason, tool_calls, evidence_count, ...}` | 后端预算状态；`stopped_reason` 区分 `recursion_limit` / `no_progress`；前端不再渲染预算/部分交付卡片 |
 | `verification` | `{status, checks, gaps, ...}` | 后端校验结果；仅持久化，前端不渲染校验卡片 |
 | `evidence_compressed` | `{stage="partial_synthesis", evidence_count, compressed_bytes, max_bytes}` | 收尾时证据正文压缩；仅持久化，前端不提示 |

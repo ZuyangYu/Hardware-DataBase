@@ -71,6 +71,7 @@ export const GROUPS: Group[] = [
   },
   {
     title: '模型与提示词',
+    hint: 'Agent 的内置行为由平台统一维护（工作区、工具真实性、无代码边界）；这里只追加业务术语或输出约定。',
     fields: [
       ['AGENT_LLM_PROVIDER', 'Provider (ollama/custom)'],
       ['AGENT_OLLAMA_BASE_URL', 'Ollama Base URL'],
@@ -79,6 +80,7 @@ export const GROUPS: Group[] = [
       ['AGENT_CUSTOM_BASE_URL', 'Custom Base URL'],
       ['AGENT_CUSTOM_MODEL', 'Custom Model'],
       ['AGENT_CUSTOM_MAX_TOKENS', 'Custom Max Tokens'],
+      ['AGENT_REASONING_EFFORT', '推理强度 (low/high/max, 空=默认)'],
       ['AGENT_MODEL_MAX_INPUT_TOKENS', '模型输入上下文上限'],
       ['AGENT_TEMPERATURE', 'Temperature'],
       ['AGENT_TIMEOUT_SECONDS', '超时(秒)'],
@@ -91,8 +93,8 @@ export const GROUPS: Group[] = [
       ['LLM_QUEUE_WARN_SECONDS', '排队告警阈值(秒)'],
       ['LLM_STREAM_IDLE_TIMEOUT_SECONDS', '流空闲超时(秒, 0=关闭)'],
       ['WORKER_TURN_CONCURRENCY', 'Worker 轮次并发'],
-      ['SYSTEM_PROMPT', 'System Prompt', { textarea: true }],
-      ['NO_CONTEXT_PROMPT', 'No-Context Prompt', { textarea: true }],
+      ['SYSTEM_PROMPT', '领域补充（可选）', { textarea: true }],
+      ['NO_CONTEXT_PROMPT', '知识库无结果提示', { textarea: true }],
     ],
   },
   {

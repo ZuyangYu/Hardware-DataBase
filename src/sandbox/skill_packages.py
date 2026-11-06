@@ -32,7 +32,11 @@ _MAX_UNPACKED_BYTES = 16 * 1024 * 1024
 _MAX_FILES = 128
 _MAX_FILE_BYTES = 4 * 1024 * 1024
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,200}$")
-_TEXT_SUFFIXES = {".py", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".lock"}
+_TEXT_SUFFIXES = {
+    ".md", ".txt", ".py", ".sh", ".json", ".yaml", ".yml", ".toml", ".lock",
+    ".csv", ".xml", ".drawio", ".svg", ".ini", ".cfg", ".sql", ".js", ".ts",
+    ".html", ".css",
+}
 _FORBIDDEN_NAMES = {
     "dockerfile",
     "docker-compose.yml",
@@ -77,6 +81,7 @@ class TextSkillPackage:
     description: str
     content: str
     files: tuple[str, ...]
+    resources: tuple[tuple[str, str], ...] = ()
 
 
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -84,18 +89,18 @@ _SKILL_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$")
 _FRONTMATTER_RE = re.compile(r"\A---\n(.{1,4096}?)\n---(?:\n|\Z)", re.DOTALL)
 
 
-def validate_text_skill_package(data: bytes) -> TextSkillPackage:
-    """Load a text-only Skill ZIP; Markdown resources become bounded prompt data.
+def _read_text_archive(raw: bytes) -> tuple[dict[str, str], str]:
+    """Read one inert text Skill ZIP and return its files plus folder prefix.
 
-    HDB has no on-demand file-reader tool for text Skills, so every Markdown
-    reference is included with its path and reviewed as one immutable version.
-    Other assets and executable files are rejected rather than silently lost.
+    Text Skill assets are stored and reviewed as immutable source.  They are
+    never imported or executed by HDB; the agent reads them on demand from the
+    materialized read-only Skill directory.
     """
-    if not isinstance(data, (bytes, bytearray)) or not 0 < len(data) <= _MAX_ARCHIVE_BYTES:
+    if not isinstance(raw, (bytes, bytearray)) or not 0 < len(raw) <= _MAX_ARCHIVE_BYTES:
         raise SkillPackageError("text Skill ZIP exceeds the 8 MiB limit")
-    raw = bytes(data)
+    data = bytes(raw)
     try:
-        archive = zipfile.ZipFile(io.BytesIO(raw))
+        archive = zipfile.ZipFile(io.BytesIO(data))
     except (OSError, zipfile.BadZipFile) as exc:
         raise SkillPackageError("text Skill must be a valid ZIP archive") from exc
     files: dict[str, str] = {}
@@ -111,8 +116,10 @@ def validate_text_skill_package(data: bytes) -> TextSkillPackage:
                 raise SkillPackageError("text Skill symlinks are not allowed")
             if info.file_size > _MAX_FILE_BYTES or total + info.file_size > _MAX_UNPACKED_BYTES:
                 raise SkillPackageError("text Skill contains an oversized file")
-            if not (name.endswith(".md") or name.split("/")[-1] in {"LICENSE.txt", "NOTICE.txt"}):
-                raise SkillPackageError("text Skill accepts only Markdown and license text; use executable upload for code")
+            if name.lower().split("/")[-1] in _FORBIDDEN_NAMES:
+                raise SkillPackageError("text Skill contains a forbidden build recipe")
+            if Path(name).suffix.lower() not in _TEXT_SUFFIXES:
+                raise SkillPackageError(f"text Skill file type is not allowed: {name}")
             content = archive.read(info)
             total += len(content)
             if total > _MAX_UNPACKED_BYTES:
@@ -133,6 +140,19 @@ def validate_text_skill_package(data: bytes) -> TextSkillPackage:
     prefix = root.removesuffix("SKILL.md")
     if prefix and (prefix.count("/") != 1 or any(not name.startswith(prefix) for name in files)):
         raise SkillPackageError("text Skill ZIP must contain just one Skill folder")
+    return files, prefix
+
+
+def validate_text_skill_package(data: bytes) -> TextSkillPackage:
+    """Validate a text Skill ZIP with optional on-demand resource files.
+
+    All files are inert UTF-8 source.  SKILL.md and its references are kept as
+    separate files when materialized, so large rule sets and helper scripts no
+    longer have to be squeezed into one conversation-sized prompt block.
+    """
+    raw = bytes(data) if isinstance(data, (bytes, bytearray)) else b""
+    files, prefix = _read_text_archive(raw)
+    root = f"{prefix}SKILL.md"
     markdown = files[root].replace("\r\n", "\n").replace("\r", "\n")
     frontmatter = _FRONTMATTER_RE.match(markdown)
     if not frontmatter:
@@ -157,17 +177,25 @@ def validate_text_skill_package(data: bytes) -> TextSkillPackage:
     if not isinstance(version, str) or not _SKILL_VERSION_RE.fullmatch(version) or ".." in version:
         raise SkillPackageError("SKILL.md metadata.version is invalid")
 
-    names = sorted(name for name in files if name.endswith(".md") and name != root)
+    names = sorted(value for value in files if value != root)
     combined = markdown + "".join(
-        f"\n\n---\n### 随附资料：{name.removeprefix(prefix)}\n\n{files[name]}" for name in names
+        f"\n\n---\n### 随附资料：{value.removeprefix(prefix)}\n\n{files[value]}"
+        for value in names
     )
-    if len(combined.encode("utf-8")) > 16 * 1024:
-        raise SkillPackageError("text Skill Markdown exceeds the 16 KiB conversation limit")
     return TextSkillPackage(
         archive_digest=hashlib.sha256(raw).hexdigest(), skill_ref=f"skill/{name}",
         version=version, description=description.strip(), content=combined,
-        files=tuple(sorted(name.removeprefix(prefix) for name in files)),
+        files=tuple(sorted(value.removeprefix(prefix) for value in files)),
+        resources=tuple(
+            sorted((value.removeprefix(prefix), files[value]) for value in files)
+        ),
     )
+
+
+def load_text_skill_files(data: bytes) -> dict[str, str]:
+    """Return ``relative path -> text`` for one validated text Skill archive."""
+
+    return dict(validate_text_skill_package(data).resources)
 
 
 def _safe_name(name: str) -> str:
@@ -318,4 +346,4 @@ class SkillPackageStore:
         return True
 
 
-__all__ = ["SkillPackage", "TextSkillPackage", "SkillPackageError", "SkillPackageStore", "validate_skill_package", "validate_text_skill_package", "validate_requirements_lock"]
+__all__ = ["SkillPackage", "TextSkillPackage", "SkillPackageError", "SkillPackageStore", "load_text_skill_files", "validate_skill_package", "validate_text_skill_package", "validate_requirements_lock"]

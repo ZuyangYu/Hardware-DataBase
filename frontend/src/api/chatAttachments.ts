@@ -5,7 +5,7 @@
 import { ApiError, api, uploadFiles } from './client';
 import type { AttachmentView } from './types';
 
-export const CHAT_ATTACHMENT_ACCEPT = '.pdf,.docx,.txt,.md,.xlsx,.xlsm,.edf,.edif';
+export const CHAT_ATTACHMENT_ACCEPT = '.pdf,.docx,.txt,.md,.xlsx,.xlsm,.edf,.edif,.drawio';
 
 const RETRYABLE_UPLOAD_STATUSES = new Set([502, 503, 504]);
 const UPLOAD_RETRY_DELAYS_MS = [700, 1400];

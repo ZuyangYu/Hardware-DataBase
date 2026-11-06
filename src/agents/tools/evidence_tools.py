@@ -54,16 +54,6 @@ def _missing_entity_hints(rt: Any) -> str:
     return "\n\n（缺口提示：" + "；".join(hints) + "。）"
 
 
-CANDIDATE_PROMPT = (
-    "检索工具默认返回候选证据（id/来源/位置/摘要），候选不会获得引用编号，也不占用证据预算。"
-    "先判断候选是否直接回答问题，再用 evidence_read 读取 2-4 条最相关候选；"
-    "候选 id 只能传给 evidence_read，不能写进最终回答；引用编号只能来自 evidence_read 返回的 [n]。"
-    "如果某个目标或来源只有候选、还没有编号证据，优先用 evidence_read 读取该来源的候选，"
-    "不要用相同或近似的查询重复检索。型号、位号、信号名、表号等精确关键词可用 kb_grep 一次传多个模式。"
-    "如果当前问题是在延续本会话之前的话题，可先调用 session_recall 查看上一轮已读证据和未解决缺口；"
-    "完全无关的新问题不要调用。"
-)
-
 
 def make_evidence_read(rt: Any):
     """Return the model-facing candidate promotion tool."""
@@ -158,4 +148,4 @@ def make_evidence_read(rt: Any):
     return evidence_read
 
 
-__all__ = ["CANDIDATE_PROMPT", "make_evidence_read"]
+__all__ = ["make_evidence_read"]

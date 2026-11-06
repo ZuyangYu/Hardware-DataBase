@@ -1,7 +1,7 @@
 """Agent-facing workspace tools.
 
 These are the general-agent "hands": list, read and write files inside the
-task workspace.  They are read/write confined to the workspace root and do
+session workspace.  They are read/write confined to the workspace root and do
 not execute anything (shell arrives with the sandbox phase).
 """
 
@@ -18,7 +18,7 @@ def _json(payload: dict[str, Any]) -> str:
 
 
 def build_workspace_tools(workspace_dir: str, rt: Any = None) -> list[Any]:
-    """Return closures bound to one task workspace."""
+    """Return closures bound to one workspace."""
 
     workspace = Workspace(workspace_dir)
 
@@ -59,7 +59,7 @@ def build_workspace_tools(workspace_dir: str, rt: Any = None) -> list[Any]:
         return result
 
     def workspace_list(path: str = ".") -> str:
-        """列出任务工作区中的文件和目录。path 是相对路径，默认当前目录。"""
+        """列出工作区中的文件和目录。path 是相对路径，默认当前目录。"""
         _check()
         try:
             return _run("workspace_list", path, lambda: _json(workspace.list(path)))
@@ -67,7 +67,7 @@ def build_workspace_tools(workspace_dir: str, rt: Any = None) -> list[Any]:
             return _json({"error": str(exc)})
 
     def workspace_read(path: str) -> str:
-        """读取任务工作区中的一个 UTF-8 文本文件。path 是相对路径。"""
+        """读取工作区中的一个 UTF-8 文本文件。path 是相对路径。"""
         _check()
         try:
             return _run("workspace_read", path, lambda: _json(workspace.read(path)))
@@ -75,7 +75,7 @@ def build_workspace_tools(workspace_dir: str, rt: Any = None) -> list[Any]:
             return _json({"error": str(exc)})
 
     def workspace_write(path: str, content: str) -> str:
-        """把文本写入任务工作区的相对路径；父目录会自动创建。
+        """把文本写入工作区的相对路径；父目录会自动创建。
 
         交付物（表格/报告/清单）必须写到 out/ 目录下，例如
         out/component_list.md。写入后该文件会在本轮结束时登记为可下载产物。

@@ -62,7 +62,7 @@ PART_TYPE_VISUAL_EVIDENCE = "visual_evidence"
 PARSER_VERSION = "local_doc_v2"
 
 SUPPORTED_EXTENSIONS: frozenset[str] = frozenset(
-    {".pdf", ".docx", ".txt", ".md", ".xlsx", ".xlsm", ".edf", ".edif"}
+    {".pdf", ".docx", ".txt", ".md", ".xlsx", ".xlsm", ".edf", ".edif", ".drawio"}
 )
 # XLS is rejected (legacy binary format); the KB upload path has the same
 # policy for structured parsing.

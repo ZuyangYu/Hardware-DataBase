@@ -45,15 +45,11 @@ from src.agents.answer_stream import (
 from src.agents.assembly import build_agent
 from src.agents.turn_prompt import (
     EXPORT_PROMPT as _EXPORT_PROMPT,  # noqa: F401 - re-exported for callers
-    SYSTEM_PROMPT as _SYSTEM_PROMPT,  # noqa: F401 - re-exported for callers
     build_turn_prompt,
 )
 from src.agents.middleware.gap_closure import GapClosureMiddleware
 from src.agents.middleware.mcp_tool_search import McpToolSearchMiddleware
-from src.agents.skill_materializer import (
-    load_skill_prompt_context,
-    materialize_text_skills,
-)
+from src.agents.skill_materializer import materialize_text_skills
 from src.agents.context_budget import (
     initial_context_state,
     publish_turn_context,
@@ -94,6 +90,7 @@ from src.agents.turn_meta import (
     _is_incomplete_answer,
     answer_gap_lines,
     _normalize_citation_labels,
+    _general_subagent_spec,
     _research_subagent_spec,
     _scope_dependency_fields,
     _scrub_invalid_citations,
@@ -1260,27 +1257,9 @@ class MultiSourceAgentRunner:
             if rt.knowledge_scope is None
             else ""
         )
-        skill_root = None
-        if not is_general:
-            skill_root = materialize_text_skills(ctx)
-        skill_context = (
-            ""
-            if skill_root
-            else load_skill_prompt_context(
-                ctx,
-                on_error=lambda exc: emit_event(
-                    {
-                        "type": "degraded",
-                        "payload": {
-                            "stage": "skill_context",
-                            "component": "skill",
-                            "failure_type": type(exc).__name__,
-                            "capability": "unavailable",
-                        },
-                    }
-                ),
-            )
-        )
+        # Skills use the Deep Agents filesystem/Skills middleware and are read
+        # on demand.  Never dump the full SKILL.md into the system prompt.
+        skill_root = materialize_text_skills(ctx)
         tool_bundle = build_turn_tools(
             rt=rt,
             ctx=ctx,
@@ -1310,7 +1289,6 @@ class MultiSourceAgentRunner:
             is_general=is_general,
             wiki_assist=wiki_assist,
             memory_context=memory_context,
-            skill_context=skill_context,
             tool_fragments=tool_bundle.fragments,
             tool_suffix=tool_bundle.prompt_suffix,
             skill_present=bool(skill_root),
@@ -1320,6 +1298,34 @@ class MultiSourceAgentRunner:
         )
         system_prompt = turn_prompt.system_prompt
         context_fragments = turn_prompt.fragments
+        workspace_instructions = ""
+        if workspace is not None:
+            try:
+                from src.core.workspace_store import get_workspace_store
+
+                workspace_instructions = get_workspace_store().read_instructions(
+                    workspace.id
+                )
+            except Exception:
+                workspace_instructions = ""
+        if workspace_instructions:
+            system_prompt += (
+                "\n\n## 工作区指令（AGENTS.md）\n"
+                "以下内容由当前工作区所有者维护，仅适用于本工作区；"
+                "与系统安全规则冲突时以系统规则为准。\n\n"
+                f"{workspace_instructions}"
+            )
+            context_fragments.append(("workspace_instructions", workspace_instructions))
+        has_drawio_file_tool = any(
+            str(getattr(tool, "name", "") or "") == "mcp__drawio__create_drawio_file"
+            for tool in tool_bundle.tools
+        )
+        if has_drawio_file_tool and ".drawio" in query.lower():
+            system_prompt += (
+                "\n用户明确要求 .drawio 文件：必须调用 "
+                "mcp__drawio__create_drawio_file，并一次性提供完整、闭合的 "
+                "mxGraphModel XML；不要只返回文字说明或链接。"
+            )
 
         direct_control_answer: str | None = None
         direct_answer_grounding = "intent_clarification"
@@ -1592,6 +1598,15 @@ class MultiSourceAgentRunner:
             )
 
         agent_subagents: list[dict[str, Any]] | None = None
+        if show_turn_meta:
+            general_subagent = _general_subagent_spec(
+                tools=plan.tools,
+                model=model,
+                skill_root=skill_root,
+                skill_read_observer=_observe_skill_read,
+            )
+            if general_subagent is not None:
+                agent_subagents = [general_subagent]
         if (
             RESEARCH_SUBAGENT_ENABLED
             and query_mode == "deep"
@@ -1604,7 +1619,7 @@ class MultiSourceAgentRunner:
                 skill_read_observer=_observe_skill_read,
             )
             if research is not None:
-                agent_subagents = [research]
+                agent_subagents = [*(agent_subagents or []), research]
         if show_turn_meta and query_mode == "deep":
             system_prompt = _complex_task_prompt(
                 system_prompt, has_subagents=bool(agent_subagents)
@@ -1654,6 +1669,12 @@ class MultiSourceAgentRunner:
             has_checkpointer=checkpointer is not None,
         )
         agent_middleware: list[Any] = [LoopBudgetMiddleware(loop_budget)]
+        # Deep-Agent-style internal planning.  Keep the tool available on
+        # every turn so the prompt never references a tool that is absent;
+        # the todo list is model-internal and does not emit plan cards.
+        from langchain.agents.middleware import TodoListMiddleware
+
+        agent_middleware.append(TodoListMiddleware())
         if plan.mcp_tool_search_enabled:
             agent_middleware.append(McpToolSearchMiddleware(rt))
         agent_middleware.append(gap_middleware)
@@ -1888,7 +1909,7 @@ class MultiSourceAgentRunner:
         rt.finalize_evidence()
         answer_text = _current_run().answer
         if not partial_delivery and _is_incomplete_answer(
-            answer_text, show_turn_meta=show_turn_meta, has_plan=False
+            answer_text, show_turn_meta=show_turn_meta
         ):
             answer_text = ""
         if not answer_text and rt.evidence and PARTIAL_SYNTHESIS_ENABLED:
@@ -1909,6 +1930,14 @@ class MultiSourceAgentRunner:
                 fallback = (
                     f"本轮未能生成带引用标注的回答，仅检索到候选证据来源：{listed}。"
                     "建议换个问法或补充更具体的关键词后重试。"
+                )
+            elif is_general:
+                # A general/workspace chat has no knowledge-base context.  Never
+                # surface the KB no-context prompt here; ask for the missing
+                # object or a retry instead.
+                fallback = (
+                    "本轮没有生成有效回答，请重试一次；"
+                    "如果要优化图或文件，请把文件/图的内容重新发我，或说明要改哪个对象。"
                 )
             else:
                 fallback = settings.NO_CONTEXT_PROMPT or "未生成回答。"
@@ -2122,7 +2151,16 @@ class MultiSourceAgentRunner:
                 or "retrieval failed"
             )
         elif not rt.evidence:
-            status, error_stage, error_message = "no_evidence", "retrieval", "no evidence"
+            if str(getattr(rt, "kb_name", "") or "").strip() in {
+                "",
+                GENERAL_CHAT_KB_NAME,
+            }:
+                # General/workspace chat has no retrieval target.  Reporting
+                # "no_evidence" makes healthy replies look like a retrieval
+                # failure and feeds the wrong UI/fallback path.
+                status, error_stage, error_message = "not_applicable", "", ""
+            else:
+                status, error_stage, error_message = "no_evidence", "retrieval", "no evidence"
         else:
             status, error_stage, error_message = "success", "", ""
         result = {

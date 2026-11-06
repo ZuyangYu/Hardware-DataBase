@@ -403,8 +403,9 @@ class MessageView(BaseModel):
     cards: list[dict] = Field(default_factory=list)
     # 该 turn 持久化的执行轨迹（stage/tool 事件折叠；刷新后轨迹面板不消失）。
     trace_steps: list[dict] = Field(default_factory=list)
-    # 复杂任务的计划/预算/校验投影（来自 turn summary；刷新后不清空）。
-    plan: dict | None = None
+    # 该 turn 的外部插件写入提案卡（来自事件 + 提案当前状态）。
+    mcp_write_cards: list[dict] = Field(default_factory=list)
+    # 预算/校验投影（来自 turn summary；刷新后不清空）。
     budget: dict | None = None
     verification: dict | None = None
     subagents: list[dict] = Field(default_factory=list)

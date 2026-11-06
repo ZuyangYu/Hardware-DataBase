@@ -98,18 +98,6 @@ class MetaEventContractTests(unittest.TestCase):
         self.assertEqual(payload["item_id"], "stage:route")
         self.assertEqual(payload["policy"], "balanced")
 
-    def test_plan_items_are_typed_but_tolerate_extra_fields(self):
-        payload = validate_agent_event(
-            "plan_updated",
-            {
-                "revision": 2,
-                "items": [{"content": "读取 BOM", "status": "completed", "owner": "agent"}],
-            },
-        )
-        self.assertEqual(payload["item_id"], "plan")
-        self.assertEqual(payload["items"][0]["status"], "completed")
-        self.assertEqual(payload["items"][0]["owner"], "agent")
-
     def test_subagent_and_compaction_have_stable_item_ids(self):
         subagent = validate_agent_event(
             "subagent_started",

@@ -5,10 +5,9 @@ one or more sessions.  A session is a conversation; a turn/run is one agent
 execution inside that session.  This deliberately replaces the old
 "every chat auto-creates a task" model.
 
-Storage backends mirror the task store: SQLite is the development/default
-backend, PostgreSQL is used when ``TASK_STORE_BACKEND=postgres`` and a DSN is
-configured.  The tables live in the same database as the task store but are
-independent; callers should depend on this module, not on task tables.
+SQLite is the development/default backend; PostgreSQL is used when
+``WORKSPACE_STORE_BACKEND=postgres`` and a DSN is configured.  Callers depend
+on this module only: the retired task tables are not part of the model.
 """
 
 from __future__ import annotations
@@ -65,7 +64,6 @@ def _now() -> str:
 @dataclass
 class Workspace:
     id: str
-    tenant_id: str
     user_id: int
     kind: str
     name: str
@@ -79,7 +77,6 @@ class Workspace:
 @dataclass
 class WorkspaceArtifact:
     id: str
-    tenant_id: str
     workspace_id: str
     session_id: int
     turn_id: str
@@ -111,16 +108,13 @@ class WorkspaceStore:
         configured = str(
             backend
             or os.getenv("WORKSPACE_STORE_BACKEND", "")
-            or os.getenv("TASK_STORE_BACKEND", "")
             or getattr(src_settings, "WORKSPACE_STORE_BACKEND", "")
             or (
                 "postgres"
                 if str(getattr(src_settings, "CONTROL_PLANE_BACKEND", "")).lower()
                 == "postgres"
-                and not os.getenv("TASK_STORE_BACKEND", "")
                 else ""
             )
-            or getattr(src_settings, "TASK_STORE_BACKEND", "sqlite")
             or "sqlite"
         ).strip().lower()
         self.backend = "postgres" if configured == "postgres" else "sqlite"
@@ -128,14 +122,13 @@ class WorkspaceStore:
             dsn
             or os.getenv("WORKSPACE_DB_URL", "")
             or getattr(src_settings, "WORKSPACE_DB_URL", "")
-            or getattr(src_settings, "TASK_DB_URL", "")
             or getattr(src_settings, "CONTROL_PLANE_DATABASE_URL", "")
             or ""
         ).strip()
         if self.backend == "postgres" and not self.dsn:
             raise RuntimeError(
-                "workspace store backend=postgres requires WORKSPACE_DB_URL, "
-                "TASK_DB_URL or CONTROL_PLANE_DATABASE_URL"
+                "workspace store backend=postgres requires WORKSPACE_DB_URL "
+                "or CONTROL_PLANE_DATABASE_URL"
             )
         self.db_path = (
             None
@@ -145,7 +138,6 @@ class WorkspaceStore:
                     db_path
                     or os.getenv("WORKSPACE_DB_PATH", "")
                     or getattr(src_settings, "WORKSPACE_DB_PATH", "")
-                    or getattr(src_settings, "TASK_DB_PATH", "")
                     or ""
                 )
             )
@@ -157,7 +149,6 @@ class WorkspaceStore:
                 workspace_root
                 or os.getenv("WORKSPACE_ROOT", "")
                 or getattr(src_settings, "WORKSPACE_ROOT", "")
-                or getattr(src_settings, "TASK_WORKSPACE_ROOT", "")
                 or os.path.join(src_settings.STORAGE_DIR, "workspaces")
             )
         )
@@ -221,7 +212,6 @@ class WorkspaceStore:
                 """
                 CREATE TABLE IF NOT EXISTS agent_workspaces (
                     id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL DEFAULT 'default',
                     user_id BIGINT NOT NULL,
                     kind TEXT NOT NULL,
                     name TEXT NOT NULL,
@@ -260,7 +250,6 @@ class WorkspaceStore:
                 """
                 CREATE TABLE IF NOT EXISTS agent_workspace_artifacts (
                     id TEXT PRIMARY KEY,
-                    tenant_id TEXT NOT NULL DEFAULT 'default',
                     workspace_id TEXT NOT NULL,
                     session_id BIGINT NOT NULL DEFAULT 0,
                     turn_id TEXT NOT NULL DEFAULT '',
@@ -291,7 +280,6 @@ class WorkspaceStore:
         name: str,
         kb_name: str = "",
         kb_id: int | None = None,
-        tenant_id: str = "default",
     ) -> Workspace:
         normalized_kind = str(kind or "general").strip().lower()
         if normalized_kind not in WORKSPACE_KINDS:
@@ -305,13 +293,12 @@ class WorkspaceStore:
                 conn,
                 """
                 INSERT INTO agent_workspaces (
-                    id, tenant_id, user_id, kind, name, kb_name, kb_id,
+                    id, user_id, kind, name, kb_name, kb_id,
                     workspace_dir, created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     workspace_id,
-                    str(tenant_id or "default"),
                     int(user_id),
                     normalized_kind,
                     str(name or "未命名工作区"),
@@ -324,7 +311,6 @@ class WorkspaceStore:
             )
         return Workspace(
             id=workspace_id,
-            tenant_id=str(tenant_id or "default"),
             user_id=int(user_id),
             kind=normalized_kind,
             name=str(name or "未命名工作区"),
@@ -403,6 +389,29 @@ class WorkspaceStore:
             )
         return [self._row_to_workspace(row) for row in rows]
 
+    def read_instructions(self, workspace_id: str, *, max_bytes: int = 8192) -> str:
+        """Read the workspace-level ``AGENTS.md`` project instructions.
+
+        This is the platform adaptation of Deep Agents' ``MemoryMiddleware``:
+        the file lives at the workspace root, is user-owned, and is bounded so
+        it cannot dominate the system prompt.
+        """
+
+        workspace = self.get_workspace(workspace_id)
+        if workspace is None:
+            return ""
+        path = os.path.join(workspace.workspace_dir, "AGENTS.md")
+        try:
+            if not os.path.isfile(path):
+                return ""
+            with open(path, "rb") as handle:
+                raw = handle.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raw = raw[:max_bytes]
+            return raw.decode("utf-8", errors="ignore").strip()
+        except OSError:
+            return ""
+
     def attach_session(self, workspace_id: str, session_id: int) -> None:
         now = _now()
         with self._connect() as conn:
@@ -465,7 +474,6 @@ class WorkspaceStore:
         name: str | None = None,
         kind: str | None = None,
         metadata: dict[str, Any] | None = None,
-        tenant_id: str = "default",
     ) -> WorkspaceArtifact:
         workspace = self.get_workspace(workspace_id)
         if workspace is None:
@@ -496,7 +504,6 @@ class WorkspaceStore:
             version = int((row["count"] if row is not None else 0) or 0) + 1
             artifact = WorkspaceArtifact(
                 id=uuid.uuid4().hex,
-                tenant_id=str(tenant_id or workspace.tenant_id or "default"),
                 workspace_id=str(workspace_id),
                 session_id=int(session_id or 0),
                 turn_id=str(turn_id or ""),
@@ -514,14 +521,13 @@ class WorkspaceStore:
                 conn,
                 """
                 INSERT INTO agent_workspace_artifacts (
-                    id, tenant_id, workspace_id, session_id, turn_id, name,
+                    id, workspace_id, session_id, turn_id, name,
                     kind, mime, path, size_bytes, sha256, version,
                     metadata_json, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     artifact.id,
-                    artifact.tenant_id,
                     artifact.workspace_id,
                     artifact.session_id,
                     artifact.turn_id,
@@ -616,7 +622,6 @@ class WorkspaceStore:
     def _row_to_workspace(self, row: Any) -> Workspace:
         return Workspace(
             id=str(row["id"]),
-            tenant_id=str(row["tenant_id"] or "default"),
             user_id=int(row["user_id"]),
             kind=str(row["kind"]),
             name=str(row["name"]),
@@ -634,7 +639,6 @@ class WorkspaceStore:
             metadata = {}
         return WorkspaceArtifact(
             id=str(row["id"]),
-            tenant_id=str(row["tenant_id"] or "default"),
             workspace_id=str(row["workspace_id"]),
             session_id=int(row["session_id"] or 0),
             turn_id=str(row["turn_id"] or ""),

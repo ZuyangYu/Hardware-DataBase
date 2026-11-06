@@ -1,4 +1,4 @@
-"""Budget, plan, partial synthesis and verification projections for one turn."""
+"""Budget, partial synthesis and verification projections for one turn."""
 
 from __future__ import annotations
 
@@ -323,7 +323,7 @@ def test_turn_verification_marks_partial_and_detects_source_separation():
     assert result["budget_exhausted"] is True
 
 
-def test_complex_deep_turn_does_not_offer_a_planner_but_keeps_research_subagent(monkeypatch):
+def test_complex_deep_turn_offers_deepagent_planning_and_research_subagent(monkeypatch):
     captured: dict = {}
 
     class _Agent:
@@ -356,13 +356,16 @@ def test_complex_deep_turn_does_not_offer_a_planner_but_keeps_research_subagent(
     middleware_names = {
         type(item).__name__.lower() for item in captured.get("middleware") or []
     }
-    assert not any("plan" in name or "todo" in name for name in middleware_names)
+    # Deep-Agent-style internal planning is enabled; the retired task
+    # workbench planner is not.
+    assert "todolistmiddleware" in middleware_names
     assert "loopbudgetmiddleware" in middleware_names
     subagents = captured.get("subagents") or []
-    assert [item["name"] for item in subagents] == ["research"]
+    assert [item["name"] for item in subagents] == ["general-purpose", "research"]
+    research = next(item for item in subagents if item["name"] == "research")
     tool_names = {
         getattr(tool, "name", None) or getattr(tool, "__name__", "")
-        for tool in subagents[0]["tools"]
+        for tool in research["tools"]
     }
     assert "document_search" in tool_names
     assert "knowledge_search" in tool_names
@@ -716,12 +719,10 @@ def test_message_view_projects_persisted_turn_metadata():
     )
     view = _message_view(
         message,
-        plan={"items": [{"content": "step", "status": "completed"}], "revision": 1},
         budget={"status": "ok", "exhausted": False},
         verification={"status": "pass", "checks": []},
         subagents=[{"name": "research", "status": "completed"}],
     )
-    assert view.plan["revision"] == 1
     assert view.budget["status"] == "ok"
     assert view.verification["status"] == "pass"
     assert view.subagents[0]["name"] == "research"

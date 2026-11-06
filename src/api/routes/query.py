@@ -1298,7 +1298,7 @@ def start_turn(
     # browser can safely call it after a refresh to ensure the turn is queued.
     # A dependency-overridden pipeline is only used by in-process API tests;
     # production never enters this branch and always relies on the worker.
-    if request.app.dependency_overrides.get(get_pipeline) is not None and turn.status in {"pending", "task_pending", "streaming", "cancelling"}:
+    if request.app.dependency_overrides.get(get_pipeline) is not None and turn.status in {"pending", "streaming", "cancelling"}:
         start_thread_with_current_context(
             _run_turn,
             turn_id=turn.id,

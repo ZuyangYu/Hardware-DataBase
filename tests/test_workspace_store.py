@@ -38,6 +38,18 @@ def test_workspace_session_mapping_and_default_reuse(tmp_path):
     assert store.list_session_ids(knowledge.id) == [102]
 
 
+def test_workspace_agents_md_instructions_are_read_and_bounded(tmp_path):
+    store = _store(tmp_path)
+    workspace = store.create_workspace(user_id=7, kind="general", name="memory")
+    agents = Path(workspace.workspace_dir) / "AGENTS.md"
+    agents.write_text("回答末尾写 PROJECT-ORION。", encoding="utf-8")
+
+    assert store.read_instructions(workspace.id) == "回答末尾写 PROJECT-ORION。"
+
+    agents.write_text("x" * 9000, encoding="utf-8")
+    assert len(store.read_instructions(workspace.id)) == 8192
+
+
 def test_workspace_artifact_versions_and_path_confinement(tmp_path):
     store = _store(tmp_path)
     workspace = store.create_workspace(user_id=7, kind="general", name="demo")

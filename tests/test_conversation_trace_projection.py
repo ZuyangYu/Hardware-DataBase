@@ -144,8 +144,6 @@ class TraceStepProjectionTests(unittest.TestCase):
                 ),
                 event("stage", {"key": "generate", "label": "生成回答", "status": "done"}),
                 event("stage", {"key": "permission", "label": "权限检查", "status": "done"}),
-                event("stage", {"key": "task_context", "label": "任务上下文", "status": "running"}),
-                event("stage", {"key": "task_mode", "label": "任务模式", "status": "running"}),
                 event("stage", {"key": "skill_loaded", "label": "Skill 已挂载", "status": "running"}),
             ]
         )

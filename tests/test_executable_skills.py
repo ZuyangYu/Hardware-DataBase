@@ -13,7 +13,6 @@ from pydantic import ValidationError
 from deepagents import create_deep_agent
 
 import src.settings as settings
-from src.agents.skill_materializer import load_skill_prompt_context
 from src.api.routes import sandbox as routes
 from src.api.schemas import SandboxSkillExecutionBindingRequest, SandboxSkillRunRequest
 from src.sandbox.artifact_broker import ArtifactBroker
@@ -296,59 +295,6 @@ def test_admin_published_all_department_skills_require_employee_department_and_s
         skills.subscribe("skill/global-text", principal_id="employee-none", department_id="")
     with pytest.raises(SkillNotAuthorized):
         skills.subscribe("skill/global-run", principal_id="employee-none", department_id="")
-
-
-def test_subscribed_text_is_mounted_in_employee_conversation_only(setup, monkeypatch):
-    import src.core.auth as auth_module
-
-    _, _, skills, _, _ = setup
-    monkeypatch.setattr(settings, "SANDBOX_TASK_DB_PATH", skills.db_path)
-    monkeypatch.setattr(auth_module, "AuthService", lambda: SimpleNamespace(
-        get_user_by_username=lambda username: SimpleNamespace(
-            id=42, role="employee", is_active=True, department_id="dept-1",
-        ) if username == "tester" else None,
-    ))
-    skills.register(skill_ref="skill/checklist", version="v1", content="Verify component voltage",
-                    department_id="dept-1")
-    skills.review("skill/checklist")
-    skills.mark_tested("skill/checklist")
-    skills.enable("skill/checklist")
-    context = SimpleNamespace(user_id="tester", metadata={"actor_department_id": "dept-1"},
-                              is_system_admin=lambda: False)
-    load = load_skill_prompt_context
-    assert load(context) == ""
-    skills.subscribe("skill/checklist", principal_id=42, department_id="dept-1")
-    assert "Verify component voltage" in load(context)
-    assert load(SimpleNamespace(user_id="tester", metadata={"actor_department_id": "dept-2"},
-                                is_system_admin=lambda: False)) == ""
-    skills.unsubscribe("skill/checklist", principal_id=42)
-    assert load(context) == ""
-
-
-def test_skill_prompt_context_failure_reports_bounded_error(setup, monkeypatch):
-    from src.sandbox import skills as skills_module
-    import src.core.auth as auth_module
-
-    _, _, skills, _, _ = setup
-    monkeypatch.setattr(settings, "SANDBOX_TASK_DB_PATH", skills.db_path)
-    monkeypatch.setattr(auth_module, "AuthService", lambda: SimpleNamespace(
-        get_user_by_username=lambda username: SimpleNamespace(
-            id=42, role="employee", is_active=True, department_id="dept-1",
-        ) if username == "tester" else None,
-    ))
-
-    def explode(*args, **kwargs):
-        raise RuntimeError("catalog unavailable")
-
-    monkeypatch.setattr(skills_module.SkillCatalog, "prompt_blocks", explode)
-    context = SimpleNamespace(user_id="tester", metadata={"actor_department_id": "dept-1"},
-                              is_system_admin=lambda: False)
-    seen: list[str] = []
-    text = load_skill_prompt_context(
-        context, on_error=lambda exc: seen.append(type(exc).__name__),
-    )
-    assert text == ""
-    assert seen == ["RuntimeError"]
 
 
 def test_revoked_executable_skill_delete_requires_revoked_bundle_and_finished_task(setup):

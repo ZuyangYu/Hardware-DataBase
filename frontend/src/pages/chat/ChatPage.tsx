@@ -20,9 +20,8 @@ import type { AttachmentView, ExportArtifactView, ExportBatchResponse, ExportFor
 import { cn } from '@/lib/utils';
 import AppIcon from '@/components/AppIcon';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
-import { CHAT_MAIN_CLASS, chatBubbleClass, chatRowClass } from './chatPageStyles';
+import { CHAT_MAIN_CLASS } from './chatPageStyles';
 import { useKbChat } from './useKbChat';
-import McpWriteProposalCard from './components/McpWriteProposalCard';
 import ChatSessionSidebar from './components/ChatSessionSidebar';
 import ChatHeader from './components/ChatHeader';
 import MessageList from './components/MessageList';
@@ -689,6 +688,10 @@ export default function ChatPage({
           exportPreviewsByJobId={exportPreviewsByJobId}
           exportFormats={exportFormats}
           artifactsByTurnId={artifactsByTurnId}
+          mcpWriteCards={mcpWriteCards}
+          onConfirmMcpWrite={(card) => void confirmMcpWriteCard(card)}
+          onRejectMcpWrite={(card) => void rejectMcpWriteCard(card)}
+          onDownloadMcpWrite={(card) => void downloadMcpWriteCard(card)}
         />
         {turnQueueNotice && (
           <div className="shrink-0 px-[24px] pb-[6px]" data-testid="turn-queue-notice">
@@ -701,24 +704,6 @@ export default function ChatPage({
                   ? `（截止 ${new Date(turnQueueNotice.waitDeadline).toLocaleTimeString()}）`
                   : ''}
               </span>
-            </div>
-          </div>
-        )}
-        {mcpWriteCards.length > 0 && (
-          <div className="shrink-0 px-[24px] pb-[6px]">
-            <div className="mx-auto flex w-full max-w-[820px] flex-col gap-[10px]">
-              {mcpWriteCards.map((card) => (
-                <div key={card.proposal_id} className={chatRowClass('assistant')}>
-                  <div className={chatBubbleClass('assistant')}>
-                    <McpWriteProposalCard
-                      card={card}
-                      onConfirm={(target) => void confirmMcpWriteCard(target)}
-                      onReject={(target) => void rejectMcpWriteCard(target)}
-                      onDownload={(target) => void downloadMcpWriteCard(target)}
-                    />
-                  </div>
-                </div>
-              ))}
             </div>
           </div>
         )}
