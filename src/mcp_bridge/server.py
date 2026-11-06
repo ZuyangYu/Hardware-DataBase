@@ -215,28 +215,200 @@ def list_kb_files(kb_name: str) -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-def read_file_chunks(kb_name: str, file_id: str, max_chunks: int = 20) -> dict[str, Any]:
-    """Read parsed chunks for one source file."""
+def read_file_chunks(
+    kb_name: str,
+    file_id: str,
+    max_chunks: int = 20,
+    start_index: int = 0,
+    query: str = "",
+) -> dict[str, Any]:
+    """Read parsed chunks for one source file (chunk -> document spans).
+
+    ``start_index`` positions at a chunk index (all chunks are served by the
+    API; this slice is bridge-side).  ``query`` filters chunks whose content
+    contains the needle (case-insensitive) after slicing.
+    """
     data = _request(
         "GET",
         f"/kbs/{_kb_path(kb_name)}/files/{quote(str(file_id), safe='')}/chunks",
     )
-    chunks = data.get("chunks") or []
+    raw_chunks = data.get("chunks") or []
+    chunk_count = int(data.get("chunk_count") or len(raw_chunks))
+    start = max(0, int(start_index or 0))
+    needle = str(query or "").strip().casefold()
     limit = max(1, min(int(max_chunks or 20), 100))
+    picked = []
+    for chunk in raw_chunks:
+        if not isinstance(chunk, dict):
+            continue
+        index = int(chunk.get("index") or 0)
+        if index < start:
+            continue
+        content = str(chunk.get("content") or "")
+        if needle and needle not in content.casefold():
+            continue
+        picked.append(
+            {
+                "index": chunk.get("index"),
+                "content": _clip(content, 4_000),
+                "metadata": chunk.get("metadata") or {},
+            }
+        )
+        if len(picked) >= limit:
+            break
     return {
         "document_id": data.get("document_id", ""),
         "file_name": data.get("file_name", ""),
-        "chunk_count": data.get("chunk_count", len(chunks)),
+        "chunk_count": chunk_count,
         "backend": data.get("backend", ""),
-        "chunks": [
-            {
-                "index": chunk.get("index"),
-                "content": _clip(chunk.get("content"), 4_000),
-                "metadata": chunk.get("metadata") or {},
-            }
-            for chunk in chunks[:limit]
-            if isinstance(chunk, dict)
-        ],
+        "start_index": start,
+        "query": needle,
+        "chunks": picked,
+    }
+
+
+_CHUNK_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_CHUNK_CACHE_TTL = 900.0
+
+
+def _tokenize_query(text: str) -> list[str]:
+    """ASCII words (>=2 chars) + CJK bigrams for lexical chunk scoring."""
+    tokens: list[str] = []
+    lowered = str(text or "").strip().casefold()
+    if not lowered:
+        return tokens
+    for word in re.findall(r"[a-z0-9_./\-]{2,}", lowered):
+        tokens.append(word)
+    for run in re.findall(r"[\u4e00-\u9fff]+", lowered):
+        if len(run) == 1:
+            tokens.append(run)
+        for i in range(len(run) - 1):
+            tokens.append(run[i : i + 2])
+    return list(dict.fromkeys(tokens))
+
+
+def _snippet_around(content: str, tokens: list[str], width: int = 260) -> str:
+    lowered = content.casefold()
+    pos = min(
+        (lowered.find(token) for token in tokens if lowered.find(token) >= 0),
+        default=0,
+    )
+    start = max(0, pos - width // 3)
+    snippet = content[start : start + width]
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if start + width < len(content) else ""
+    return f"{prefix}{snippet}{suffix}"
+
+
+def _score_chunk(content: str, tokens: list[str]) -> float:
+    lowered = content.casefold()
+    score = 0.0
+    for token in tokens:
+        hits = lowered.count(token)
+        if hits <= 0:
+            continue
+        score += 1.0 + min(hits, 8) * 0.25
+        if token.isascii() and token.islower() and len(token) >= 4:
+            score += 0.5  # long ascii token is a strong identity signal
+    return round(score, 3)
+
+
+def _load_chunks(kb_name: str, file_id: str, refresh: bool) -> dict[str, Any]:
+    key = (str(kb_name), str(file_id))
+    now = time.monotonic()
+    cache = _CHUNK_CACHE.get(key)
+    if cache and not refresh and now - float(cache.get("loaded") or 0.0) < _CHUNK_CACHE_TTL:
+        return cache
+    data = _request(
+        "GET",
+        f"/kbs/{_kb_path(kb_name)}/files/{quote(str(file_id), safe='')}/chunks",
+    )
+    chunks = [
+        {
+            "index": int(row.get("index") or 0),
+            "content": _clip(row.get("content"), 4_000),
+            "metadata": row.get("metadata") or {},
+            "rag_id": row.get("rag_id") or (row.get("metadata") or {}).get("ragflow_chunk_id", ""),
+        }
+        for row in (data.get("chunks") or [])
+        if isinstance(row, dict)
+    ]
+    fresh = {
+        "loaded": now,
+        "chunks": chunks,
+        "total": int(data.get("chunk_count") or len(chunks)),
+        "backend": data.get("backend", ""),
+    }
+    if len(_CHUNK_CACHE) > 40:
+        oldest = sorted(_CHUNK_CACHE.items(), key=lambda item: item[1].get("loaded") or 0.0)[:8]
+        for stale_key, _ in oldest:
+            _CHUNK_CACHE.pop(stale_key, None)
+    _CHUNK_CACHE[key] = fresh
+    return fresh
+
+
+@mcp.tool()
+def search_knowledge_base(
+    kb_name: str,
+    query: str,
+    top_k: int = 8,
+    file_id: str = "",
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Stateless lexical search over one KB's parsed chunks (no session).
+
+    Returns chunk locators (file / index / rag_id) with snippet + score for
+    the calling agent to reason over and verify with
+    ``hdb_read_file_chunks``.  The chunk index is cached per file (~15 min
+    TTL, ``refresh=True`` forces a rebuild); ``file_id`` narrows the search.
+    For LLM-composed answers use ``ask_knowledge_base`` (heavy).
+    """
+    needle = str(query or "").strip()
+    if not needle:
+        raise ValueError("query is required")
+    rows = _request("GET", f"/kbs/{_kb_path(kb_name)}/files")
+    tokens = _tokenize_query(needle)
+    if not tokens:
+        raise ValueError("query has no searchable tokens")
+    results: list[dict[str, Any]] = []
+    files_searched = 0
+    chunks_searched = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        fid = str(row.get("id") or "")
+        fid_name = str(row.get("name") or "")
+        if file_id and fid != file_id and fid_name != file_id:
+            continue
+        cache = _load_chunks(kb_name, fid, refresh)
+        files_searched += 1
+        for chunk in cache.get("chunks") or []:
+            chunks_searched += 1
+            content = str(chunk.get("content") or "")
+            score = _score_chunk(content, tokens)
+            if score <= 0:
+                continue
+            results.append(
+                {
+                    "file_id": fid,
+                    "file_name": fid_name,
+                    "chunk_index": chunk.get("index"),
+                    "rag_id": chunk.get("rag_id") or "",
+                    "score": score,
+                    "snippet": _snippet_around(content, tokens),
+                }
+            )
+    results.sort(key=lambda row: row.get("score") or 0.0, reverse=True)
+    top_k_clamped = max(1, min(int(top_k or 8), _MAX_ROWS))
+    return {
+        "kb_name": kb_name,
+        "query": needle,
+        "results": results[:top_k_clamped],
+        "result_count": len(results[:top_k_clamped]),
+        "files_searched": files_searched,
+        "chunks_searched": chunks_searched,
+        "cache_files": len(_CHUNK_CACHE),
+        "note": "lexical score over raw chunks; verify hits with hdb_read_file_chunks(file_id, start_index)",
     }
 
 
@@ -261,7 +433,18 @@ def download_kb_file(
     username = str(_LOGIN_USER.get("username") or _USERNAME or "").strip()
     user = auth.get_user_by_username(username) if username else None
     if user is None:
-        raise RuntimeError("cannot resolve the configured user for file download")
+        # API-key deployments carry no session identity: fall back to the
+        # knowledge base owner resolved from the KB registration.
+        owner_id = kb.get("owner_user_id")
+        try:
+            user = auth.get_user_by_id(int(owner_id))
+        except (TypeError, ValueError):
+            user = None
+    if user is None:
+        raise RuntimeError(
+            "cannot resolve the configured user for file download "
+            "(HDB_USERNAME/HDB_PASSWORD per user, or a KB owner_user_id fallback)"
+        )
     ctx = build_context_for_user(user, kb_name, auth=auth)
     infos = AppPipeline().list_file_infos(kb_name, ctx=ctx)
     info = next(
@@ -317,9 +500,13 @@ def ask_knowledge_base(
     kb_name: str,
     timeout_seconds: float = _TIMEOUT,
 ) -> dict[str, Any]:
-    """Ask one question against a mounted knowledge base and wait for the
-    cited answer.  This uses the platform's normal turn governance; it is not
-    a raw vector-search API.
+    """Compose an LLM answer over one knowledge base turn with citations.
+
+    Heavy by design: each call creates one conversation + one admitted turn
+    and runs the full agent pipeline (1-5 min, model-quota dependent).  For
+    MCP/agent retrieval prefer `search_knowledge_base` — stateless chunk
+    hits with locators, no session, milliseconds.  Keep this tool only when
+    a platform-composed narrative answer is genuinely required.
     """
     session = _request(
         "POST",
@@ -548,12 +735,17 @@ def query_circuit(
     query: str,
     design_id: str = "",
     limit: int = _MAX_ROWS,
+    mode: str = "both",
+    include_summary: bool = False,
+    include_modules: bool = False,
 ) -> dict[str, Any]:
     """Search one circuit design by instance/refdes or net/signal name.
 
-    If ``design_id`` is empty the first design returned by the knowledge base
-    is used.  The platform applies the caller's KB read permission and returns
-    at most ``limit`` rows per category.
+    ``mode`` selects the search plane: ``both`` (default), ``nets``, or
+    ``instances``.  The bulky design summary and per-page module roll-up are
+    opt-in via ``include_summary`` / ``include_modules`` (default off) — keep
+    the default for repeated point probing.  If ``design_id`` is empty the
+    first design returned by the knowledge base is used.
     """
     if not design_id:
         designs = (
@@ -572,7 +764,15 @@ def query_circuit(
                 "error": "no circuit design found",
             }
         design_id = str(designs[0].get("design_id") or "")
-    params = urlencode({"net_query": query, "instance_query": query})
+    plane = str(mode or "both").strip().lower()
+    if plane not in {"both", "nets", "instances"}:
+        plane = "both"
+    pairs: list[tuple[str, str]] = []
+    if plane in {"both", "nets"}:
+        pairs.append(("net_query", query))
+    if plane in {"both", "instances"}:
+        pairs.append(("instance_query", query))
+    params = urlencode(pairs)
     data = _request(
         "GET",
         f"/kbs/{_kb_path(kb_name)}/structured/circuit-designs/"
@@ -582,8 +782,9 @@ def query_circuit(
     return {
         "design_id": design_id,
         "query": query,
-        "summary": data.get("summary") or {},
-        "modules": (data.get("modules") or [])[:limit],
+        "mode": plane,
+        "summary": (data.get("summary") or {}) if include_summary else {},
+        "modules": (data.get("modules") or [])[:limit] if include_modules else [],
         "instances": (data.get("instances") or [])[:limit],
         "nets": (data.get("nets") or [])[:limit],
         "cross_references": (data.get("cross_references") or [])[:limit],
