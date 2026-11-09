@@ -987,19 +987,131 @@ def create_drawio_file(
     }
 
 
+_HTTP_AUTH_CACHE: dict[str, tuple[float, str]] = {}
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+async def _json_401(send, message: str) -> None:
+    """Emit a minimal MCP-compatible 401 JSON error."""
+    import json as _json
+
+    payload = _json.dumps({"error": message}).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(payload)).encode("latin-1")),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": payload})
+
+
+class _McpTokenAuthMiddleware:
+    """ASGI gate around the FastMCP streamable-http app.
+
+    ``static-token`` compares the ``X-HDB-MCP-Token`` header against
+    ``HDB_MCP_HTTP_TOKEN`` (one shared deployment secret).  ``mcp-token``
+    verifies a per-user ``hdbmcp_*`` token via the platform exchange —
+    same contract scripts/hdb_mcp_user_setup.sh mints.
+    """
+
+    def __init__(self, app, mode: str) -> None:
+        self.app = app
+        self.mode = mode
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http" or not str(scope.get("path", "")).startswith("/mcp"):
+            await self.app(scope, receive, send)
+            return
+        headers = {
+            key.decode("latin-1").casefold(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        token = str(headers.get("x-hdb-mcp-token", "")).strip()
+        if self.mode == "static-token":
+            expected = os.getenv("HDB_MCP_HTTP_TOKEN", "")
+            import hmac as _hmac
+
+            if not expected or not token or not _hmac.compare_digest(token, expected):
+                await _json_401(send, "X-HDB-MCP-Token header missing or wrong")
+                return
+        else:  # mcp-token
+            if not token.startswith("hdbmcp_"):
+                await _json_401(send, "X-HDB-MCP-Token hdbmcp_* header required")
+                return
+            cached = _HTTP_AUTH_CACHE.get(token)
+            now = time.monotonic()
+            if not (cached and now < cached[0]):
+                response = _client().post(
+                    f"{_API_BASE}/mcp/session",
+                    headers={"X-HDB-MCP-Token": token},
+                )
+                if response.status_code >= 400:
+                    await _json_401(send, f"mcp token rejected ({response.status_code})")
+                    return
+                bearer = (response.json() or {}).get("token") or ""
+                if not bearer:
+                    await _json_401(send, "mcp token exchange returned no bearer")
+                    return
+                if len(_HTTP_AUTH_CACHE) > 1000:  # prune oldest entries
+                    for stale in sorted(_HTTP_AUTH_CACHE.items(), key=lambda item: item[1][0])[:32]:
+                        _HTTP_AUTH_CACHE.pop(stale[0], None)
+                _HTTP_AUTH_CACHE[token] = (now + 900.0, bearer)
+        await self.app(scope, receive, send)
+
+
+def _warn_or_fail_open_socket(host: str, auth_mode: str) -> None:
+    if _is_loopback(host) or auth_mode:
+        return
+    if os.getenv("HDB_MCP_HTTP_ALLOW_UNAUTHED") == "1":
+        print(
+            "[hdb-mcp] WARNING: binding %s without auth "
+            "(HDB_MCP_HTTP_ALLOW_UNAUTHED=1) — intranet exposure only." % host
+        )
+        return
+    raise RuntimeError(
+        f"Refusing to bind {host} without HDB_MCP_HTTP_AUTH. "
+        "Set HDB_MCP_HTTP_AUTH=static-token|owner-token, or "
+        "HDB_MCP_HTTP_ALLOW_UNAUTHED=1 to acknowledge open intranet exposure."
+    )
+
+
+def _is_loopback(host: str) -> bool:
+    return host in _LOOPBACK_HOSTS
+
+
 def main() -> None:
     """Start the MCP bridge in either stdio or remote streamable-http mode.
 
     HDB_MCP_TRANSPORT=stdio (default) keeps the host-spawned local process;
     streamable-http exposes the same tools over HTTP at /mcp for remote
     registration (scripts/hdb_mcp_http.sh, platform plugins page).
+
+    Cross-host binding via HDB_MCP_HOST=0.0.0.0 requires HDB_MCP_HTTP_AUTH
+    (static-token | mcp-token) or the explicit escape hatch
+    HDB_MCP_HTTP_ALLOW_UNAUTHED=1 — we refuse open LAN sockets by default.
     """
     transport = os.getenv("HDB_MCP_TRANSPORT", "stdio").strip().lower()
     host = os.getenv("HDB_MCP_HOST", "127.0.0.1")
     port = int(os.getenv("HDB_MCP_PORT", "9100"))
     if transport in {"http", "streamable-http", "streamable_http"}:
+        auth_mode = os.getenv("HDB_MCP_HTTP_AUTH", "").strip().lower()
+        if auth_mode and auth_mode not in {"static-token", "mcp-token"}:
+            raise RuntimeError(
+                "HDB_MCP_HTTP_AUTH must be empty, 'static-token' or 'mcp-token'"
+            )
+        _warn_or_fail_open_socket(host, auth_mode)
         mcp.settings.host = host
         mcp.settings.port = port
+        if auth_mode:
+            import uvicorn
+
+            app = _McpTokenAuthMiddleware(mcp.streamable_http_app(), mode=auth_mode)
+            uvicorn.run(app, host=host, port=port, log_level="info")
+            return
         mcp.run(transport="streamable-http")  # endpoint: http://<host>:<port>/mcp
         return
     mcp.run(transport="stdio")
