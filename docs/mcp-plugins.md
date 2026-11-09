@@ -303,7 +303,7 @@ scripts/hdb_mcp_http.sh
 ```
 
 - 工具集与 stdio 桥完全一致（search/read_file_chunks/query_table/query_circuit/list_kbs…）；
-- **跨机绑定？**：`HDB_MCP_HOST=127.0.0.1`（默认）仅本机；设 `HDB_MCP_HOST=0.0.0.0` 供跨机 agent 连接时，**必须**配置 `HDB_MCP_HTTP_AUTH`（`static-token` 共享密钥 或 `mcp-token` 用户 hdbmcp_* 令牌校验），否则进程默认拒绝启动；内网可用逃逸 `HDB_MCP_HTTP_ALLOW_UNAUTHED=1`；
+- **跨机接入**：`HDB_MCP_HOST=127.0.0.1`（默认）仅本机可连；设 `HDB_MCP_HOST=0.0.0.0` 供跨机 agent 连接。默认挂 per-user hdbmcp_* 令牌门禁（`X-HDB-MCP-Token`），确认内网裸开时显式 `HDB_MCP_HTTP_ALLOW_UNAUTHED=1`（进程将打印 WARNING）；
 - 工具对 HDB API 的鉴权经 `HDB_MCP_TOKEN`（mcp-session 换取短期 Bearer）或 `HDB_API_TOKEN`；
 - token 被撤销/轮换后用 `scripts/hdb_mcp_user_setup.sh` 重新发行；
 - 无状态检索用 `search_knowledge_base`（agent 首选）。平台代答/带引用叙述走 Web 会话管道 `/conversations/{id}/turns`，MCP 工具面不再暴露 ask*。

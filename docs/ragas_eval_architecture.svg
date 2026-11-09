@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 860" font-family="'PingFang SC','Microsoft YaHei',sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1180" height="860" fill="#f8fafc"/>
+  <text x="590" y="34" text-anchor="middle" font-size="20" font-weight="bold" fill="#0f172a">RAGAS 评估系统架构（当前）</text>
+
+  <!-- 数据集 -->
+  <rect x="40" y="60" width="240" height="52" rx="8" fill="#e2e8f0" stroke="#94a3b8"/>
+  <text x="160" y="82" text-anchor="middle" font-size="13" fill="#0f172a">数据集 aaa_hard_eval_v1.jsonl</text>
+  <text x="160" y="100" text-anchor="middle" font-size="11" fill="#475569">47 条 · pydantic 严格校验</text>
+
+  <!-- Service -->
+  <rect x="40" y="160" width="240" height="52" rx="8" fill="#dbeafe" stroke="#3b82f6"/>
+  <text x="160" y="182" text-anchor="middle" font-size="13" fill="#0f172a">EvaluationService</text>
+  <text x="160" y="200" text-anchor="middle" font-size="11" fill="#475569">dataset_loader → collect / score</text>
+
+  <line x1="160" y1="112" x2="160" y2="158" stroke="#475569" marker-end="url(#arrow)"/>
+
+  <!-- 收集层 -->
+  <rect x="40" y="260" width="240" height="92" rx="8" fill="#dcfce7" stroke="#22c55e"/>
+  <text x="160" y="284" text-anchor="middle" font-size="13" font-weight="bold" fill="#14532d">① 收集层 AnswerRunner</text>
+  <text x="160" y="304" text-anchor="middle" font-size="11" fill="#166534">AppPipeline → agent loop</text>
+  <text x="160" y="322" text-anchor="middle" font-size="11" fill="#166534">circuit / spreadsheet / document 检索</text>
+  <text x="160" y="340" text-anchor="middle" font-size="11" fill="#166534">快照落盘 snapshot.jsonl（可 resume）</text>
+
+  <line x1="160" y1="212" x2="160" y2="258" stroke="#475569" marker-end="url(#arrow)"/>
+
+  <!-- RAGFlow -->
+  <rect x="60" y="400" width="200" height="64" rx="8" fill="#fef9c3" stroke="#ca8a04"/>
+  <text x="160" y="424" text-anchor="middle" font-size="12" fill="#713f12">RAGFlow :6080</text>
+  <text x="160" y="442" text-anchor="middle" font-size="11" fill="#713f12">检索 / 表格索引 / 网表索引</text>
+  <line x1="160" y1="352" x2="160" y2="398" stroke="#475569" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+
+  <!-- 评分层大框 -->
+  <rect x="360" y="120" width="560" height="470" rx="12" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>
+  <text x="640" y="148" text-anchor="middle" font-size="15" font-weight="bold" fill="#1e40af">② 评分层（每样本并行 · 三层独立）</text>
+
+  <!-- A 词法层 -->
+  <rect x="390" y="170" width="250" height="190" rx="8" fill="#f1f5f9" stroke="#64748b"/>
+  <text x="515" y="194" text-anchor="middle" font-size="13" font-weight="bold" fill="#334155">A. 词法层 score_hardware_rules ★</text>
+  <rect x="406" y="208" width="218" height="30" rx="5" fill="#e2e8f0"/>
+  <text x="515" y="228" text-anchor="middle" font-size="11" fill="#0f172a">forbidden_claims（禁词，默认）</text>
+  <rect x="406" y="244" width="218" height="30" rx="5" fill="#e2e8f0"/>
+  <text x="515" y="264" text-anchor="middle" font-size="11" fill="#0f172a">evidence_consistency（工具路由，默认）</text>
+  <rect x="406" y="280" width="218" height="30" rx="5" fill="#fee2e2" stroke="#fca5a5" stroke-dasharray="4 3"/>
+  <text x="515" y="300" text-anchor="middle" font-size="11" fill="#7f1d1d">completeness / honesty / conflict</text>
+  <text x="515" y="322" text-anchor="middle" font-size="10.5" fill="#7f1d1d">仅 --hardware-semantic 诊断模式</text>
+  <text x="515" y="345" text-anchor="middle" font-size="10.5" fill="#475569">子串匹配 · 确定性可复现 · 进门禁</text>
+
+  <!-- B RAGAS层 -->
+  <rect x="670" y="170" width="230" height="250" rx="8" fill="#eff6ff" stroke="#3b82f6"/>
+  <text x="785" y="194" text-anchor="middle" font-size="13" font-weight="bold" fill="#1e40af">B. RAGAS 裁判层 ★</text>
+  <text x="785" y="214" text-anchor="middle" font-size="10.5" fill="#475569">ragas 0.4.3 collections（官方默认超参）</text>
+  <rect x="684" y="224" width="202" height="24" rx="5" fill="#dbeafe"/>
+  <text x="785" y="241" text-anchor="middle" font-size="11" fill="#0f172a">AnswerCorrectness（LLM+Emb）</text>
+  <rect x="684" y="252" width="202" height="24" rx="5" fill="#dbeafe"/>
+  <text x="785" y="269" text-anchor="middle" font-size="11" fill="#0f172a">Faithfulness（LLM）</text>
+  <rect x="684" y="280" width="202" height="24" rx="5" fill="#dbeafe"/>
+  <text x="785" y="297" text-anchor="middle" font-size="11" fill="#0f172a">AnswerRelevancy（LLM+Emb）</text>
+  <rect x="684" y="308" width="202" height="24" rx="5" fill="#dbeafe"/>
+  <text x="785" y="325" text-anchor="middle" font-size="11" fill="#0f172a">ContextPrecision / Recall（LLM）</text>
+  <text x="785" y="356" text-anchor="middle" font-size="10.5" fill="#475569">上下文预处理：相关重排 · 字符预算 · 去 HTML</text>
+  <text x="785" y="374" text-anchor="middle" font-size="10.5" fill="#475569">instructor 结构化判卷</text>
+  <text x="785" y="392" text-anchor="middle" font-size="10.5" fill="#475569">并发 Semaphore（EVAL_MAX_WORKERS=8）</text>
+  <text x="785" y="410" text-anchor="middle" font-size="10.5" fill="#b91c1c">⚠ 真实评分偶发 Connection error（待查）</text>
+
+  <!-- C 权限层 -->
+  <rect x="390" y="384" width="250" height="92" rx="8" fill="#fdf4ff" stroke="#c084fc"/>
+  <text x="515" y="408" text-anchor="middle" font-size="13" font-weight="bold" fill="#6b21a8">C. 权限层 access.py</text>
+  <text x="515" y="428" text-anchor="middle" font-size="11" fill="#7e22ce">expected_access=denied 样本走拒绝校验</text>
+  <text x="515" y="446" text-anchor="middle" font-size="11" fill="#7e22ce">RAGAS 指标标 not_applicable</text>
+  <text x="515" y="464" text-anchor="middle" font-size="10.5" fill="#a855f7">允许/拒绝观测与预期比对</text>
+
+  <!-- 外部依赖 -->
+  <rect x="960" y="170" width="190" height="110" rx="8" fill="#fef9c3" stroke="#ca8a04"/>
+  <text x="1055" y="194" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#713f12">opencode zen Go v1</text>
+  <text x="1055" y="214" text-anchor="middle" font-size="11" fill="#713f12">裁判+agent: omen-alpha</text>
+  <text x="1055" y="232" text-anchor="middle" font-size="11" fill="#b91c1c">★ 强制 x-opencode-session 头</text>
+  <text x="1055" y="250" text-anchor="middle" font-size="10.5" fill="#713f12">llm_factory + instructor</text>
+  <line x1="900" y1="236" x2="958" y2="225" stroke="#2563eb" marker-end="url(#arrowBlue)"/>
+
+  <rect x="960" y="300" width="190" height="96" rx="8" fill="#fef9c3" stroke="#ca8a04"/>
+  <text x="1055" y="324" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#713f12">火山方舟 ark</text>
+  <text x="1055" y="344" text-anchor="middle" font-size="11" fill="#713f12">doubao-embedding-vision</text>
+  <text x="1055" y="362" text-anchor="middle" font-size="10.5" fill="#713f12">2048 维 · 语义相似度</text>
+  <line x1="900" y1="256" x2="958" y2="348" stroke="#2563eb" marker-end="url(#arrowBlue)"/>
+
+  <!-- 连线到评分层 -->
+  <line x1="280" y1="306" x2="500" y2="306" stroke="#475569" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+  <text x="390" y="298" text-anchor="middle" font-size="10.5" fill="#475569">快照</text>
+  <line x1="380" y1="290" x2="380" y2="290" stroke="none"/>
+  <path d="M 280 300 C 330 280 340 220 388 200" stroke="#475569" fill="none" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+
+  <!-- 汇总层 -->
+  <rect x="390" y="630" width="500" height="120" rx="10" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>
+  <text x="640" y="658" text-anchor="middle" font-size="14" font-weight="bold" fill="#14532d">③ 汇总与门禁 gates.evaluate_gate</text>
+  <text x="640" y="682" text-anchor="middle" font-size="11" fill="#166534">answer_correctness ≥0.75 · faithfulness ≥0.75 · evidence_consistency ≥0.75</text>
+  <text x="640" y="702" text-anchor="middle" font-size="11" fill="#166534">forbidden_claims =1.0 ★ · 语义指标缺席时门禁自动跳过 ★</text>
+  <text x="640" y="726" text-anchor="middle" font-size="11" fill="#166534">critical 样本逐项校验 · fail_on_threshold → exit 2</text>
+
+  <line x1="515" y1="476" x2="560" y2="628" stroke="#475569" marker-end="url(#arrow)"/>
+  <line x1="785" y1="422" x2="720" y2="628" stroke="#475569" marker-end="url(#arrow)"/>
+
+  <!-- 输出 -->
+  <rect x="920" y="630" width="230" height="120" rx="8" fill="#e2e8f0" stroke="#94a3b8"/>
+  <text x="1035" y="656" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#0f172a">输出产物</text>
+  <text x="1035" y="678" text-anchor="middle" font-size="11" fill="#475569">summary.json · results.jsonl</text>
+  <text x="1035" y="696" text-anchor="middle" font-size="11" fill="#475569">report.html · summary.csv</text>
+  <text x="1035" y="714" text-anchor="middle" font-size="11" fill="#475569">snapshot_manifest</text>
+  <line x1="890" y1="690" x2="918" y2="690" stroke="#475569" marker-end="url(#arrow)"/>
+
+  <!-- 底部注释 -->
+  <rect x="40" y="790" width="1100" height="50" rx="8" fill="#fff7ed" stroke="#fb923c"/>
+  <text x="590" y="812" text-anchor="middle" font-size="11.5" fill="#7c2d12">CLI 开关：--metric none（跳过裁判，纯词法离线评分） | --hardware-semantic（旧语义规则诊断模式）</text>
+  <text x="590" y="830" text-anchor="middle" font-size="11.5" fill="#7c2d12">★ = 本次新增/改动：会话头注入 · forbidden_claims 独立指标+门禁 · 语义规则降级 · --metric none</text>
+</svg>

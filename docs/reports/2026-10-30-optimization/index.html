@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>2026-10-30 优化项汇报图</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #eef1f6;
+      color: #18181a;
+      font-family: "Droid Sans Fallback", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    header {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 48px 32px 20px;
+    }
+    h1 { margin: 0 0 8px; font-size: 30px; letter-spacing: -0.02em; }
+    header p { margin: 0; color: #6b7280; font-size: 14px; line-height: 1.7; }
+    main {
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 20px 32px 64px;
+      display: grid;
+      gap: 28px;
+    }
+    section {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 18px;
+      padding: 20px;
+      box-shadow: 0 1px 2px rgba(24, 24, 26, 0.04);
+    }
+    section h2 { margin: 0 0 4px; font-size: 17px; }
+    section p { margin: 0 0 16px; color: #6b7280; font-size: 12.5px; }
+    img { display: block; width: 100%; height: auto; border-radius: 12px; border: 1px solid #eef1f6; }
+    .meta { margin-top: 10px; color: #9aa1b1; font-size: 11px; }
+    @media print {
+      body { background: #fff; }
+      header { padding: 0 0 16px; }
+      main { padding: 0; display: block; }
+      section { border: 0; padding: 0; margin: 0 0 28px; break-inside: avoid; page-break-inside: avoid; }
+      section h2, section p { display: none; }
+      img { border: 0; border-radius: 0; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>2026-10-30 优化项汇报图</h1>
+    <p>
+      本周优化项按主题分开绘制，共 7 张独立 SVG。数据来自 10 题 ADAS 压测、16 项端到端验收、全量测试日志和 git diff；
+      没有 before 基线的指标只画优化后实测值，不编造对比。
+    </p>
+  </header>
+  <main>
+    <section>
+      <h2>01 · 检索链路：候选条目没有进入正式证据账本</h2>
+      <p>候选 1,209 / 精读 66 次 / 正式证据 128；候选与证据比例 10.6%。</p>
+      <img src="01-retrieval-funnel.svg" alt="检索链路候选漏斗" />
+      <div class="meta">数据：/tmp/hdb-question-stress-converged.json · 2026-10-30</div>
+    </section>
+    <section>
+      <h2>02 · 逐题检索质量</h2>
+      <p>10/10 有引用；平均 12.8 条证据、11.2 个引用、6.6 次 evidence_read。</p>
+      <img src="02-retrieval-quality.svg" alt="逐题检索质量" />
+      <div class="meta">数据：/tmp/hdb-question-stress-converged.json · 10 题 ADAS 压测</div>
+    </section>
+    <section>
+      <h2>03 · 端到端验收矩阵</h2>
+      <p>16/16 项全部通过，覆盖检索、上下文、事件并发和前端降噪。</p>
+      <img src="03-acceptance-matrix.svg" alt="端到端验收矩阵" />
+      <div class="meta">数据：/tmp/hdb-final-acceptance.json · 2026-10-30 12:29</div>
+    </section>
+    <section>
+      <h2>04 · 测试覆盖与通过率</h2>
+      <p>2,514 项通过、0 失败；本次相关回归 74 项全部通过。</p>
+      <img src="04-test-coverage.svg" alt="测试覆盖与通过率" />
+      <div class="meta">数据：全量 pytest · Vitest · Playwright E2E · targeted pytest</div>
+    </section>
+    <section>
+      <h2>05 · 聊天区降噪</h2>
+      <p>元信息面板 3→0、禁用文案 6→0、前端代码少 417 行。</p>
+      <img src="05-frontend-noise.svg" alt="聊天区降噪前后对比" />
+      <div class="meta">数据：git diff HEAD · /tmp/hdb-final-acceptance.json</div>
+    </section>
+    <section>
+      <h2>06 · 架构瘦身</h2>
+      <p>本周 git 删除 136,401 行；文档生成子系统占 92.5%。</p>
+      <img src="06-code-slimming.svg" alt="架构瘦身统计" />
+      <div class="meta">数据：git show --numstat 1ea0838 / 1995eab · git diff --numstat</div>
+    </section>
+    <section>
+      <h2>07 · 上下文治理</h2>
+      <p>Qwen2.5 的 64k 配置压回 32,768；10 题压测 0 失败、0 预算耗尽、0 上下文异常。</p>
+      <img src="07-context-governance.svg" alt="上下文治理" />
+      <div class="meta">数据：tests/test_context_budget.py · 10 题压测 · 16 项验收</div>
+    </section>
+  </main>
+</body>
+</html>
