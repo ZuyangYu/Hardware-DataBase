@@ -59,3 +59,12 @@ def test_source_tree_has_no_removed_feature_references() -> None:
                 if token in text:
                     offenders.append(f"{path.relative_to(ROOT)}: {token}")
     assert offenders == []
+
+
+def test_readiness_default_worker_roles_exclude_removed_authoring(monkeypatch) -> None:
+    monkeypatch.delenv("HDB_REQUIRED_WORKER_ROLES", raising=False)
+    from src.observability.health import required_worker_roles
+
+    roles = required_worker_roles()
+    assert "authoring" not in roles
+    assert {"chat", "parse", "export"} <= roles
