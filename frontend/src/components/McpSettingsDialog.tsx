@@ -124,6 +124,29 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
       ].join('\n')
     : '';
 
+  // 小白连一行的标准接入 JSON：直接贴到 ~/.config/opencode/config.json
+  const opencodeEntrySnippet = created
+    ? JSON.stringify(
+        {
+          '$schema': 'https://opencode.ai/config.json',
+          mcp: {
+            hdb: {
+              type: 'remote',
+              url: remoteUrl,
+              headers: {
+                'X-HDB-MCP-Token': created.token,
+              },
+            },
+          },
+        },
+        null,
+        2,
+      )
+    : '';
+  const entryHint =
+    '把上面这段 JSON 复制进 ~/.config/opencode/config.json（已有配置就把 "mcp": {...} 这一段并进去），保存后打开新的 Agent 对话即可。' +
+    '若 Agent 不支持远程 MCP，仍可用 scripts/hdb_mcp_user_setup.sh 的本机子进程方式接入。';
+
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -257,6 +280,22 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
             <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] text-[12px] leading-[20px] text-[#18181a]">
               {created ? remotePaste : '生成个人凭证后，这里会显示远程 URL、X-HDB-MCP-Token 请求头和工具名前缀。'}
             </pre>
+            <div className="mt-[14px] flex items-center justify-between gap-[8px]">
+              <span className="text-[12px] text-[#454b5c]">复制这段 JSON，直接贴到 Agent 配置即可连上（小白友好）</span>
+              {created ? (
+                <Button
+                  variant="outline"
+                  className="h-[30px] rounded-[9px] border-[#e3e7f1] px-[10px] text-[12px] text-[#464c5e]"
+                  onClick={() => void copyText(opencodeEntrySnippet, 'Agent 接入 JSON')}
+                >
+                  复制接入 JSON
+                </Button>
+              ) : null}
+            </div>
+            <pre className="max-h-[320px] overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] font-mono text-[12px] leading-[20px] text-[#18181a]">
+              {created ? opencodeEntrySnippet : '生成个人凭证后，这里会显示可直接粘到 Agent 配置文件里的 JSON 片段。'}
+            </pre>
+            <p className="mt-[6px] text-[11px] leading-[18px] text-[#8a93a5]">{entryHint}</p>
 
           </div>
 
@@ -279,7 +318,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
         <h2 className="text-[14px] font-semibold text-[#18181a]">使用说明</h2>
         <ol className="mt-[10px] grid gap-[8px] text-[12px] leading-[19px] text-[#5f687a]">
           <li>1. 生成个人凭证，复制"可复制接入说明"里的远程 URL 与请求头。</li>
-          <li>2. 在 Agent（OpenCode / Claude / Cursor 等）的 MCP 设置里登记该 URL，并配置 <code>X-HDB-MCP-Token</code> 请求头。</li>
+          <li>2. 白屏最直接：把“复制接入 JSON”里的内容原样贴进 Agent 的配置文件（如 <code>~/.config/opencode/config.json</code> 的 mcp 字段）；或手动登记远程 URL 并配置 <code>X-HDB-MCP-Token</code> 请求头。</li>
           <li>3. 远程 MCP 本身常驻服务端，无需本机启动子进程。Agent 会自动加载 hdb 工具（工具名形如 <code>hdb_list_kbs</code>），直接用自然语言提问即可。</li>
           <li>4. 凭证泄露或人员变动时，立即在本页撤销并重新生成。</li>
         </ol>
