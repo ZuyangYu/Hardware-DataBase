@@ -11,9 +11,9 @@ cd "$APP_ROOT" || exit 1
 if [ -f "$APP_ROOT/.env" ]; then
   while IFS='=' read -r key value; do
     case "$key" in
-      HDB_API_HOST|HDB_API_PORT|HDB_FRONT_PORT|HDB_WORKER_ROLES|HDB_DRAWIO_MCP_ENABLED|HDB_DRAWIO_MCP_PORT) export "$key=$value" ;;
+      HDB_API_HOST|HDB_API_PORT|HDB_FRONT_PORT|HDB_WORKER_ROLES|HDB_DRAWIO_MCP_ENABLED|HDB_DRAWIO_MCP_PORT|HDB_MCP_HTTP_ENABLED|HDB_MCP_HOST|HDB_MCP_PORT) export "$key=$value" ;;
     esac
-  done < <(grep -E '^(HDB_API_HOST|HDB_API_PORT|HDB_FRONT_PORT|HDB_WORKER_ROLES|HDB_DRAWIO_MCP_ENABLED|HDB_DRAWIO_MCP_PORT)=' "$APP_ROOT/.env" 2>/dev/null || true)
+  done < <(grep -E '^(HDB_API_HOST|HDB_API_PORT|HDB_FRONT_PORT|HDB_WORKER_ROLES|HDB_DRAWIO_MCP_ENABLED|HDB_DRAWIO_MCP_PORT|HDB_MCP_HTTP_ENABLED|HDB_MCP_HOST|HDB_MCP_PORT)=' "$APP_ROOT/.env" 2>/dev/null || true)
 fi
 
 API_HOST="${HDB_API_HOST:-127.0.0.1}"
@@ -29,6 +29,10 @@ EXPORT_WORKER_PID_FILE="$PID_DIR/export-worker.pid"
 DRAWIO_MCP_ENABLED="${HDB_DRAWIO_MCP_ENABLED:-false}"
 DRAWIO_MCP_PORT="${HDB_DRAWIO_MCP_PORT:-8091}"
 DRAWIO_MCP_PID_FILE="$PID_DIR/drawio-mcp.pid"
+MCP_HTTP_ENABLED="${HDB_MCP_HTTP_ENABLED:-false}"
+MCP_HTTP_BIND="${HDB_MCP_HOST:-127.0.0.1}"
+MCP_HTTP_PORT="${HDB_MCP_PORT:-9100}"
+MCP_HTTP_PID_FILE="$PID_DIR/mcp-http.pid"
 # Worker 角色进程: 默认 chat/authoring/parse 三个独立进程(互不阻塞)。
 # HDB_WORKER_ROLES=all 时回退为单进程 legacy 模式。
 WORKER_ROLES="${HDB_WORKER_ROLES:-chat parse}"
@@ -46,6 +50,8 @@ WORKER_PATTERNS=(
 api_ok()   { curl -sf -m 2 "http://${API_HOST}:${API_PORT}/health" >/dev/null 2>&1; }
 front_ok() { curl -sf -m 2 -o /dev/null "http://127.0.0.1:${FRONT_PORT}/"; }
 drawio_mcp_ok() { curl -sf -m 2 "http://127.0.0.1:${DRAWIO_MCP_PORT}/health" >/dev/null 2>&1; }
+# 无 token 访问 /mcp 会返回 401，curl 仍以 0 退出；只要能连上就算已监听。
+mcp_http_ok() { curl -s -o /dev/null -m 2 "http://127.0.0.1:${MCP_HTTP_PORT}/mcp" >/dev/null 2>&1; }
 pid_alive() { kill -0 "$1" 2>/dev/null; }
 
 pid_matches_root() {
@@ -227,6 +233,35 @@ stop_drawio_mcp() {
   stop_process drawio-mcp "$APP_ROOT/deploy/drawio-mcp" "$DRAWIO_MCP_PID_FILE"
 }
 
+start_mcp_http() {
+  [ "$MCP_HTTP_ENABLED" = "true" ] || return 0
+  local token_file="$HOME/.config/hdb/mcp_token"
+  if mcp_http_ok; then
+    if managed_pid "$MCP_HTTP_PID_FILE" "$APP_ROOT" >/dev/null; then
+      echo "[mcp-http] 已在运行 (${MCP_HTTP_BIND}:${MCP_HTTP_PORT}, pid $(cat "$MCP_HTTP_PID_FILE"))"
+    else
+      echo "[mcp-http] 检测到未纳管实例（:${MCP_HTTP_PORT}），跳过启动"
+    fi
+    return 0
+  fi
+  if [ ! -f "$token_file" ]; then
+    echo "[mcp-http] 缺少 $token_file，跳过（先在本机生成个人 MCP 凭证）"
+    return 0
+  fi
+  echo "[mcp-http] 启动中 (${MCP_HTTP_BIND}:${MCP_HTTP_PORT})..."
+  start_process mcp-http "$APP_ROOT" "$MCP_HTTP_PID_FILE" \
+    env HDB_MCP_TRANSPORT=streamable-http HDB_MCP_HOST="$MCP_HTTP_BIND" HDB_MCP_PORT="$MCP_HTTP_PORT" \
+    bash scripts/hdb_mcp_http.sh
+  if ! wait_for mcp_http_ok 15; then
+    echo "[mcp-http] 启动失败，查看 $LOG_DIR/mcp-http.log"
+    return 1
+  fi
+}
+
+stop_mcp_http() {
+  stop_process mcp-http "$APP_ROOT" "$MCP_HTTP_PID_FILE"
+}
+
 NODEENV="${NODEENV:-$APP_ROOT/storage/nodeenv}"
 
 ensure_node() {
@@ -324,6 +359,7 @@ do_start() {
   # 本脚本的 legacy all worker 重复消费同一队列。
   start_worker_processes
   start_drawio_mcp || true
+  start_mcp_http || true
   do_status
 }
 
@@ -332,6 +368,7 @@ do_stop() {
   stop_process api "$APP_ROOT" "$API_PID_FILE"
   stop_worker_processes
   stop_drawio_mcp
+  stop_mcp_http
   # 兜底清理未纳管的本项目 worker 实例。
   cleanup_stale_workers
   for _ in $(seq 1 5); do
@@ -387,6 +424,16 @@ do_status() {
       unmanaged=1
     fi
   fi
+  if [ "$MCP_HTTP_ENABLED" = "true" ]; then
+    local mcp_http_pid
+    mcp_http_pid="$(managed_pid "$MCP_HTTP_PID_FILE" "$APP_ROOT" 2>/dev/null || true)"
+    if [ -n "$mcp_http_pid" ] && pid_alive "$mcp_http_pid" && mcp_http_ok; then
+      echo "✅ [mcp-http] ${MCP_HTTP_BIND}:${MCP_HTTP_PORT}/mcp"
+    else
+      echo "⚠️  [mcp-http] 未启动（HDB_MCP_HTTP_ENABLED=true）"
+      unmanaged=1
+    fi
+  fi
   if [ "$rc" = 0 ] && [ "$unmanaged" = 0 ]; then
     echo "—— API、前端和脚本纳管的 Worker 均已就绪 ——"
   elif [ "$rc" = 0 ]; then
@@ -401,6 +448,7 @@ do_logs() {
   local role logs log
   logs="$LOG_DIR/api.log $LOG_DIR/frontend.log $LOG_DIR/memory-worker.log $LOG_DIR/export-worker.log"
   [ "$DRAWIO_MCP_ENABLED" = "true" ] && logs="$logs $LOG_DIR/drawio-mcp.log"
+  [ "$MCP_HTTP_ENABLED" = "true" ] && logs="$logs $LOG_DIR/mcp-http.log"
   if [ "$WORKER_ROLES" = "all" ]; then
     logs="$logs $LOG_DIR/worker.log"
   else
