@@ -187,7 +187,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
             <dl className="mt-[16px] grid gap-[9px] text-[12px]">
               <div className="flex items-start justify-between gap-[16px]">
                 <dt className="shrink-0 text-[#757f9c]">凭证</dt>
-                <dd className="break-all text-right font-mono text-[12px] text-[#18181a]">
+                <dd className="min-w-0 break-all text-right font-mono text-[12px] text-[#18181a]">
                   {tokenValue || active.masked_token || '已生成'}
                 </dd>
               </div>
