@@ -34,6 +34,10 @@ export HDB_API_BASE="${HDB_API_BASE:-http://127.0.0.1:8002/api/v1}"
 export HDB_MCP_TRANSPORT="${HDB_MCP_TRANSPORT:-streamable-http}"
 export HDB_MCP_HOST="${HDB_MCP_HOST:-127.0.0.1}"
 export HDB_MCP_PORT="${HDB_MCP_PORT:-9100}"
+# Cross-host binding requires auth: static-token (shared secret) or
+# mcp-token (per-user hdbmcp_* verification).  An unauthentic open listen
+# requires an explicit HDB_MCP_HTTP_ALLOW_UNAUTHED=1 escape hatch.
+export HDB_MCP_HTTP_AUTH HDB_MCP_HTTP_TOKEN HDB_MCP_HTTP_ALLOW_UNAUTHED
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 if [[ -x "$ROOT/.venv/bin/python" ]]; then
