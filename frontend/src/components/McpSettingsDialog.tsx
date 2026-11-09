@@ -211,6 +211,15 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
                 >
                   {busy ? '生成中' : created ? '重新生成' : '生成凭证'}
                 </Button>
+                {created ? (
+                  <Button
+                    variant="outline"
+                    className="h-[34px] rounded-[10px] border-[#e3e7f1] text-[13px] text-[#464c5e]"
+                    onClick={() => void copyText(created.token, 'Token')}
+                  >
+                    复制 Token
+                  </Button>
+                ) : null}
                 <Button
                   variant="outline"
                   disabled={busy}
@@ -269,19 +278,6 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
               {created ? agentPrompt : '生成个人凭证后，这里会显示一段可直接发给 Agent 的完整接入说明。'}
             </pre>
           </div>
-
-          {created ? (
-            <div className="mt-[12px] flex flex-wrap gap-[8px]">
-              <Button
-                variant="outline"
-                className="h-[30px] rounded-[9px] border-[#e3e7f1] px-[10px] text-[12px] text-[#464c5e]"
-                onClick={() => void copyText(created.token, 'Token')}
-              >
-                复制 Token
-              </Button>
-
-            </div>
-          ) : null}
         </section>
       </div>
 
