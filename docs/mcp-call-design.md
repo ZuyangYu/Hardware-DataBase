@@ -37,15 +37,14 @@ HDB API（/api/v1）
   - `HDB_API_TOKEN`
   - `PYTHONPATH`
 
-工具固定为 18 个：
+工具固定为 16 个：
 
 ```text
 list_kbs
 list_kb_files
 read_file_chunks
+search_knowledge_base
 download_kb_file
-ask_knowledge_base
-get_evidence
 list_tables
 query_table
 list_assets
@@ -57,14 +56,12 @@ delete_file
 list_spreadsheets
 list_circuit_designs
 query_circuit
-create_drawio_file
 ```
 
 写入规则：
 
 - `upload_file`：真实写入，要求 KB write 权限，平台审计并触发解析。
 - `delete_file`：默认 dry-run，必须显式 `confirm=true`。
-- `create_drawio_file`：只返回 XML 内容，不写宿主文件。
 
 ## 4. OpenCode 配置
 
@@ -98,7 +95,7 @@ Skill 通过软链接注册：
 hdb_list_kbs
 hdb_query_circuit
 hdb_query_table
-hdb_create_drawio_file
+hdb_search_knowledge_base
 ...
 ```
 
@@ -141,7 +138,7 @@ opencode run --auto "调用 hdb_list_kbs，列出知识库名称。"
 ```text
 使用 @hw-design-solution 按“模式 A：单文档执行”画 AAA TCN2 主板的②整体硬件方案框图。
 先用 hdb_list_circuit_designs 和 hdb_query_circuit 查关键器件；
-再用 hdb_create_drawio_file 生成 aaa_tcn2_opencode.drawio；
+再用 hdb_search_knowledge_base + hdb_read_file_chunks 读原始约束与证据；
 最后用 skill 的 scripts/checks 做六项自检。
 ```
 
