@@ -63,45 +63,6 @@ def test_query_circuit_uses_first_design_and_filters():
     assert result["design_id"] == "design-1"
     assert result["instances"][0]["refdes"] == "U1800"
     assert seen["params"] == {"net_query": "U1800", "instance_query": "U1800"}
-
-
-def test_create_drawio_file_builds_valid_xml_with_escaped_labels():
-    result = bridge.create_drawio_file(
-        "test<diagram>.drawio",
-        blocks=[
-            {"id": "soc", "label": "主控 <SoC>", "x": 100, "y": 100, "w": 200, "h": 100},
-            {"id": "ddr", "label": "LPDDR4", "x": 400, "y": 100, "w": 200, "h": 100},
-        ],
-        edges=[
-            {"source": "soc", "target": "ddr", "label": "DDR0_LP4"},
-        ],
-        labels=[{"text": "VCC3V3", "x": 250, "y": 60, "w": 80, "h": 30}],
-    )
-    assert result["filename"] == "test_diagram_.drawio"
-    assert result["sha256"]
-    import xml.etree.ElementTree as ET
-
-    root = ET.fromstring(result["content"])
-    cells = root.findall(".//mxCell")
-    assert any(cell.attrib.get("id") == "0" for cell in cells)
-    assert any(cell.attrib.get("id") == "1" for cell in cells)
-    assert any(cell.attrib.get("id") == "soc" for cell in cells)
-    assert any(cell.attrib.get("id") == "e1" for cell in cells)
-    assert "&lt;SoC&gt;" in result["content"]
-    assert "DDR0_LP4" in result["content"]
-
-
-def test_create_drawio_rejects_unknown_edge_target():
-    import pytest
-
-    with pytest.raises(ValueError, match="source/target"):
-        bridge.create_drawio_file(
-            "bad.drawio",
-            blocks=[{"id": "soc", "label": "SoC", "x": 0, "y": 0, "w": 100, "h": 50}],
-            edges=[{"source": "soc", "target": "missing"}],
-        )
-
-
 def test_query_table_validates_and_executes(monkeypatch):
     monkeypatch.setattr(
         bridge,
@@ -160,24 +121,6 @@ def test_upload_file_posts_multipart_and_returns_ack():
     assert "multipart/form-data" in seen["content_type"]
     assert "note.txt" in seen["body"]
     assert "hello" in seen["body"]
-
-
-def test_create_drawio_file_auto_routes_without_explicit_points():
-    result = bridge.create_drawio_file(
-        "auto.drawio",
-        blocks=[
-            {"id": "a", "label": "A", "x": 100, "y": 100, "w": 100, "h": 60},
-            {"id": "b", "label": "B", "x": 400, "y": 300, "w": 100, "h": 60},
-        ],
-        edges=[{"source": "a", "target": "b", "label": "A→B"}],
-    )
-    assert 'as="sourcePoint"' in result["content"]
-    assert 'as="targetPoint"' in result["content"]
-    assert '<Array as="points">' in result["content"]
-    import xml.etree.ElementTree as ET
-
-    ET.fromstring(result["content"])
-
 
 def test_list_tables_uses_department_scoped_database(monkeypatch):
     monkeypatch.setattr(

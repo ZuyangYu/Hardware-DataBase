@@ -148,7 +148,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
     '   执行：claude mcp add --transport http hdb ' + (remoteUrl || '<HDB MCP 地址>') + ' --header "X-HDB-MCP-Token: ' + tokenForPrompt + '"',
     'C. 其它支持远程 MCP 的客户端：新建远程 MCP，名称 hdb，地址同上，认证/请求头填 X-HDB-MCP-Token。',
     '',
-    '保存或执行后重启/新开会话，先调用 hdb_list_kbs 验证连接；成功应看到 hdb_ 前缀的工具（共 17 个）。',
+    '保存或执行后重启/新开会话，先调用 hdb_list_kbs 验证连接；成功应看到 hdb_ 前缀的工具（共 16 个）。',
     '然后调用 hdb_search_knowledge_base，搜索“项目中关于休眠电流的要求”，把命中的文件与 chunk 位置告诉我。',
   ].join('\n');
 

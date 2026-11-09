@@ -294,7 +294,7 @@ profile digest、runtime attestation 和 Artifact Broker 扫描器引用；启�
 
 ## HDB 自身作为远程 MCP（知识库/网表/表格检索）
 
-hdb 自带的 17 个 MCP 工具现在也支持标准远程接入（streamable_http）：
+hdb 自带的 16 个 MCP 工具现在也支持标准远程接入（streamable_http）：
 
 ```bash
 # 启动远程 server（默认 127.0.0.1:9100，双模式兼容 stdio）
