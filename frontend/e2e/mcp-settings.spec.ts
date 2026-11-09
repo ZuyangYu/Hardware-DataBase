@@ -29,6 +29,7 @@ async function installMocks(page: Page) {
           has_token: false, token_id: '', name: '', masked_token: '',
           created_at: '', expires_at: '', last_used_at: '',
           api_base: 'http://127.0.0.1:8002/api/v1',
+          mcp_remote_url: 'http://127.0.0.1:9100/mcp',
         } });
       }
       if (request.method() === 'POST') {
@@ -42,6 +43,7 @@ async function installMocks(page: Page) {
           last_used_at: '',
           token: 'hdbmcp_test_secret',
           api_base: 'http://127.0.0.1:8002/api/v1',
+          mcp_remote_url: 'http://127.0.0.1:9100/mcp',
           command: 'install -d -m 700 ~/.config/hdb && printf %s hdbmcp_test_secret > ~/.config/hdb/mcp_token && opencode mcp add hdb --global -- /repo/scripts/hdb_mcp_stdio.sh',
         } });
       }
@@ -64,6 +66,9 @@ test('侧边栏 MCP 接入页可以生成凭证并复制完整接入说明', asy
 
   await expect(page.getByText('hdbmcp_test_secret', { exact: true })).toBeVisible();
   await expect(page.getByText(/opencode mcp add hdb/)).toBeVisible();
+  await expect(page.getByText(/MCP 远程接入（标准 streamable-http）/)).toBeVisible();
+  await expect(page.getByText(/远程 MCP URL（streamable-http）/)).toBeVisible();
+  await expect(page.getByText('X-HDB-MCP-Token: hdbmcp_test_secret', { exact: true })).toBeVisible();
   await expect(page.getByText('平台 API 地址（HDB_API_BASE，由本地桥使用）')).toBeVisible();
   await expect(page.getByText('http://127.0.0.1:8002/api/v1', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: '复制全部' })).toBeVisible();

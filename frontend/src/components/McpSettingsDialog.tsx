@@ -21,6 +21,7 @@ type McpTokenStatus = {
   expires_at: string;
   last_used_at: string;
   api_base: string;
+  mcp_remote_url?: string;
 };
 
 type McpTokenCreated = McpTokenStatus & {
@@ -114,13 +115,21 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
 
   const active = created || (status?.has_token ? status : null);
   const apiBase = created?.api_base || status?.api_base || '';
-  const connectionPaste = created
+  const remoteUrl = created?.mcp_remote_url || status?.mcp_remote_url || '';
+  const remotePaste = created
     ? [
-        'MCP 传输：stdio（本机子进程，不是远程 URL）',
+        'MCP 远程接入（标准 streamable-http）',
+        `URL: ${remoteUrl}`,
+        `请求头：X-HDB-MCP-Token: ${created.token}`,
+        '工具名前缀：hdb_（Agent 自动加载）',
+      ].join('\n')
+    : '';
+  const stdioPaste = created
+    ? [
+        '备用：MCP 本机子进程（stdio）',
         `平台 API 地址：${created.api_base}`,
         `个人 Token：${created.token}`,
         `接入命令：${created.command}`,
-        '工具名前缀：hdb_（OpenCode 自动加，不需要手输）',
       ].join('\n')
     : '';
 
@@ -219,11 +228,26 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
         </section>
 
         <section className="rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
-          <h2 className="text-[14px] font-semibold text-[#18181a]">给外部 Agent 的接入说明</h2>
+          <h2 className="text-[14px] font-semibold text-[#18181a]">给外部 Agent 的接入说明（推荐：远程 MCP）</h2>
           <p className="mt-[4px] text-[12px] leading-[18px] text-[#757f9c]">
-            这是本机 stdio MCP，不是远程 MCP URL。外部 Agent 通过下面的命令启动本地桥，
-            再用你的 Token 访问平台 API。
+            远程 MCP 是标准 streamable-http，任何支持 MCP 的 Agent（OpenCode / Claude / Cursor
+            等）直接连 URL，带上你的 hdbmcp_* 令牌即可，无需在本机启动子进程。
           </p>
+
+          <div className="mt-[14px] grid gap-[10px] text-[12px]">
+            <div className="grid gap-[4px]">
+              <span className="text-[#757f9c]">远程 MCP URL（streamable-http）</span>
+              <code className="break-all rounded-[8px] border border-[#e3e7f1] bg-[#f8fafc] px-[10px] py-[8px] font-mono text-[12px] text-[#18181a]">
+                {remoteUrl || '生成凭证后显示'}
+              </code>
+            </div>
+            <div className="grid gap-[4px]">
+              <span className="text-[#757f9c]">请求头（工具调用时的门禁）</span>
+              <code className="break-all rounded-[8px] border border-[#e3e7f1] bg-[#f8fafc] px-[10px] py-[8px] font-mono text-[12px] text-[#18181a]">
+                X-HDB-MCP-Token: {created?.token || active?.masked_token || '<你的 hdbmcp_*>'}
+              </code>
+            </div>
+          </div>
 
           <div className="mt-[14px] grid gap-[10px] text-[12px]">
             <div className="grid gap-[4px]">
@@ -233,9 +257,9 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
               </code>
             </div>
             <div className="grid gap-[4px]">
-              <span className="text-[#757f9c]">传输方式 / 运行位置</span>
+              <span className="text-[#757f9c]">备选传输（高级）：stdio，本机子进程</span>
               <div className="rounded-[8px] border border-[#e3e7f1] bg-[#f8fafc] px-[10px] py-[8px] text-[#18181a]">
-                stdio，本机子进程；不是远程 MCP URL
+                推荐优先使用上方远程 URL；本机子进程仅在 Agent/网络不支持远程 MCP 时使用
               </div>
             </div>
           </div>
@@ -247,14 +271,18 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
                 <Button
                   variant="outline"
                   className="h-[30px] rounded-[9px] border-[#e3e7f1] px-[10px] text-[12px] text-[#464c5e]"
-                  onClick={() => void copyText(connectionPaste, '接入说明')}
+                  onClick={() => void copyText(remotePaste, '远程接入说明')}
                 >
                   复制全部
                 </Button>
               ) : null}
             </div>
             <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] text-[12px] leading-[20px] text-[#18181a]">
-              {created ? connectionPaste : '生成个人凭证后，这里会显示 Token、连接地址和一句话接入命令。'}
+              {created ? remotePaste : '生成个人凭证后，这里会显示远程 URL、X-HDB-MCP-Token 请求头和工具名前缀。'}
+            </pre>
+            <div className="mt-[6px] text-[12px] font-medium text-[#454b5c]">备选：本机子进程（stdio）复制说明</div>
+            <pre className="max-h-[200px] overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] text-[12px] leading-[20px] text-[#18181a]">
+              {created ? stdioPaste : '生成个人凭证后，这里会显示本机子进程命令（备选方式）。'}
             </pre>
           </div>
 
@@ -270,7 +298,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
               <Button
                 variant="outline"
                 className="h-[30px] rounded-[9px] border-[#e3e7f1] px-[10px] text-[12px] text-[#464c5e]"
-                onClick={() => void copyText(created.command, '接入命令')}
+                onClick={() => void copyText(stdioPaste, '子进程接入说明')}
               >
                 复制接入命令
               </Button>

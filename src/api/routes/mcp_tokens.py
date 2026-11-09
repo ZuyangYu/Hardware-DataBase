@@ -51,6 +51,18 @@ def _api_base(request: Request) -> str:
     return str(request.base_url).rstrip("/") + "/api/v1"
 
 
+def _mcp_remote_url(request: Request) -> str:
+    """Public URL of the hdb MCP bridge (streamable-http, remote mode).
+
+    Defaults to the API host + :9100/mcp; HDB_MCP_HTTP_HOST/HDB_MCP_HTTP_PORT
+    override when the bridge is deployed elsewhere (nginx, other box, …).
+    """
+    host = os.getenv("HDB_MCP_HTTP_HOST") or (request.url.hostname or "127.0.0.1")
+    port = os.getenv("HDB_MCP_HTTP_PORT", "9100")
+    scheme = os.getenv("HDB_MCP_HTTP_SCHEME", "http")
+    return f"{scheme}://{host}:{port}/mcp"
+
+
 def _command(request: Request, token: str) -> str:
     api_base = _api_base(request)
     repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
@@ -76,6 +88,7 @@ def get_my_mcp_token(
     return McpTokenStatus(
         **mcp_tokens.get_status(user.id),
         api_base=_api_base(request),
+        mcp_remote_url=_mcp_remote_url(request),
     )
 
 
@@ -101,6 +114,7 @@ def create_my_mcp_token(
         has_token=True,
         **created,
         api_base=_api_base(request),
+        mcp_remote_url=_mcp_remote_url(request),
         command=_command(request, created["token"]),
     )
 
