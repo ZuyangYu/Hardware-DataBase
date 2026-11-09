@@ -5,6 +5,7 @@ import type { AuthSession } from '../auth';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui';
 import { Button } from '@/components/ui/button';
 import { notify } from '@/components/ui/app-toast';
+import { copyTextToClipboard } from '../lib/clipboard';
 
 type Props = {
   open: boolean;
@@ -22,6 +23,7 @@ type McpTokenStatus = {
   last_used_at: string;
   api_base: string;
   mcp_remote_url?: string;
+  token?: string;
 };
 
 type McpTokenCreated = McpTokenStatus & {
@@ -43,12 +45,17 @@ function formatDate(value: string): string {
 }
 
 async function copyText(value: string, label: string) {
-  try {
-    await navigator.clipboard.writeText(value);
-    notify.success(`${label}已复制`);
-  } catch {
-    notify.error('复制失败，请手动选择文本');
+  if (!value) {
+    notify.error('暂无可复制内容');
+    return;
   }
+  const copied = await copyTextToClipboard(value);
+  if (copied) {
+    notify.success(`${label}已复制`);
+    return;
+  }
+  notify.error('自动复制失败，请在弹出的窗口中手动复制');
+  window.prompt(`自动复制失败，请手动复制${label}：`, value);
 }
 
 export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
@@ -115,8 +122,10 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
 
   const active = created || (status?.has_token ? status : null);
   const remoteUrl = created?.mcp_remote_url || status?.mcp_remote_url || '';
+  const tokenValue = created?.token || active?.token || '';
+  const hasToken = Boolean(tokenValue);
   // 让通用 Agent 自己接线并验证的一段话（小白直接复制粘贴）
-  const tokenForPrompt = created?.token || '<你的 hdbmcp_* 令牌>';
+  const tokenForPrompt = tokenValue || '<你的 hdbmcp_* 令牌>';
   const agentPrompt = [
     '请帮我把 HDB 知识库 MCP 接入你当前的运行环境，并完成一次验证。',
     '这是一个标准 MCP 服务（streamable-http），只读知识库检索，不需要 API Key。',
@@ -164,7 +173,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
             <div>
               <h2 className="text-[14px] font-semibold text-[#18181a]">个人凭证</h2>
               <p className="mt-[4px] text-[12px] leading-[18px] text-[#757f9c]">
-                默认有效期 365 天。Token 只在生成时显示一次，请立即复制或保存到密码管理器。
+                默认有效期 365 天。凭证保存在服务端，可随时查看和复制；如怀疑泄露请立即撤销。
               </p>
             </div>
             <span className={`shrink-0 rounded-full px-[9px] py-[3px] text-[11px] ${active ? 'bg-[#e8f7ee] text-[#28784f]' : 'bg-[#f1f3f7] text-[#6b7486]'}`}>
@@ -179,7 +188,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
               <div className="flex items-start justify-between gap-[16px]">
                 <dt className="shrink-0 text-[#757f9c]">凭证</dt>
                 <dd className="break-all text-right font-mono text-[12px] text-[#18181a]">
-                  {created?.token || active.masked_token || '已生成'}
+                  {tokenValue || active.masked_token || '已生成'}
                 </dd>
               </div>
               <div className="flex justify-between gap-[16px]">
@@ -209,13 +218,13 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
                   className="h-[34px] rounded-[10px] bg-[#18181a] text-[13px] text-white hover:bg-[#303030]"
                   onClick={() => void generate()}
                 >
-                  {busy ? '生成中' : created ? '重新生成' : '生成凭证'}
+                  {busy ? '生成中' : '重新生成'}
                 </Button>
-                {created ? (
+                {hasToken ? (
                   <Button
                     variant="outline"
                     className="h-[34px] rounded-[10px] border-[#e3e7f1] text-[13px] text-[#464c5e]"
-                    onClick={() => void copyText(created.token, 'Token')}
+                    onClick={() => void copyText(tokenValue, 'Token')}
                   >
                     复制 Token
                   </Button>
@@ -240,15 +249,15 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
             )}
           </div>
 
-          {active && !created ? (
+          {active && !hasToken ? (
             <p className="mt-[10px] text-[11px] leading-[17px] text-[#8a93a5]">
-              当前账号已有凭证，但令牌只在生成时显示一次。要复制完整接入说明，请点“生成凭证”（旧凭证会立即失效）。
+              当前凭证由旧版本生成，令牌无法回显。点“重新生成”会换发新令牌，此后可随时查看和复制。
             </p>
           ) : null}
 
           {created ? (
             <div className="mt-[14px] rounded-[10px] border border-[#f0d7a8] bg-[#fff8e8] px-[12px] py-[9px] text-[12px] leading-[18px] text-[#8a5a00]">
-              Token 只显示这一次。关闭或刷新页面后，只能重新生成，旧凭证会立即失效。
+              新 Token 已生成，旧凭证已立即失效。此令牌保存在服务端，可随时回到本页查看和复制。
             </div>
           ) : null}
         </section>
@@ -264,7 +273,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
           <div className="mt-[14px] flex min-h-0 flex-1 flex-col gap-[6px]">
             <div className="flex items-center justify-between gap-[8px]">
               <span className="text-[12px] text-[#454b5c]">复制给 Agent（含地址、令牌、登记方法与验证步骤）</span>
-              {created ? (
+              {hasToken ? (
                 <Button
                   variant="outline"
                   className="h-[30px] rounded-[9px] border-[#e3e7f1] px-[10px] text-[12px] text-[#464c5e]"
@@ -275,7 +284,11 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
               ) : null}
             </div>
             <pre className="min-h-[120px] flex-1 overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] text-[12px] leading-[20px] text-[#18181a]">
-              {created ? agentPrompt : '生成个人凭证后，这里会显示一段可直接发给 Agent 的完整接入说明。'}
+              {hasToken
+                ? agentPrompt
+                : active
+                  ? '当前凭证由旧版本生成，令牌无法回显。请先点“重新生成”换发一次新令牌。'
+                  : '生成个人凭证后，这里会显示一段可直接发给 Agent 的完整接入说明。'}
             </pre>
           </div>
         </section>
@@ -284,7 +297,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
       <section className="shrink-0 rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
         <h2 className="text-[14px] font-semibold text-[#18181a]">使用说明</h2>
         <ol className="mt-[10px] grid gap-[8px] text-[12px] leading-[19px] text-[#5f687a]">
-          <li>1. 生成个人凭证（令牌只显示一次）。</li>
+          <li>1. 生成个人凭证。</li>
           <li>2. 点"复制给 Agent"，把整段话原样粘贴给你正在使用的 Agent。</li>
           <li>3. Agent 会自己完成登记并调用 <code>hdb_list_kbs</code> 验证；之后直接用自然语言提问即可。</li>
           <li>4. 凭证泄露或人员变动时，立即在本页撤销并重新生成。</li>

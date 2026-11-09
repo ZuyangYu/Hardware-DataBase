@@ -30,6 +30,7 @@ class McpTokenStatus(BaseModel):
     last_used_at: str = ""
     api_base: str = ""
     mcp_remote_url: str = ""
+    token: str = ""
 
 
 class CreateMcpTokenRequest(BaseModel):
@@ -38,7 +39,6 @@ class CreateMcpTokenRequest(BaseModel):
 
 
 class CreateMcpTokenResponse(McpTokenStatus):
-    token: str = ""
     command: str = ""
 
 
