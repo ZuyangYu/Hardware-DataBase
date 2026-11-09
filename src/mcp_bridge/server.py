@@ -12,7 +12,7 @@ Run over stdio:
 
 Tools:
 - list_kbs / list_kb_files / read_file_chunks
-- ask_knowledge_base (runs one KB turn and returns the cited answer)
+- search_knowledge_base (stateless chunk hits with locators; no session)
 - list_spreadsheets / list_circuit_designs / query_circuit
 - create_drawio_file (compact block/edge spec -> native .drawio XML)
 """
@@ -23,7 +23,6 @@ import base64
 import binascii
 import hashlib
 import html
-import json
 import os
 import re
 import time
@@ -41,14 +40,11 @@ _API_KEY = os.getenv("HDB_API_KEY", "").strip()
 _MCP_TOKEN = os.getenv("HDB_MCP_TOKEN", "").strip()
 _USERNAME = os.getenv("HDB_USERNAME", "").strip()
 _PASSWORD = os.getenv("HDB_PASSWORD", "")
-_TIMEOUT = float(os.getenv("HDB_MCP_TIMEOUT", "300"))
 
 _MAX_TOOL_TEXT = 20_000
-_MAX_EVIDENCE = 12
 _MAX_ROWS = 50
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 _LOGIN_USER: dict[str, Any] = {}
-_EVIDENCE_CACHE: dict[str, dict[str, Any]] = {}
 _DRAWIO_EDGE_STYLE = (
     "edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;"
     "jettySize=auto;html=1;endArrow=block;endFill=1;"
@@ -146,35 +142,6 @@ def _kb_path(kb_name: str) -> str:
 def _clip(value: Any, limit: int = _MAX_TOOL_TEXT) -> str:
     text = str(value or "")
     return text if len(text) <= limit else text[:limit] + "\n…(truncated)"
-
-
-def _evidence_items(turn: dict[str, Any], limit: int = _MAX_EVIDENCE) -> list[dict[str, Any]]:
-    summary = turn.get("summary") or {}
-    items: list[dict[str, Any]] = []
-    for raw in (summary.get("evidence") or [])[:limit]:
-        if not isinstance(raw, dict):
-            continue
-        item = {
-            key: raw.get(key)
-            for key in (
-                "citation_number",
-                "source_name",
-                "locator",
-                "snippet",
-                "content",
-                "score",
-            )
-            if raw.get(key) not in (None, "")
-        }
-        evidence_id = hashlib.sha1(
-            json.dumps(item, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-        ).hexdigest()[:16]
-        item["evidence_id"] = evidence_id
-        _EVIDENCE_CACHE[evidence_id] = item
-        if len(_EVIDENCE_CACHE) > 500:
-            _EVIDENCE_CACHE.pop(next(iter(_EVIDENCE_CACHE)))
-        items.append(item)
-    return items
 
 
 def _visible_kb(kb_name: str) -> dict[str, Any]:
@@ -361,7 +328,7 @@ def search_knowledge_base(
     the calling agent to reason over and verify with
     ``hdb_read_file_chunks``.  The chunk index is cached per file (~15 min
     TTL, ``refresh=True`` forces a rebuild); ``file_id`` narrows the search.
-    For LLM-composed answers use ``ask_knowledge_base`` (heavy).
+    Composed narrative answers live in the web /conversations/turns pipeline, not in this bridge's toolset.
     """
     needle = str(query or "").strip()
     if not needle:
@@ -492,80 +459,6 @@ def download_kb_file(
         "size_bytes": len(data),
         "content_base64": base64.b64encode(data).decode("ascii"),
     }
-
-
-@mcp.tool()
-def ask_knowledge_base(
-    question: str,
-    kb_name: str,
-    timeout_seconds: float = _TIMEOUT,
-) -> dict[str, Any]:
-    """Compose an LLM answer over one knowledge base turn with citations.
-
-    Heavy by design: each call creates one conversation + one admitted turn
-    and runs the full agent pipeline (1-5 min, model-quota dependent).  For
-    MCP/agent retrieval prefer `search_knowledge_base` — stateless chunk
-    hits with locators, no session, milliseconds.  Keep this tool only when
-    a platform-composed narrative answer is genuinely required.
-    """
-    session = _request(
-        "POST",
-        "/conversations",
-        json={"kb_name": kb_name, "title": question[:40] or "MCP question"},
-    )
-    session_id = int(session["id"])
-    turn_payload = _request(
-        "POST",
-        f"/conversations/{session_id}/turns",
-        json={"query": question, "source_scope": "knowledge_base_only"},
-    )
-    turn_id = str(turn_payload["turn"]["id"])
-    _request("POST", f"/turns/{turn_id}/start")
-
-    deadline = time.monotonic() + max(10.0, float(timeout_seconds))
-    status = "pending"
-    while time.monotonic() < deadline:
-        turn = _request("GET", f"/turns/{turn_id}")
-        status = str(turn.get("status") or "")
-        if status in {"completed", "failed", "cancelled"}:
-            summary = turn.get("summary") or {}
-            evidence = _evidence_items(turn)
-            return {
-                "status": status,
-                "answer": turn.get("answer") or "",
-                "error_message": turn.get("error_message") or "",
-                "evidence": evidence,
-                "evidence_count": len(summary.get("evidence") or []),
-                "turn_id": turn_id,
-                "session_id": session_id,
-            }
-        time.sleep(2)
-    return {
-        "status": "timeout",
-        "answer": "",
-        "error_message": f"turn still {status} after {timeout_seconds}s",
-        "evidence": [],
-        "evidence_count": 0,
-        "turn_id": turn_id,
-        "session_id": session_id,
-    }
-
-
-@mcp.tool()
-def get_evidence(evidence_id: str) -> dict[str, Any]:
-    """Return one evidence item previously produced by ask_knowledge_base.
-
-    The cache is process-local and bounded; durable evidence readback belongs
-    to the platform's evidence store.  Callers should treat a missing id as
-    "re-ask the question", not as "the source does not exist".
-    """
-    item = _EVIDENCE_CACHE.get(str(evidence_id or "").strip())
-    if item is None:
-        return {
-            "error": "evidence not found in this bridge process",
-            "evidence_id": str(evidence_id or ""),
-        }
-    return item
 
 
 @mcp.tool()
