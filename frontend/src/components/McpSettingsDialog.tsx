@@ -209,7 +209,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
                   className="h-[34px] rounded-[10px] bg-[#18181a] text-[13px] text-white hover:bg-[#303030]"
                   onClick={() => void generate()}
                 >
-                  {busy ? '生成中' : '重新生成'}
+                  {busy ? '生成中' : created ? '重新生成' : '生成凭证'}
                 </Button>
                 <Button
                   variant="outline"
@@ -230,6 +230,12 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
               </Button>
             )}
           </div>
+
+          {active && !created ? (
+            <p className="mt-[10px] text-[11px] leading-[17px] text-[#8a93a5]">
+              当前账号已有凭证，但令牌只在生成时显示一次。要复制完整接入说明，请点“生成凭证”（旧凭证会立即失效）。
+            </p>
+          ) : null}
 
           {created ? (
             <div className="mt-[14px] rounded-[10px] border border-[#f0d7a8] bg-[#fff8e8] px-[12px] py-[9px] text-[12px] leading-[18px] text-[#8a5a00]">
