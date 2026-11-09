@@ -15,7 +15,6 @@ def _reset(monkeypatch):
     monkeypatch.setattr(bridge, "_TOKEN", "test-token")
     monkeypatch.setattr(bridge, "_API_BASE", "http://hdb.test/api/v1")
     monkeypatch.setattr(bridge.time, "sleep", lambda _seconds: None)
-    bridge._EVIDENCE_CACHE.clear()
     yield
     if bridge._http is not None:
         bridge._http.close()
@@ -24,51 +23,6 @@ def _reset(monkeypatch):
 
 def _use(handler):
     bridge._http = httpx.Client(transport=httpx.MockTransport(handler))
-
-
-def test_ask_knowledge_base_polls_until_terminal():
-    polls = {"n": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path == "/api/v1/conversations":
-            return httpx.Response(200, json={"id": 7})
-        if path == "/api/v1/conversations/7/turns":
-            return httpx.Response(201, json={"turn": {"id": "turn-1"}})
-        if path == "/api/v1/turns/turn-1/start":
-            return httpx.Response(202, json={})
-        if path == "/api/v1/turns/turn-1":
-            polls["n"] += 1
-            if polls["n"] == 1:
-                return httpx.Response(200, json={"status": "streaming"})
-            return httpx.Response(
-                200,
-                json={
-                    "status": "completed",
-                    "answer": "U1800 是 TPS62872 [1]",
-                    "summary": {
-                        "evidence": [
-                            {
-                                "citation_number": 1,
-                                "source_name": "825504380_ADAS_SCH_TCN2.EDF",
-                                "locator": "U1800",
-                                "snippet": "TPS62872",
-                            }
-                        ]
-                    },
-                },
-            )
-        raise AssertionError(f"unexpected path {path}")
-
-    _use(handler)
-    result = bridge.ask_knowledge_base("U1800 型号", "AAA")
-    assert result["status"] == "completed"
-    assert "TPS62872" in result["answer"]
-    assert result["evidence_count"] == 1
-    assert result["evidence"][0]["source_name"] == "825504380_ADAS_SCH_TCN2.EDF"
-    evidence_id = result["evidence"][0]["evidence_id"]
-    assert bridge.get_evidence(evidence_id)["snippet"] == "TPS62872"
-    assert polls["n"] == 2
 
 
 def test_list_kbs_returns_payload():

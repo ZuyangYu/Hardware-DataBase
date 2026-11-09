@@ -1,13 +1,13 @@
 # MCP 取数纪律（mcp-probe）
 
-> 状态：2026-11-06 初稿（2026-11-06 晚 P0 修复后更新快照），依据 AAA/ADAS 项目"100% MCP 溯源"实测成败复盘沉淀；owner 校订后删除本行。
+> 状态：2026-11-06 初稿；2026-11-06 晚 P0 修复合入；2026-11-09 更新：hdb_ask_knowledge_base 与 get_evidence 已从 MCP 工具面移除（平台 /turns 管道仍保留在 Web 会话侧），工具面收窄为 17 个无状态工具。owner 校订后删除本行。
 > 适用环节：任何交付物的"必需输入"取数阶段（01~07 全部）。与 SKILL.md 四-1"数值三源"配套——三源纪律管"数值从哪来"，本文件管"MCP 路径探到了什么程度才允许放弃"。
 
 ## 一、探边纪律（探完才许放弃）
 
 1. **先探边，再判死**。对被判定"MCP 取不到"的每一条必需输入，必须先用该工具的**显式最大参数**探一次（不是默认参数）。典型教训：`read_file_chunks` 默认 max_chunks=20 只能读出封面/说明，据此判死"chunking 拿不到正文"是错的——max_chunks=100 即可命中模块总表。为什么：用默认参数得出的"取不到"是"没取到"，不是"取不到"；"没取到"进判定=把操作失误固化成事实结论。
 2. **降维成点查，不许嫌吵**。"需要整个网图/整份文档"常常是错觉：先把交付物需要的事实逐条列成清单，每条对应一次 `hdb_query_circuit` / `hdb_query_table` 点查询即闭环。单条查询返回几百行摘要噪音是**不优雅**，不是**不可行**——两者不许混判。为什么：一旦把"成本高"当"不可行"，取证就静默滑向本地文件，溯源链断裂且没有留下"曾经尝试 MCP"的记录。
-3. **一次失败不算失败**。`hdb_ask_knowledge_base` 的失败形态是：额度 429 + 流式超时**交替出现**（本会话实测 4 失败 1 成功）。判定"RAG 不可用"需要至少 2 次不同问句、跨越较长时间窗的失败，并且每次失败都要换更窄的问题再试一次（宽问句更容易撞超时）。为什么：一次失败拉黑整条链路的后果 = 关键注记留下"本地才知道"的缺口，且永远不会被复核。
+3. **一次失败不算失败**。重型检索（2026-11-09 已移出 MCP 的 ask 类、或未来任何"跑模型管线"的工具）的失败形态是：额度 429 + 流式超时**交替出现**（AAA 试跑实测 4 失败 1 成功）。判定"不可用"需要至少 2 次不同问句、跨越较长时间窗的失败，并且每次失败都要换更窄的问题再试一次（宽问句更容易撞超时）。为什么：一次失败拉黑整条链路的后果 = 关键注记留下"本地才知道"的缺口，且永远不会被复核。
 4. **降级必须登记**。探边全部用尽后仍取不到的，才允许用本地副本。降级时必须在产出物的"来源"列标注：`本地副本 <文件名>（MCP 探边 <工具+参数> 已用尽）`，并把它列入 P0 修复队列（例：`download_kb_file` 用户解析 bug、`read_file_chunks` 无 start_index）。为什么：降级是可审计事件，不是默认行为；不登记就永远没人负责修工具。
 
 ## 二、探边 checklist（逐工具，2026-11-06 版）
@@ -17,7 +17,7 @@
 | `hdb_read_file_chunks` | 新增 `start_index`（可在 100 chunk 之后继续）与 `query` 关键词过滤 | 先 `max_chunks=100` 粗扫定位 chunk 区间，再用 `start_index` 翻页；关键词过滤可直接命中 | API 侧一次返回全部 chunks，bridge 侧切片——分页噪声便宜了 |
 | `hdb_query_circuit` | 新增 `include_summary/include_modules`（默认 off）与 `mode`=both/nets/instances | 重复点查务必保持默认 off；需要看电源网/时钟网清单时再开 `include_summary=True` | MPN 仍不进索引：查 TC377 无果（实际是 TC367），需改用 TC367 或依赖 value/part_number 字段 |
 | `hdb_search_knowledge_base`（**新**） | 检索是 lexical 评分（中文 bigram），非向量召回 | 返回 chunk locator（file/chunk_index/rag_id）+ score+snippet；配合 `read_file_chunks(start_index)` 精读；chunk 索引 15min TTL，`refresh=True` 可强制重建 | 仍建议对"结果证据"做一次精读核验，避免只信 snippet |
-| `hdb_ask_knowledge_base` | **已降出 MCP 默认面**：每次调用真实创建 conversation+turn，走 admission+模型管线（1-5min、吃配额）；仅当需要平台代写带引用答案时使用 | 通用 agent 取素材一律改用 `hdb_search_knowledge_base`；仍用 ask 时保持 timeout ≤150s+窄问句 | 额度/超时交替问题不修（除非转正为人机对话场景再修） |
+| hdb_ask_knowledge_base（已移除） | —（不再暴露；历史实现见 git 历史及 docs/reports/2026-11-06 试跑记录） | 平台代答场景走 Web `/conversations/{id}/turns` 管道 | 不适用；如未来重新引入需先修复 429/超时体验 |
 | `hdb_download_kb_file` | — | 直接可用；以 API_KEY 方式运行的用户解析现回退到 KB 的 `owner_user_id`✔ | 修复后可用；若 owner 失效仍会报错，需换身份或补 owner |
 | `hdb_query_table` | 表格语义层有列错位/连接器混排 | 先看 `列样本` 与实际数据列对齐（正文列常在 col_5，表头声明在 col_7）；同一 sheet 多连接器要按"在控制器上编号"行分段 | 需要靠 describe 类辅助工具（排队中） |
 
