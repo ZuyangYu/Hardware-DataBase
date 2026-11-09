@@ -29,6 +29,7 @@ class McpTokenStatus(BaseModel):
     expires_at: str = ""
     last_used_at: str = ""
     api_base: str = ""
+    mcp_remote_url: str = ""
 
 
 class CreateMcpTokenRequest(BaseModel):
