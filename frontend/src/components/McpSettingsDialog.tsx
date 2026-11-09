@@ -148,7 +148,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         data-mcp-settings-dialog
-        className="flex max-h-[88vh] flex-col gap-0 rounded-[16px] p-0 ring-1 ring-[#e3e7f1] sm:max-w-[980px]"
+        className="flex max-h-[88vh] flex-col gap-0 rounded-[16px] p-0 ring-1 ring-[#e3e7f1] sm:max-w-[980px] xl:h-[88vh] xl:max-h-[900px]"
       >
         <DialogHeader className="gap-[4px] px-[24px] pt-[20px]">
           <DialogTitle className="text-[16px] font-semibold text-[#18181a]">MCP 接入</DialogTitle>
@@ -157,9 +157,9 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
           </DialogDescription>
         </DialogHeader>
 
-        <div className="grid gap-[16px] overflow-y-auto px-[24px] py-[16px]">
-          <div className="grid gap-[16px] xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-        <section className="rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
+        <div className="flex min-h-0 flex-1 flex-col gap-[16px] overflow-y-auto px-[24px] py-[16px] xl:overflow-hidden">
+          <div className="grid gap-[16px] xl:min-h-0 xl:flex-1 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+        <section className="flex min-h-0 flex-col overflow-y-auto rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
           <div className="flex items-start justify-between gap-[12px]">
             <div>
               <h2 className="text-[14px] font-semibold text-[#18181a]">个人凭证</h2>
@@ -244,7 +244,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
           ) : null}
         </section>
 
-        <section className="rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
+        <section className="flex min-h-0 flex-col rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
           <h2 className="text-[14px] font-semibold text-[#18181a]">给外部 Agent 的接入说明</h2>
           <p className="mt-[4px] text-[12px] leading-[18px] text-[#757f9c]">
             复制下面这段话，直接发给你正在使用的 Agent（OpenCode / Claude Code / Cursor 等）。
@@ -252,7 +252,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
           </p>
 
 
-          <div className="mt-[14px] grid gap-[6px]">
+          <div className="mt-[14px] flex min-h-0 flex-1 flex-col gap-[6px]">
             <div className="flex items-center justify-between gap-[8px]">
               <span className="text-[12px] text-[#454b5c]">复制给 Agent（含地址、令牌、登记方法与验证步骤）</span>
               {created ? (
@@ -265,7 +265,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
                 </Button>
               ) : null}
             </div>
-            <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] text-[12px] leading-[20px] text-[#18181a]">
+            <pre className="min-h-[120px] flex-1 overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] text-[12px] leading-[20px] text-[#18181a]">
               {created ? agentPrompt : '生成个人凭证后，这里会显示一段可直接发给 Agent 的完整接入说明。'}
             </pre>
           </div>
@@ -285,7 +285,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
         </section>
       </div>
 
-      <section className="mt-[16px] rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
+      <section className="shrink-0 rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
         <h2 className="text-[14px] font-semibold text-[#18181a]">使用说明</h2>
         <ol className="mt-[10px] grid gap-[8px] text-[12px] leading-[19px] text-[#5f687a]">
           <li>1. 生成个人凭证（令牌只显示一次）。</li>
