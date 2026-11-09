@@ -157,7 +157,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         data-mcp-settings-dialog
-        className="flex max-h-[88vh] flex-col gap-0 rounded-[16px] p-0 ring-1 ring-[#e3e7f1] sm:max-w-[980px] xl:h-[88vh] xl:max-h-[900px]"
+        className="flex max-h-[96vh] flex-col gap-0 rounded-[16px] p-0 ring-1 ring-[#e3e7f1] sm:max-w-[980px] xl:h-[690px]"
       >
         <DialogHeader className="gap-[4px] px-[24px] pt-[20px]">
           <DialogTitle className="text-[16px] font-semibold text-[#18181a]">MCP 接入</DialogTitle>
@@ -168,7 +168,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
 
         <div className="flex min-h-0 flex-1 flex-col gap-[16px] overflow-y-auto px-[24px] py-[16px] xl:overflow-hidden">
           <div className="grid gap-[16px] xl:min-h-0 xl:flex-1 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-        <section className="flex min-h-0 flex-col overflow-y-auto rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
+        <section className="flex min-h-0 flex-col rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
           <div className="flex items-start justify-between gap-[12px]">
             <div>
               <h2 className="text-[14px] font-semibold text-[#18181a]">个人凭证</h2>
@@ -260,6 +260,19 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
               新 Token 已生成，旧凭证已立即失效。此令牌保存在服务端，可随时回到本页查看和复制。
             </div>
           ) : null}
+
+          <div className="mt-[14px] border-t border-[#eef1f6] pt-[12px]">
+            <h3 className="text-[13px] font-semibold text-[#18181a]">使用说明</h3>
+            <ol className="mt-[8px] grid gap-[6px] text-[12px] leading-[18px] text-[#5f687a]">
+              <li>1. 生成个人凭证。</li>
+              <li>2. 点“复制给 Agent”，把整段话原样粘贴给你正在使用的 Agent。</li>
+              <li>3. Agent 会自己完成登记并调用 <code>hdb_list_kbs</code> 验证；之后直接用自然语言提问即可。</li>
+              <li>4. 凭证泄露或人员变动时，立即在本页撤销并重新生成。</li>
+            </ol>
+            <p className="mt-[8px] text-[11px] leading-[17px] text-[#8a93a5]">
+              你当前登录账号：{auth.user.username}。所有通过该凭证的调用都会记到你的账号名下。
+            </p>
+          </div>
         </section>
 
         <section className="flex min-h-0 flex-col rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
@@ -293,19 +306,6 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
           </div>
         </section>
       </div>
-
-      <section className="shrink-0 rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
-        <h2 className="text-[14px] font-semibold text-[#18181a]">使用说明</h2>
-        <ol className="mt-[10px] grid gap-[8px] text-[12px] leading-[19px] text-[#5f687a]">
-          <li>1. 生成个人凭证。</li>
-          <li>2. 点"复制给 Agent"，把整段话原样粘贴给你正在使用的 Agent。</li>
-          <li>3. Agent 会自己完成登记并调用 <code>hdb_list_kbs</code> 验证；之后直接用自然语言提问即可。</li>
-          <li>4. 凭证泄露或人员变动时，立即在本页撤销并重新生成。</li>
-        </ol>
-        <p className="mt-[10px] text-[11px] leading-[18px] text-[#8a93a5]">
-          你当前登录账号：{auth.user.username}。所有通过该凭证的调用都会记到你的账号名下。
-        </p>
-      </section>
         </div>
 
         <div className="flex justify-end border-t border-[#eef1f6] px-[24px] py-[12px]">
