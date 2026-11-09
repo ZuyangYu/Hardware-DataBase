@@ -144,8 +144,35 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
       )
     : '';
   const entryHint =
-    '把上面这段 JSON 复制进 ~/.config/opencode/config.json（已有配置就把 "mcp": {...} 这一段并进去），保存后打开新的 Agent 对话即可。' +
-    '若 Agent 不支持远程 MCP，仍可用 scripts/hdb_mcp_user_setup.sh 的本机子进程方式接入。';
+    '把上面这段 JSON 复制进 ~/.config/opencode/config.json（已有配置就把 "mcp": {...} 这一段并进去），保存后打开新的 Agent 对话即可。';
+
+  // 让通用 Agent 自己接线并验证的一段话（小白直接复制粘贴）
+  const tokenForPrompt = created?.token || '<你的 hdbmcp_* 令牌>';
+  const agentPrompt = [
+    '请帮我把 HDB 知识库 MCP 接入你当前的运行环境，并完成一次验证。',
+    '这是一个标准 MCP 服务（streamable-http），只读知识库检索，不需要 API Key。',
+    '',
+    'MCP 名称：hdb',
+    `服务地址：${remoteUrl || '<HDB MCP 地址>'}`,
+    `请求头：X-HDB-MCP-Token: ${tokenForPrompt}`,
+    '',
+    '请按你实际的客户端类型选择一种操作：',
+    'A. 如果你是 OpenCode：',
+    '   编辑 ~/.config/opencode/config.json，把下面这段合并进已有的 mcp 字段（不要覆盖其它 mcp 项）：',
+    '   {',
+    '     "hdb": {',
+    '       "type": "remote",',
+    `       "url": "${remoteUrl || '<HDB MCP 地址>'}",`,
+    '       "headers": { "X-HDB-MCP-Token": "' + tokenForPrompt + '" }',
+    '     }',
+    '   }',
+    'B. 如果你是 Claude Code：',
+    '   执行：claude mcp add --transport http hdb ' + (remoteUrl || '<HDB MCP 地址>') + ' --header "X-HDB-MCP-Token: ' + tokenForPrompt + '"',
+    'C. 其它支持远程 MCP 的客户端：新建远程 MCP，名称 hdb，地址同上，认证/请求头填 X-HDB-MCP-Token。',
+    '',
+    '保存或执行后重启/新开会话，先调用 hdb_list_kbs 验证连接；成功应看到 hdb_ 前缀的工具（共 17 个）。',
+    '然后调用 hdb_search_knowledge_base，搜索“项目中关于休眠电流的要求”，把命中的文件与 chunk 位置告诉我。',
+  ].join('\n');
 
 
   return (
@@ -296,6 +323,22 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
               {created ? opencodeEntrySnippet : '生成个人凭证后，这里会显示可直接粘到 Agent 配置文件里的 JSON 片段。'}
             </pre>
             <p className="mt-[6px] text-[11px] leading-[18px] text-[#8a93a5]">{entryHint}</p>
+
+            <div className="mt-[14px] flex items-center justify-between gap-[8px]">
+              <span className="text-[12px] text-[#454b5c]">
+                或者把这段话发给你正在使用的 Agent，让它自己接入并验证
+              </span>
+              <Button
+                variant="outline"
+                className="h-[30px] rounded-[9px] border-[#e3e7f1] px-[10px] text-[12px] text-[#464c5e]"
+                onClick={() => void copyText(agentPrompt, 'Agent 自助接入说明')}
+              >
+                复制给 Agent
+              </Button>
+            </div>
+            <pre className="max-h-[320px] overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] text-[12px] leading-[20px] text-[#18181a]">
+              {created ? agentPrompt : '生成个人凭证后，这里会显示一段可直接发给 Agent 的自助接入说明。'}
+            </pre>
 
           </div>
 
