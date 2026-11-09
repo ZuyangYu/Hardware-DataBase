@@ -66,9 +66,9 @@ test('侧边栏 MCP 接入页可以生成凭证并复制完整接入说明', asy
 
   await expect(page.getByText('hdbmcp_test_secret', { exact: true })).toBeVisible();
   
-  await expect(page.getByText(/MCP 远程接入（标准 streamable-http）/)).toBeVisible();
-  await expect(page.getByText(/远程 MCP URL（streamable-http）/)).toBeVisible();
-  await expect(page.getByText('X-HDB-MCP-Token: hdbmcp_test_secret', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '复制给 Agent' })).toBeVisible();
+  await expect(page.getByText(/hdb_list_kbs/)).toBeVisible();
+  await expect(page.getByText(/X-HDB-MCP-Token: hdbmcp_test_secret/)).toBeVisible();
   await expect(page.getByText('X-HDB-MCP-Token: hdbmcp_test_secret', { exact: true })).toBeVisible();
   
   await expect(page.getByRole('button', { name: '复制全部' })).toBeVisible();
