@@ -114,7 +114,6 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
   }
 
   const active = created || (status?.has_token ? status : null);
-  const apiBase = created?.api_base || status?.api_base || '';
   const remoteUrl = created?.mcp_remote_url || status?.mcp_remote_url || '';
   const remotePaste = created
     ? [
@@ -124,14 +123,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
         '工具名前缀：hdb_（Agent 自动加载）',
       ].join('\n')
     : '';
-  const stdioPaste = created
-    ? [
-        '备用：MCP 本机子进程（stdio）',
-        `平台 API 地址：${created.api_base}`,
-        `个人 Token：${created.token}`,
-        `接入命令：${created.command}`,
-      ].join('\n')
-    : '';
+
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -249,21 +241,6 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
             </div>
           </div>
 
-          <div className="mt-[14px] grid gap-[10px] text-[12px]">
-            <div className="grid gap-[4px]">
-              <span className="text-[#757f9c]">平台 API 地址（HDB_API_BASE，由本地桥使用）</span>
-              <code className="break-all rounded-[8px] border border-[#e3e7f1] bg-[#f8fafc] px-[10px] py-[8px] font-mono text-[12px] text-[#18181a]">
-                {apiBase || '生成凭证后显示'}
-              </code>
-            </div>
-            <div className="grid gap-[4px]">
-              <span className="text-[#757f9c]">备选传输（高级）：stdio，本机子进程</span>
-              <div className="rounded-[8px] border border-[#e3e7f1] bg-[#f8fafc] px-[10px] py-[8px] text-[#18181a]">
-                推荐优先使用上方远程 URL；本机子进程仅在 Agent/网络不支持远程 MCP 时使用
-              </div>
-            </div>
-          </div>
-
           <div className="mt-[14px] grid gap-[6px]">
             <div className="flex items-center justify-between gap-[8px]">
               <span className="text-[12px] text-[#454b5c]">可复制接入说明</span>
@@ -280,10 +257,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
             <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] text-[12px] leading-[20px] text-[#18181a]">
               {created ? remotePaste : '生成个人凭证后，这里会显示远程 URL、X-HDB-MCP-Token 请求头和工具名前缀。'}
             </pre>
-            <div className="mt-[6px] text-[12px] font-medium text-[#454b5c]">备选：本机子进程（stdio）复制说明</div>
-            <pre className="max-h-[200px] overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] text-[12px] leading-[20px] text-[#18181a]">
-              {created ? stdioPaste : '生成个人凭证后，这里会显示本机子进程命令（备选方式）。'}
-            </pre>
+
           </div>
 
           {created ? (
@@ -295,13 +269,7 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
               >
                 复制 Token
               </Button>
-              <Button
-                variant="outline"
-                className="h-[30px] rounded-[9px] border-[#e3e7f1] px-[10px] text-[12px] text-[#464c5e]"
-                onClick={() => void copyText(stdioPaste, '子进程接入说明')}
-              >
-                复制接入命令
-              </Button>
+
             </div>
           ) : null}
         </section>
@@ -310,9 +278,9 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
       <section className="mt-[16px] rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
         <h2 className="text-[14px] font-semibold text-[#18181a]">使用说明</h2>
         <ol className="mt-[10px] grid gap-[8px] text-[12px] leading-[19px] text-[#5f687a]">
-          <li>1. 生成个人凭证，复制“可复制接入说明”。</li>
-          <li>2. 在装好 OpenCode / Claude Code 的机器上执行接入命令。</li>
-          <li>3. 新开一个对话（不要在当前对话里继续）。OpenCode 会自动加载 hdb 工具，工具名显示为 <code>hdb_list_kbs</code> 这种形式；你直接用自然语言提问即可。</li>
+          <li>1. 生成个人凭证，复制"可复制接入说明"里的远程 URL 与请求头。</li>
+          <li>2. 在 Agent（OpenCode / Claude / Cursor 等）的 MCP 设置里登记该 URL，并配置 <code>X-HDB-MCP-Token</code> 请求头。</li>
+          <li>3. 远程 MCP 本身常驻服务端，无需本机启动子进程。Agent 会自动加载 hdb 工具（工具名形如 <code>hdb_list_kbs</code>），直接用自然语言提问即可。</li>
           <li>4. 凭证泄露或人员变动时，立即在本页撤销并重新生成。</li>
         </ol>
         <p className="mt-[10px] text-[11px] leading-[18px] text-[#8a93a5]">
