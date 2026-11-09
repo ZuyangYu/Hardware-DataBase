@@ -31,8 +31,60 @@ from urllib.parse import quote, urlencode
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
-mcp = FastMCP("hdb-knowledge")
+
+def _normalise_host(value: str) -> str:
+    host = str(value or "").strip().rstrip("/")
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    return host.split("/", 1)[0]
+
+
+def _mcp_allowed_hosts() -> list[str]:
+    """Host-header allow-list for the streamable-http transport.
+
+    Loopback is always allowed.  ``HDB_MCP_HTTP_HOST`` (the public address
+    the UI advertises) and ``HDB_MCP_ALLOWED_HOSTS`` (comma-separated extras)
+    extend it for LAN/domain access.  A bare host gets the ``:*`` port
+    wildcard; an explicit ``host:port``/IPv6 pattern is kept as-is.
+    """
+    patterns = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    extras = ",".join(
+        [
+            os.getenv("HDB_MCP_ALLOWED_HOSTS", ""),
+            os.getenv("HDB_MCP_HTTP_HOST", ""),
+        ]
+    )
+    for raw in extras.split(","):
+        host = _normalise_host(raw)
+        if not host:
+            continue
+        pattern = host if ":" in host else f"{host}:*"
+        if pattern not in patterns:
+            patterns.append(pattern)
+    return patterns
+
+
+def _mcp_allowed_origins(hosts: list[str]) -> list[str]:
+    origins: list[str] = []
+    for host in hosts:
+        for scheme in ("http", "https"):
+            origin = f"{scheme}://{host}"
+            if origin not in origins:
+                origins.append(origin)
+    return origins
+
+
+_ALLOWED_HOSTS = _mcp_allowed_hosts()
+mcp = FastMCP(
+    "hdb-knowledge",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_ALLOWED_HOSTS,
+        allowed_origins=_mcp_allowed_origins(_ALLOWED_HOSTS),
+    ),
+)
 
 _API_BASE = os.getenv("HDB_API_BASE", "http://127.0.0.1:8002/api/v1").rstrip("/")
 _TOKEN = os.getenv("HDB_API_TOKEN", "").strip()

@@ -600,3 +600,22 @@ def test_main_guard_and_bind_flows(monkeypatch):
     monkeypatch.setenv("HDB_MCP_HOST", "127.0.0.1")
     bridge.main()
     assert isinstance(uv_calls[-1]["app"], bridge._McpTokenAuthMiddleware)
+
+
+def test_http_allowed_hosts_include_public_host(monkeypatch):
+    monkeypatch.setenv("HDB_MCP_HTTP_HOST", "192.0.2.10")
+    monkeypatch.delenv("HDB_MCP_ALLOWED_HOSTS", raising=False)
+    hosts = bridge._mcp_allowed_hosts()
+    assert "127.0.0.1:*" in hosts
+    assert "192.0.2.10:*" in hosts
+    origins = bridge._mcp_allowed_origins(hosts)
+    assert "http://192.0.2.10:*" in origins
+
+
+def test_http_allowed_hosts_merge_extra_patterns(monkeypatch):
+    monkeypatch.setenv("HDB_MCP_HTTP_HOST", "https://hdb.example.com/")
+    monkeypatch.setenv("HDB_MCP_ALLOWED_HOSTS", "10.0.0.5, example.org:9100")
+    hosts = bridge._mcp_allowed_hosts()
+    assert "hdb.example.com:*" in hosts
+    assert "10.0.0.5:*" in hosts
+    assert "example.org:9100" in hosts
