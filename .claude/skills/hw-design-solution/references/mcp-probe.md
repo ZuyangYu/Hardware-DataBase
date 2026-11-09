@@ -1,6 +1,6 @@
 # MCP 取数纪律（mcp-probe）
 
-> 状态：2026-11-06 初稿；2026-11-06 晚 P0 修复合入；2026-11-09 更新：hdb_ask_knowledge_base 与 get_evidence 已从 MCP 工具面移除（平台 /turns 管道仍保留在 Web 会话侧），工具面收窄为 17 个无状态工具。owner 校订后删除本行。
+> 状态：2026-11-06 初稿；2026-11-06 晚 P0 修复合入；2026-11-09：① hdb_ask* 与 get_evidence 移除，toolset 收窄为 17。② 远程 MCP 去掉 static-token 分支，只留 per-user hdbmcp_* 门禁（ACCEPT 默认）；HDB_MCP_HOST=0.0.0.0 跨机不再默认拒绝，改警告 + 挂门禁（HDB_MCP_HTTP_ALLOW_UNAUTHED=1 显式裸开）。owner 校订后删除本行。
 > 适用环节：任何交付物的"必需输入"取数阶段（01~07 全部）。与 SKILL.md 四-1"数值三源"配套——三源纪律管"数值从哪来"，本文件管"MCP 路径探到了什么程度才允许放弃"。
 
 ## 一、探边纪律（探完才许放弃）
@@ -18,7 +18,7 @@
 | `hdb_query_circuit` | 新增 `include_summary/include_modules`（默认 off）与 `mode`=both/nets/instances | 重复点查务必保持默认 off；需要看电源网/时钟网清单时再开 `include_summary=True` | MPN 仍不进索引：查 TC377 无果（实际是 TC367），需改用 TC367 或依赖 value/part_number 字段 |
 | `hdb_search_knowledge_base`（**新**） | 检索是 lexical 评分（中文 bigram），非向量召回 | 返回 chunk locator（file/chunk_index/rag_id）+ score+snippet；配合 `read_file_chunks(start_index)` 精读；chunk 索引 15min TTL，`refresh=True` 可强制重建 | 仍建议对"结果证据"做一次精读核验，避免只信 snippet |
 | hdb_ask_knowledge_base（已移除） | —（不再暴露；历史实现见 git 历史及 docs/reports/2026-11-06 试跑记录） | 平台代答场景走 Web `/conversations/{id}/turns` 管道 | 不适用；如未来重新引入需先修复 429/超时体验 |
-| `hdb_download_kb_file` | — | 直接可用；以 API_KEY 方式运行的用户解析现回退到 KB 的 `owner_user_id`✔ | 修复后可用；若 owner 失效仍会报错，需换身份或补 owner |
+| `hdb_download_kb_file` | — | 直接可用；API_KEY 部署回退 KB `owner_user_id`✔；远程 MCP 起手后仅剩 `hdbmcp_*` 单一令牌门禁 | — |
 | `hdb_query_table` | 表格语义层有列错位/连接器混排 | 先看 `列样本` 与实际数据列对齐（正文列常在 col_5，表头声明在 col_7）；同一 sheet 多连接器要按"在控制器上编号"行分段 | 需要靠 describe 类辅助工具（排队中） |
 
 > 表中"已登记缺陷"是 2026-11-06 快照，tool 修复落地后要重新实测并更新本表；**禁止拿旧快照当永久限制**。

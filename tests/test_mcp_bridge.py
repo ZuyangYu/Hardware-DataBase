@@ -488,10 +488,25 @@ def test_main_transports(monkeypatch):
     monkeypatch.setenv("HDB_MCP_HOST", "0.0.0.0")
     monkeypatch.setenv("HDB_MCP_PORT", "9100")
     monkeypatch.setenv("HDB_MCP_HTTP_ALLOW_UNAUTHED", "1")
+
+    import uvicorn as _uv
+
+    monkeypatch.setattr(
+        _uv, "run", lambda *args, **kwargs: calls.append({"transport": "streamable-http", **kwargs})
+    )
     bridge.main()
-    assert calls[-1] == {"transport": "streamable-http"}
+    assert calls[-1]["transport"] == "streamable-http"
+    assert calls[-1]["host"] == "0.0.0.0"
+    assert calls[-1]["port"] == 9100
     assert bridge.mcp.settings.host == "0.0.0.0"
     assert bridge.mcp.settings.port == 9100
+
+
+
+def _recording_app(recorder: dict) -> object:
+    async def app(scope, receive, send):
+        recorder["called"] = True
+    return app
 
 
 def _recording_app(recorder: dict) -> object:
@@ -526,29 +541,6 @@ def _run_middleware_scope(mw: object, headers: dict[str, str]) -> dict[str, obje
     return captured
 
 
-def test_http_auth_static_token_mode(monkeypatch):
-    monkeypatch.setenv("HDB_MCP_HTTP_TOKEN", "hdb-shared-secret")
-    recorder: dict = {}
-    mw = bridge._McpTokenAuthMiddleware(_recording_app(recorder), mode="static-token")
-
-    wrong = _run_middleware_scope(mw, {})  # no header
-    messages = wrong.get("messages") or []
-    assert messages and messages[0]["status"] == 401
-    assert recorder.get("called") is not True
-
-    good = _run_middleware_scope(mw, {"X-HDB-MCP-Token": "hdb-shared-secret"})
-    assert recorder.get("called") is True
-    assert (good.get("messages") or []) == []
-
-
-def test_http_auth_static_token_fails_closed(monkeypatch):
-    monkeypatch.delenv("HDB_MCP_HTTP_TOKEN", raising=False)
-    mw = bridge._McpTokenAuthMiddleware(_recording_app({}), mode="static-token")
-    result = _run_middleware_scope(mw, {"X-HDB-MCP-Token": "bogus"})
-    messages = result.get("messages") or []
-    assert messages and messages[0]["status"] == 401
-
-
 def test_http_auth_mcp_token_verifies_via_platform(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         if (
@@ -561,7 +553,7 @@ def test_http_auth_mcp_token_verifies_via_platform(monkeypatch):
     monkeypatch.setattr(bridge, "_API_BASE", "http://hdb.test/api/v1")
     _use(handler)
     recorder: dict = {}
-    mw = bridge._McpTokenAuthMiddleware(_recording_app(recorder), mode="mcp-token")
+    mw = bridge._McpTokenAuthMiddleware(_recording_app(recorder))
 
     wrong = _run_middleware_scope(mw, {})  # no header
     messages = wrong.get("messages") or []
@@ -579,33 +571,32 @@ def test_http_auth_mcp_token_verifies_via_platform(monkeypatch):
 
 
 def test_main_guard_and_bind_flows(monkeypatch):
-    calls: list[dict] = []
-    monkeypatch.setattr(bridge.mcp, "run", lambda **kwargs: calls.append(kwargs))
+    """Token gate mounted by default; escape hatch swaps to bare app."""
+    uv_calls = []
     monkeypatch.setenv("HDB_MCP_TRANSPORT", "streamable-http")
     monkeypatch.setenv("HDB_MCP_HOST", "0.0.0.0")
     monkeypatch.setenv("HDB_MCP_PORT", "9100")
-    monkeypatch.delenv("HDB_MCP_HTTP_AUTH", raising=False)
     monkeypatch.delenv("HDB_MCP_HTTP_ALLOW_UNAUTHED", raising=False)
-    monkeypatch.delenv("HDB_MCP_HTTP_TOKEN", raising=False)
 
-    with pytest.raises(RuntimeError) as excinfo:  # open LAN refused by default
-        bridge.main()
-    assert "Refusing to bind" in str(excinfo.value)
-
-    monkeypatch.setenv("HDB_MCP_HTTP_ALLOW_UNAUTHED", "1")  # acknowledged open socket
-    bridge.main()
-    assert calls[-1] == {"transport": "streamable-http"}
-
-    # auth path: static-token guarded uvicorn, runner mocked to avoid live serve
-    monkeypatch.delenv("HDB_MCP_HTTP_ALLOW_UNAUTHED", raising=False)
-    monkeypatch.setenv("HDB_MCP_HTTP_AUTH", "static-token")
-    monkeypatch.setenv("HDB_MCP_HTTP_TOKEN", "hdb-shared-secret")
     import uvicorn as _uvicorn_mod
 
-    uv_calls: list[dict] = []
     monkeypatch.setattr(
-        _uvicorn_mod, "run", lambda *args, **kwargs: uv_calls.append({"args": args, **kwargs})
+        _uvicorn_mod,
+        "run",
+        lambda *args, **kwargs: uv_calls.append({"host": kwargs.get("host"), "app": args[0]}),
     )
-    bridge.main()
-    assert uv_calls[-1]["port"] == 9100 and uv_calls[-1]["host"] == "0.0.0.0"
 
+    # default: middleware gate mounted (cross-host requires tokens)
+    bridge.main()
+    assert uv_calls[-1]["host"] == "0.0.0.0"
+    assert isinstance(uv_calls[-1]["app"], bridge._McpTokenAuthMiddleware)
+
+    monkeypatch.setenv("HDB_MCP_HTTP_ALLOW_UNAUTHED", "1")  # explicit escape hatch
+    bridge.main()
+    assert not isinstance(uv_calls[-1]["app"], bridge._McpTokenAuthMiddleware)
+
+    # loopback default also mounts the gate
+    monkeypatch.delenv("HDB_MCP_HTTP_ALLOW_UNAUTHED", raising=False)
+    monkeypatch.setenv("HDB_MCP_HOST", "127.0.0.1")
+    bridge.main()
+    assert isinstance(uv_calls[-1]["app"], bridge._McpTokenAuthMiddleware)
