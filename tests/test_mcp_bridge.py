@@ -515,3 +515,25 @@ def test_download_kb_file_falls_back_to_kb_owner(monkeypatch, tmp_path):
     )
     result = bridge.download_kb_file("AAA", "f2")
     assert base64.b64decode(result["content_base64"]) == b"owner-fallback"
+
+
+def test_main_transports(monkeypatch):
+    calls = []
+
+    def fake_run(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(bridge.mcp, "run", fake_run)
+    monkeypatch.delenv("HDB_MCP_TRANSPORT", raising=False)
+    monkeypatch.delenv("HDB_MCP_HOST", raising=False)
+    monkeypatch.delenv("HDB_MCP_PORT", raising=False)
+    bridge.main()
+    assert calls[-1] == {"transport": "stdio"}
+
+    monkeypatch.setenv("HDB_MCP_TRANSPORT", "streamable-http")
+    monkeypatch.setenv("HDB_MCP_HOST", "0.0.0.0")
+    monkeypatch.setenv("HDB_MCP_PORT", "9100")
+    bridge.main()
+    assert calls[-1] == {"transport": "streamable-http"}
+    assert bridge.mcp.settings.host == "0.0.0.0"
+    assert bridge.mcp.settings.port == 9100

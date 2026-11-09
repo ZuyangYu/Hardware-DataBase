@@ -1094,5 +1094,23 @@ def create_drawio_file(
     }
 
 
+def main() -> None:
+    """Start the MCP bridge in either stdio or remote streamable-http mode.
+
+    HDB_MCP_TRANSPORT=stdio (default) keeps the host-spawned local process;
+    streamable-http exposes the same tools over HTTP at /mcp for remote
+    registration (scripts/hdb_mcp_http.sh, platform plugins page).
+    """
+    transport = os.getenv("HDB_MCP_TRANSPORT", "stdio").strip().lower()
+    host = os.getenv("HDB_MCP_HOST", "127.0.0.1")
+    port = int(os.getenv("HDB_MCP_PORT", "9100"))
+    if transport in {"http", "streamable-http", "streamable_http"}:
+        mcp.settings.host = host
+        mcp.settings.port = port
+        mcp.run(transport="streamable-http")  # endpoint: http://<host>:<port>/mcp
+        return
+    mcp.run(transport="stdio")
+
+
 if __name__ == "__main__":
-    mcp.run()
+    main()

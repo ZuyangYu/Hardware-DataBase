@@ -291,3 +291,19 @@ profile digest、runtime attestation 和 Artifact Broker 扫描器引用；启�
 
 除远程 MCP 外部连接测试的显式 break-glass 诊断开关外，不要为了排错绕过启用门禁；
 生产部署前先对照 [`deploy/mcp-sandbox/README.md`](../deploy/mcp-sandbox/README.md) 完成运行时验收。
+
+## HDB 自身作为远程 MCP（知识库/网表/表格检索）
+
+hdb 自带的 19 个 MCP 工具现在也支持标准远程接入（streamable_http）：
+
+```bash
+# 启动远程 server（默认 127.0.0.1:9100，双模式兼容 stdio）
+scripts/hdb_mcp_http.sh
+# 登记平台插件 URL：http://<host>:9100/mcp
+```
+
+- 工具集与 stdio 桥完全一致（search/query_circuit/query_table/read_file_chunks/ask…）；
+- 工具对 HDB API 的鉴权经 `HDB_MCP_TOKEN`（mcp-session 换取短期 Bearer）或 `HDB_API_TOKEN`；
+- token 被撤销/轮换后用 `scripts/hdb_mcp_user_setup.sh` 重新发行；
+- 无状态检索用 `search_knowledge_base`（agent 首选），带证据的 `ask_knowledge_base` 仅在需要平台代答时使用（重、1-5 分钟、吃模型配额，每次调用会新建 conversation）。
+
