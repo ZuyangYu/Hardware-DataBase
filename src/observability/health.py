@@ -177,7 +177,10 @@ def _compute_ready() -> dict[str, Any]:
 
 
 def required_worker_roles() -> set[str]:
-    value = os.getenv("HDB_REQUIRED_WORKER_ROLES", "chat,authoring,parse,export")
+    # ``authoring`` was removed with the document-authoring subsystem; keep the
+    # default to the workers every chat deployment needs.  Deployments that run
+    # extra roles (memory/evaluation/quality) opt in via the env var.
+    value = os.getenv("HDB_REQUIRED_WORKER_ROLES", "chat,parse,export")
     return {role.strip() for role in value.split(",") if role.strip()}
 
 
