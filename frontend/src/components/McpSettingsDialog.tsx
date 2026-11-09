@@ -115,37 +115,6 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
 
   const active = created || (status?.has_token ? status : null);
   const remoteUrl = created?.mcp_remote_url || status?.mcp_remote_url || '';
-  const remotePaste = created
-    ? [
-        'MCP 远程接入（标准 streamable-http）',
-        `URL: ${remoteUrl}`,
-        `请求头：X-HDB-MCP-Token: ${created.token}`,
-        '工具名前缀：hdb_（Agent 自动加载）',
-      ].join('\n')
-    : '';
-
-  // 小白连一行的标准接入 JSON：直接贴到 ~/.config/opencode/config.json
-  const opencodeEntrySnippet = created
-    ? JSON.stringify(
-        {
-          '$schema': 'https://opencode.ai/config.json',
-          mcp: {
-            hdb: {
-              type: 'remote',
-              url: remoteUrl,
-              headers: {
-                'X-HDB-MCP-Token': created.token,
-              },
-            },
-          },
-        },
-        null,
-        2,
-      )
-    : '';
-  const entryHint =
-    '把上面这段 JSON 复制进 ~/.config/opencode/config.json（已有配置就把 "mcp": {...} 这一段并进去），保存后打开新的 Agent 对话即可。';
-
   // 让通用 Agent 自己接线并验证的一段话（小白直接复制粘贴）
   const tokenForPrompt = created?.token || '<你的 hdbmcp_* 令牌>';
   const agentPrompt = [
@@ -270,76 +239,29 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
         </section>
 
         <section className="rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
-          <h2 className="text-[14px] font-semibold text-[#18181a]">给外部 Agent 的接入说明（推荐：远程 MCP）</h2>
+          <h2 className="text-[14px] font-semibold text-[#18181a]">给外部 Agent 的接入说明</h2>
           <p className="mt-[4px] text-[12px] leading-[18px] text-[#757f9c]">
-            远程 MCP 是标准 streamable-http，任何支持 MCP 的 Agent（OpenCode / Claude / Cursor
-            等）直接连 URL，带上你的 hdbmcp_* 令牌即可，无需在本机启动子进程。
+            复制下面这段话，直接发给你正在使用的 Agent（OpenCode / Claude Code / Cursor 等）。
+            这段话已经包含服务地址、你的令牌、对应客户端的登记方法和验证步骤，Agent 会自己完成接入。
           </p>
 
-          <div className="mt-[14px] grid gap-[10px] text-[12px]">
-            <div className="grid gap-[4px]">
-              <span className="text-[#757f9c]">远程 MCP URL（streamable-http）</span>
-              <code className="break-all rounded-[8px] border border-[#e3e7f1] bg-[#f8fafc] px-[10px] py-[8px] font-mono text-[12px] text-[#18181a]">
-                {remoteUrl || '生成凭证后显示'}
-              </code>
-            </div>
-            <div className="grid gap-[4px]">
-              <span className="text-[#757f9c]">请求头（工具调用时的门禁）</span>
-              <code className="break-all rounded-[8px] border border-[#e3e7f1] bg-[#f8fafc] px-[10px] py-[8px] font-mono text-[12px] text-[#18181a]">
-                X-HDB-MCP-Token: {created?.token || active?.masked_token || '<你的 hdbmcp_*>'}
-              </code>
-            </div>
-          </div>
 
           <div className="mt-[14px] grid gap-[6px]">
             <div className="flex items-center justify-between gap-[8px]">
-              <span className="text-[12px] text-[#454b5c]">可复制接入说明</span>
+              <span className="text-[12px] text-[#454b5c]">复制给 Agent（含地址、令牌、登记方法与验证步骤）</span>
               {created ? (
                 <Button
                   variant="outline"
                   className="h-[30px] rounded-[9px] border-[#e3e7f1] px-[10px] text-[12px] text-[#464c5e]"
-                  onClick={() => void copyText(remotePaste, '远程接入说明')}
+                  onClick={() => void copyText(agentPrompt, 'Agent 自助接入说明')}
                 >
-                  复制全部
+                  复制给 Agent
                 </Button>
               ) : null}
             </div>
-            <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] text-[12px] leading-[20px] text-[#18181a]">
-              {created ? remotePaste : '生成个人凭证后，这里会显示远程 URL、X-HDB-MCP-Token 请求头和工具名前缀。'}
+            <pre className="max-h-[360px] overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] text-[12px] leading-[20px] text-[#18181a]">
+              {created ? agentPrompt : '生成个人凭证后，这里会显示一段可直接发给 Agent 的完整接入说明。'}
             </pre>
-            <div className="mt-[14px] flex items-center justify-between gap-[8px]">
-              <span className="text-[12px] text-[#454b5c]">复制这段 JSON，直接贴到 Agent 配置即可连上（小白友好）</span>
-              {created ? (
-                <Button
-                  variant="outline"
-                  className="h-[30px] rounded-[9px] border-[#e3e7f1] px-[10px] text-[12px] text-[#464c5e]"
-                  onClick={() => void copyText(opencodeEntrySnippet, 'Agent 接入 JSON')}
-                >
-                  复制接入 JSON
-                </Button>
-              ) : null}
-            </div>
-            <pre className="max-h-[320px] overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] font-mono text-[12px] leading-[20px] text-[#18181a]">
-              {created ? opencodeEntrySnippet : '生成个人凭证后，这里会显示可直接粘到 Agent 配置文件里的 JSON 片段。'}
-            </pre>
-            <p className="mt-[6px] text-[11px] leading-[18px] text-[#8a93a5]">{entryHint}</p>
-
-            <div className="mt-[14px] flex items-center justify-between gap-[8px]">
-              <span className="text-[12px] text-[#454b5c]">
-                或者把这段话发给你正在使用的 Agent，让它自己接入并验证
-              </span>
-              <Button
-                variant="outline"
-                className="h-[30px] rounded-[9px] border-[#e3e7f1] px-[10px] text-[12px] text-[#464c5e]"
-                onClick={() => void copyText(agentPrompt, 'Agent 自助接入说明')}
-              >
-                复制给 Agent
-              </Button>
-            </div>
-            <pre className="max-h-[320px] overflow-auto whitespace-pre-wrap break-all rounded-[10px] border border-[#e3e7f1] bg-[#f8fafc] px-[12px] py-[10px] text-[12px] leading-[20px] text-[#18181a]">
-              {created ? agentPrompt : '生成个人凭证后，这里会显示一段可直接发给 Agent 的自助接入说明。'}
-            </pre>
-
           </div>
 
           {created ? (
@@ -360,9 +282,9 @@ export default function McpSettingsDialog({ open, onOpenChange, auth }: Props) {
       <section className="mt-[16px] rounded-[14px] border border-[#e3e7f1] bg-white px-[18px] py-[16px]">
         <h2 className="text-[14px] font-semibold text-[#18181a]">使用说明</h2>
         <ol className="mt-[10px] grid gap-[8px] text-[12px] leading-[19px] text-[#5f687a]">
-          <li>1. 生成个人凭证，复制"可复制接入说明"里的远程 URL 与请求头。</li>
-          <li>2. 白屏最直接：把“复制接入 JSON”里的内容原样贴进 Agent 的配置文件（如 <code>~/.config/opencode/config.json</code> 的 mcp 字段）；或手动登记远程 URL 并配置 <code>X-HDB-MCP-Token</code> 请求头。</li>
-          <li>3. 远程 MCP 本身常驻服务端，无需本机启动子进程。Agent 会自动加载 hdb 工具（工具名形如 <code>hdb_list_kbs</code>），直接用自然语言提问即可。</li>
+          <li>1. 生成个人凭证（令牌只显示一次）。</li>
+          <li>2. 点"复制给 Agent"，把整段话原样粘贴给你正在使用的 Agent。</li>
+          <li>3. Agent 会自己完成登记并调用 <code>hdb_list_kbs</code> 验证；之后直接用自然语言提问即可。</li>
           <li>4. 凭证泄露或人员变动时，立即在本页撤销并重新生成。</li>
         </ol>
         <p className="mt-[10px] text-[11px] leading-[18px] text-[#8a93a5]">
