@@ -8,6 +8,7 @@ const user = {
 };
 
 async function installMocks(page: Page) {
+  let issuedToken = '';
   await page.addInitScript((sessionUser) => {
     localStorage.setItem('hdb_auth_session', JSON.stringify({ token: 'mcp-ui-test', user: sessionUser }));
   }, user);
@@ -26,13 +27,20 @@ async function installMocks(page: Page) {
     if (path === '/api/v1/me/mcp-token') {
       if (request.method() === 'GET') {
         return route.fulfill({ json: {
-          has_token: false, token_id: '', name: '', masked_token: '',
-          created_at: '', expires_at: '', last_used_at: '',
+          has_token: Boolean(issuedToken),
+          token_id: issuedToken ? 'test-token-id' : '',
+          name: issuedToken ? '个人 MCP' : '',
+          masked_token: issuedToken ? 'hdbmcp_test-token-id_••••' : '',
+          created_at: issuedToken ? '2026-11-06T00:00:00Z' : '',
+          expires_at: issuedToken ? '2027-11-06T00:00:00Z' : '',
+          last_used_at: '',
           api_base: 'http://127.0.0.1:8002/api/v1',
           mcp_remote_url: 'http://127.0.0.1:9100/mcp',
+          token: issuedToken,
         } });
       }
       if (request.method() === 'POST') {
+        issuedToken = 'hdbmcp_test_secret';
         return route.fulfill({ json: {
           has_token: true,
           token_id: 'test-token-id',
@@ -41,7 +49,7 @@ async function installMocks(page: Page) {
           created_at: '2026-11-06T00:00:00Z',
           expires_at: '2027-11-06T00:00:00Z',
           last_used_at: '',
-          token: 'hdbmcp_test_secret',
+          token: issuedToken,
           api_base: 'http://127.0.0.1:8002/api/v1',
           mcp_remote_url: 'http://127.0.0.1:9100/mcp',
           command: 'install -d -m 700 ~/.config/hdb && printf %s hdbmcp_test_secret > ~/.config/hdb/mcp_token && opencode mcp add hdb --global -- /repo/scripts/hdb_mcp_stdio.sh',
@@ -67,9 +75,17 @@ test('侧边栏 MCP 接入页可以生成凭证并复制完整接入说明', asy
   await expect(page.getByText('hdbmcp_test_secret', { exact: true })).toBeVisible();
   
   await expect(page.getByRole('button', { name: '复制给 Agent' })).toBeVisible();
-  await expect(page.getByText(/hdb_list_kbs/)).toBeVisible();
+  await expect(page.getByText(/hdb_list_kbs/).first()).toBeVisible();
   await expect(page.getByText(/X-HDB-MCP-Token: hdbmcp_test_secret/)).toBeVisible();
-  await expect(page.getByText('X-HDB-MCP-Token: hdbmcp_test_secret', { exact: true })).toBeVisible();
   
-  await expect(page.getByRole('button', { name: '复制全部' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '复制 Token' })).toBeVisible();
+
+  await page.getByRole('button', { name: '关闭' }).click();
+  await page.getByRole('button', { name: '打开个人菜单' }).click();
+  await page.getByRole('menuitem', { name: 'MCP 接入', exact: true }).click();
+
+  await expect(page.getByText('hdbmcp_test_secret', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '复制 Token' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '复制给 Agent' })).toBeVisible();
+  await expect(page.getByText(/X-HDB-MCP-Token: hdbmcp_test_secret/)).toBeVisible();
 });
