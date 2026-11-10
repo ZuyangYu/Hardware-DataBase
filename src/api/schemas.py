@@ -439,9 +439,9 @@ class CreateTurnRequest(BaseModel):
     query: str = Field(min_length=1, max_length=20_000)
     knowledge_scope: KnowledgeSelectionInput | None = None
     client_request_id: str | None = Field(default=None, max_length=128)
-    # Fast is the default.  ``deep`` is an explicit opt-in for multi-source
-    # research; the route must not silently upgrade a KB turn.
-    query_mode: Literal["fast", "deep"] = "fast"
+    # Retained for wire compatibility; the route normalizes KB turns to deep
+    # retrieval and general chat bypasses the knowledge-base agent entirely.
+    query_mode: Literal["fast", "deep"] = "deep"
     # Wiki 辅助开关(每轮): False 时不注册 wiki_search 工具。
     wiki_assist: bool = False
     # Chat attachments (design §5.1): session-scoped references; the server

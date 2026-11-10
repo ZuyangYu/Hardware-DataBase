@@ -70,13 +70,6 @@ KB_TOOL_GUIDANCE = """## 知识库工具（仅在挂载时）
 - 电路拓扑观察（derived_topology）只能描述已观察到的连接关系；器件的额定/保护能力必须有对应的数据手册类证据支持。
 """
 
-FAST_KB_TOOL_GUIDANCE = """## 知识库工具（按需使用）
-你有这些工具：list_knowledge_files、search_documents、read_document、spreadsheet_schema_lookup、spreadsheet_sql_query、circuit_search。
-- 需要文件清单时用 list_knowledge_files；精确位号/型号/信号名/表号用 search_documents(mode="exact"/"auto")；概念问题用 search_documents(mode="semantic")；拿到结果后用 read_document 读上下文。
-- 表格用 spreadsheet_schema_lookup + spreadsheet_sql_query；网表用 circuit_search。
-- 简单问题直接回答，不要为了流程反复搜索；信息足够就停止。不要强制做缺口检查或补检。
-"""
-
 EXPORT_PROMPT = """## 导出任务协议
 当用户要求导出、输出、生成或整理为 Markdown、Excel、Word、PDF 或 PowerPoint 时：
 1. 导出任务由服务器异步生成，模型只负责给出最终的结构化中文内容，不负责传输文件二进制。
@@ -117,7 +110,6 @@ def build_turn_prompt(
     tool_suffix: str = "",
     skill_present: bool = False,
     export: bool = False,
-    query_mode: str = "deep",
 ) -> TurnPrompt:
     """Assemble the system prompt and the fragments kept for tracing.
 
@@ -138,14 +130,11 @@ def build_turn_prompt(
     if custom_prompt:
         sections.append(custom_prompt)
     if not is_general:
-        if str(query_mode or "deep").strip().lower() == "deep":
-            sections.append(
-                KB_TOOL_GUIDANCE.format_map(
-                    _PromptDict(kb_name=kb_name, workflow=workflow)
-                )
+        sections.append(
+            KB_TOOL_GUIDANCE.format_map(
+                _PromptDict(kb_name=kb_name, workflow=workflow)
             )
-        else:
-            sections.append(FAST_KB_TOOL_GUIDANCE)
+        )
     if not wiki_assist:
         sections.append(_WIKI_DISABLED_RULE.strip())
     base_rules = "\n\n".join(part for part in sections if part)
@@ -175,7 +164,6 @@ def build_turn_prompt(
 
 __all__ = [
     "EXPORT_PROMPT",
-    "FAST_KB_TOOL_GUIDANCE",
     "KB_TOOL_GUIDANCE",
     "SKILL_CITATION_RULE",
     "SKILL_OUTPUT_RULE",
