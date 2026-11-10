@@ -44,6 +44,9 @@ class CallBudgetExceeded(LoopStop):
 RETRIEVAL_TOOL_NAMES = frozenset(
     {
         "knowledge_search",
+        "kb_glob",
+        "kb_grep",
+        "kb_read",
         "document_search",
         "document_search_batch",
         "circuit_search",

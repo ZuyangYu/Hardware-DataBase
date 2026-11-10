@@ -58,6 +58,7 @@ class AppPipeline:
                 spreadsheet_service=getattr(self.backend, "spreadsheet_indexes", None),
                 circuit_service=getattr(self.backend, "circuit_indexes", None),
                 conversation_service=getattr(self.backend, "conversation_indexes", None),
+                document_manager=self.documents,
             )
         except Exception as exc:
             error(f"AppPipeline 初始化失败: {exc}")
