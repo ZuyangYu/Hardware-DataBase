@@ -1162,9 +1162,9 @@ def create_turn(
         )
     from src.api.admission import admission_model_name, enforce_admission
 
-    # Honor the caller's explicit mode (fast is the schema default).  Deep is
-    # an opt-in for multi-source research, never an implicit KB upgrade.
-    query_mode = body.query_mode
+    # Resource type follows the execution mode: deep knowledge-base turns get
+    # the stricter deep bucket, general chat keeps the chat bucket.
+    query_mode = "fast" if session.kb_name == GENERAL_CHAT_KB_NAME else "deep"
     enforce_admission(
         user,
         str(user.id),
@@ -1525,7 +1525,7 @@ def _query_generator(
     ctx,
     thread_id,
     event_callback,
-    query_mode="fast",
+    query_mode="deep",
     should_cancel=None,
     persist_thread=False,
     wiki_assist=False,

@@ -416,7 +416,7 @@ def test_general_chat_runs_through_agent_without_retrieval_tools(monkeypatch):
     assert "evidence_read" in tool_names
     assert "document_search" not in tool_names
     assert "document_search_batch" not in tool_names
-    assert "circuit_search" in tool_names
+    assert "circuit_search" not in tool_names
     assert "当前未挂载知识库" not in captured["system_prompt"]
 
 

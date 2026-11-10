@@ -1023,7 +1023,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       const turnRequest = buildTurnRequest(
         query,
         requestUuid(),
-        'fast',
+        scopeKbName === GENERAL_CHAT_KB_NAME ? 'fast' : 'deep',
         attachments ?? null,
         turnKnowledgeScope,
       );

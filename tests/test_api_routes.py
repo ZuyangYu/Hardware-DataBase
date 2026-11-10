@@ -360,7 +360,7 @@ class ApiRoutesTests(unittest.TestCase):
                 time.sleep(0.05)
         record.assert_called_once()
         self.assertEqual(record.call_args.kwargs["status"], "completed")
-        self.assertEqual(record.call_args.kwargs["mode"], "fast")
+        self.assertEqual(record.call_args.kwargs["mode"], "deep")
         self.assertGreaterEqual(record.call_args.kwargs["duration_s"], 0.0)
 
     def test_general_query_unified_through_pipeline(self):
@@ -545,7 +545,7 @@ class ApiRoutesTests(unittest.TestCase):
         user_message = [message for message in messages if message["role"] == "user"][-1]
         self.assertEqual(user_message["trace_steps"], [])
 
-    def test_knowledge_base_turn_honors_explicit_fast_mode(self):
+    def test_knowledge_base_turn_forces_deep_retrieval(self):
         t = self._token("user1")
         session = self.client.post(
             "/api/v1/conversations",
@@ -560,7 +560,7 @@ class ApiRoutesTests(unittest.TestCase):
         )
 
         self.assertEqual(created.status_code, 201, created.text)
-        self.assertEqual(created.json()["turn"]["query_mode"], "fast")
+        self.assertEqual(created.json()["turn"]["query_mode"], "deep")
 
 
 

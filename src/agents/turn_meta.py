@@ -364,9 +364,7 @@ def _agent_recursion_limit(
     if query_mode == "deep":
         base = max(72, rounds * 24)
     else:
-        # A general-agent fast turn still needs room for a multi-step task;
-        # 24 graph steps was too small for even a moderate hardware question.
-        base = max(48, rounds * 8)
+        base = max(24, rounds * 8)
     complexity = _turn_complexity(
         query=query,
         query_mode=query_mode,
@@ -376,7 +374,7 @@ def _agent_recursion_limit(
     enabled = COMPLEXITY_BUDGET_ENABLED
     max_limit = max(base, RECURSION_LIMIT_MAX)
     if enabled:
-        multiplier = 8 if query_mode == "deep" else 4
+        multiplier = 8 if query_mode == "deep" else 3
         limit = min(max_limit, base + int(complexity["score"]) * multiplier)
     else:
         limit = base
