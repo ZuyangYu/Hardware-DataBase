@@ -172,7 +172,11 @@ def build_turn_tools(
         # File-shaped KB tools: locate -> grep/read -> answer without forcing
         # every lookup through candidate -> evidence_read.
         kb_workspace_tools = make_kb_workspace_tools(
-            rt, rag_backend, document_store, document_manager=document_manager
+            rt,
+            rag_backend,
+            document_store,
+            document_manager=document_manager,
+            semantic_search=document_tool,
         )
         # Main agent sees a small, stable tool surface.  Low-level retrieval
         # adapters stay in execution_tools for knowledge_search/subagents.
