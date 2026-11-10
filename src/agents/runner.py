@@ -1298,6 +1298,7 @@ class MultiSourceAgentRunner:
             # A bare "输出" in a workspace request is not a document-export
             # request and must not bypass the agent.
             export=_export_intent_for_turn(query),
+            query_mode=query_mode,
         )
         system_prompt = turn_prompt.system_prompt
         context_fragments = turn_prompt.fragments
@@ -1601,7 +1602,9 @@ class MultiSourceAgentRunner:
             )
 
         agent_subagents: list[dict[str, Any]] | None = None
-        if show_turn_meta:
+        # Subagents are a deep-mode capability.  Fast turns stay in the main
+        # loop so their tool budget and KB context are never split.
+        if show_turn_meta and query_mode == "deep":
             general_subagent = _general_subagent_spec(
                 tools=plan.tools,
                 model=model,

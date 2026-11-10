@@ -180,15 +180,17 @@ def build_turn_tools(
         )
         # Main agent sees a small, stable tool surface.  Low-level retrieval
         # adapters stay in execution_tools for knowledge_search/subagents.
-        visible: list[Any] = [*kb_workspace_tools, session_tool, evidence_tool]
-        # Deep mode keeps the multi-source knowledge_search for explicit
-        # semantic research; fast mode uses the file-shaped tools only.
-        if str(getattr(rt, "query_mode", "deep") or "deep") == "deep":
-            visible.insert(0, knowledge_tool)
+        visible: list[Any] = [*kb_workspace_tools]
+        if circuit_tool is not None:
+            visible.append(circuit_tool)
         if rt.knowledge_scope is None:
             for tool in (spreadsheet_schema_tool, spreadsheet_sql_tool):
                 if tool is not None:
                     visible.append(tool)
+        # Deep mode adds the multi-source research and evidence tools.  Fast
+        # turns stay on the small general-agent surface.
+        if str(getattr(rt, "query_mode", "deep") or "deep") == "deep":
+            visible = [knowledge_tool, session_tool, evidence_tool, *visible]
         # Multi-KB scoped structured tools are execution adapters; keep them
         # out of the main surface as well.
         result.tools.extend(visible)
