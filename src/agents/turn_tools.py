@@ -174,15 +174,13 @@ def build_turn_tools(
         kb_workspace_tools = make_kb_workspace_tools(
             rt, rag_backend, document_store, document_manager=document_manager
         )
-        # Main agent sees capabilities, not the source-specific adapter list.
-        visible: list[Any] = [
-            knowledge_tool,
-            session_tool,
-            evidence_tool,
-            *kb_workspace_tools,
-        ]
-        if catalog_tool is not None:
-            visible.append(catalog_tool)
+        # Main agent sees a small, stable tool surface.  Low-level retrieval
+        # adapters stay in execution_tools for knowledge_search/subagents.
+        visible: list[Any] = [*kb_workspace_tools, session_tool, evidence_tool]
+        # Deep mode keeps the multi-source knowledge_search for explicit
+        # semantic research; fast mode uses the file-shaped tools only.
+        if str(getattr(rt, "query_mode", "deep") or "deep") == "deep":
+            visible.insert(0, knowledge_tool)
         if rt.knowledge_scope is None:
             for tool in (spreadsheet_schema_tool, spreadsheet_sql_tool):
                 if tool is not None:

@@ -1,4 +1,4 @@
-"""File-shaped KB tools: glob/grep/read over the DocumentManager chunk source."""
+"""Unified KB tools: search/read/list over the DocumentManager chunk source."""
 
 from __future__ import annotations
 
@@ -83,44 +83,65 @@ def _tools(*, document_manager=None, backend=None):
     )
 
 
-def test_kb_glob_lists_matching_files():
-    _, (glob, _grep, _read) = _tools()
+def test_list_knowledge_files_lists_matching_files():
+    _, (search, read, files) = _tools()
 
-    payload = json.loads(glob("**/*TCN2*"))
+    payload = json.loads(files("**/*TCN2*"))
 
     assert payload["count"] == 1
     assert payload["files"][0]["path"] == "/kb/AAA/825504380_ADAS_SCH_TCN2.pdf"
     assert payload["files"][0]["file_id"] == "36"
 
 
-def test_kb_grep_returns_file_locator_and_snippet_without_evidence():
-    rt, (_glob, grep, _read) = _tools()
+def test_search_knowledge_exact_returns_locator_and_snippet_without_evidence():
+    rt, (search, read, files) = _tools()
 
-    payload = json.loads(grep(["X2000", "TPS62872"], max_hits=10))
+    payload = json.loads(search("X2000", mode="exact", top_k=10))
 
-    assert payload["count"] == 2
-    first = payload["hits"][0]
-    assert first["path"].endswith("TCN2.pdf")
-    assert first["locator"]["page_num"] in (12, 18)
-    assert "X2000" in first["snippet"] or "TPS62872" in first["snippet"]
+    assert payload["mode"] == "exact"
+    assert payload["result_count"] == 1
+    first = payload["results"][0]
+    assert first["file_name"].endswith("TCN2.pdf")
+    assert first["locator"]["page_num"] == 12
+    assert "X2000" in first["snippet"]
     assert rt.evidence == []
 
 
-def test_kb_read_returns_text_and_cursor():
-    _, (_glob, _grep, read) = _tools()
+def test_search_knowledge_auto_detects_exact_term():
+    _, (search, read, files) = _tools()
 
-    payload = json.loads(read("/kb/AAA/825504380_ADAS_SCH_TCN2.pdf", start=0, limit=20))
+    payload = json.loads(search("TPS62872", top_k=5))
+
+    assert payload["mode"] == "exact"
+    assert payload["result_count"] == 1
+
+
+def test_search_knowledge_semantic_uses_lexical_ranking():
+    _, (search, read, files) = _tools()
+
+    payload = json.loads(search("VCC3V3 到 VCC0V75", mode="semantic", top_k=5))
+
+    assert payload["mode"] == "semantic"
+    assert payload["result_count"] >= 1
+    assert "TPS62872" in payload["results"][0]["snippet"]
+
+
+def test_read_knowledge_returns_text_and_next_index():
+    _, (search, read, files) = _tools()
+
+    payload = json.loads(read("36", start_index=0, max_chunks=1))
 
     assert payload["file_id"] == "36"
-    assert payload["total_chars"] > 20
-    assert len(payload["text"]) == 20
-    assert payload["next"] == 20
+    assert payload["chunk_count"] == 2
+    assert len(payload["chunks"]) == 1
+    assert "X2000" in payload["chunks"][0]["content"]
+    assert payload["next_index"] == 1
 
 
-def test_kb_read_reports_missing_file():
-    _, (_glob, _grep, read) = _tools()
+def test_read_knowledge_reports_missing_file():
+    _, (search, read, files) = _tools()
 
-    payload = json.loads(read("/kb/AAA/not-there.pdf"))
+    payload = json.loads(read("not-there.pdf"))
 
     assert "not found" in payload["error"]
 
@@ -128,10 +149,10 @@ def test_kb_read_reports_missing_file():
 def test_document_manager_is_preferred_over_raw_rag_backend():
     raw = _Backend(_chunks(), fail=True)
     manager = _Backend(_chunks())
-    _, (_glob, grep, _read) = _tools(document_manager=manager, backend=raw)
+    _, (search, read, files) = _tools(document_manager=manager, backend=raw)
 
-    payload = json.loads(grep(["X2000"]))
+    payload = json.loads(search("X2000", mode="exact"))
 
-    assert payload["count"] == 1
+    assert payload["result_count"] == 1
     assert manager.calls == 1
     assert raw.calls == 0

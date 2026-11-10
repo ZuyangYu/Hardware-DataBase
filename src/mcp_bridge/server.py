@@ -21,7 +21,6 @@ from __future__ import annotations
 import base64
 import binascii
 import os
-import re
 import time
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -29,6 +28,14 @@ from urllib.parse import quote, urlencode
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+
+from src.services.knowledge_retrieval import (
+    clip as _clip,
+    grep_chunks,
+    lexical_search,
+    looks_like_exact_term,
+    read_chunks,
+)
 
 
 def _normalise_host(value: str) -> str:
@@ -170,11 +177,6 @@ def _kb_path(kb_name: str) -> str:
     return quote(str(kb_name or ""), safe="")
 
 
-def _clip(value: Any, limit: int = _MAX_TOOL_TEXT) -> str:
-    text = str(value or "")
-    return text if len(text) <= limit else text[:limit] + "\n…(truncated)"
-
-
 def _visible_kb(kb_name: str) -> dict[str, Any]:
     name = str(kb_name or "").strip()
     for row in _request("GET", "/kbs"):
@@ -235,25 +237,12 @@ def read_file_chunks(
     start = max(0, int(start_index or 0))
     needle = str(query or "").strip().casefold()
     limit = max(1, min(int(max_chunks or 20), 100))
-    picked = []
-    for chunk in raw_chunks:
-        if not isinstance(chunk, dict):
-            continue
-        index = int(chunk.get("index") or 0)
-        if index < start:
-            continue
-        content = str(chunk.get("content") or "")
-        if needle and needle not in content.casefold():
-            continue
-        picked.append(
-            {
-                "index": chunk.get("index"),
-                "content": _clip(content, 4_000),
-                "metadata": chunk.get("metadata") or {},
-            }
-        )
-        if len(picked) >= limit:
-            break
+    picked = read_chunks(
+        [chunk for chunk in raw_chunks if isinstance(chunk, dict)],
+        start_index=start,
+        max_chunks=limit,
+        query=needle,
+    )
     return {
         "document_id": data.get("document_id", ""),
         "file_name": data.get("file_name", ""),
@@ -267,48 +256,6 @@ def read_file_chunks(
 
 _CHUNK_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 _CHUNK_CACHE_TTL = 900.0
-
-
-def _tokenize_query(text: str) -> list[str]:
-    """ASCII words (>=2 chars) + CJK bigrams for lexical chunk scoring."""
-    tokens: list[str] = []
-    lowered = str(text or "").strip().casefold()
-    if not lowered:
-        return tokens
-    for word in re.findall(r"[a-z0-9_./\-]{2,}", lowered):
-        tokens.append(word)
-    for run in re.findall(r"[\u4e00-\u9fff]+", lowered):
-        if len(run) == 1:
-            tokens.append(run)
-        for i in range(len(run) - 1):
-            tokens.append(run[i : i + 2])
-    return list(dict.fromkeys(tokens))
-
-
-def _snippet_around(content: str, tokens: list[str], width: int = 260) -> str:
-    lowered = content.casefold()
-    pos = min(
-        (lowered.find(token) for token in tokens if lowered.find(token) >= 0),
-        default=0,
-    )
-    start = max(0, pos - width // 3)
-    snippet = content[start : start + width]
-    prefix = "…" if start > 0 else ""
-    suffix = "…" if start + width < len(content) else ""
-    return f"{prefix}{snippet}{suffix}"
-
-
-def _score_chunk(content: str, tokens: list[str]) -> float:
-    lowered = content.casefold()
-    score = 0.0
-    for token in tokens:
-        hits = lowered.count(token)
-        if hits <= 0:
-            continue
-        score += 1.0 + min(hits, 8) * 0.25
-        if token.isascii() and token.islower() and len(token) >= 4:
-            score += 0.5  # long ascii token is a strong identity signal
-    return round(score, 3)
 
 
 def _load_chunks(kb_name: str, file_id: str, refresh: bool) -> dict[str, Any]:
@@ -352,23 +299,22 @@ def search_knowledge_base(
     top_k: int = 8,
     file_id: str = "",
     refresh: bool = False,
+    mode: str = "auto",
 ) -> dict[str, Any]:
-    """Stateless lexical search over one KB's parsed chunks (no session).
+    """Stateless search over one KB's parsed chunks (no session).
 
-    Returns chunk locators (file / index / rag_id) with snippet + score for
-    the calling agent to reason over and verify with
+    ``mode``: ``auto`` (default) detects exact refdes/part/net ids and uses
+    literal grep, otherwise lexical ranking; ``exact`` forces literal grep;
+    ``semantic``/``lexical`` uses lexical ranking.  Results are chunk
+    locators (file / index / rag_id) with snippet + score; read the text with
     ``hdb_read_file_chunks``.  The chunk index is cached per file (~15 min
-    TTL, ``refresh=True`` forces a rebuild); ``file_id`` narrows the search.
-    Composed narrative answers live in the web /conversations/turns pipeline, not in this bridge's toolset.
+    TTL, ``refresh=True`` forces a rebuild).
     """
     needle = str(query or "").strip()
     if not needle:
         raise ValueError("query is required")
     rows = _request("GET", f"/kbs/{_kb_path(kb_name)}/files")
-    tokens = _tokenize_query(needle)
-    if not tokens:
-        raise ValueError("query has no searchable tokens")
-    results: list[dict[str, Any]] = []
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     files_searched = 0
     chunks_searched = 0
     for row in rows:
@@ -379,34 +325,31 @@ def search_knowledge_base(
         if file_id and fid != file_id and fid_name != file_id:
             continue
         cache = _load_chunks(kb_name, fid, refresh)
+        grouped[(fid, fid_name)] = list(cache.get("chunks") or [])
         files_searched += 1
-        for chunk in cache.get("chunks") or []:
-            chunks_searched += 1
-            content = str(chunk.get("content") or "")
-            score = _score_chunk(content, tokens)
-            if score <= 0:
-                continue
-            results.append(
-                {
-                    "file_id": fid,
-                    "file_name": fid_name,
-                    "chunk_index": chunk.get("index"),
-                    "rag_id": chunk.get("rag_id") or "",
-                    "score": score,
-                    "snippet": _snippet_around(content, tokens),
-                }
-            )
-    results.sort(key=lambda row: row.get("score") or 0.0, reverse=True)
-    top_k_clamped = max(1, min(int(top_k or 8), _MAX_ROWS))
+        chunks_searched += len(cache.get("chunks") or [])
+    plane = str(mode or "auto").strip().lower()
+    exact = plane == "exact" or (
+        plane == "auto" and looks_like_exact_term(needle)
+    )
+    if exact:
+        results = grep_chunks(grouped, [needle], max_hits=max(1, min(int(top_k or 8), 50)))
+        used = "exact"
+    else:
+        results = lexical_search(
+            grouped, needle, top_k=max(1, min(int(top_k or 8), 50))
+        )
+        used = "semantic" if plane == "semantic" else "lexical"
     return {
         "kb_name": kb_name,
         "query": needle,
-        "results": results[:top_k_clamped],
-        "result_count": len(results[:top_k_clamped]),
+        "mode": used,
+        "results": results,
+        "result_count": len(results),
         "files_searched": files_searched,
         "chunks_searched": chunks_searched,
         "cache_files": len(_CHUNK_CACHE),
-        "note": "lexical score over raw chunks; verify hits with hdb_read_file_chunks(file_id, start_index)",
+        "note": "lexical/exact score over raw chunks; read hits with hdb_read_file_chunks(file_id, start_index)",
     }
 
 
