@@ -40,6 +40,12 @@ class OkResponse(BaseModel):
     message: str = ""
 
 
+class DirectoryDeleteResponse(OkResponse):
+    deleted_files: int = 0
+    deleted_directories: int = 0
+    errors: list[str] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # Knowledge Bases
 # ---------------------------------------------------------------------------
@@ -50,6 +56,30 @@ class CreateKbRequest(BaseModel):
 
 class UpdateKbSharingRequest(BaseModel):
     is_shared: bool
+
+
+class CreateDirectoryRequest(BaseModel):
+    parent_id: int = Field(default=0, ge=0)
+    name: str = Field(min_length=1, max_length=255)
+
+
+class RenameDirectoryRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    parent_id: int | None = Field(default=None, ge=0)
+
+
+class DirectoryView(BaseModel):
+    id: int
+    kb_id: int = 0
+    parent_id: int = 0
+    name: str = ""
+    path: str = ""
+    depth: int = 0
+    child_directory_count: int = 0
+    file_count: int = 0
+    created_by: str = ""
+    created_at: str = ""
+    updated_at: str = ""
 
 
 class KbView(BaseModel):
@@ -70,7 +100,19 @@ class FileView(BaseModel):
     status: str = ""
     processor_kind: str = ""
     dataset_kind: str = ""
+    directory_id: int = 0
+    relative_path: str = ""
+    display_name: str = ""
     metadata: dict = Field(default_factory=dict)
+
+
+class UploadFileResult(BaseModel):
+    index: int
+    relative_path: str = ""
+    status: str
+    record_id: int | None = None
+    error_code: str = ""
+    message: str = ""
 
 
 class UploadAck(BaseModel):
@@ -80,6 +122,44 @@ class UploadAck(BaseModel):
     skipped_count: int = 0
     status: str
     messages: list[str] = Field(default_factory=list)
+    files: list[UploadFileResult] = Field(default_factory=list)
+
+
+class DirectoryImportFileView(BaseModel):
+    id: int
+    relative_path: str = ""
+    source_group: str = ""
+    status: str = "queued"
+    record_id: int | None = None
+    error_code: str = ""
+    error_message: str = ""
+    attempt_count: int = 0
+
+
+class DirectoryImportPlanEntry(BaseModel):
+    relative_path: str = Field(min_length=1, max_length=8192)
+    source_group: str = ""
+
+
+class CreateDirectoryImportPlanRequest(BaseModel):
+    directory_id: int = Field(default=0, ge=0)
+    entries: list[DirectoryImportPlanEntry] = Field(min_length=1, max_length=5000)
+
+
+class DirectoryImportJobView(BaseModel):
+    id: int
+    directory_id: int = 0
+    status: str = "queued"
+    total_files: int = 0
+    success_count: int = 0
+    failed_count: int = 0
+    skipped_count: int = 0
+    cancel_requested: bool = False
+    created_by: str = ""
+    last_error: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+    files: list[DirectoryImportFileView] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ from src.pipelines.document_rag.schemas import (
 )
 from src.services.kb_scope import kb_scope_from_context
 from src.services.evidence_fusion import EvidenceIdentityIncomplete, evidence_identity
+from src.services.pipeline_directories import document_relative_path
 
 
 def _check_time(should_cancel, remaining_seconds):
@@ -129,6 +130,8 @@ class RecordScopedAdapter:
             "project_id": record.project_id, "processor_kind": self.processor_kind,
             "content_kind": item.content_kind, "chunk_or_structured_locator": dict(item.locator),
             "locator": dict(item.locator),
+            "directory_id": int(getattr(record, "directory_id", 0) or 0),
+            "relative_path": document_relative_path(self.document_store, record),
             "index_revision": int(getattr(record, "index_revision", 0) or 0),
             "processing_artifact_id": str(getattr(record, "processing_artifact_id", "") or ""),
             "processor_version": str(getattr(record, "processor_version", "") or ""),
@@ -138,7 +141,8 @@ class RecordScopedAdapter:
             identity = evidence_identity(metadata)
         except EvidenceIdentityIncomplete as exc:
             raise ScopedRetrievalError("source_unavailable", "evidence_identity_incomplete") from exc
-        return Evidence(id=identity, content=item.content, source_name=record.document_name,
+        return Evidence(id=identity, content=item.content,
+                        source_name=document_relative_path(self.document_store, record),
                         score=item.score, metadata=metadata, backend="local_structured",
                         retriever=str(item.metadata.get("tool") or self.processor_kind))
 
@@ -232,6 +236,8 @@ class RecordScopedAdapter:
                         "project_id": record.project_id, "processor_kind": self.processor_kind,
                         "content_kind": item.content_kind, "chunk_or_structured_locator": dict(item.locator),
                         "locator": dict(item.locator),
+                        "directory_id": int(getattr(record, "directory_id", 0) or 0),
+                        "relative_path": document_relative_path(self.document_store, record),
                         "index_revision": int(getattr(record, "index_revision", 0) or 0),
                         "processing_artifact_id": str(getattr(record, "processing_artifact_id", "") or ""),
                         "processor_version": str(getattr(record, "processor_version", "") or ""),
@@ -241,9 +247,17 @@ class RecordScopedAdapter:
                         identity = evidence_identity(metadata)
                     except EvidenceIdentityIncomplete as exc:
                         raise ScopedRetrievalError("source_unavailable", "evidence_identity_incomplete") from exc
-                    evidence.append(Evidence(id=identity, content=item.content, source_name=record.document_name,
-                                             score=item.score, metadata=metadata, backend="local_structured",
-                                             retriever=str(item.metadata.get("tool") or self.processor_kind)))
+                    evidence.append(
+                        Evidence(
+                            id=identity,
+                            content=item.content,
+                            source_name=document_relative_path(self.document_store, record),
+                            score=item.score,
+                            metadata=metadata,
+                            backend="local_structured",
+                            retriever=str(item.metadata.get("tool") or self.processor_kind),
+                        )
+                    )
             _check_time(should_cancel, remaining_seconds)
             _, current = self._records(kb_name, ctx, contract)
             if {key: asdict(value) for key, value in current.items()} != {key: asdict(value) for key, value in records.items()}:

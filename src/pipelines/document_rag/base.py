@@ -29,6 +29,8 @@ class RAGBackend(ABC):
         ctx: RequestContext | None = None,
         source_group: str | None = None,
         progress_callback: Callable[[int, str], None] | None = None,
+        directory_id: int = 0,
+        file_metadata: list[dict] | None = None,
     ) -> IngestResult:
         """Application upload entrypoint for backend-specific document flows."""
 
@@ -49,7 +51,13 @@ class RAGBackend(ABC):
         """Delete a document from a knowledge base."""
 
     @abstractmethod
-    def list_documents(self, kb_name: str, ctx: RequestContext | None = None) -> list[DocumentInfo]:
+    def list_documents(
+        self,
+        kb_name: str,
+        ctx: RequestContext | None = None,
+        *,
+        directory_id: int | None = None,
+    ) -> list[DocumentInfo]:
         """List documents in a knowledge base."""
 
     def get_parse_result(self, kb_name: str, document_id: str, ctx: RequestContext | None = None,

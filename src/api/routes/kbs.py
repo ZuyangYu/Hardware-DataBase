@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import ROLE_SYSTEM_ADMIN, AuthService, AuthUser
@@ -9,12 +9,17 @@ from src.pipelines.document_rag.schemas import kb_scope_key
 from src.api.context import build_context_for_user
 from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access, require_employee
 from src.api.schemas import (
+    CreateDirectoryRequest,
     CreateKbRequest,
+    DirectoryDeleteResponse,
+    DirectoryView,
     FileView,
     KbView,
     OkResponse,
+    RenameDirectoryRequest,
     UpdateKbSharingRequest,
 )
+from src.services.pipeline_directories import DirectoryValidationError, PipelineDirectoryService
 
 router = APIRouter(tags=["kbs"])
 
@@ -70,6 +75,11 @@ def list_kbs(
 @router.get("/kbs/{kb_name}/files", response_model=list[FileView])
 def list_files(
     kb_name: str,
+    directory_id: int | None = Query(default=None, ge=0),
+    recursive: bool = Query(default=False),
+    query: str = Query(default="", max_length=200),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
     user: AuthUser = Depends(current_user),
     pipeline: AppPipeline = Depends(get_pipeline),
     auth: AuthService = Depends(get_auth_service),
@@ -78,18 +88,206 @@ def list_files(
     reject_system_admin_kb_access(ctx)
     if not ctx.has_kb_permission(kb_name, "read"):
         raise HTTPException(status_code=403, detail="read permission required")
-    infos = pipeline.list_file_infos(kb_name, ctx=ctx)
-    return [
-        FileView(
-            id=info.id,
-            name=info.name,
-            status=info.status,
-            processor_kind=info.processor_kind,
-            dataset_kind=info.dataset_kind,
-            metadata=info.metadata or {},
+    directory_service = _directory_service(pipeline)
+    if directory_id is not None:
+        try:
+            if recursive:
+                allowed_directory_ids = directory_service.descendant_ids(
+                    kb_name=kb_name,
+                    department_id=_ctx_department_id(ctx),
+                    directory_id=directory_id,
+                )
+            else:
+                directory_service.get(
+                    kb_name=kb_name,
+                    department_id=_ctx_department_id(ctx),
+                    directory_id=directory_id,
+                )
+                allowed_directory_ids = {int(directory_id)}
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        infos = pipeline.list_file_infos(
+            kb_name,
+            ctx=ctx,
+            directory_id=None if recursive else directory_id,
         )
-        for info in infos
-    ]
+    else:
+        allowed_directory_ids = None
+        infos = pipeline.list_file_infos(kb_name, ctx=ctx)
+    needle = query.strip().casefold()
+    rows: list[FileView] = []
+    for info in infos:
+        metadata = info.metadata or {}
+        info_directory_id = int(metadata.get("directory_id") or 0)
+        if allowed_directory_ids is not None and info_directory_id not in allowed_directory_ids:
+            continue
+        relative_path = str(metadata.get("relative_path") or info.name)
+        if needle and needle not in relative_path.casefold():
+            continue
+        rows.append(
+            FileView(
+                id=info.id,
+                name=info.name,
+                status=info.status,
+                processor_kind=info.processor_kind,
+                dataset_kind=info.dataset_kind,
+                directory_id=info_directory_id,
+                relative_path=relative_path,
+                display_name=str(metadata.get("display_name") or info.name),
+                metadata=metadata,
+            )
+        )
+    return rows[offset: offset + limit]
+
+
+def _ctx_department_id(ctx) -> str:
+    value = ctx.metadata.get("resource_department_id") or ctx.metadata.get("department_id")
+    if value in (None, ""):
+        raise HTTPException(status_code=400, detail="department_id is required")
+    return str(value)
+
+
+def _directory_service(pipeline: AppPipeline) -> PipelineDirectoryService:
+    backend = getattr(pipeline, "backend", None)
+    store = getattr(backend, "store", None)
+    if store is None:
+        store = getattr(getattr(pipeline, "documents", None), "processing_backend", None)
+        store = getattr(store, "store", None)
+    return PipelineDirectoryService(store=store)
+
+
+@router.get("/kbs/{kb_name}/directories", response_model=list[DirectoryView])
+def list_directories(
+    kb_name: str,
+    parent_id: int = Query(default=0, ge=0),
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
+    if not ctx.has_kb_permission(kb_name, "read"):
+        raise HTTPException(status_code=403, detail="read permission required")
+    try:
+        return _directory_service(pipeline).list_children(
+            kb_name=kb_name,
+            department_id=_ctx_department_id(ctx),
+            parent_id=parent_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/kbs/{kb_name}/directories", response_model=DirectoryView)
+def create_directory(
+    kb_name: str,
+    body: CreateDirectoryRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
+    if not ctx.has_kb_permission(kb_name, "write"):
+        raise HTTPException(status_code=403, detail="write permission required")
+    try:
+        return _directory_service(pipeline).create(
+            kb_name=kb_name,
+            department_id=_ctx_department_id(ctx),
+            kb_id=ctx.metadata.get("kb_id"),
+            parent_id=body.parent_id,
+            name=body.name,
+            created_by=ctx.user_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DirectoryValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.patch("/kbs/{kb_name}/directories/{directory_id}", response_model=DirectoryView)
+def rename_directory(
+    kb_name: str,
+    directory_id: int,
+    body: RenameDirectoryRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
+    if not ctx.has_kb_permission(kb_name, "admin"):
+        raise HTTPException(status_code=403, detail="admin permission required")
+    try:
+        directory_service = _directory_service(pipeline)
+        if body.parent_id is not None:
+            moved = directory_service.move(
+                kb_name=kb_name,
+                department_id=_ctx_department_id(ctx),
+                directory_id=directory_id,
+                parent_id=body.parent_id,
+            )
+            if body.name.strip() != moved["name"]:
+                moved = directory_service.rename(
+                    kb_name=kb_name,
+                    department_id=_ctx_department_id(ctx),
+                    directory_id=directory_id,
+                    name=body.name,
+                )
+            return moved
+        return directory_service.rename(
+            kb_name=kb_name,
+            department_id=_ctx_department_id(ctx),
+            directory_id=directory_id,
+            name=body.name,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DirectoryValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/kbs/{kb_name}/directories/{directory_id}", response_model=DirectoryDeleteResponse)
+def delete_directory(
+    kb_name: str,
+    directory_id: int,
+    recursive: bool = Query(default=False),
+    confirm: bool = Query(default=False),
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
+    if not ctx.has_kb_permission(kb_name, "admin"):
+        raise HTTPException(status_code=403, detail="admin permission required")
+    try:
+        if recursive:
+            if int(directory_id) == 0:
+                raise DirectoryValidationError("根目录不能删除")
+            if not confirm:
+                raise HTTPException(
+                    status_code=400,
+                    detail="recursive directory deletion requires confirm=true",
+                )
+            result = pipeline.delete_directory_recursive(kb_name, directory_id, ctx=ctx)
+            if not result.get("ok"):
+                errors = "; ".join(str(item) for item in result.get("errors", [])[:5])
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{result.get('message', '递归删除失败')}: {errors}".rstrip(": "),
+                )
+            return DirectoryDeleteResponse(**result)
+        _directory_service(pipeline).delete_empty(
+            kb_name=kb_name,
+            department_id=_ctx_department_id(ctx),
+            directory_id=directory_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DirectoryValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return DirectoryDeleteResponse(ok=True, message="目录已删除", deleted_directories=1)
 
 
 @router.post("/kbs", response_model=OkResponse)

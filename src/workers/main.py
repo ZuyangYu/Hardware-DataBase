@@ -214,6 +214,30 @@ class HardwareWorker:
         finally:
             heartbeat(self.worker_id)
 
+    def _process_directory_imports(self, limit: int = 1) -> bool:
+        """Submit staged folder-import files through the normal pipeline."""
+        try:
+            from src.services.directory_imports import DirectoryImportService
+
+            store = getattr(getattr(self.pipeline, "backend", None), "store", None)
+            if store is None:
+                return False
+            service = getattr(self, "_directory_import_service", None)
+            if service is None:
+                service = DirectoryImportService(
+                    store=store, pipeline=self.pipeline, auth=self.auth
+                )
+                self._directory_import_service = service
+            did_work = False
+            for _ in range(max(1, int(limit))):
+                if not service.run_once(f"{self.worker_id}-directory-import"):
+                    break
+                did_work = True
+            return did_work
+        except Exception as exc:  # noqa: BLE001 - fail-soft auxiliary path
+            error(f"Directory import worker failed: {exc}")
+            return False
+
     def _process_mcp_write_proposals(self, limit: int = 1) -> bool:
         """Execute user-confirmed MCP write proposals (candidate-artifact mode)."""
 
@@ -293,6 +317,14 @@ class HardwareWorker:
                 set_queue_state("chat", depth=depth, oldest_age_s=oldest_age_s)
             except Exception as exc:  # noqa: BLE001 - metrics are fail-soft
                 error(f"Chat queue state failed: {exc}")
+        if self._role_enabled("parse"):
+            try:
+                if self._process_directory_imports(
+                    limit=max(1, int(getattr(src.settings, "WORKER_PARSE_BATCH_SIZE", 1)))
+                ):
+                    did_work = True
+            except Exception as exc:  # noqa: BLE001 - fail-soft auxiliary path
+                error(f"Directory import loop failed: {exc}")
         if self._role_enabled("parse") and self.runtime is not None:
             batch = max(1, src.settings.WORKER_PARSE_BATCH_SIZE)
             for _ in range(batch):

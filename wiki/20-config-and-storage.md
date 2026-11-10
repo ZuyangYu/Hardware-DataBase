@@ -97,6 +97,7 @@
   （TIMESTAMPTZ/BOOLEAN），必须先跑 `scripts/production_hardening/rebuild_auth_domain.py`
   重建为机械形状（TEXT 时间戳、BIGINT 标志）再切 `AUTH_STORE_BACKEND=postgres`；
   形状不对时 `AuthService`/`AppLogService` 构造会 fail-closed 并提示该命令。
+
 | `RAGFLOW_SIMILARITY_THRESHOLD` / `RAGFLOW_VECTOR_WEIGHT` | `0.25` / `0.4` |
 | `FINAL_TOP_K` | `5` |
 | `AGENT_MAX_RETRIEVAL_ROUNDS` | `3` |
@@ -381,4 +382,48 @@ storage/
 3. **文件与行强绑定**：附件 / 导出 / 电路 / 表格索引都遵循「先删行后删文件或反之有明确顺序」，
    失败会留下可重试状态而不是静默丢失。
 4. **跨库无分布式事务**：附件清理用 outbox；会话删除先写 outbox 再删会话；
-   删 KB 是「逐记录 + 目录清理」并上报 partial。
+    删 KB 是「逐记录 + 目录清理」并上报 partial。
+
+## 7. Pipeline 目录与归档
+
+Pipeline Domain 增加 `pipeline_directories` 表，并在 `pipeline_documents` 增加
+`directory_id INTEGER NOT NULL DEFAULT 0`。`directory_id=0` 是知识库根目录哨兵；
+真实目录保存父子关系、规范化名称、深度和所属 KB/部门。
+
+目录文件的物理归档布局为：
+
+```text
+PIPELINE_ARCHIVE_ROOT/
+└── departments/<safe-dept>/kbs/<kb>/directories/<directory_id>/<source_group>/<file>
+```
+
+文件物理路径使用目录 ID，不直接拼接用户目录名；目录重命名只改变逻辑展示路径，
+不会搬迁归档。`DocumentArchiveManager.resolve_record_path()` 同时兼容新目录布局、
+部门归档旧布局和历史扁平布局。
+
+上传请求默认仍受 `HDB_API_MAX_UPLOAD_BYTES`（默认 512 MiB）限制；普通单文件/小批量
+继续同步处理，文件夹可走持久化导入批次（`directory_import_jobs` /
+`directory_import_files`，暂存目录 `storage/directory_imports/<uuid>/`）。批次由
+parse worker 逐文件推进，失败文件保留暂存字节用于重试。
+
+P1 目录能力相关配置：
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `DIRECTORY_RAW_ONLY_UNKNOWN` | `false` | 未知扩展名仅归档、不解析 |
+| `HDB_DIRECTORY_MAX_FILES` | `0` | 单目录文件数配额，0=关闭 |
+| `HDB_DIRECTORY_MAX_BYTES` | `0` | 单目录字节配额，0=关闭 |
+| `HDB_DIRECTORY_IMPORT_MAX_FILES` | `2000` | 单次文件夹导入文件数上限 |
+| `HDB_DIRECTORY_IMPORT_MAX_BYTES` | `2 GiB` | 单次文件夹导入暂存上限 |
+
+迁移/升级顺序（幂等）：
+
+1. 停写并备份 `storage/pipeline_documents.db`、`storage/directory_imports/` 和
+   `storage/pipeline_archives/`（PG 部署同时备份 Pipeline Domain schema）；
+2. 启动一次 store 或运行 `uv run hardware-database-maintenance verify-pipeline-schema`，
+   自动创建 `pipeline_directories`、`directory_import_jobs`、`directory_import_files`
+   并回填旧文档 `directory_id=0`；
+3. 报告必须满足 `duplicate_paths=[]`、`orphan_directories=[]`，旧记录数量不减少；
+4. 运行 `reconcile-pipeline` 检查归档缺失/孤儿；
+5. PG 切换使用既有 `migrate_sqlite_to_postgres.py --group pipeline`；回滚按该脚本
+   runbook 恢复备份，旧版本至少仍能读取新目录归档路径（`resolve_record_path` 兼容）。

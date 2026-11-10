@@ -9,6 +9,7 @@ from src.agents.schemas import Evidence
 from src.pipelines.document_rag.base import RAGBackend
 from src.pipelines.document_store import PipelineDocumentStore
 from src.services.evidence_sources import with_source_metadata
+from src.services.pipeline_directories import document_relative_path
 
 
 class ScopedEvidenceBatch(list):
@@ -174,14 +175,15 @@ def _backend_filters(
         return backend_filters
 
     if record and record.kb_name == kb_name:
+        relative_path = document_relative_path(document_store, record)
         source_names = []
-        for name in [record.original_file_name, record.document_name, backend_filters.get("source_name")]:
+        for name in [relative_path, record.original_file_name, record.document_name, backend_filters.get("source_name")]:
             name = str(name or "").strip()
             if name and name not in source_names:
                 source_names.append(name)
         if source_names:
             backend_filters["source_names"] = source_names
-        backend_filters["source_name"] = record.document_name
+        backend_filters["source_name"] = relative_path or record.document_name
     return backend_filters
 
 

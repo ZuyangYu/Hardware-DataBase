@@ -242,6 +242,18 @@ POST /conversations/{id}/extract-memory ; GET/PUT /memory-settings
 - 模块树 / 测试数据（报告 + 测量项查询，limit 100）/ 原理图（设计 → 页面、标签/模块区域/截图/PDF 缓存）；
 - 外部对话：列表 + 轮次/块详情、「AI 摘要」重生成、删除。
 
+目录工作区位于文件标签页顶部：
+
+- 左侧目录树按需加载子目录，根目录固定为 `directory_id=0`；
+- 面包屑显示服务端派生路径；
+- 当前目录支持上传文件，文件夹按钮使用 `webkitdirectory`；
+- 浏览器提供的 `webkitRelativePath` 会去掉最外层文件夹名后生成 manifest；
+- 上传完成后显示逐文件成功、复用、冲突、跳过和失败结果；
+- `write` 权限控制新建目录/上传，`admin` 控制重命名/删除；非空目录删除会被服务端拒绝；
+- 文件列表按目录过滤，展示 `relative_path`，旧客户端仍可使用 basename `name`；
+- 文件夹上传可勾选“后台导入”，创建持久化批次并轮询状态，失败项支持单个/整批重试，运行中批次可取消；
+- 目录树提供移动（目标父目录 ID）和递归删除确认；递归删除需二次勾选并显示删除文件/目录数量。
+
 端点：
 
 ```
@@ -251,6 +263,15 @@ GET .../structured/spreadsheets | circuit-designs | circuit-designs/{id}
 | circuit-designs/{id}/parse-log | modules | test-reports | test-measurements
 | schematics | schematics/{id}/pages/{page}
 GET .../external-conversations ; GET .../{id} ; POST .../{id}/summary ; DELETE .../{id}
+```
+
+目录相关端点：
+
+```text
+GET/POST /kbs/{kb}/directories
+PATCH/DELETE /kbs/{kb}/directories/{directoryId}
+GET /kbs/{kb}/files?directory_id=&recursive=&query=&limit=&offset=
+POST /kbs/{kb}/files  # directory_id + manifest + repeated files
 ```
 
 ### 4.5 `MemoryPage`

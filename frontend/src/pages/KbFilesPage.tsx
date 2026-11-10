@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type InputHTMLAttributes, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import { api, ApiError, isForbiddenError, uploadFilesWithProgress } from '../api/client';
@@ -7,6 +7,8 @@ import type {
   CircuitDesignRow,
   CircuitDesignsResponse,
   CircuitParseLogResponse,
+  DirectoryImportJobView,
+  DirectoryView,
   ExternalConversationDetailResponse,
   ExternalConversationListItem,
   ExternalConversationsResponse,
@@ -67,6 +69,7 @@ const STATUS_LABELS: Record<string, string> = {
   parsing: '解析中',
   processing: '解析中',
   started: '解析中',
+  raw_archived: '已归档未解析',
 };
 
 const PROCESSOR_LABELS: Record<string, string> = {
@@ -75,12 +78,10 @@ const PROCESSOR_LABELS: Record<string, string> = {
   spreadsheet_table: '表格',
   circuit_design: '电路',
   external_conversation: '外部对话',
+  raw_file: '仅归档',
 };
 
-const SOURCE_GROUPS = ['设计数据', '物料数据', '文档资料', '测试数据', '项目管理数据', '外部数据', '人员与组织数据'];
-const EXTERNAL_DATA_GROUP = '外部数据';
 const WORKSPACE_TABS = [
-  { key: 'files', label: '文件', icon: 'file' },
   { key: 'spreadsheets', label: 'Excel 台账', icon: 'grid' },
   { key: 'circuits', label: '电路设计', icon: 'database' },
   { key: 'modules', label: '模块树', icon: 'folder' },
@@ -106,16 +107,35 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
   const [parseResult, setParseResult] = useState<ParseResultView | null>(null);
   const [parseLoading, setParseLoading] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [sourceGroup, setSourceGroup] = useState('设计数据');
   const [selectedFiles, setSelectedFiles] = useState<FileList | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
+  const [folderUpload, setFolderUpload] = useState(false);
+  const [currentDirectoryId, setCurrentDirectoryId] = useState(0);
+  const [directoryCache, setDirectoryCache] = useState<Record<number, DirectoryView[]>>({});
+  const [directoryById, setDirectoryById] = useState<Record<number, DirectoryView>>({});
+  const [directoryLoading, setDirectoryLoading] = useState(false);
+  const [newDirectoryOpen, setNewDirectoryOpen] = useState(false);
+  const [newDirectoryName, setNewDirectoryName] = useState('');
+  const [creatingDirectory, setCreatingDirectory] = useState(false);
+  const [expandedDirectories, setExpandedDirectories] = useState<Set<number>>(new Set());
+  const [directoryRenameTarget, setDirectoryRenameTarget] = useState<DirectoryView | null>(null);
+  const [directoryRenameName, setDirectoryRenameName] = useState('');
+  const [directoryDeleteTarget, setDirectoryDeleteTarget] = useState<DirectoryView | null>(null);
+  const [directoryMutationLoading, setDirectoryMutationLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadPercent, setUploadPercent] = useState(0);
+  const [useImportBatch, setUseImportBatch] = useState(true);
+  const [importJobs, setImportJobs] = useState<DirectoryImportJobView[]>([]);
+  const [importDeleteTarget, setImportDeleteTarget] = useState<DirectoryImportJobView | null>(null);
+  const [deletingImport, setDeletingImport] = useState(false);
+  const [recursiveDelete, setRecursiveDelete] = useState(false);
+  const [recursiveFiles, setRecursiveFiles] = useState(true);
   const [deleteTarget, setDeleteTarget] = useState<FileView | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [tasks, setTasks] = useState<ParseTaskView[]>([]);
   const [tasksLoaded, setTasksLoaded] = useState(false);
-  const [activeTab, setActiveTab] = useState<WorkspaceTab>('files');
+  const [activeTab, setActiveTab] = useState<WorkspaceTab | null>(null);
   const [spreadsheetLedger, setSpreadsheetLedger] = useState<SpreadsheetLedgerResponse | null>(null);
   const [spreadsheetsLoading, setSpreadsheetsLoading] = useState(false);
   const [selectedSpreadsheetId, setSelectedSpreadsheetId] = useState('');
@@ -175,8 +195,12 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
     // doesn't jump to skeletons every 3s and flicker.
     if (!silent) setLoaded(false);
     setForbidden(null);
+    const params = new URLSearchParams({
+      directory_id: String(currentDirectoryId),
+      recursive: String(recursiveFiles),
+    });
     api
-      .get<FileView[]>(`/api/v1/kbs/${encodeURIComponent(kbName)}/files`)
+      .get<FileView[]>(`/api/v1/kbs/${encodeURIComponent(kbName)}/files?${params.toString()}`)
       .then((rows) => {
         if (!cancelled) setFiles(rows);
       })
@@ -194,7 +218,36 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [kbName]);
+  }, [currentDirectoryId, kbName, recursiveFiles]);
+
+  const loadDirectoryChildren = useCallback(async (parentId: number, force = false) => {
+    if (!force && directoryCache[parentId]) return directoryCache[parentId];
+    setDirectoryLoading(true);
+    try {
+      const rows = await api.get<DirectoryView[]>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/directories?parent_id=${parentId}`,
+      );
+      setDirectoryCache((current) => ({ ...current, [parentId]: rows }));
+      setDirectoryById((current) => ({
+        ...current,
+        ...Object.fromEntries(rows.map((row) => [row.id, row])),
+      }));
+      return rows;
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '加载目录失败');
+      return [];
+    } finally {
+      setDirectoryLoading(false);
+    }
+  }, [directoryCache, kbName]);
+
+  useEffect(() => {
+    void loadDirectoryChildren(0);
+  }, [loadDirectoryChildren]);
+
+  useEffect(() => {
+    if (currentDirectoryId !== 0) void loadDirectoryChildren(currentDirectoryId);
+  }, [currentDirectoryId, loadDirectoryChildren]);
 
   const loadTasks = useCallback((silent = false) => {
     if (!canWrite) {
@@ -220,6 +273,35 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
       cancelled = true;
     };
   }, [canWrite, kbName]);
+
+  const loadImportJobs = useCallback(async () => {
+    if (!canWrite) return;
+    try {
+      const rows = await api.get<DirectoryImportJobView[]>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/directory-imports?limit=20`,
+      );
+      setImportJobs(rows);
+    } catch {
+      // Background import polling is fail-soft; the file list and parse tasks
+      // remain the primary status surfaces.
+    }
+  }, [canWrite, kbName]);
+
+  useEffect(() => {
+    void loadImportJobs();
+  }, [loadImportJobs]);
+
+  useEffect(() => {
+    if (!canWrite) return undefined;
+    const active = importJobs.some((job) => ['queued', 'running'].includes(job.status));
+    if (!active) return undefined;
+    const timer = window.setInterval(() => {
+      void loadImportJobs();
+      loadFiles(true);
+      void loadDirectoryChildren(currentDirectoryId, true);
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [canWrite, currentDirectoryId, importJobs, loadDirectoryChildren, loadFiles, loadImportJobs]);
 
   useEffect(() => {
     const cancel = loadFiles();
@@ -499,22 +581,12 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
       notify.error('请选择文件');
       return;
     }
-    // M15: 提交前逐文件预检(扩展名/总大小)，避免整批到服务器才被 413 拒收。
-    const supportedExts =
-      sourceGroup === EXTERNAL_DATA_GROUP
-        ? ['.txt', '.md', '.markdown']
-        : ['.pdf', '.doc', '.docx', '.xlsx', '.edf', '.edif'];
+    // Unknown extensions are intentionally sent to the backend so each file
+    // can be skipped and reported without cancelling the whole batch.
     const maxTotalBytes = 512 * 1024 * 1024; // 与后端 upload.py MAX_UPLOAD_BYTES 默认一致
     let totalBytes = 0;
-    const rejected: string[] = [];
     for (const file of Array.from(selectedFiles)) {
       totalBytes += file.size;
-      const ext = '.' + (file.name.split('.').pop() || '').toLowerCase();
-      if (!supportedExts.includes(ext)) rejected.push(`${file.name}（不支持 ${ext || '无扩展名'}）`);
-    }
-    if (rejected.length > 0) {
-      notify.error(`以下文件类型不被支持，已取消上传：${rejected.join('、')}`);
-      return;
     }
     if (totalBytes > maxTotalBytes) {
       notify.error(`批次总大小 ${(totalBytes / 1024 / 1024).toFixed(1)}MB 超过 ${maxTotalBytes / 1024 / 1024}MB 上限，请分批上传`);
@@ -525,21 +597,47 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
     try {
       const form = new FormData();
       Array.from(selectedFiles).forEach((file) => form.append('files', file));
-      form.append('source_group', sourceGroup);
-      const result = await uploadFilesWithProgress<UploadAck>(
-        `/api/v1/kbs/${encodeURIComponent(kbName)}/files`,
-        form,
-        (percent) => setUploadPercent(percent),
-      );
-      const message = result.messages[0] || `成功 ${result.success_count}/${result.total_count}`;
-      if (result.failed_count > 0 || result.skipped_count > 0) {
-        notify.warning(message);
+      form.append('directory_id', String(currentDirectoryId));
+      if (folderUpload) {
+        form.append('manifest', JSON.stringify({
+          entries: Array.from(selectedFiles).map((file, index) => ({
+            index,
+            relative_path: folderRelativePath(file),
+            source_group: sourceGroupForFile(file),
+          })),
+        }));
+      }
+      if (folderUpload && useImportBatch) {
+        const job = await uploadFilesWithProgress<DirectoryImportJobView>(
+          `/api/v1/kbs/${encodeURIComponent(kbName)}/directory-imports`,
+          form,
+          (percent) => setUploadPercent(percent),
+        );
+        notify.success(`已创建后台导入批次 #${job.id}（${job.total_files} 个文件）`);
+        setImportJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
       } else {
-        notify.success(message);
+        const result = await uploadFilesWithProgress<UploadAck>(
+          `/api/v1/kbs/${encodeURIComponent(kbName)}/files`,
+          form,
+          (percent) => setUploadPercent(percent),
+        );
+        const message = result.messages[0] || `成功 ${result.success_count}/${result.total_count}`;
+        if (result.failed_count > 0 || result.skipped_count > 0) {
+          notify.warning(message);
+        } else {
+          notify.success(message);
+        }
       }
       setSelectedFiles(null);
+      setFolderUpload(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
-      await Promise.all([loadFiles(), loadTasks()]);
+      if (folderInputRef.current) folderInputRef.current.value = '';
+      await Promise.all([
+        loadFiles(),
+        loadTasks(),
+        loadImportJobs(),
+        loadDirectoryChildren(currentDirectoryId, true),
+      ]);
     } catch (error) {
       if (error instanceof ApiError && error.status === 413) {
         notify.error(`批次超过服务器上传大小上限，已被拒收；请减小批量后重试（${error.message.slice(0, 80)}）`);
@@ -549,6 +647,147 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
     } finally {
       setUploading(false);
       setUploadPercent(0);
+    }
+  }
+
+  async function handleCreateDirectory() {
+    const name = newDirectoryName.trim();
+    if (!name || creatingDirectory) return;
+    setCreatingDirectory(true);
+    try {
+      const created = await api.post<DirectoryView>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/directories`,
+        { parent_id: currentDirectoryId, name },
+      );
+      setDirectoryById((current) => ({ ...current, [created.id]: created }));
+      await loadDirectoryChildren(currentDirectoryId, true);
+      setNewDirectoryName('');
+      setNewDirectoryOpen(false);
+      notify.success('目录已创建');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '创建目录失败');
+    } finally {
+      setCreatingDirectory(false);
+    }
+  }
+
+  async function selectDirectory(directoryId: number) {
+    setCurrentDirectoryId(directoryId);
+    await loadDirectoryChildren(directoryId);
+  }
+
+  async function handleRenameDirectory() {
+    if (!directoryRenameTarget || !directoryRenameName.trim() || directoryMutationLoading) return;
+    setDirectoryMutationLoading(true);
+    try {
+      const updated = await api.patch<DirectoryView>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/directories/${directoryRenameTarget.id}`,
+        { name: directoryRenameName.trim() },
+      );
+      setDirectoryById((current) => ({ ...current, [updated.id]: updated }));
+      await loadDirectoryChildren(directoryRenameTarget.parent_id, true);
+      if (currentDirectoryId === updated.id) setDirectoryById((current) => ({ ...current, [updated.id]: updated }));
+      setDirectoryRenameTarget(null);
+      notify.success('目录已重命名');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '重命名目录失败');
+    } finally {
+      setDirectoryMutationLoading(false);
+    }
+  }
+
+  async function handleMoveDirectory(directory: DirectoryView) {
+    const answer = window.prompt('目标父目录 ID（0 = 根目录）', String(directory.parent_id));
+    if (answer == null) return;
+    const parentId = Number(answer);
+    if (!Number.isInteger(parentId) || parentId < 0) {
+      notify.error('目录 ID 无效');
+      return;
+    }
+    setDirectoryMutationLoading(true);
+    try {
+      await api.patch<DirectoryView>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/directories/${directory.id}`,
+        { name: directory.name, parent_id: parentId },
+      );
+      await loadDirectoryChildren(directory.parent_id, true);
+      await loadDirectoryChildren(parentId, true);
+      notify.success('目录已移动');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '移动目录失败');
+    } finally {
+      setDirectoryMutationLoading(false);
+    }
+  }
+
+  async function handleRetryImport(job: DirectoryImportJobView, fileId?: number) {
+    try {
+      const suffix = fileId == null ? '' : `?file_id=${fileId}`;
+      const updated = await api.post<DirectoryImportJobView>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/directory-imports/${job.id}/retry${suffix}`,
+        {},
+      );
+      setImportJobs((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      notify.success('失败文件已重新排队');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '重试导入失败');
+    }
+  }
+
+  async function handleCancelImport(job: DirectoryImportJobView) {
+    try {
+      const updated = await api.post<DirectoryImportJobView>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/directory-imports/${job.id}/cancel`,
+        {},
+      );
+      setImportJobs((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      notify.success('导入批次已取消');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '取消导入失败');
+    }
+  }
+
+  async function handleDeleteImport() {
+    if (!importDeleteTarget || deletingImport) return;
+    setDeletingImport(true);
+    try {
+      await api.delete<OkResponse>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/directory-imports/${importDeleteTarget.id}`,
+      );
+      setImportJobs((current) => current.filter((item) => item.id !== importDeleteTarget.id));
+      setImportDeleteTarget(null);
+      notify.success('导入批次记录已删除；已导入文件不受影响');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '删除导入记录失败');
+    } finally {
+      setDeletingImport(false);
+    }
+  }
+
+  async function handleDeleteDirectory() {
+    if (!directoryDeleteTarget || directoryMutationLoading) return;
+    setDirectoryMutationLoading(true);
+    try {
+      const suffix = recursiveDelete ? '?recursive=true&confirm=true' : '';
+      const result = await api.delete<OkResponse & { deleted_files?: number; deleted_directories?: number }>(
+        `/api/v1/kbs/${encodeURIComponent(kbName)}/directories/${directoryDeleteTarget.id}${suffix}`,
+      );
+      if (recursiveDelete) {
+        notify.success(`已递归删除 ${result.deleted_files ?? 0} 个文件、${result.deleted_directories ?? 0} 个目录`);
+      }
+      await loadDirectoryChildren(directoryDeleteTarget.parent_id, true);
+      setExpandedDirectories((current) => {
+        const next = new Set(current);
+        next.delete(directoryDeleteTarget.id);
+        return next;
+      });
+      if (currentDirectoryId === directoryDeleteTarget.id) setCurrentDirectoryId(directoryDeleteTarget.parent_id);
+      setDirectoryDeleteTarget(null);
+      notify.success('目录已删除');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '删除目录失败');
+    } finally {
+      setDirectoryMutationLoading(false);
     }
   }
 
@@ -647,7 +886,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
       {
         key: 'name',
         title: '文件名',
-        render: (file) => <span className="truncate font-medium text-[#18181a]">{file.name}</span>,
+         render: (file) => <span title={file.relative_path || file.name} className="truncate font-medium text-[#18181a]">{file.relative_path || file.name}</span>,
       },
       {
         key: 'type',
@@ -739,35 +978,142 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
         </Button>
       </div>
 
+      <DirectoryWorkspace
+        kbName={kbName}
+        cache={directoryCache}
+        filesContent={
+          <FilesPanel
+            loaded={loaded}
+            files={files}
+            columns={columns}
+            recursive={recursiveFiles}
+            onRecursiveChange={setRecursiveFiles}
+            onViewChunks={(file) => void handleViewChunks(file)}
+          />
+        }
+        currentDirectoryId={currentDirectoryId}
+        currentDirectory={directoryById[currentDirectoryId] ?? null}
+        expanded={expandedDirectories}
+        loading={directoryLoading}
+        canWrite={canWrite}
+        canAdmin={canAdmin}
+        newDirectoryOpen={newDirectoryOpen}
+        newDirectoryName={newDirectoryName}
+        onToggle={(directoryId) => {
+          setExpandedDirectories((current) => {
+            const next = new Set(current);
+            if (next.has(directoryId)) next.delete(directoryId);
+            else next.add(directoryId);
+            return next;
+          });
+          if (!directoryCache[directoryId]) void loadDirectoryChildren(directoryId);
+        }}
+        onSelect={(directoryId) => void selectDirectory(directoryId)}
+        onNewDirectory={() => setNewDirectoryOpen(true)}
+        onNewDirectoryOpenChange={setNewDirectoryOpen}
+        onNewDirectoryNameChange={setNewDirectoryName}
+        onMove={(directory) => void handleMoveDirectory(directory)}
+        onCreateDirectory={() => void handleCreateDirectory()}
+        creatingDirectory={creatingDirectory}
+        onRefresh={() => void loadDirectoryChildren(currentDirectoryId, true)}
+        onRename={(directory) => {
+          setDirectoryRenameTarget(directory);
+          setDirectoryRenameName(directory.name);
+        }}
+        onDelete={setDirectoryDeleteTarget}
+      />
+
+      <Dialog open={Boolean(directoryRenameTarget)} onOpenChange={(open) => !open && setDirectoryRenameTarget(null)}>
+        <DialogContent className="max-w-[420px] rounded-[16px]">
+          <DialogHeader><DialogTitle>重命名目录</DialogTitle></DialogHeader>
+          <div className="grid gap-[12px]">
+            <Input value={directoryRenameName} onChange={(event) => setDirectoryRenameName(event.target.value)} autoFocus />
+            <div className="flex justify-end gap-[8px]">
+              <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[34px]')} onClick={() => setDirectoryRenameTarget(null)}>取消</Button>
+              <Button className="h-[34px] bg-[#18181a] text-white" disabled={directoryMutationLoading} onClick={() => void handleRenameDirectory()}>保存</Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <ConfirmDialog
+        open={Boolean(importDeleteTarget)}
+        title={`删除导入批次记录 #${importDeleteTarget?.id ?? ''}`}
+        description="只删除批次历史和暂存文件，已经成功导入的文件不会被删除。"
+        confirmText="删除记录"
+        loading={deletingImport}
+        onOpenChange={(open) => {
+          if (!open) setImportDeleteTarget(null);
+        }}
+        onConfirm={() => void handleDeleteImport()}
+      />
+
+      <ConfirmDialog
+        open={Boolean(directoryDeleteTarget)}
+        title={recursiveDelete ? '递归删除目录' : '删除目录'}
+        description={
+          recursiveDelete
+            ? '将删除该目录下所有文件、子目录和解析记录，无法撤销。'
+            : '仅允许删除空目录；目录中的文件和子目录不会被自动删除。'
+        }
+        confirmText={recursiveDelete ? '递归删除' : '删除'}
+        onOpenChange={(open) => {
+          if (!open) {
+            setDirectoryDeleteTarget(null);
+            setRecursiveDelete(false);
+          }
+        }}
+        onConfirm={() => void handleDeleteDirectory()}
+        loading={directoryMutationLoading}
+      >
+        <label className="flex items-center gap-[8px] text-[13px] text-[#464c5e]">
+          <input
+            type="checkbox"
+            checked={recursiveDelete}
+            onChange={(event) => setRecursiveDelete(event.target.checked)}
+          />
+          递归删除目录内容（含文件、子目录和解析记录）
+        </label>
+      </ConfirmDialog>
+
       {canWrite && (
         <div className="mt-[16px] flex flex-wrap items-end gap-[10px] rounded-[14px] bg-white p-[16px] shadow-[0_8px_24px_rgba(17,17,17,0.045)]">
-          <div className="grid min-w-[180px] gap-[4px]">
-            <span className="text-[11px] text-[#858b9c]">文件类型</span>
-            <Select value={sourceGroup} onValueChange={setSourceGroup}>
-              <SelectTrigger className="h-[34px] w-full rounded-[10px] border-[#e3e7f1] bg-white text-[13px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {SOURCE_GROUPS.map((group) => (
-                  <SelectItem key={group} value={group}>{group}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
           <label className="grid min-w-[280px] flex-1 gap-[4px]">
             <span className="text-[11px] text-[#858b9c]">上传文件</span>
             <input
               ref={fileInputRef}
               type="file"
               multiple
-              accept={
-                sourceGroup === EXTERNAL_DATA_GROUP
-                  ? '.txt,.md,.markdown'
-                  : '.pdf,.doc,.docx,.xlsx,.edf,.edif'
-              }
-              onChange={(event) => setSelectedFiles(event.target.files)}
+              accept=".pdf,.doc,.docx,.xlsx,.edf,.edif,.txt,.md,.markdown"
+              onChange={(event) => {
+                setFolderUpload(false);
+                setSelectedFiles(event.target.files);
+              }}
               className="h-[34px] rounded-[10px] border border-[#e3e7f1] bg-white px-[10px] py-[5px] text-[12px] text-[#464c5e] file:mr-[10px] file:rounded-[8px] file:border-0 file:bg-[#f3f4f6] file:px-[10px] file:py-[4px] file:text-[12px] file:text-[#464c5e]"
             />
+          </label>
+          <label className="inline-flex h-[34px] cursor-pointer items-center gap-[6px] rounded-[10px] border border-[#e3e7f1] bg-white px-[12px] text-[12px] text-[#464c5e] hover:bg-[#fafbfc]">
+            <AppIcon name="folder" size={14} />
+            选择文件夹
+            <input
+              ref={folderInputRef}
+              type="file"
+              multiple
+              {...({ webkitdirectory: '', directory: '' } as unknown as InputHTMLAttributes<HTMLInputElement>)}
+              onChange={(event) => {
+                setFolderUpload(true);
+                setSelectedFiles(event.target.files);
+              }}
+              className="sr-only"
+            />
+          </label>
+          <label className="inline-flex h-[34px] items-center gap-[6px] text-[12px] text-[#464c5e]">
+            <input
+              type="checkbox"
+              checked={useImportBatch}
+              onChange={(event) => setUseImportBatch(event.target.checked)}
+            />
+            文件夹后台导入
           </label>
           <Button
             onClick={handleUpload}
@@ -775,8 +1121,58 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
             className="h-[34px] gap-[6px] rounded-[10px] bg-[#18181a] px-[16px] text-[13px] text-white hover:bg-[#303030]"
           >
             <AppIcon name="plus" size={14} />
-            {uploading ? `上传中 ${uploadPercent}%` : '开始上传'}
+            {uploading ? `上传中 ${uploadPercent}%` : folderUpload && useImportBatch ? '创建导入批次' : '开始上传'}
           </Button>
+        </div>
+      )}
+
+      {canWrite && importJobs.length > 0 && (
+        <div className="mt-[16px] rounded-[14px] bg-white p-[16px] shadow-[0_8px_24px_rgba(17,17,17,0.045)]">
+          <div className="mb-[10px] flex items-center justify-between">
+            <h3 className="text-[14px] font-semibold text-[#18181a]">文件夹导入批次</h3>
+            <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[30px] px-[10px]')} onClick={() => void loadImportJobs()}>
+              <AppIcon name="refresh" size={13} />
+              刷新
+            </Button>
+          </div>
+          <div className="grid gap-[8px]">
+            {importJobs.map((job) => {
+              const done = job.success_count + job.failed_count + job.skipped_count;
+              const progress = job.total_files ? Math.round((done / job.total_files) * 100) : 0;
+              return (
+                <div key={job.id} className="grid gap-[6px] rounded-[10px] border border-[#f0f1f4] bg-[#fafbfc] px-[12px] py-[10px]">
+                  <div className="flex flex-wrap items-center gap-[8px]">
+                    <span className="flex-1 text-[13px] font-medium text-[#18181a]">批次 #{job.id} · {job.status}</span>
+                    <span className="text-[11px] text-[#858b9c]">
+                      成功 {job.success_count} · 失败 {job.failed_count} · 跳过 {job.skipped_count} / 共 {job.total_files}
+                    </span>
+                    {['failed', 'partial'].includes(job.status) && (
+                      <button type="button" className="text-[12px] text-[#18181a]" onClick={() => void handleRetryImport(job)}>重试失败项</button>
+                    )}
+                    {['queued', 'running'].includes(job.status) && (
+                      <button type="button" className="text-[12px] text-[#d20b0b]" onClick={() => void handleCancelImport(job)}>取消</button>
+                    )}
+                    {!['queued', 'running'].includes(job.status) && (
+                      <button type="button" className="text-[12px] text-[#d20b0b]" onClick={() => setImportDeleteTarget(job)}>删除记录</button>
+                    )}
+                  </div>
+                  <div className="h-[6px] overflow-hidden rounded-full bg-[#eceef1]">
+                    <div className="h-full rounded-full bg-[#18181a]" style={{ width: `${progress}%` }} />
+                  </div>
+                  {job.last_error && <div className="text-[11px] text-[#d20b0b]">{job.last_error}</div>}
+                  <div className="grid gap-[2px] text-[11px] text-[#757f9c]">
+                    {job.files.filter((file) => file.status === 'failed').slice(0, 3).map((file) => (
+                      <div key={file.id} className="flex items-center gap-[6px]">
+                        <span className="min-w-0 flex-1 truncate">{file.relative_path}</span>
+                        <span className="text-[#d20b0b]">{file.error_code || 'failed'}</span>
+                        <button type="button" className="text-[#18181a]" onClick={() => void handleRetryImport(job, file.id)}>重试</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
 
@@ -811,7 +1207,15 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
       )}
 
       <div className="mt-[20px] overflow-hidden rounded-[20px_20px_0_0] bg-white shadow-[0_-4px_16px_0_rgba(0,0,0,0.05)]">
-        <div className="flex gap-[4px] overflow-x-auto border-b border-[#f0f1f4] px-[18px] pt-[14px]">
+        <div className="flex items-center justify-between px-[18px] pt-[12px] text-[11px] text-[#858b9c]">
+          <span>结构化数据视图</span>
+          {activeTab !== null && (
+            <button type="button" onClick={() => setActiveTab(null)} className="text-[#464c5e] hover:text-[#18181a]">
+              收起
+            </button>
+          )}
+        </div>
+        <div className="flex gap-[4px] overflow-x-auto border-b border-[#f0f1f4] px-[18px] pt-[6px]">
           {WORKSPACE_TABS.map((tab) => (
             <button
               key={tab.key}
@@ -829,15 +1233,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
             </button>
           ))}
         </div>
-        <div className="p-[18px_18px_24px]">
-          {activeTab === 'files' && (
-            <FilesPanel
-              loaded={loaded}
-              files={files}
-              columns={columns}
-              onViewChunks={(file) => void handleViewChunks(file)}
-            />
-          )}
+        {activeTab !== null && <div className="p-[18px_18px_24px]">
           {activeTab === 'spreadsheets' && (
             <SpreadsheetPanel
               ledger={spreadsheetLedger}
@@ -917,7 +1313,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
               onRegenerateSummary={() => void handleRegenerateSummary()}
             />
           )}
-        </div>
+        </div>}
       </div>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
@@ -1011,24 +1407,55 @@ function FilesPanel({
   loaded,
   files,
   columns,
+  recursive,
+  onRecursiveChange,
   onViewChunks,
 }: {
   loaded: boolean;
   files: FileView[];
   columns: DataTableColumn<FileView>[];
+  recursive: boolean;
+  onRecursiveChange: (value: boolean) => void;
   onViewChunks: (file: FileView) => void;
 }) {
-  if (!loaded) return <PanelSkeleton rows={3} />;
-  if (files.length === 0) return <EmptyState text="该知识库暂无文件" />;
+  const toggle = (
+    <label className="mb-[10px] inline-flex items-center gap-[6px] text-[12px] text-[#464c5e]">
+      <input
+        type="checkbox"
+        checked={recursive}
+        onChange={(event) => onRecursiveChange(event.target.checked)}
+      />
+      显示子目录中的文件
+    </label>
+  );
+  if (!loaded) {
+    return (
+      <div>
+        {toggle}
+        <PanelSkeleton rows={3} />
+      </div>
+    );
+  }
+  if (files.length === 0) {
+    return (
+      <div>
+        {toggle}
+        <EmptyState text="该目录及其子目录暂无文件" />
+      </div>
+    );
+  }
   return (
-    <DataTable
-      columns={columns}
-      data={files}
-      rowKey={(file) => file.id}
-      size="compact"
-      onRowClick={onViewChunks}
-      emptyText="暂无文件"
-    />
+    <div>
+      {toggle}
+      <DataTable
+        columns={columns}
+        data={files}
+        rowKey={(file) => file.id}
+        size="compact"
+        onRowClick={onViewChunks}
+        emptyText="暂无文件"
+      />
+    </div>
   );
 }
 
@@ -1707,6 +2134,217 @@ function rowKey(row: Record<string, unknown>, index: number): string {
 function formatTaskTime(value?: number | null): string {
   if (value == null) return '-';
   return new Date(value * 1000).toLocaleString();
+}
+
+function folderRelativePath(file: File): string {
+  const raw = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
+  const segments = raw.split('/').filter(Boolean);
+  return (segments.length > 1 ? segments.slice(1) : segments).join('/');
+}
+
+function sourceGroupForFile(file: File): string {
+  const name = file.name.toLowerCase();
+  const extension = name.includes('.') ? `.${name.split('.').pop()}` : '';
+  if (extension === '.xlsx') return '物料数据';
+  if (extension === '.edf' || extension === '.edif') return '设计数据';
+  if (extension === '.txt' || extension === '.md' || extension === '.markdown') return '外部数据';
+  // Empty means the backend auto-classifies from the filename/extension.
+  return '';
+}
+
+type DirectoryWorkspaceProps = {
+  kbName: string;
+  cache: Record<number, DirectoryView[]>;
+  filesContent: ReactNode;
+  currentDirectoryId: number;
+  currentDirectory: DirectoryView | null;
+  expanded: Set<number>;
+  loading: boolean;
+  canWrite: boolean;
+  canAdmin: boolean;
+  newDirectoryOpen: boolean;
+  newDirectoryName: string;
+  creatingDirectory: boolean;
+  onToggle: (directoryId: number) => void;
+  onSelect: (directoryId: number) => void;
+  onNewDirectory: () => void;
+  onNewDirectoryOpenChange: (open: boolean) => void;
+  onNewDirectoryNameChange: (name: string) => void;
+  onCreateDirectory: () => void;
+  onRefresh: () => void;
+  onRename: (directory: DirectoryView) => void;
+  onDelete: (directory: DirectoryView) => void;
+  onMove: (directory: DirectoryView) => void;
+};
+
+function DirectoryWorkspace({
+  kbName,
+  cache,
+  filesContent,
+  currentDirectoryId,
+  currentDirectory,
+  expanded,
+  loading,
+  canWrite,
+  canAdmin,
+  newDirectoryOpen,
+  newDirectoryName,
+  creatingDirectory,
+  onToggle,
+  onSelect,
+  onNewDirectory,
+  onNewDirectoryOpenChange,
+  onNewDirectoryNameChange,
+  onCreateDirectory,
+  onRefresh,
+  onRename,
+  onDelete,
+  onMove,
+}: DirectoryWorkspaceProps) {
+  const currentPath = currentDirectory?.path || '';
+  return (
+    <section className="mt-[16px] overflow-hidden rounded-[14px] border border-[#e3e7f1] bg-white shadow-[0_8px_24px_rgba(17,17,17,0.035)]">
+      <div className="flex flex-wrap items-center justify-between gap-[10px] border-b border-[#f0f1f4] px-[16px] py-[12px]">
+        <div className="min-w-0">
+          <div className="text-[11px] text-[#858b9c]">当前位置</div>
+          <div className="mt-[2px] truncate text-[14px] font-semibold text-[#18181a]">{kbName}{currentPath ? ` / ${currentPath}` : ''}</div>
+        </div>
+        <div className="flex flex-wrap gap-[8px]">
+          <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[32px] px-[10px]')} onClick={onRefresh}>
+            <AppIcon name="refresh" size={13} />
+            刷新目录
+          </Button>
+          {canWrite && (
+            <Button className="h-[32px] gap-[6px] rounded-[9px] bg-[#18181a] px-[12px] text-[12px] text-white hover:bg-[#303030]" onClick={onNewDirectory}>
+              <AppIcon name="plus" size={13} />
+              新建目录
+            </Button>
+          )}
+        </div>
+      </div>
+      <div className="grid min-h-[118px] grid-cols-[minmax(220px,300px)_1fr] max-[720px]:grid-cols-1">
+        <div className="border-r border-[#f0f1f4] p-[10px] max-[720px]:border-r-0 max-[720px]:border-b">
+          <button
+            type="button"
+            onClick={() => onSelect(0)}
+            className={cn(
+              'flex w-full items-center gap-[7px] rounded-[8px] px-[9px] py-[7px] text-left text-[12px] transition-colors',
+              currentDirectoryId === 0 ? 'bg-[#f3f4f6] font-medium text-[#18181a]' : 'text-[#464c5e] hover:bg-[#fafbfc]',
+            )}
+          >
+            <AppIcon name="folder" size={14} />
+            <span className="flex-1 truncate">{kbName}</span>
+          </button>
+          <div className="mt-[3px] grid gap-[2px]">
+            {(cache[0] || []).map((directory) => (
+              <DirectoryTreeNode
+                key={directory.id}
+                directory={directory}
+                cache={cache}
+                expanded={expanded}
+                currentDirectoryId={currentDirectoryId}
+                canAdmin={canAdmin}
+                onToggle={onToggle}
+                onSelect={onSelect}
+                onRename={onRename}
+                onDelete={onDelete}
+                onMove={onMove}
+              />
+            ))}
+          </div>
+          {loading && <div className="px-[9px] py-[7px] text-[11px] text-[#858b9c]">加载目录中…</div>}
+        </div>
+        <div className="min-w-0 max-h-[520px] overflow-auto px-[16px] py-[12px]">
+          {filesContent ?? (
+            <div className="flex min-h-[90px] items-center text-[12px] text-[#757f9c]">
+              {currentDirectoryId === 0
+                ? '切换到「文件」标签页查看当前目录文件。'
+                : `${currentDirectory?.file_count ?? 0} 个文件 · ${currentDirectory?.child_directory_count ?? 0} 个子目录`}
+            </div>
+          )}
+        </div>
+      </div>
+      <Dialog open={newDirectoryOpen} onOpenChange={onNewDirectoryOpenChange}>
+        <DialogContent className="max-w-[420px] rounded-[16px]">
+          <DialogHeader><DialogTitle>新建目录</DialogTitle></DialogHeader>
+          <div className="grid gap-[12px]">
+            <Input value={newDirectoryName} onChange={(event) => onNewDirectoryNameChange(event.target.value)} placeholder="例如 datasheets" autoFocus />
+            <div className="flex justify-end gap-[8px]">
+              <Button variant="outline" className={cn(OUTLINE_ACTION_BUTTON_CLASS, 'h-[34px]')} onClick={() => onNewDirectoryOpenChange(false)}>取消</Button>
+              <Button className="h-[34px] bg-[#18181a] text-white" disabled={creatingDirectory || !newDirectoryName.trim()} onClick={onCreateDirectory}>创建</Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </section>
+  );
+}
+
+function DirectoryTreeNode({
+  directory,
+  cache,
+  expanded,
+  currentDirectoryId,
+  canAdmin,
+  onToggle,
+  onSelect,
+  onRename,
+  onDelete,
+  onMove,
+}: {
+  directory: DirectoryView;
+  cache: Record<number, DirectoryView[]>;
+  expanded: Set<number>;
+  currentDirectoryId: number;
+  canAdmin: boolean;
+  onToggle: (directoryId: number) => void;
+  onSelect: (directoryId: number) => void;
+  onRename: (directory: DirectoryView) => void;
+  onDelete: (directory: DirectoryView) => void;
+  onMove: (directory: DirectoryView) => void;
+}) {
+  const children = cache[directory.id] || [];
+  const isExpanded = expanded.has(directory.id);
+  return (
+    <div>
+      <div className={cn('group flex items-center gap-[3px] rounded-[8px] px-[4px] transition-colors', currentDirectoryId === directory.id ? 'bg-[#f3f4f6]' : 'hover:bg-[#fafbfc]')}>
+        <button type="button" aria-label={isExpanded ? '收起目录' : '展开目录'} onClick={() => onToggle(directory.id)} className="grid h-[26px] w-[24px] place-items-center text-[#858b9c]">
+          <span className="text-[12px]">{directory.child_directory_count > 0 ? (isExpanded ? '⌄' : '›') : ''}</span>
+        </button>
+        <button type="button" onClick={() => onSelect(directory.id)} className="flex min-w-0 flex-1 items-center gap-[7px] py-[6px] text-left text-[12px] text-[#464c5e]">
+          <AppIcon name="folder" size={14} />
+          <span className="min-w-0 flex-1 truncate">{directory.name}</span>
+          <span className="text-[10px] text-[#a0a6b5]">{directory.file_count}</span>
+        </button>
+        {canAdmin && (
+          <div className="hidden items-center gap-[2px] pr-[3px] group-hover:flex group-focus-within:flex">
+            <button type="button" aria-label={`重命名 ${directory.name}`} onClick={() => onRename(directory)} className="rounded px-[4px] py-[3px] text-[10px] text-[#757f9c] hover:bg-white hover:text-[#18181a]">改名</button>
+            <button type="button" aria-label={`移动 ${directory.name}`} onClick={() => onMove(directory)} className="rounded px-[4px] py-[3px] text-[10px] text-[#757f9c] hover:bg-white hover:text-[#18181a]">移动</button>
+            <button type="button" aria-label={`删除 ${directory.name}`} onClick={() => onDelete(directory)} className="rounded px-[4px] py-[3px] text-[10px] text-[#d20b0b] hover:bg-white">删</button>
+          </div>
+        )}
+      </div>
+      {isExpanded && children.length > 0 && (
+        <div className="ml-[16px] border-l border-[#f0f1f4] pl-[3px]">
+          {children.map((child) => (
+            <DirectoryTreeNode
+              key={child.id}
+              directory={child}
+              cache={cache}
+              expanded={expanded}
+              currentDirectoryId={currentDirectoryId}
+              canAdmin={canAdmin}
+              onToggle={onToggle}
+              onSelect={onSelect}
+              onRename={onRename}
+              onDelete={onDelete}
+              onMove={onMove}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function ParseTaskRow({

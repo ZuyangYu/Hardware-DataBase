@@ -290,6 +290,8 @@ class AppPipeline:
         ctx: RequestContext | None = None,
         source_group: str | None = None,
         progress_callback: Callable[[int, str], None] | None = None,
+        directory_id: int = 0,
+        file_metadata: list[dict] | None = None,
     ) -> IngestResult:
         temp_paths: list[str] = []
         file_paths: list[str] = []
@@ -317,6 +319,8 @@ class AppPipeline:
                 ctx=ctx,
                 source_group=source_group,
                 progress_callback=progress_callback,
+                directory_id=directory_id,
+                file_metadata=file_metadata,
             )
             self._audit(
                 "upload_document",
@@ -490,6 +494,18 @@ class AppPipeline:
             )
             raise
 
+    def delete_directory_recursive(
+        self,
+        kb_name: str,
+        directory_id: int,
+        *,
+        ctx: RequestContext | None = None,
+    ) -> dict:
+        """Delete all files and directories below one directory."""
+        from src.services.pipeline_directories import delete_kb_directory_tree
+
+        return delete_kb_directory_tree(self, kb_name, directory_id, ctx=ctx)
+
     def create_kb(self, name: str, ctx: RequestContext | None = None) -> Tuple[bool, str]:
         try:
             name = validate_kb_name(name.strip().replace(" ", "_"))
@@ -612,8 +628,16 @@ class AppPipeline:
     def list_files(self, kb_name: str, ctx: RequestContext | None = None) -> List[str]:
         return self.documents.list_files(kb_name, ctx=ctx)
 
-    def list_file_infos(self, kb_name: str, ctx: RequestContext | None = None):
-        return self.documents.list_file_infos(kb_name, ctx=ctx)
+    def list_file_infos(
+        self,
+        kb_name: str,
+        ctx: RequestContext | None = None,
+        *,
+        directory_id: int | None = None,
+    ):
+        if directory_id is None:
+            return self.documents.list_file_infos(kb_name, ctx=ctx)
+        return self.documents.list_file_infos(kb_name, ctx=ctx, directory_id=directory_id)
 
     # ---- external conversations (外部对话) ------------------------------
     def list_external_conversations(self, kb_name: str, ctx: RequestContext | None = None):

@@ -21,6 +21,7 @@ from src.agents.tools.pointer_index import (
     records_signature,
 )
 from src.agents.tools.runtime import format_tool_result, timed_tool_call
+from src.services.pipeline_directories import document_relative_path
 
 _GREP_CACHE_TTL_SECONDS = 300.0
 _GREP_MAX_CHUNKS_PER_SOURCE = 5000
@@ -76,7 +77,7 @@ def _chunk_locator(metadata: dict[str, Any], fallback: int) -> dict[str, Any]:
     return locator
 
 
-def _chunk_evidence(record: Any, chunk: Any, kb_id: int) -> Evidence:
+def _chunk_evidence(record: Any, chunk: Any, kb_id: int, document_store: Any = None) -> Evidence:
     metadata = dict(getattr(chunk, "metadata", {}) or {})
     content = str(getattr(chunk, "content", "") or "")
     chunk_id = str(
@@ -86,13 +87,14 @@ def _chunk_evidence(record: Any, chunk: Any, kb_id: int) -> Evidence:
     )
     evidence_id = f"grep:{getattr(record, 'id', 0)}:{chunk_id}"
     locator = _chunk_locator(metadata, int(getattr(chunk, "index", 0) or 0))
+    relative_path = document_relative_path(document_store, record) if document_store is not None else str(
+        getattr(record, "document_name", "") or "未命名文档"
+    )
     return Evidence(
         id=evidence_id,
         content=content,
         source_name=str(
-            getattr(record, "original_file_name", "")
-            or getattr(record, "document_name", "")
-            or "未命名文档"
+            relative_path or getattr(record, "original_file_name", "") or "未命名文档"
         ),
         content_kind=str(getattr(record, "content_kind", "") or "document_text"),
         processor_kind=str(getattr(record, "processor_kind", "") or "ragflow"),
@@ -110,6 +112,8 @@ def _chunk_evidence(record: Any, chunk: Any, kb_id: int) -> Evidence:
             "status": str(getattr(record, "status", "") or ""),
             "processor_kind": str(getattr(record, "processor_kind", "") or "ragflow"),
             "content_kind": str(getattr(record, "content_kind", "") or "document_text"),
+            "directory_id": int(getattr(record, "directory_id", 0) or 0),
+            "relative_path": relative_path,
         },
     )
 
@@ -156,6 +160,7 @@ def _xlsx_candidates(
                 fetched = conn.execute(sql, params).fetchall()
         except Exception:
             continue
+        relative_path = document_relative_path(getattr(rt, "document_store", None), record)
         for sheet_name, row_index, semantic_text, raw_text in fetched:
             content = str(semantic_text or raw_text or "")
             if not content or not any(pattern.search(content) for pattern in patterns):
@@ -170,7 +175,7 @@ def _xlsx_candidates(
                     Evidence(
                         id=evidence_id,
                         content=content,
-                        source_name=str(getattr(record, "original_file_name", "") or getattr(record, "document_name", "")),
+                        source_name=relative_path or str(getattr(record, "document_name", "")),
                         content_kind=str(getattr(record, "content_kind", "") or "spreadsheet_table"),
                         processor_kind=str(getattr(record, "processor_kind", "") or "spreadsheet_table"),
                         score=1.0,
@@ -186,6 +191,8 @@ def _xlsx_candidates(
                             "evidence_text_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                             "processor_kind": "spreadsheet_table",
                             "content_kind": str(getattr(record, "content_kind", "") or "spreadsheet_table"),
+                            "directory_id": int(getattr(record, "directory_id", 0) or 0),
+                            "relative_path": relative_path,
                         },
                     ),
                 )
@@ -237,7 +244,7 @@ def _circuit_candidates(
 
 
 def _all_circuit_items(
-    records: list[Any], circuit_service: Any, *, limit: int = 5000
+    records: list[Any], circuit_service: Any, document_store: Any = None, *, limit: int = 5000
 ) -> list[Evidence]:
     store = getattr(circuit_service, "store", None) if circuit_service is not None else None
     if store is None or not hasattr(store, "list_designs"):
@@ -249,11 +256,7 @@ def _all_circuit_items(
         source_by_kb.setdefault(str(getattr(record, "kb_name", "") or ""), record)
     items: list[Evidence] = []
     for kb_name, record in source_by_kb.items():
-        source_name = str(
-            getattr(record, "original_file_name", "")
-            or getattr(record, "document_name", "")
-            or "电路网表"
-        )
+        source_name = document_relative_path(document_store, record) or "电路网表"
         try:
             designs = store.list_designs(kb_name)
         except Exception:
@@ -352,7 +355,7 @@ def make_kb_grep(rt: Any, rag_backend: Any, document_store: Any, spreadsheet_ser
             should_cancel=getattr(rt, "should_cancel", None),
         )
         chunks = list(getattr(result, "chunks", []) or [])[:_GREP_MAX_CHUNKS_PER_SOURCE]
-        items = [_chunk_evidence(record, chunk, kb_id) for chunk in chunks]
+        items = [_chunk_evidence(record, chunk, kb_id, document_store) for chunk in chunks]
         cache[key] = (now, items)
         return items
 
@@ -447,7 +450,7 @@ def make_kb_grep(rt: Any, rag_backend: Any, document_store: Any, spreadsheet_ser
                             regex=True, limit=5000, seen=set(),
                         )
                     )
-                    items.extend(_all_circuit_items(records, circuit_service))
+                    items.extend(_all_circuit_items(records, circuit_service, document_store))
                     index.build(
                         list({item.id: item for item in items}.values()), signature
                     )

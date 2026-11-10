@@ -6,7 +6,6 @@ import hashlib
 from enum import Enum
 from dotenv import load_dotenv
 
-
 ENV_FILE_ENCODING = "utf-8-sig"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 默认仍是仓库根 .env；容器部署可用 HDB_ENV_PATH 把可写配置指向挂载目录。
@@ -16,7 +15,6 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_FILE_PATH = os.getenv("HDB_ENV_PATH") or os.path.join(BASE_DIR, ".env")
 CONFIG_REVISION = ""
 
-
 def _config_revision(path: str = ENV_FILE_PATH) -> str:
     """Stable content revision shared by API and workers at task boundaries."""
     try:
@@ -24,7 +22,6 @@ def _config_revision(path: str = ENV_FILE_PATH) -> str:
             return hashlib.sha256(handle.read()).hexdigest()[:16]
     except OSError:
         return "missing"
-
 
 # Keys that used to be deployment flags but are now built-in behavior or an
 # internal constant.  They are intentionally ignored; startup warns once so
@@ -44,7 +41,6 @@ OBSOLETE_ENV_KEYS: dict[str, str] = {
     "SHARED_RETRIEVAL_EXECUTOR_ENABLED": "built-in shared retrieval pool",
 }
 
-
 def obsolete_env_keys(path: str = ENV_FILE_PATH) -> tuple[str, ...]:
     """Return obsolete keys present in the process env or the .env file."""
     keys = set(os.environ)
@@ -59,11 +55,9 @@ def obsolete_env_keys(path: str = ENV_FILE_PATH) -> tuple[str, ...]:
         pass
     return tuple(sorted(key for key in keys if key in OBSOLETE_ENV_KEYS))
 
-
 def _env_bool(name: str, default: bool) -> bool:
     """Parse a boolean environment setting using the application's flag syntax."""
     return os.getenv(name, str(default).lower()).strip().lower() in {"1", "true", "yes", "on"}
-
 
 def _env_csv(name: str) -> frozenset[str]:
     """Parse a comma-separated rollout allowlist into normalized values."""
@@ -85,19 +79,16 @@ CONFIG_REVISION = _config_revision()
 STORAGE_DIR = os.getenv("STORAGE_DIR") or os.path.join(BASE_DIR, "storage")
 PIPELINE_ARCHIVE_ROOT = os.getenv("PIPELINE_ARCHIVE_ROOT", os.path.join(STORAGE_DIR, "pipeline_archives"))
 RAGFLOW_FILE_ROOT = os.getenv("RAGFLOW_FILE_ROOT", PIPELINE_ARCHIVE_ROOT)
+# P1: unknown extensions are archived but never parsed when explicitly enabled.
+DIRECTORY_RAW_ONLY_UNKNOWN = os.getenv("DIRECTORY_RAW_ONLY_UNKNOWN", "false").strip().lower() in {"1", "true", "yes", "on"}
 LOG_DIR = os.path.join(STORAGE_DIR, "logs")
 # Workspace-first agent storage.  A workspace owns the hidden file tree and
 # artifacts for a session/user; there is no task product behind it.
-WORKSPACE_DB_PATH = os.getenv(
-    "WORKSPACE_DB_PATH", os.path.join(STORAGE_DIR, "workspaces.db")
-)
-WORKSPACE_ROOT = os.getenv(
-    "WORKSPACE_ROOT", os.path.join(STORAGE_DIR, "workspaces")
-)
+WORKSPACE_DB_PATH = os.getenv("WORKSPACE_DB_PATH", os.path.join(STORAGE_DIR, "workspaces.db"))
+WORKSPACE_ROOT = os.getenv("WORKSPACE_ROOT", os.path.join(STORAGE_DIR, "workspaces"))
 # Workspace store backend: "" follows CONTROL_PLANE_BACKEND; or sqlite/postgres.
 WORKSPACE_STORE_BACKEND = os.getenv("WORKSPACE_STORE_BACKEND", "").strip().lower()
 WORKSPACE_DB_URL = os.getenv("WORKSPACE_DB_URL", "").strip()
-
 
 def _resolve_storage_path(raw_path: str | None, default_name: str) -> str:
     """Resolve memory data paths independently of the process CWD."""
@@ -105,8 +96,6 @@ def _resolve_storage_path(raw_path: str | None, default_name: str) -> str:
     if not os.path.isabs(path):
         path = os.path.join(STORAGE_DIR, path)
     return os.path.abspath(path)
-
-
 RESULT_EXPORT_STORAGE_DIR = _resolve_storage_path(os.getenv("RESULT_EXPORT_STORAGE_DIR"), "exports")
 RESULT_EXPORT_ENABLED = _env_bool("RESULT_EXPORT_ENABLED", True)
 RESULT_EXPORT_MD_ENABLED = _env_bool("RESULT_EXPORT_MD_ENABLED", True)
@@ -154,22 +143,16 @@ SPREADSHEET_SKIP_BOILERPLATE_SHEETS = os.getenv("SPREADSHEET_SKIP_BOILERPLATE_SH
 # Agent 单题证据堆上限:超出后按问题词法相关性准入新证据(已入堆不淘汰)。
 AGENT_EVIDENCE_BUDGET = int(os.getenv("AGENT_EVIDENCE_BUDGET", "30") or 30)
 # 对话附件(长文档分片)精读需要比普通问答更多的证据槽位; 附件在场时取两者较大值。
-AGENT_ATTACHMENT_EVIDENCE_BUDGET = int(
-    os.getenv("AGENT_ATTACHMENT_EVIDENCE_BUDGET", "80") or 80
-)
+AGENT_ATTACHMENT_EVIDENCE_BUDGET = int(os.getenv("AGENT_ATTACHMENT_EVIDENCE_BUDGET", "80") or 80)
 
 # 站内通知的可选外发 webhook（企业微信/钉钉/邮件网关等）。留空则仅站内通知。
 NOTIFY_WEBHOOK_URL = os.getenv("NOTIFY_WEBHOOK_URL", "").strip()
 NOTIFY_WEBHOOK_TOKEN = os.getenv("NOTIFY_WEBHOOK_TOKEN", "").strip()
-NOTIFY_WEBHOOK_TIMEOUT_SECONDS = float(
-    os.getenv("NOTIFY_WEBHOOK_TIMEOUT_SECONDS", "2") or 2
-)
+NOTIFY_WEBHOOK_TIMEOUT_SECONDS = float(os.getenv("NOTIFY_WEBHOOK_TIMEOUT_SECONDS", "2") or 2)
 
 AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", os.path.join(STORAGE_DIR, "auth.db"))
 # LangGraph checkpointer：agent 会话状态（thread 级完整消息历史）的持久化库。
-AGENT_CHECKPOINT_DB_PATH = os.getenv(
-    "AGENT_CHECKPOINT_DB_PATH", os.path.join(STORAGE_DIR, "agent_checkpoints.db")
-)
+AGENT_CHECKPOINT_DB_PATH = os.getenv("AGENT_CHECKPOINT_DB_PATH", os.path.join(STORAGE_DIR, "agent_checkpoints.db"))
 # P1-001: checkpointer backend selection; postgres is the multi-instance target.
 AGENT_CHECKPOINT_BACKEND = os.getenv("AGENT_CHECKPOINT_BACKEND", "sqlite").strip().lower()
 if AGENT_CHECKPOINT_BACKEND not in {"sqlite", "postgres"}:
@@ -185,11 +168,9 @@ AUTH_SESSION_TTL_HOURS = int(os.getenv("AUTH_SESSION_TTL_HOURS", "24"))
 MCP_TOKEN_TTL_DAYS = int(os.getenv("MCP_TOKEN_TTL_DAYS", "365"))
 MCP_SESSION_TTL_HOURS = int(os.getenv("MCP_SESSION_TTL_HOURS", "24"))
 
-
 class Provider(Enum):
     OLLAMA = "ollama"
     CUSTOM = "custom"
-
 
 try:
     AGENT_LLM_PROVIDER = Provider(os.getenv("AGENT_LLM_PROVIDER", "ollama").lower())
@@ -325,9 +306,7 @@ RESOURCE_PERMIT_LEASE_SECONDS = int(os.getenv("RESOURCE_PERMIT_LEASE_SECONDS", "
 RESOURCE_UNCERTAIN_ESCALATE_SECONDS = int(os.getenv("RESOURCE_UNCERTAIN_ESCALATE_SECONDS", "600"))
 # After this grace period an isolated uncertain permit is released with
 # server_deadline_passed evidence instead of blocking admission forever.
-RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS = int(
-    os.getenv("RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS", "1800")
-)
+RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS = int(os.getenv("RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS", "1800"))
 RESOURCE_GOVERNOR_MAINTENANCE_SECONDS = float(
     os.getenv("RESOURCE_GOVERNOR_MAINTENANCE_SECONDS", "5")
 )
@@ -382,9 +361,7 @@ PROVIDER_RPM_LIMIT = int(os.getenv("PROVIDER_RPM_LIMIT", "0"))
 PROVIDER_TPM_LIMIT = int(os.getenv("PROVIDER_TPM_LIMIT", "0"))
 # Production processes must point at a pre-provisioned quota database instead
 # of silently creating a same-named local file.
-RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED = _env_bool(
-    "RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED", False
-)
+RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED = _env_bool("RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED", False)
 CHAT_QUEUE_DEADLINE_SECONDS = int(os.getenv("CHAT_QUEUE_DEADLINE_SECONDS", "600"))
 # Deep（知识库复杂任务）回合的硬看门狗。内部工具/时间预算已封顶，
 # 外部看门狗只负责兜底，不再允许 15 分钟级挂起。
@@ -548,7 +525,6 @@ _EVIDENCE_BOOL_KEYS = frozenset("EVIDENCE_SOURCE_AWARE_ENABLED".split())
 EVIDENCE_INT_SETTING_KEYS = frozenset(set(_EVIDENCE_DEFAULTS) - _EVIDENCE_BOOL_KEYS)
 EVIDENCE_POSITIVE_SETTING_KEYS = EVIDENCE_INT_SETTING_KEYS
 
-
 def _load_evidence_settings() -> dict[str, object]:
     return {**{k: _env_bool(k, bool(v)) for k, v in _EVIDENCE_DEFAULTS.items() if k in _EVIDENCE_BOOL_KEYS},
             **{k: int(os.getenv(k, str(v)) or v) for k, v in _EVIDENCE_DEFAULTS.items() if k not in _EVIDENCE_BOOL_KEYS}}
@@ -562,7 +538,6 @@ def _multi_kb_byte_limit(name: str) -> int:
             raise ValueError(f"{name} must be positive")
         return value
     return int(os.getenv("MULTI_KB_CONTEXT_MAX_TOKENS", "8000"))
-
 
 MULTI_KB_FUSION_MAX_BYTES = _multi_kb_byte_limit("MULTI_KB_FUSION_MAX_BYTES")
 MULTI_KB_TURN_EVIDENCE_MAX_BYTES = _multi_kb_byte_limit("MULTI_KB_TURN_EVIDENCE_MAX_BYTES")
@@ -740,7 +715,6 @@ NO_CONTEXT_PROMPT = os.getenv(
     "知识库中没有找到相关上下文，请说明这一点；如需基于通用知识回答，必须明确标注。"
 )
 
-
 def ensure_runtime_dirs():
     """Ensure directories required by RAGFlow and pipeline archives exist."""
     os.makedirs(STORAGE_DIR, exist_ok=True)
@@ -748,9 +722,7 @@ def ensure_runtime_dirs():
     os.makedirs(PIPELINE_ARCHIVE_ROOT, exist_ok=True)
     os.makedirs(RAGFLOW_FILE_ROOT, exist_ok=True)
 
-
 ensure_runtime_dirs()
-
 
 # v3 §11.2: settings that only take effect after a process restart (storage
 # backends, DSNs, role/port and other construction-time wiring).  Everything
@@ -799,7 +771,6 @@ RESTART_REQUIRED_SETTINGS = frozenset(
         "MCP_CREDENTIALS_KEY",
     }
 )
-
 
 DEFAULT_VALUES = {
     "RAGFLOW_BASE_URL": "http://localhost:9380",
@@ -1115,7 +1086,6 @@ DEFAULT_VALUES = {
     "NO_CONTEXT_PROMPT": NO_CONTEXT_PROMPT,
 }
 
-
 DEFAULT_VALUES.update({key: (("true" if default else "false") if isinstance(default, bool) else str(default)) for key, default in _EVIDENCE_DEFAULTS.items()})
 
 def reload_settings():
@@ -1132,7 +1102,6 @@ def reload_settings():
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-
 
 def _reload_settings():
     """Parse the reloadable configuration under the settings lock."""
@@ -1706,7 +1675,6 @@ def _reload_settings():
     NO_CONTEXT_PROMPT = os.getenv("NO_CONTEXT_PROMPT", DEFAULT_VALUES["NO_CONTEXT_PROMPT"])
     ensure_runtime_dirs()
 
-
 def _format_env_value(value: str) -> str:
     """Format a .env value while preserving spaces and newlines safely."""
     value = str(value)
@@ -1721,7 +1689,6 @@ def _format_env_value(value: str) -> str:
         )
         return f'"{escaped}"'
     return value
-
 
 def _env_value_quote_closed(value: str) -> bool:
     """Return whether a quoted .env value closes on the current physical line."""
@@ -1741,7 +1708,6 @@ def _env_value_quote_closed(value: str) -> bool:
         if char == quote:
             return True
     return False
-
 
 def save_settings_to_env(settings_dict: dict, env_path: str = None):
     """Update .env keys while preserving comments and unrelated settings.
@@ -1822,7 +1788,6 @@ def save_settings_to_env(settings_dict: dict, env_path: str = None):
             except OSError:
                 pass
             raise
-
 
 # Keys parsed as numbers or an enum at import/reload time. A value that cannot
 # be converted would brick the server on next boot (module-level parse raises),
@@ -1988,7 +1953,6 @@ _FLOAT_SETTING_KEYS = frozenset({
     "SANDBOX_RECONCILE_INTERVAL_SECONDS",
 })
 
-
 def validate_settings_values(settings_dict: dict) -> None:
     """Validate candidate .env values against their expected types.
 
@@ -2070,7 +2034,6 @@ def validate_settings_values(settings_dict: dict) -> None:
                 int(text)
             except ValueError as exc:
                 raise ValueError(f"{key} 必须是整数或空值，当前值: {text!r}") from exc
-
 
 def validate_provider_configuration(overrides: dict | None = None) -> None:
     """P0-008: reject provider selections that cannot run in this deployment.
