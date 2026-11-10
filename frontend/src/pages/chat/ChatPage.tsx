@@ -712,6 +712,8 @@ export default function ChatPage({
           availableKbs={visibleKbs}
           input={input}
           setInput={setInput}
+          queryMode={chat.queryMode}
+          onQueryModeChange={chat.setQueryMode}
           streaming={streaming}
           onKbChange={handleKbChange}
           onSend={handleSendWithAttachments}
