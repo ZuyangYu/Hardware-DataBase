@@ -230,10 +230,25 @@ def read_file_chunks(
     API; this slice is bridge-side).  ``query`` filters chunks whose content
     contains the needle (case-insensitive) after slicing.
     """
-    data = _request(
-        "GET",
-        f"/kbs/{_kb_path(kb_name)}/files/{quote(str(file_id), safe='')}/chunks",
-    )
+    try:
+        data = _request(
+            "GET",
+            f"/kbs/{_kb_path(kb_name)}/files/{quote(str(file_id), safe='')}/chunks",
+        )
+    except RuntimeError as exc:
+        if "citation_processor_unsupported" in str(exc):
+            # Spreadsheet/circuit records have no document chunk stream.
+            # Point the caller at the structured tools instead of failing
+            # with an opaque upstream 422.
+            return {
+                "error": "structured_source",
+                "message": (
+                    "该文件是表格/网表，不是文档 chunk；"
+                    "请使用 query_table 或 query_circuit。"
+                ),
+                "file_id": str(file_id),
+            }
+        raise
     raw_chunks = data.get("chunks") or []
     chunk_count = int(data.get("chunk_count") or len(raw_chunks))
     start = max(0, int(start_index or 0))
@@ -320,6 +335,7 @@ def search_knowledge_base(
         raise ValueError("query is required")
     rows = _request("GET", f"/kbs/{_kb_path(kb_name)}/files")
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    skipped: list[dict[str, str]] = []
     files_searched = 0
     chunks_searched = 0
     for row in rows:
@@ -331,15 +347,41 @@ def search_knowledge_base(
             continue
         processor = str(row.get("processor_kind") or "")
         wanted = str(kind or "document").strip().lower()
+        if wanted not in {"document", "table", "circuit", "all"}:
+            wanted = "document"
         if wanted == "document" and processor and processor != "ragflow":
             continue
         if wanted == "table" and "spreadsheet" not in processor:
             continue
         if wanted == "circuit" and "circuit" not in processor:
             continue
-        if wanted not in {"document", "table", "circuit", "all"}:
-            wanted = "document"
-        cache = _load_chunks(kb_name, fid, refresh)
+        if wanted in {"table", "circuit"} or (
+            wanted == "all" and processor and processor != "ragflow"
+        ):
+            # Structured sources are not chunk streams.  `kind=all` still
+            # searches documents and reports the skipped files so the caller
+            # can switch to query_table/query_circuit for those rows.
+            skipped.append(
+                {
+                    "file_id": fid,
+                    "file_name": fid_name,
+                    "kind": processor or wanted,
+                    "reason": "use query_table/query_circuit for structured sources",
+                }
+            )
+            continue
+        try:
+            cache = _load_chunks(kb_name, fid, refresh)
+        except Exception as exc:  # noqa: BLE001 - one bad file must not kill the search
+            skipped.append(
+                {
+                    "file_id": fid,
+                    "file_name": fid_name,
+                    "kind": processor,
+                    "reason": str(exc)[:200],
+                }
+            )
+            continue
         grouped[(fid, fid_name)] = list(cache.get("chunks") or [])
         files_searched += 1
         chunks_searched += len(cache.get("chunks") or [])
@@ -366,8 +408,13 @@ def search_knowledge_base(
         "result_count": len(results),
         "files_searched": files_searched,
         "chunks_searched": chunks_searched,
+        "skipped_files": skipped,
         "cache_files": len(_CHUNK_CACHE),
-        "note": "lexical/exact score over raw chunks; read hits with hdb_read_file_chunks(file_id, start_index)",
+        "note": (
+            "lexical/exact score over document chunks; read hits with "
+            "read_file_chunks(file_id, start_index). Structured files are "
+            "listed in skipped_files; use query_table/query_circuit for them."
+        ),
     }
 
 
