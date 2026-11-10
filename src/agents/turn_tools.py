@@ -28,6 +28,7 @@ from src.agents.tools.evidence_tools import make_evidence_read
 from src.agents.tools.external_conversation_tools import make_conversation_search
 from src.agents.tools.grep_tools import make_kb_grep
 from src.agents.tools.knowledge_search import make_knowledge_search
+from src.agents.tools.kb_workspace_tools import make_kb_workspace_tools
 from src.agents.tools.memory_tools import make_memory_search
 from src.agents.tools.pipeline_catalog import make_catalog_tool
 from src.agents.tools.session_tools import make_session_recall
@@ -64,6 +65,7 @@ def build_turn_tools(
     rag_backend: Any,
     document_store: Any,
     spreadsheet_service: Any,
+    document_manager: Any = None,
     circuit_service: Any,
     conversation_service: Any,
     wiki_service: Any,
@@ -167,8 +169,18 @@ def build_turn_tools(
             wiki_search=wiki_tool,
             spreadsheet_row_search=spreadsheet_row_tool,
         )
+        # File-shaped KB tools: locate -> grep/read -> answer without forcing
+        # every lookup through candidate -> evidence_read.
+        kb_workspace_tools = make_kb_workspace_tools(
+            rt, rag_backend, document_store, document_manager=document_manager
+        )
         # Main agent sees capabilities, not the source-specific adapter list.
-        visible: list[Any] = [knowledge_tool, session_tool, evidence_tool]
+        visible: list[Any] = [
+            knowledge_tool,
+            session_tool,
+            evidence_tool,
+            *kb_workspace_tools,
+        ]
         if catalog_tool is not None:
             visible.append(catalog_tool)
         if rt.knowledge_scope is None:
@@ -179,6 +191,7 @@ def build_turn_tools(
         # out of the main surface as well.
         result.tools.extend(visible)
         result.execution_tools.extend(low_level)
+        result.execution_tools.extend(kb_workspace_tools)
         result.execution_tools.append(knowledge_tool)
         if catalog_tool is not None:
             result.execution_tools.append(catalog_tool)

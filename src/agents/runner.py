@@ -596,9 +596,11 @@ class MultiSourceAgentRunner:
         conversation_service=None,
         memory_service_factory: Callable[[], MemoryService] | None = None,
         wiki_service: Any | None = None,
+        document_manager: Any | None = None,
     ):
         self.rag_backend = rag_backend
         self.document_store = document_store or PipelineDocumentStore()
+        self.document_manager = document_manager
         self.spreadsheet_service = spreadsheet_service or SpreadsheetIndexService()
         self.circuit_service = circuit_service or CircuitIndexService()
         if conversation_service is None:
@@ -1274,6 +1276,7 @@ class MultiSourceAgentRunner:
             numeric_user_id=numeric_user_id,
             rag_backend=self.rag_backend,
             document_store=self.document_store,
+            document_manager=self.document_manager,
             spreadsheet_service=self.spreadsheet_service,
             circuit_service=self.circuit_service,
             conversation_service=self.conversation_service,
