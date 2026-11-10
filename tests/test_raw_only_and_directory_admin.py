@@ -132,7 +132,7 @@ def test_recursive_directory_delete_removes_files_and_tree(tmp_path):
     deleted = []
 
     class _Documents:
-        def delete_document(self, file_id, kb_name, ctx=None):
+        def delete_document(self, file_id, kb_name, ctx=None, *, directory_id=None):
             deleted.append(file_id)
             store.delete_document_by_id(int(str(file_id).split(":", 1)[1]))
             return SimpleNamespace(ok=True, message="deleted")

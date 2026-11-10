@@ -678,7 +678,12 @@ def upload_file(
 
 
 @mcp.tool()
-def delete_file(kb_name: str, filename: str, confirm: bool = False) -> dict[str, Any]:
+def delete_file(
+    kb_name: str,
+    filename: str,
+    confirm: bool = False,
+    directory_id: int = 0,
+) -> dict[str, Any]:
     """Delete one file from a knowledge base (requires write permission).
 
     Deletion is destructive.  Pass ``confirm=true`` only after the user has
@@ -696,7 +701,9 @@ def delete_file(kb_name: str, filename: str, confirm: bool = False) -> dict[str,
             "message": "pass confirm=true to delete this file",
         }
     return _request(
-        "DELETE", f"/kbs/{_kb_path(kb_name)}/files/{quote(name, safe='')}"
+        "DELETE",
+        f"/kbs/{_kb_path(kb_name)}/files/{quote(name, safe='')}",
+        params={"directory_id": int(directory_id or 0)},
     )
 
 

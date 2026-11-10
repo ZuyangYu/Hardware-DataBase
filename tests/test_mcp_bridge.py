@@ -661,3 +661,22 @@ def test_search_knowledge_base_scopes_to_directory_and_keeps_relative_path():
     assert result["results"][0]["file_id"] == "ragflow:1"
     assert result["results"][0]["file_name"] == "docs/spec.pdf"
     assert not any(path.endswith("/ragflow:2/chunks") for path in seen)
+
+
+def test_delete_file_passes_directory_scope():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["directory_id"] = request.url.params.get("directory_id")
+        return httpx.Response(200, json={"ok": True, "message": "deleted"})
+
+    _use(handler)
+    result = bridge.delete_file(
+        "AAA", "spec.pdf", confirm=True, directory_id=7
+    )
+    assert result["ok"] is True
+    assert seen["method"] == "DELETE"
+    assert seen["path"] == "/api/v1/kbs/AAA/files/spec.pdf"
+    assert seen["directory_id"] == "7"

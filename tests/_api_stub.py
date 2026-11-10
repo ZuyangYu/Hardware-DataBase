@@ -76,7 +76,7 @@ class StubPipeline:
         self.deleted_kbs.append(kb_name)
         return True, f"知识库 '{kb_name}' 已删除"
 
-    def delete_document(self, filename, kb_name, ctx=None):
+    def delete_document(self, filename, kb_name, ctx=None, *, directory_id=None):
         self.deleted.append((kb_name, filename))
         # The API route calls pipeline.delete_document directly and treats the
         # return value as a message string (same as AppPipeline.delete_document
