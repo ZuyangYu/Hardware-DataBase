@@ -624,4 +624,93 @@ def test_turn_preparation_stays_synchronous():
     assert not isgeneratorfunction(MultiSourceAgentRunner._prepare_turn)
     assert isgeneratorfunction(MultiSourceAgentRunner._stream_impl)
 
+def test_deep_subagents_inherit_turn_budget_and_kb_scope(monkeypatch):
+    """Subagent graphs must share the parent deadline instead of running free."""
 
+    from src.agents import runner as runner_mod
+    from src.agents.middleware.loop_budget import LoopBudgetMiddleware
+
+    captured: dict = {}
+
+    def _fake_create_deep_agent(**kwargs):
+        captured.update(kwargs)
+
+        class _Agent:
+            def stream(self, *args, **kwargs):
+                return iter(())
+
+        return _Agent()
+
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", _fake_create_deep_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend())
+    list(
+        runner.stream(
+            query=(
+                "请评审 TCN2 电源树：1. 列出 X2000 连接器全部管脚；"
+                "2. 对比 TPS62872 与 LP87702 的风险；"
+                "3. 给出至少 3 条改进建议并引用证据。"
+            ),
+            kb_name="kb_hw",
+            history=[],
+            thread_id="t-subagent-budget",
+            query_mode="deep",
+        )
+    )
+
+    subagents = captured.get("subagents") or []
+    assert {spec["name"] for spec in subagents} == {
+        "general-purpose",
+        "research",
+    }
+    main_budget = next(
+        item
+        for item in captured["middleware"]
+        if isinstance(item, LoopBudgetMiddleware)
+    )
+    for spec in subagents:
+        budget_middleware = [
+            item
+            for item in spec["middleware"]
+            if isinstance(item, LoopBudgetMiddleware)
+        ]
+        assert budget_middleware
+        # The nested graph must consume the parent's counters, not a copy.
+        assert budget_middleware[0].budget is main_budget.budget
+        assert main_budget.budget.deadline is not None
+        assert main_budget.budget.tool_call_cap is not None
+        assert "当前知识库为「kb_hw」" in spec["system_prompt"]
+
+
+def test_llm_stream_idle_timeout_completes_with_partial_notice(monkeypatch):
+    """A stalled provider stream must not fail the turn at the watchdog."""
+
+    from src.agents import runner as runner_mod
+
+    def _boom(*args, **kwargs):
+        raise TimeoutError("LLM stream idle for more than 60s")
+
+    fake_agent = type("F", (), {})()
+    fake_agent.stream = _boom
+    monkeypatch.setattr(runner_mod, "create_chat_model", lambda: object())
+    monkeypatch.setattr(runner_mod, "create_deep_agent", lambda **kwargs: fake_agent)
+    monkeypatch.setattr(runner_mod, "record_agent", Mock())
+
+    events = []
+    runner = MultiSourceAgentRunner(rag_backend=_FakeRAGBackend(), circuit_service=None)
+    deltas = list(
+        runner.stream(
+            query="问题",
+            kb_name="kb_hw",
+            history=[],
+            event_callback=events.append,
+        )
+    )
+
+    assert len(deltas) == 1
+    assert "时间预算" in deltas[0]
+    budgets = [event for event in events if event["type"] == "budget"]
+    assert budgets
+    assert budgets[-1]["payload"]["stopped_reason"] == "time_limit"

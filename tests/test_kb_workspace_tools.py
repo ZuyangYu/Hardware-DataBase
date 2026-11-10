@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from src.agents.schemas import Evidence
 from src.agents.tools.kb_workspace_tools import make_kb_workspace_tools
 from src.agents.tools.runtime import ToolRuntime
+from src.agents.turn_meta import _general_subagent_spec
 from src.pipelines.document_rag.schemas import ParsedChunk, ParseResult
 
 
@@ -137,18 +138,36 @@ def test_list_knowledge_files_returns_kind():
     assert only_docs["count"] == 1
 
 
-def test_search_documents_exact_returns_locator_and_snippet_without_evidence():
+def test_search_documents_exact_registers_evidence_with_citation():
     rt, (search, read, files) = _tools()
 
     payload = json.loads(search("X2000", mode="exact", top_k=10))
 
     assert payload["mode"] == "exact"
     assert payload["result_count"] == 1
+    assert payload["evidence_count"] == 1
     first = payload["results"][0]
     assert first["file_name"].endswith("TCN2.pdf")
     assert first["locator"]["page_num"] == 12
     assert "X2000" in first["snippet"]
-    assert rt.evidence == []
+    assert first["citation_number"] == 1
+    assert len(rt.evidence) == 1
+    evidence = rt.evidence[0]
+    assert evidence.content.startswith("DEBUG CONNECTOR X2000")
+    assert evidence.metadata["source_type"] == "knowledge_base_document"
+    assert evidence.metadata["kb_id"] == 4
+    assert evidence.metadata["local_record_id"] == 36
+
+
+def test_repeated_search_reuses_citation_without_duplicating_evidence():
+    rt, (search, read, files) = _tools()
+
+    first = json.loads(search("X2000", mode="exact", top_k=10))
+    second = json.loads(search("X2000", mode="exact", top_k=10))
+
+    assert first["results"][0]["citation_number"] == 1
+    assert second["results"][0]["citation_number"] == 1
+    assert len(rt.evidence) == 1
 
 
 def test_search_documents_auto_detects_exact_term():
@@ -173,8 +192,8 @@ def test_search_documents_semantic_uses_document_search_runner():
     assert payload["results"][0]["rag_id"] == "rag-9"
 
 
-def test_read_document_returns_text_and_next_index():
-    _, (search, read, files) = _tools()
+def test_read_document_returns_text_and_registers_evidence():
+    rt, (search, read, files) = _tools()
 
     payload = json.loads(read("36", start_index=0, max_chunks=1))
 
@@ -182,6 +201,10 @@ def test_read_document_returns_text_and_next_index():
     assert payload["chunk_count"] == 2
     assert len(payload["chunks"]) == 1
     assert "X2000" in payload["chunks"][0]["content"]
+    assert payload["chunks"][0]["citation_number"] == 1
+    assert payload["evidence_count"] == 1
+    assert len(rt.evidence) == 1
+    assert rt.evidence[0].metadata["source_type"] == "knowledge_base_document"
     assert payload["next_index"] == 1
 
 
@@ -204,3 +227,19 @@ def test_document_manager_is_preferred_over_raw_rag_backend():
     assert payload["result_count"] == 1
     assert manager.calls == 1
     assert raw.calls == 0
+
+
+def test_general_subagent_tools_keep_parent_runtime_bindings():
+    """Subagent tools are the same rt-bound closures as the main agent."""
+
+    rt, tools = _tools()
+    spec = _general_subagent_spec(tools=tools, model=object())
+
+    search = next(
+        tool for tool in spec["tools"] if tool.__name__ == "search_documents"
+    )
+    payload = json.loads(search("X2000", mode="exact"))
+
+    assert payload["evidence_count"] == 1
+    assert len(rt.evidence) == 1
+    assert rt.evidence[0].metadata["local_record_id"] == 36

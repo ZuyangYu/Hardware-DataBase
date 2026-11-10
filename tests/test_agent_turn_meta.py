@@ -141,6 +141,9 @@ def test_hardware_removal_target_mismatch_is_a_failed_check():
 
 def test_research_subagent_receives_read_only_tools_only():
     tools = [
+        SimpleNamespace(name="search_documents"),
+        SimpleNamespace(name="read_document"),
+        SimpleNamespace(name="list_knowledge_files"),
         SimpleNamespace(name="document_search"),
         SimpleNamespace(name="attachment_read"),
         SimpleNamespace(name="attachment_edit"),
@@ -148,7 +151,13 @@ def test_research_subagent_receives_read_only_tools_only():
     ]
     spec = _research_subagent_spec(tools=tools, model=object())
     assert spec is not None
-    assert {tool.name for tool in spec["tools"]} == {"document_search", "attachment_read"}
+    assert {tool.name for tool in spec["tools"]} == {
+        "search_documents",
+        "read_document",
+        "list_knowledge_files",
+        "document_search",
+        "attachment_read",
+    }
 
 
 def test_partial_synthesis_trims_unregistered_citations_and_compacts_context():

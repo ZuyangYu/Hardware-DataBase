@@ -408,6 +408,7 @@ class _TurnPlan:
     direct_control_answer: str | None
     direct_answer_grounding: str
     context_fragments: list[tuple[str, str]] = field(default_factory=list)
+    kb_scope_line: str = ""
     execution_tools: list[Any] = field(default_factory=list)
     skill_root: str | None = None
     workspace: Any | None = None
@@ -1356,6 +1357,7 @@ class MultiSourceAgentRunner:
             direct_control_answer=direct_control_answer,
             direct_answer_grounding=direct_answer_grounding,
             context_fragments=context_fragments,
+            kb_scope_line=kb_scope_line,
             execution_tools=tool_bundle.execution_tools,
             skill_root=skill_root,
             workspace=workspace,
@@ -1600,62 +1602,13 @@ class MultiSourceAgentRunner:
                 skill_ref=skill_ref,
             )
 
-        agent_subagents: list[dict[str, Any]] | None = None
-        if show_turn_meta:
-            general_subagent = _general_subagent_spec(
-                tools=plan.tools,
-                model=model,
-                skill_root=skill_root,
-                skill_read_observer=_observe_skill_read,
-            )
-            if general_subagent is not None:
-                agent_subagents = [general_subagent]
-        if (
-            RESEARCH_SUBAGENT_ENABLED
-            and query_mode == "deep"
-            and str(budget_state["complexity"].get("level") or "simple") == "complex"
-        ):
-            research = _research_subagent_spec(
-                tools=plan.execution_tools,
-                model=model,
-                skill_root=skill_root,
-                skill_read_observer=_observe_skill_read,
-            )
-            if research is not None:
-                agent_subagents = [*(agent_subagents or []), research]
-        if show_turn_meta and query_mode == "deep":
-            system_prompt = _complex_task_prompt(
-                system_prompt, has_subagents=bool(agent_subagents)
-            )
-        if not is_general:
-            system_prompt += (
-                "\n引用编号只对当前轮有效；不要复用上一轮回答或对话历史中的 [n]，"
-                "必须使用本轮工具返回的证据编号。"
-            )
-        if skill_root:
-            system_prompt += (
-                "\n本轮 read_file 仅用于读取已审核并物化的 Skill 的 SKILL.md，"
-                "不得读取或尝试读取其他路径。"
-            )
         tool_call_cap = budget_state.get("tool_call_cap")
         retrieval_call_cap = budget_state.get("retrieval_call_cap")
         finalize_reserve = int(budget_state.get("finalize_reserve") or 0)
-        if tool_call_cap:
-            system_prompt += (
-                f"\n本轮所有工具调用总次数硬上限为 {int(tool_call_cap)} 次"
-                "（包括检索、读证据、写文件等全部工具）。"
-            )
-            if retrieval_call_cap:
-                system_prompt += (
-                    f"其中检索类工具最多 {int(retrieval_call_cap)} 次；"
-                    f"最后 {finalize_reserve} 次预留给最终答案/文件产出。"
-                    "达到检索上限后不要继续检索，直接基于已有证据生成或写文件。"
-                )
-            system_prompt += (
-                "请把调用集中在最必要的查询上，不要重复相近的检索。"
-            )
+        # Build the turn budget before subagent specs so every nested graph
+        # shares the same deadline and tool-call counters instead of running
+        # in an unbounded loop that the parent cannot interrupt.
         turn_started = time.monotonic()
-        pre_candidates = set(rt.candidate_evidence)
         loop_budget = LoopBudget(rt)
         loop_budget.tool_call_cap = tool_call_cap
         loop_budget.retrieval_call_cap = retrieval_call_cap
@@ -1677,6 +1630,64 @@ class MultiSourceAgentRunner:
                 ),
             )
         loop_budget.deadline = turn_started + loop_seconds
+        subagent_middleware = [LoopBudgetMiddleware(loop_budget)]
+
+        agent_subagents: list[dict[str, Any]] | None = None
+        if show_turn_meta:
+            general_subagent = _general_subagent_spec(
+                tools=plan.tools,
+                model=model,
+                skill_root=skill_root,
+                skill_read_observer=_observe_skill_read,
+                middleware=subagent_middleware,
+                kb_scope_line=plan.kb_scope_line,
+            )
+            if general_subagent is not None:
+                agent_subagents = [general_subagent]
+        if (
+            RESEARCH_SUBAGENT_ENABLED
+            and query_mode == "deep"
+            and str(budget_state["complexity"].get("level") or "simple") == "complex"
+        ):
+            research = _research_subagent_spec(
+                tools=plan.execution_tools,
+                model=model,
+                skill_root=skill_root,
+                skill_read_observer=_observe_skill_read,
+                middleware=subagent_middleware,
+                kb_scope_line=plan.kb_scope_line,
+            )
+            if research is not None:
+                agent_subagents = [*(agent_subagents or []), research]
+        if show_turn_meta and query_mode == "deep":
+            system_prompt = _complex_task_prompt(
+                system_prompt, has_subagents=bool(agent_subagents)
+            )
+        if not is_general:
+            system_prompt += (
+                "\n引用编号只对当前轮有效；不要复用上一轮回答或对话历史中的 [n]，"
+                "必须使用本轮工具返回的证据编号。"
+            )
+        if skill_root:
+            system_prompt += (
+                "\n本轮 read_file 仅用于读取已审核并物化的 Skill 的 SKILL.md，"
+                "不得读取或尝试读取其他路径。"
+            )
+        if tool_call_cap:
+            system_prompt += (
+                f"\n本轮所有工具调用总次数硬上限为 {int(tool_call_cap)} 次"
+                "（包括检索、读证据、写文件等全部工具）。"
+            )
+            if retrieval_call_cap:
+                system_prompt += (
+                    f"其中检索类工具最多 {int(retrieval_call_cap)} 次；"
+                    f"最后 {finalize_reserve} 次预留给最终答案/文件产出。"
+                    "达到检索上限后不要继续检索，直接基于已有证据生成或写文件。"
+                )
+            system_prompt += (
+                "请把调用集中在最必要的查询上，不要重复相近的检索。"
+            )
+        pre_candidates = set(rt.candidate_evidence)
         gap_middleware = GapClosureMiddleware(
             rt=rt,
             pre_candidates=pre_candidates,
@@ -1732,6 +1743,12 @@ class MultiSourceAgentRunner:
                 stream_mode="messages",
             ):
                 rt.check_cancel()
+                # A model call can straddle the turn deadline: the middleware
+                # checked before it started, but streaming may still run long.
+                # Stop at the next chunk so the runner can synthesize from the
+                # evidence already collected instead of hitting the watchdog.
+                if loop_budget.expired():
+                    raise TimeBudgetExceeded()
                 node = str((metadata or {}).get("langgraph_node") or "")
                 _accumulate_usage(usage, chunk)
                 if isinstance(chunk, ToolMessage):
@@ -1786,6 +1803,10 @@ class MultiSourceAgentRunner:
             time_stopped = True
         except CallBudgetExceeded:
             cap_stopped = True
+        except TimeoutError:
+            # Provider stream idle timeout: keep the evidence collected so far
+            # and synthesize a partial answer instead of failing the turn.
+            time_stopped = True
         except QueryCancelled:
             return
         except Exception as exc:
