@@ -107,6 +107,55 @@ def _mechanical_table_ddl(table: str, columns: list[dict[str, Any]]) -> str:
     return f"CREATE TABLE IF NOT EXISTS {pg_ident(table)} ({', '.join(definitions)})"
 
 
+def _add_missing_columns(
+    conn, table: str, columns: list[dict[str, Any]]
+) -> None:
+    """Add columns introduced after a PostgreSQL table was first provisioned.
+
+    ``CREATE TABLE IF NOT EXISTS`` never changes an existing shape.  Without
+    this step a new column exists in the SQLite template and in fresh
+    PostgreSQL deployments, but not in an upgraded one; the subsequent index
+    creation then fails with ``UndefinedColumn``.  Only mechanical defaults
+    are accepted for NOT NULL columns so an upgrade can backfill every row
+    deterministically.
+    """
+
+    existing = {
+        str(row[0])
+        for row in conn.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+            """,
+            (table,),
+        ).fetchall()
+    }
+    for column in columns:
+        name = str(column["name"])
+        if name in existing:
+            continue
+        if int(column.get("pk") or 0) > 0:
+            raise RuntimeError(
+                f"cannot add missing primary-key column {table}.{name}; "
+                "rebuild the table explicitly"
+            )
+        parts = [pg_ident(name), _mechanical_type(column["type"])]
+        default = _mechanical_default(column.get("dflt_value"))
+        if int(column.get("notnull") or 0):
+            if default is None:
+                raise RuntimeError(
+                    f"cannot add NOT NULL column {table}.{name} without a "
+                    "mechanical default; backfill it explicitly"
+                )
+            parts.append("NOT NULL")
+        if default is not None:
+            parts.append(f"DEFAULT {default}")
+        conn.execute(
+            f"ALTER TABLE {pg_ident(table)} ADD COLUMN {' '.join(parts)}"
+        )
+
+
 def _repair_identity_column(conn, table: str, columns: list[dict[str, Any]]) -> None:
     """给存量表补齐 identity：``CREATE TABLE IF NOT EXISTS`` 不会纠正旧形状。
 
@@ -455,8 +504,9 @@ def provision_domain_group(
         loaded: set[str] = set()
         for table in wanted:
             conn.execute(_mechanical_table_ddl(table, metadata["columns"][table]))
-            # 存量表可能早于 identity 逻辑建表；CREATE IF NOT EXISTS 不会改形状，
-            # 这里顺手做幂等修复（缺 identity 的表插入会撞 NOT NULL）。
+            # 存量表可能早于新列/identity 逻辑建表；CREATE IF NOT EXISTS 不会改
+            # 形状，先补列再建索引，避免索引引用尚未存在的列。
+            _add_missing_columns(conn, table, metadata["columns"][table])
             _repair_identity_column(conn, table, metadata["columns"][table])
             loaded.add(table)
         for table in wanted:

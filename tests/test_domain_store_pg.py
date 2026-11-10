@@ -257,3 +257,48 @@ class PipelineDocumentStoreParityTests(_DomainParityCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeColumnConn:
+    def __init__(self, existing: set[str]):
+        self.existing = existing
+        self.statements: list[tuple[str, object]] = []
+
+    def execute(self, sql: str, params: object = None):
+        if "information_schema.columns" in sql:
+            rows = [(name,) for name in sorted(self.existing)]
+
+            class _Rows(list):
+                def fetchall(self):
+                    return list(self)
+
+            return _Rows(rows)
+        self.statements.append((sql, params))
+        return []
+
+
+def test_add_missing_column_uses_mechanical_default():
+    """Upgraded PG tables get new columns before indexes reference them."""
+
+    conn = _FakeColumnConn({"id", "kb_name"})
+    domain_pg._add_missing_columns(
+        conn,
+        "pipeline_documents",
+        [
+            {"name": "id", "type": "INTEGER", "pk": 1, "notnull": 1, "dflt_value": None},
+            {
+                "name": "directory_id",
+                "type": "INTEGER",
+                "pk": 0,
+                "notnull": 1,
+                "dflt_value": "0",
+            },
+        ],
+    )
+
+    assert len(conn.statements) == 1
+    sql = conn.statements[0][0]
+    assert 'ADD COLUMN "directory_id"' in sql
+    assert "BIGINT" in sql
+    assert "NOT NULL" in sql
+    assert "DEFAULT 0" in sql
