@@ -47,7 +47,14 @@ class RAGBackend(ABC):
         """Retrieve evidence for a query."""
 
     @abstractmethod
-    def delete_document(self, kb_name: str, document_id: str, ctx: RequestContext | None = None) -> BackendResult:
+    def delete_document(
+        self,
+        kb_name: str,
+        document_id: str,
+        ctx: RequestContext | None = None,
+        *,
+        directory_id: int | None = None,
+    ) -> BackendResult:
         """Delete a document from a knowledge base."""
 
     @abstractmethod

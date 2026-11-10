@@ -1099,14 +1099,26 @@ class RAGFlowBackend(RAGBackend):
                 errors.append(f"{child.document_name}: {exc}")
         return errors
 
-    def _get_record_for_document_id(self, kb_name: str, document_id: str, ctx: RequestContext | None = None):
+    def _get_record_for_document_id(
+        self,
+        kb_name: str,
+        document_id: str,
+        ctx: RequestContext | None = None,
+        *,
+        directory_id: int | None = None,
+    ):
         record_id = _record_id_from_document_id(document_id)
         if record_id is not None:
             record = self.store.get_document_by_id_scoped(record_id, _ctx_department_id(ctx))
             if record and record.kb_name == kb_name:
                 return record
             return None
-        return self.store.get_document(kb_name, document_id, department_id=_ctx_department_id(ctx))
+        return self.store.get_document(
+            kb_name,
+            document_id,
+            department_id=_ctx_department_id(ctx),
+            directory_id=int(directory_id or 0),
+        )
 
     def upload_files(
         self,
@@ -1796,9 +1808,18 @@ class RAGFlowBackend(RAGBackend):
             )
         return evidences[:top_k]
 
-    def delete_document(self, kb_name: str, document_id: str, ctx: RequestContext | None = None) -> BackendResult:
+    def delete_document(
+        self,
+        kb_name: str,
+        document_id: str,
+        ctx: RequestContext | None = None,
+        *,
+        directory_id: int | None = None,
+    ) -> BackendResult:
         self._check_kb_access(kb_name, ctx, "write")
-        record = self._get_record_for_document_id(kb_name, document_id, ctx=ctx)
+        record = self._get_record_for_document_id(
+            kb_name, document_id, ctx=ctx, directory_id=directory_id
+        )
         if not record:
             return BackendResult(ok=False, message="Document mapping was not found.", backend=self.name)
         try:

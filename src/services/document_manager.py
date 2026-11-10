@@ -59,10 +59,19 @@ class DocumentManager:
     def processing_pipeline_for_file(self, file_path: str) -> str | None:
         return supported_pipeline_for_file(file_path)
 
-    def delete_document(self, document_id: str, kb_name: str, ctx: RequestContext | None = None) -> BackendResult:
+    def delete_document(
+        self,
+        document_id: str,
+        kb_name: str,
+        ctx: RequestContext | None = None,
+        *,
+        directory_id: int | None = None,
+    ) -> BackendResult:
         """Return the full BackendResult so callers can branch on ``ok``
         rather than sniffing error prefixes out of ``message``."""
-        return self.processing_backend.delete_document(kb_name, document_id, ctx=ctx)
+        return self.processing_backend.delete_document(
+            kb_name, document_id, ctx=ctx, directory_id=directory_id
+        )
 
     def delete_knowledge_base_documents(
         self,

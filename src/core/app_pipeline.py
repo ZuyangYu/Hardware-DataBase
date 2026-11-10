@@ -454,7 +454,7 @@ class AppPipeline:
             except Exception as exc:
                 error(f"Retrieval executor unavailable after settings reload: {type(exc).__name__}")
 
-    def delete_document(self, filename: str, kb_name: str, ctx: RequestContext | None = None) -> str:
+    def delete_document(self, filename: str, kb_name: str, ctx: RequestContext | None = None, *, directory_id: int | None = None) -> str:
         try:
             self._audit_requested(
                 "delete_document",
@@ -464,7 +464,7 @@ class AppPipeline:
                 kb_name=kb_name,
                 metadata=self._kb_sharing_audit_metadata(kb_name, ctx),
             )
-            result = self.documents.delete_document(filename, kb_name, ctx=ctx)
+            result = self.documents.delete_document(filename, kb_name, ctx=ctx, directory_id=directory_id)
             # DocumentManager now returns the full BackendResult; branch on .ok
             # instead of sniffing error prefixes out of the message string.
             delete_ok = bool(getattr(result, "ok", False))

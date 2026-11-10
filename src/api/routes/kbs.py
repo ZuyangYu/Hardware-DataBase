@@ -386,6 +386,7 @@ def delete_kb(
 def delete_file(
     kb_name: str,
     filename: str,
+    directory_id: int | None = Query(default=None, ge=0),
     user: AuthUser = Depends(current_user),
     pipeline: AppPipeline = Depends(get_pipeline),
     auth: AuthService = Depends(get_auth_service),
@@ -394,5 +395,7 @@ def delete_file(
     reject_system_admin_kb_access(ctx)
     if not ctx.has_kb_permission(kb_name, "admin"):
         raise HTTPException(status_code=403, detail="admin permission required")
-    msg = pipeline.delete_document(filename, kb_name, ctx=ctx)
+    msg = pipeline.delete_document(
+        filename, kb_name, ctx=ctx, directory_id=directory_id
+    )
     return OkResponse(ok=True, message=msg)
