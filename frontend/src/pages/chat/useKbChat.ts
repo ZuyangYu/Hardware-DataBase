@@ -202,6 +202,9 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
   const [messages, setMessages] = useState<MessageView[]>([]);
   const [messagesLoaded, setMessagesLoaded] = useState(false);
   const [input, setInput] = useState('');
+  // Fast is the default. Deep research is an explicit user choice; the
+  // backend also defaults to fast and no longer upgrades KB turns silently.
+  const [queryMode, setQueryMode] = useState<'fast' | 'deep'>('fast');
   const [streaming, setStreaming] = useState(false);
   const [streamingText, setStreamingText] = useState('');
   const [traceSteps, setTraceSteps] = useState<QueryTraceStep[]>([]);
@@ -1023,7 +1026,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
       const turnRequest = buildTurnRequest(
         query,
         requestUuid(),
-        scopeKbName === GENERAL_CHAT_KB_NAME ? 'fast' : 'deep',
+        scopeKbName === GENERAL_CHAT_KB_NAME ? 'fast' : queryMode,
         attachments ?? null,
         turnKnowledgeScope,
       );
@@ -1211,7 +1214,7 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
         setTurnQueueNotice(null);
       }
     }
-  }, [input, streaming, sessions, activeSessionId, createSession, scopeKbName, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary, applyTurnQueueNotice, knowledgeScope, resolveKnowledgeScope]);
+  }, [input, streaming, sessions, activeSessionId, createSession, scopeKbName, queryMode, clearTraceTimer, resetStreamingText, queueStreamingText, upsertTraceStep, finishTrace, refreshMemorySummary, applyTurnQueueNotice, knowledgeScope, resolveKnowledgeScope]);
 
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
@@ -1278,6 +1281,8 @@ export function useKbChat(kbName: string, options: UseKbChatOptions = {}) {
     // 输入
     input,
     setInput,
+    queryMode,
+    setQueryMode,
     // 流式
     streaming,
     streamingText,

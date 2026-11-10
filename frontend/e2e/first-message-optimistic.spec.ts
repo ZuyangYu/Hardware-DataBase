@@ -91,6 +91,9 @@ async function installChat(page: Page) {
         body: `event: done\ndata: ${JSON.stringify({ answer: '首轮回答', summary: {}, footer: '' })}\n\n`,
       });
     }
+    if (path === '/api/v1/conversations/100/artifacts') {
+      return route.fulfill({ json: { items: [] } });
+    }
     if (path === '/api/v1/conversations/100/memory-summary') {
       return route.fulfill({ json: { auto_extract_enabled: false, extracted_memories: 0 } });
     }

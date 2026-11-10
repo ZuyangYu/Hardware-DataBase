@@ -50,6 +50,8 @@ type Props = {
   availableKbs?: KbView[];
   input: string;
   setInput: (value: string) => void;
+  queryMode?: 'fast' | 'deep';
+  onQueryModeChange?: (mode: 'fast' | 'deep') => void;
   streaming: boolean;
   disabled?: boolean;
   onKbChange?: (kbName: string) => void;
@@ -87,6 +89,8 @@ export default function Composer({
   availableKbs = [],
   input,
   setInput,
+  queryMode = 'fast',
+  onQueryModeChange = () => undefined,
   streaming,
   disabled = false,
   onKbChange = () => undefined,
@@ -171,6 +175,28 @@ export default function Composer({
                 })}
               </SelectContent>
             </Select>
+            {kbName ? (
+              <Select
+                value={queryMode}
+                onValueChange={(value) => onQueryModeChange(value === 'deep' ? 'deep' : 'fast')}
+                disabled={scopeDisabled}
+              >
+                <SelectTrigger
+                  aria-label="选择检索模式"
+                  title={queryMode === 'deep' ? '深度研究：多源检索，耗时更长' : '快速检索：精确匹配优先'}
+                  className={cn(CHAT_COMPOSER_MODEL_BTN_CLASS, 'min-w-[112px]')}
+                >
+                  <span className="grid size-[14px] shrink-0 place-items-center" aria-hidden>
+                    <AppIcon name="search" size={12} />
+                  </span>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start" sideOffset={6} className="min-w-[160px]">
+                  <SelectItem value="fast">快速检索</SelectItem>
+                  <SelectItem value="deep">深度研究</SelectItem>
+                </SelectContent>
+              </Select>
+            ) : null}
           </div>
           <div className="flex min-w-0 flex-wrap items-center gap-[8px]">
             {attachmentsEnabled && attachmentCount > 0 && (
