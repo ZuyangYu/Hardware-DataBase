@@ -14,11 +14,17 @@ primitives used by both this adapter and the MCP bridge.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from typing import Any
 
+from src.agents.schemas import Evidence
 from src.agents.tools.grep_tools import _scoped_documents
+from src.services.evidence_sources import (
+    KNOWLEDGE_BASE_DOCUMENT,
+    with_source_metadata,
+)
 from src.services.knowledge_retrieval import (
     grep_chunks,
     lexical_search,
@@ -28,6 +34,7 @@ from src.services.knowledge_retrieval import (
 )
 
 _PARSE_DEADLINE_SECONDS = 20.0
+_LOCATOR_KEYS = ("page_num", "page", "sheet_name", "row_index", "chunk_index")
 
 
 def _json(payload: dict[str, Any]) -> str:
@@ -50,6 +57,67 @@ def _kind(record: Any) -> str:
     if "circuit" in processor:
         return "circuit"
     return "document"
+
+
+def _chunk_locator(metadata: dict[str, Any], fallback: int) -> dict[str, Any]:
+    locator = {
+        key: metadata[key]
+        for key in _LOCATOR_KEYS
+        if metadata.get(key) not in (None, "", [], {})
+    }
+    return locator or {"chunk_index": int(fallback or 0)}
+
+
+def _evidence_from_chunk(
+    record: Any,
+    chunk: dict[str, Any],
+    *,
+    score: float = 0.0,
+) -> Evidence:
+    """Build one formal Evidence row from a parsed chunk and its record."""
+
+    metadata = dict(chunk.get("metadata") or {})
+    content = str(chunk.get("content") or "")
+    index = int(chunk.get("index") or 0)
+    chunk_id = str(
+        chunk.get("rag_id")
+        or metadata.get("ragflow_chunk_id")
+        or metadata.get("chunk_id")
+        or index
+    )
+    locator = _chunk_locator(metadata, index)
+    kb_id = int(getattr(record, "kb_id", 0) or 0)
+    evidence_metadata = with_source_metadata(
+        {
+            "source_type": KNOWLEDGE_BASE_DOCUMENT,
+            "kb_id": kb_id,
+            "kb_name": str(getattr(record, "kb_name", "") or ""),
+            "local_record_id": int(getattr(record, "id", 0) or 0),
+            "document_id": str(getattr(record, "document_id", "") or ""),
+            "chunk_id": chunk_id,
+            "source_content_hash": str(getattr(record, "content_hash", "") or ""),
+            "evidence_text_hash": hashlib.sha256(
+                content.encode("utf-8")
+            ).hexdigest(),
+            "source_group": str(getattr(record, "source_group", "") or ""),
+            "status": str(getattr(record, "status", "") or ""),
+            "processor_kind": str(getattr(record, "processor_kind", "") or ""),
+            "content_kind": str(getattr(record, "content_kind", "") or ""),
+            "retrieval_tool": "kb_workspace",
+        },
+        content=content,
+        locator=locator,
+    )
+    return Evidence(
+        id=f"doc:{getattr(record, 'id', 0)}:{chunk_id}",
+        content=content,
+        source_name=_doc_name(record),
+        content_kind=str(getattr(record, "content_kind", "") or "document_text"),
+        processor_kind=str(getattr(record, "processor_kind", "") or "ragflow"),
+        score=float(score or 0.0),
+        locator=locator,
+        metadata=evidence_metadata,
+    )
 
 
 def make_kb_workspace_tools(
@@ -109,7 +177,13 @@ def make_kb_workspace_tools(
             for record in _documents()
         }
 
-    def _run(name: str, query: str, fn):
+    def _run(
+        name: str,
+        query: str,
+        fn,
+        *,
+        stats: dict[str, Any] | None = None,
+    ):
         if rt is None:
             return fn()
         call_id = rt.next_invocation_id()
@@ -130,13 +204,117 @@ def make_kb_workspace_tools(
                 empty_reason=str(exc)[:200],
             )
             raise
+        values = dict(stats or {})
         rt.tool_result(
             call_id=call_id,
             tool_name=name,
             status="success",
             tool_kind="retrieval",
+            hit_count=int(values.get("hit_count", 0) or 0),
+            evidence_count=int(values.get("evidence_count", 0) or 0),
+            sources=list(values.get("sources", []) or []),
+            citation_numbers=list(values.get("citation_numbers", []) or []),
+            empty_reason=(
+                "no_match"
+                if int(values.get("hit_count", 0) or 0) == 0
+                else ""
+            ),
         )
         return result
+
+    def _resolve_row(row: dict[str, Any]) -> tuple[Any, dict[str, Any] | None]:
+        """Resolve a search hit back to its record and full local chunk."""
+
+        raw_id = str(row.get("file_id") or "")
+        file_name = str(row.get("file_name") or "")
+        record = next(
+            (
+                item
+                for item in _documents()
+                if str(getattr(item, "id", "")) == raw_id
+            ),
+            None,
+        )
+        if record is None and file_name:
+            record = next(
+                (item for item in _documents() if file_name in _doc_name(item)),
+                None,
+            )
+        if record is None:
+            return None, None
+        wanted_rag = str(row.get("rag_id") or "")
+        wanted_index = int(row.get("chunk_index") or 0)
+        chunks = _chunks(record)
+        chunk = next(
+            (
+                item
+                for item in chunks
+                if wanted_rag and str(item.get("rag_id") or "") == wanted_rag
+            ),
+            None,
+        )
+        if chunk is None:
+            chunk = next(
+                (
+                    item
+                    for item in chunks
+                    if int(item.get("index") or 0) == wanted_index
+                ),
+                None,
+            )
+        return record, chunk
+
+    def _admit_search_results(
+        rows: list[dict[str, Any]],
+    ) -> tuple[int, list[int], list[str]]:
+        """Register search hits as formal evidence and stamp citation numbers."""
+
+        pairs: list[tuple[dict[str, Any], Evidence]] = []
+        for row in rows:
+            record, chunk = _resolve_row(row)
+            if record is None:
+                continue
+            if chunk is None:
+                # Semantic backends can return a chunk that is not present in
+                # the local parse result.  Keep the snippet citable rather than
+                # dropping the hit, but mark the reduced body.
+                chunk = {
+                    "index": int(row.get("chunk_index") or 0),
+                    "content": str(row.get("snippet") or ""),
+                    "metadata": dict(row.get("locator") or {}),
+                    "rag_id": str(row.get("rag_id") or ""),
+                }
+                chunk["metadata"]["evidence_role"] = "search_snippet"
+            pairs.append(
+                (
+                    row,
+                    _evidence_from_chunk(
+                        record,
+                        chunk,
+                        score=float(row.get("score") or 0.0),
+                    ),
+                )
+            )
+        if not pairs or rt is None:
+            return 0, [], []
+        numbers = rt.add_evidence([item for _, item in pairs])
+        admitted = 0
+        citations: list[int] = []
+        sources: list[str] = []
+        for (row, item), number in zip(pairs, numbers):
+            if number is None:
+                row["citation_number"] = None
+                continue
+            row["citation_number"] = int(number)
+            admitted += 1
+            citations.append(int(number))
+            if item.source_name not in sources:
+                sources.append(item.source_name)
+        if admitted:
+            note_progress = getattr(rt, "note_progress", None)
+            if callable(note_progress):
+                note_progress()
+        return admitted, citations, sources
 
     def _semantic_results(query: str, top_k: int) -> list[dict[str, Any]]:
         runner = getattr(semantic_search, "run", None)
@@ -178,6 +356,8 @@ def make_kb_workspace_tools(
         语义检索；mode="exact" 强制本地 grep；mode="semantic" 强制 RAGFlow；
         返回 file_id、file_name、locator、chunk_index、score 和 snippet。
         """
+
+        stats: dict[str, Any] = {}
 
         def _search() -> str:
             needle = str(query or "").strip()
@@ -222,6 +402,13 @@ def make_kb_workspace_tools(
                     file_id=file_id,
                 )
                 used = "lexical"
+            admitted, citations, sources = _admit_search_results(results)
+            stats.update(
+                hit_count=len(results),
+                evidence_count=admitted,
+                citation_numbers=citations,
+                sources=sources,
+            )
             note_progress = getattr(rt, "note_progress", None)
             note_no_progress = getattr(rt, "note_no_progress", None)
             if results:
@@ -235,10 +422,16 @@ def make_kb_workspace_tools(
                     "mode": used,
                     "results": results,
                     "result_count": len(results),
+                    "evidence_count": admitted,
                 }
             )
 
-        return _run("search_documents", f"{mode} | {file_id} | {query}", _search)
+        return _run(
+            "search_documents",
+            f"{mode} | {file_id} | {query}",
+            _search,
+            stats=stats,
+        )
 
     def read_document(
         file_id: str,
@@ -247,6 +440,8 @@ def make_kb_workspace_tools(
         query: str = "",
     ) -> str:
         """读取文档的解析 chunk；file_id 可传 id、文件名或虚拟路径。"""
+
+        stats: dict[str, Any] = {}
 
         def _read() -> str:
             raw = str(file_id or "").strip()
@@ -291,6 +486,35 @@ def make_kb_workspace_tools(
                 max_chunks=max_chunks,
                 query=query,
             )
+            by_index = {
+                int(item.get("index") or 0): item for item in chunks
+            }
+            evidence_items = []
+            for item in picked:
+                source_chunk = by_index.get(int(item.get("index") or 0)) or {
+                    "index": item.get("index"),
+                    "content": item.get("content") or "",
+                    "metadata": item.get("metadata") or {},
+                    "rag_id": item.get("rag_id") or "",
+                }
+                evidence_items.append(
+                    _evidence_from_chunk(record, source_chunk, score=1.0)
+                )
+            citations: list[int] = []
+            if evidence_items and rt is not None:
+                numbers = rt.add_evidence(evidence_items)
+                for item, number in zip(picked, numbers):
+                    item["citation_number"] = (
+                        int(number) if number is not None else None
+                    )
+                    if number is not None:
+                        citations.append(int(number))
+            stats.update(
+                hit_count=len(picked),
+                evidence_count=len(citations),
+                citation_numbers=citations,
+                sources=[_doc_name(record)] if picked else [],
+            )
             if picked and callable(getattr(rt, "note_progress", None)):
                 rt.note_progress()
             return _json(
@@ -300,6 +524,7 @@ def make_kb_workspace_tools(
                     "start_index": max(0, int(start_index or 0)),
                     "chunk_count": len(chunks),
                     "chunks": picked,
+                    "evidence_count": len(citations),
                     "next_index": (
                         int(picked[-1]["index"]) + 1
                         if len(picked) >= max_chunks
@@ -308,10 +533,17 @@ def make_kb_workspace_tools(
                 }
             )
 
-        return _run("read_document", f"{file_id} @{start_index}", _read)
+        return _run(
+            "read_document",
+            f"{file_id} @{start_index}",
+            _read,
+            stats=stats,
+        )
 
     def list_knowledge_files(pattern: str = "**/*", kind: str = "") -> str:
         """列出知识库文件；pattern 支持通配符，kind 可限定 document/table/circuit。"""
+
+        stats: dict[str, Any] = {}
 
         def _list() -> str:
             wanted = str(kind or "").strip().lower()
@@ -331,6 +563,7 @@ def make_kb_workspace_tools(
                     None,
                 )
                 row["kind"] = _kind(record) if record is not None else row.get("kind", "")
+            stats["hit_count"] = len(files)
             return _json(
                 {
                     "pattern": str(pattern or "**/*"),
@@ -340,7 +573,12 @@ def make_kb_workspace_tools(
                 }
             )
 
-        return _run("list_knowledge_files", f"{kind} | {pattern}", _list)
+        return _run(
+            "list_knowledge_files",
+            f"{kind} | {pattern}",
+            _list,
+            stats=stats,
+        )
 
     search_documents.__name__ = "search_documents"
     read_document.__name__ = "read_document"

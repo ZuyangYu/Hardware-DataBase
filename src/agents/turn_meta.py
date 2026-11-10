@@ -162,7 +162,10 @@ def _extract_text_delta(chunk: Any) -> str:
 _RESEARCH_SUBAGENT_TOOLS = frozenset({
     "list_kb_sources",
     "list_knowledge_sources",
+    "list_knowledge_files",
     "knowledge_search",
+    "search_documents",
+    "read_document",
     "evidence_read",
     "session_recall",
     "document_search",
@@ -415,12 +418,51 @@ def _agent_recursion_limit(
     return limit, budget
 
 
+def _subagent_middleware(
+    *,
+    skill_root: str | None,
+    skill_read_observer: Callable[..., None] | None,
+    inherited: list[Any] | None = None,
+) -> list[Any]:
+    """Build subagent middleware while preserving parent turn controls.
+
+    The parent's ``LoopBudgetMiddleware`` instance is passed in explicitly so
+    subagent tool calls consume the same time/tool budget instead of running
+    in an unbounded nested graph.
+    """
+
+    stack = list(inherited or [])
+    # Subagents inherit the backend; keep read_file gated the same way.
+    stack.append(
+        SkillReadGateMiddleware(
+            enabled=bool(skill_root),
+            observer=skill_read_observer,
+        )
+    )
+    return stack
+
+
+def _subagent_scope_prompt(kb_scope_line: str = "") -> str:
+    """Tell a subagent which library its already-bound tools operate on."""
+
+    line = str(kb_scope_line or "").strip()
+    if not line:
+        return ""
+    return (
+        "\n\n" + line + "\n"
+        "检索/读写工具已经绑定本轮知识库，不需要也不要向工具传入 kb_name。"
+        "先用 list_knowledge_files 或 search_documents 确认文件，再读取命中内容。"
+    )
+
+
 def _research_subagent_spec(
     *,
     tools: list[Any],
     model: Any,
     skill_root: str | None = None,
     skill_read_observer: Callable[..., None] | None = None,
+    middleware: list[Any] | None = None,
+    kb_scope_line: str = "",
 ) -> dict[str, Any] | None:
     """Build a read-only research subagent for delegated source exploration."""
 
@@ -441,16 +483,15 @@ def _research_subagent_spec(
             "documents. Return a compact evidence digest: source name, locator, "
             "key facts, and the exact [n] citation numbers from tool output. "
             "State gaps explicitly. Never invent facts or citations."
+            + _subagent_scope_prompt(kb_scope_line)
         ),
         "tools": sub_tools,
         "model": model,
-        "middleware": [
-            # Subagents inherit the backend; keep read_file gated the same way.
-            SkillReadGateMiddleware(
-                enabled=bool(skill_root),
-                observer=skill_read_observer,
-            )
-        ],
+        "middleware": _subagent_middleware(
+            skill_root=skill_root,
+            skill_read_observer=skill_read_observer,
+            inherited=middleware,
+        ),
     }
 
 
@@ -460,6 +501,8 @@ def _general_subagent_spec(
     model: Any,
     skill_root: str | None = None,
     skill_read_observer: Callable[..., None] | None = None,
+    middleware: list[Any] | None = None,
+    kb_scope_line: str = "",
 ) -> dict[str, Any] | None:
     """Build a general-purpose subagent for complex, non-code workspace tasks."""
 
@@ -482,15 +525,15 @@ def _general_subagent_spec(
             "user confirmation; never claim a file was created. Return a "
             "concise result with facts, filenames, and any remaining gaps; do "
             "not invent tool results."
+            + _subagent_scope_prompt(kb_scope_line)
         ),
         "tools": list(tools),
         "model": model,
-        "middleware": [
-            SkillReadGateMiddleware(
-                enabled=bool(skill_root),
-                observer=skill_read_observer,
-            )
-        ],
+        "middleware": _subagent_middleware(
+            skill_root=skill_root,
+            skill_read_observer=skill_read_observer,
+            inherited=middleware,
+        ),
     }
 
 
