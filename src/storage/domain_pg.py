@@ -30,6 +30,7 @@ from contextlib import closing
 from typing import Any, Sequence
 
 from src.storage.control_plane.sql_adapter import PgSqlAdapterConnection
+from src.storage.migrations.domain_columns import add_missing_columns
 
 _INTEGER_TOKENS = ("INT", "BIGINT", "SMALLINT", "TINYINT", "BOOLEAN")
 _REAL_TOKENS = ("REAL", "FLOAT", "DOUBLE", "NUMERIC", "DECIMAL")
@@ -110,50 +111,46 @@ def _mechanical_table_ddl(table: str, columns: list[dict[str, Any]]) -> str:
 def _add_missing_columns(
     conn, table: str, columns: list[dict[str, Any]]
 ) -> None:
-    """Add columns introduced after a PostgreSQL table was first provisioned.
+    """Compatibility wrapper around the versioned domain-column migration."""
 
-    ``CREATE TABLE IF NOT EXISTS`` never changes an existing shape.  Without
-    this step a new column exists in the SQLite template and in fresh
-    PostgreSQL deployments, but not in an upgraded one; the subsequent index
-    creation then fails with ``UndefinedColumn``.  Only mechanical defaults
-    are accepted for NOT NULL columns so an upgrade can backfill every row
-    deterministically.
+    add_missing_columns(
+        conn,
+        table,
+        columns,
+        ident=pg_ident,
+        type_for=_mechanical_type,
+        default_for=_mechanical_default,
+    )
+
+
+def _drop_superseded_pipeline_document_indexes(conn, table: str) -> None:
+    """Drop the pre-directory unique index that blocks same-name files.
+
+    Before ``directory_id`` existed, the ledger enforced one file per
+    ``(kb_name, department_id, document_name, dataset_kind)``.  The directory
+    tree deliberately allows the same basename in different folders, so that
+    legacy unique index must be removed before the directory-aware index is
+    created.  Fresh databases never have it; upgraded databases do.
     """
 
-    existing = {
-        str(row[0])
-        for row in conn.execute(
-            """
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = %s
-            """,
-            (table,),
-        ).fetchall()
-    }
-    for column in columns:
-        name = str(column["name"])
-        if name in existing:
+    if table != "pipeline_documents":
+        return
+    rows = conn.execute(
+        """
+        SELECT indexname, indexdef
+        FROM pg_indexes
+        WHERE schemaname = 'public' AND tablename = %s
+        """,
+        (table,),
+    ).fetchall()
+    for name, definition in rows:
+        text = str(definition or "").upper()
+        if "UNIQUE INDEX" not in text:
             continue
-        if int(column.get("pk") or 0) > 0:
-            raise RuntimeError(
-                f"cannot add missing primary-key column {table}.{name}; "
-                "rebuild the table explicitly"
-            )
-        parts = [pg_ident(name), _mechanical_type(column["type"])]
-        default = _mechanical_default(column.get("dflt_value"))
-        if int(column.get("notnull") or 0):
-            if default is None:
-                raise RuntimeError(
-                    f"cannot add NOT NULL column {table}.{name} without a "
-                    "mechanical default; backfill it explicitly"
-                )
-            parts.append("NOT NULL")
-        if default is not None:
-            parts.append(f"DEFAULT {default}")
-        conn.execute(
-            f"ALTER TABLE {pg_ident(table)} ADD COLUMN {' '.join(parts)}"
-        )
+        if "DIRECTORY_ID" in text:
+            continue
+        if "DOCUMENT_NAME" in text and "DATASET_KIND" in text:
+            conn.execute(f"DROP INDEX IF EXISTS {pg_ident(str(name))}")
 
 
 def _repair_identity_column(conn, table: str, columns: list[dict[str, Any]]) -> None:
@@ -506,8 +503,16 @@ def provision_domain_group(
             conn.execute(_mechanical_table_ddl(table, metadata["columns"][table]))
             # 存量表可能早于新列/identity 逻辑建表；CREATE IF NOT EXISTS 不会改
             # 形状，先补列再建索引，避免索引引用尚未存在的列。
-            _add_missing_columns(conn, table, metadata["columns"][table])
+            add_missing_columns(
+                conn,
+                table,
+                metadata["columns"][table],
+                ident=pg_ident,
+                type_for=_mechanical_type,
+                default_for=_mechanical_default,
+            )
             _repair_identity_column(conn, table, metadata["columns"][table])
+            _drop_superseded_pipeline_document_indexes(conn, table)
             loaded.add(table)
         for table in wanted:
             for statement in metadata["indexes"].get(table, []):

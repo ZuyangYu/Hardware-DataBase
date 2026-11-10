@@ -229,8 +229,19 @@ def read_chunks(
     return picked
 
 
-def list_files(records: list[Any], pattern: str = "**/*") -> list[dict[str, Any]]:
-    """List KB records using virtual ``/kb/<name>/<file>`` paths."""
+def list_files(
+    records: list[Any],
+    pattern: str = "**/*",
+    *,
+    path_for: Any = None,
+) -> list[dict[str, Any]]:
+    """List KB records using virtual ``/kb/<name>/<relative path>`` paths.
+
+    ``path_for`` is an optional callback that resolves a record's
+    directory-aware relative path.  Without it, the legacy filename-only path
+    is kept for callers that predate the directory tree.
+    """
+
     raw = str(pattern or "**/*").strip() or "**/*"
     if not any(ch in raw for ch in "*?["):
         raw = f"*{raw}*"
@@ -242,10 +253,19 @@ def list_files(records: list[Any], pattern: str = "**/*") -> list[dict[str, Any]
             or getattr(record, "id", "")
             or "未命名文档"
         )
+        relative_path = ""
+        if callable(path_for):
+            try:
+                relative_path = str(path_for(record) or "")
+            except Exception:
+                relative_path = ""
+        relative_path = relative_path or name
         kb = str(getattr(record, "kb_name", "") or "kb")
-        path = f"/kb/{kb}/{name.replace('/', '_').replace(chr(92), '_')}"
+        safe_relative = relative_path.replace("/", "_").replace(chr(92), "_")
+        path = f"/kb/{kb}/{safe_relative}"
         if not (
             fnmatch.fnmatch(name.casefold(), raw.casefold())
+            or fnmatch.fnmatch(relative_path.casefold(), raw.casefold())
             or fnmatch.fnmatch(path.casefold(), raw.casefold())
         ):
             continue
@@ -254,6 +274,8 @@ def list_files(records: list[Any], pattern: str = "**/*") -> list[dict[str, Any]
                 "path": path,
                 "file_id": str(getattr(record, "id", "") or ""),
                 "name": name,
+                "relative_path": relative_path,
+                "directory_id": int(getattr(record, "directory_id", 0) or 0),
                 "kind": str(getattr(record, "processor_kind", "") or ""),
                 "status": str(getattr(record, "status", "") or ""),
             }

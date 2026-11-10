@@ -269,10 +269,20 @@ async def upload_directory_import_file(
     job = store.get_directory_import_job(job_id, kb_name, department_id)
     if job is None:
         raise HTTPException(status_code=404, detail="directory import job not found")
+    if str(job.get("status") or "") in {"completed", "cancelled", "failed", "partial"}:
+        raise HTTPException(
+            status_code=409,
+            detail="导入批次已结束，请先重试批次再上传文件",
+        )
     rows = store.list_directory_import_files(job_id, kb_name, department_id, limit=5000)
     row = next((item for item in rows if int(item["id"]) == int(file_id)), None)
     if row is None:
         raise HTTPException(status_code=404, detail="directory import file not found")
+    if str(row.get("status") or "") in {"success", "reused", "uploading"}:
+        raise HTTPException(
+            status_code=409,
+            detail="该文件已成功导入或正在处理，不能覆盖",
+        )
     staging = os.path.dirname(str(row.get("staged_path") or "")) or create_staging_dir()
     os.makedirs(staging, exist_ok=True)
     original_name = os.path.basename(
@@ -287,10 +297,30 @@ async def upload_directory_import_file(
                 break
             total += len(chunk)
             if total > MAX_IMPORT_BYTES:
+                handle.close()
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
                 raise HTTPException(status_code=413, detail="file exceeds import size limit")
             handle.write(chunk)
     if total == 0:
+        try:
+            os.remove(target)
+        except OSError:
+            pass
         raise HTTPException(status_code=400, detail="file content is empty")
+    total_bytes = sum(max(0, int(item.get("file_size") or 0)) for item in rows)
+    total_bytes += total - max(0, int(row.get("file_size") or 0))
+    if total_bytes > MAX_IMPORT_BYTES:
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=413,
+            detail=f"folder import exceeds {MAX_IMPORT_BYTES} bytes",
+        )
     store.update_directory_import_file_stage(
         int(file_id), int(job_id), target, file_size=total
     )

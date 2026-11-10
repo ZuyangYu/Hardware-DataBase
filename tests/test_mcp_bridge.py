@@ -591,3 +591,73 @@ def test_search_knowledge_base_exact_mode_uses_grep():
     assert hit["locator"]["page_num"] == 4
     assert "X1900" in hit["snippet"]
     bridge._CHUNK_CACHE.clear()
+
+
+def test_search_knowledge_base_scopes_to_directory_and_keeps_relative_path():
+    seen: list[str] = []
+    bridge._CHUNK_CACHE.clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        seen.append(path)
+        if path == "/api/v1/kbs/AAA/files":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "ragflow:1",
+                        "name": "spec.pdf",
+                        "relative_path": "docs/spec.pdf",
+                        "directory_id": 1,
+                        "processor_kind": "ragflow",
+                    },
+                    {
+                        "id": "ragflow:2",
+                        "name": "spec.pdf",
+                        "relative_path": "design/spec.pdf",
+                        "directory_id": 2,
+                        "processor_kind": "ragflow",
+                    },
+                ],
+            )
+        if path == "/api/v1/kbs/AAA/directories/1":
+            return httpx.Response(200, json={"id": 1, "name": "docs"})
+        if path == "/api/v1/kbs/AAA/directories":
+            assert request.url.params.get("parent_id") == "1"
+            return httpx.Response(200, json=[])
+        if path == "/api/v1/kbs/AAA/files/ragflow:1/chunks":
+            return httpx.Response(
+                200,
+                json={
+                    "document_id": "ragflow:1",
+                    "file_name": "spec.pdf",
+                    "chunk_count": 1,
+                    "backend": "ragflow",
+                    "chunks": [
+                        {
+                            "index": 0,
+                            "content": "spec power tree",
+                            "metadata": {"ragflow_chunk_id": "c1"},
+                        }
+                    ],
+                },
+            )
+        if path == "/api/v1/kbs/AAA/files/ragflow:2/chunks":
+            raise AssertionError("directory scope loaded a file from another directory")
+        raise AssertionError(f"unexpected path {path}")
+
+    _use(handler)
+    result = bridge.search_knowledge_base(
+        "AAA",
+        "spec",
+        top_k=5,
+        mode="exact",
+        kind="document",
+        directory_id=1,
+        recursive=True,
+    )
+    assert result["directory_id"] == 1
+    assert result["result_count"] == 1, seen
+    assert result["results"][0]["file_id"] == "ragflow:1"
+    assert result["results"][0]["file_name"] == "docs/spec.pdf"
+    assert not any(path.endswith("/ragflow:2/chunks") for path in seen)

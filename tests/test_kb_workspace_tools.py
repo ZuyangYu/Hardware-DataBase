@@ -243,3 +243,77 @@ def test_general_subagent_tools_keep_parent_runtime_bindings():
     assert payload["evidence_count"] == 1
     assert len(rt.evidence) == 1
     assert rt.evidence[0].metadata["local_record_id"] == 36
+
+
+def test_directory_scope_and_relative_paths_in_typed_tools(tmp_path):
+    from src.pipelines.document_store import PipelineDocumentStore
+    from src.services.pipeline_directories import PipelineDirectoryService
+
+    store = PipelineDocumentStore(db_path=str(tmp_path / "pipeline.db"))
+    directories = PipelineDirectoryService(store=store)
+    docs = directories.create(
+        kb_name="kb", department_id="dept", kb_id=7, parent_id=0,
+        name="docs", created_by="tester",
+    )
+    design = directories.create(
+        kb_name="kb", department_id="dept", kb_id=7, parent_id=0,
+        name="design", created_by="tester",
+    )
+    for directory, suffix in ((docs, "docs"), (design, "design")):
+        store.upsert_document(
+            kb_name="kb",
+            document_name="spec.pdf",
+            original_file_name="spec.pdf",
+            dataset_kind="design",
+            dataset_id="dataset",
+            document_id=f"remote-{suffix}",
+            source_group="文档资料",
+            department_id="dept",
+            uploaded_by="tester",
+            kb_id=7,
+            directory_id=directory["id"],
+            status="parsed",
+            content_hash=f"hash-{suffix}",
+        )
+    rt = ToolRuntime(
+        kb_name="kb",
+        ctx=SimpleNamespace(metadata={"department_id": "dept", "kb_id": 7}),
+    )
+    backend = _Backend(
+        [ParsedChunk(index=0, content="spec.pdf 电源树", metadata={"ragflow_chunk_id": "c1"})]
+    )
+    search, read, files = make_kb_workspace_tools(rt, backend, store)
+
+    payload = json.loads(search("电源树", mode="exact", top_k=10))
+    assert payload["result_count"] == 2
+    assert {row["file_name"] for row in payload["results"]} == {
+        "docs/spec.pdf",
+        "design/spec.pdf",
+    }
+    assert {item.source_name for item in rt.evidence} == {
+        "docs/spec.pdf",
+        "design/spec.pdf",
+    }
+
+    scoped = json.loads(
+        search(
+            "电源树",
+            mode="exact",
+            directory_id=docs["id"],
+            recursive=False,
+        )
+    )
+    assert scoped["result_count"] == 1
+    assert scoped["results"][0]["file_name"] == "docs/spec.pdf"
+
+    listing = json.loads(files("**/*"))
+    assert {row["relative_path"] for row in listing["files"]} == {
+        "docs/spec.pdf",
+        "design/spec.pdf",
+    }
+    scoped_listing = json.loads(
+        files("**/*", directory_id=design["id"], recursive=False)
+    )
+    assert [row["relative_path"] for row in scoped_listing["files"]] == [
+        "design/spec.pdf"
+    ]

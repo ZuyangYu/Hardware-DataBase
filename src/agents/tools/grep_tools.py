@@ -21,7 +21,10 @@ from src.agents.tools.pointer_index import (
     records_signature,
 )
 from src.agents.tools.runtime import format_tool_result, timed_tool_call
-from src.services.pipeline_directories import document_relative_path
+from src.services.pipeline_directories import (
+    PipelineDirectoryService,
+    document_relative_path,
+)
 
 _GREP_CACHE_TTL_SECONDS = 300.0
 _GREP_MAX_CHUNKS_PER_SOURCE = 5000
@@ -104,6 +107,7 @@ def _chunk_evidence(record: Any, chunk: Any, kb_id: int, document_store: Any = N
             "kb_id": int(kb_id or getattr(record, "kb_id", 0) or 0),
             "kb_name": str(getattr(record, "kb_name", "") or ""),
             "local_record_id": int(getattr(record, "id", 0) or 0),
+            "directory_id": int(getattr(record, "directory_id", 0) or 0),
             "document_id": str(getattr(record, "document_id", "") or ""),
             "chunk_id": chunk_id,
             "source_content_hash": str(getattr(record, "content_hash", "") or ""),
@@ -112,7 +116,6 @@ def _chunk_evidence(record: Any, chunk: Any, kb_id: int, document_store: Any = N
             "status": str(getattr(record, "status", "") or ""),
             "processor_kind": str(getattr(record, "processor_kind", "") or "ragflow"),
             "content_kind": str(getattr(record, "content_kind", "") or "document_text"),
-            "directory_id": int(getattr(record, "directory_id", 0) or 0),
             "relative_path": relative_path,
         },
     )
@@ -341,6 +344,27 @@ def make_kb_grep(rt: Any, rag_backend: Any, document_store: Any, spreadsheet_ser
 
     cache: dict[tuple[str, str], tuple[float, list[Evidence]]] = {}
 
+    def _allowed_directory_ids(directory_id: int, recursive: bool) -> set[int] | None:
+        target = int(directory_id or 0)
+        if target <= 0:
+            return None
+        if not recursive or document_store is None:
+            return {target}
+        metadata = dict(getattr(getattr(rt, "ctx", None), "metadata", {}) or {})
+        department_id = str(
+            metadata.get("resource_department_id")
+            or metadata.get("department_id")
+            or ""
+        )
+        try:
+            return PipelineDirectoryService(store=document_store).descendant_ids(
+                kb_name=str(getattr(rt, "kb_name", "") or ""),
+                department_id=department_id,
+                directory_id=target,
+            )
+        except Exception:
+            return set()
+
     def _document_chunks(record: Any, kb_id: int) -> list[Evidence]:
         key = (str(getattr(record, "kb_name", "")), str(getattr(record, "document_id", "")))
         now = time.monotonic()
@@ -355,7 +379,10 @@ def make_kb_grep(rt: Any, rag_backend: Any, document_store: Any, spreadsheet_ser
             should_cancel=getattr(rt, "should_cancel", None),
         )
         chunks = list(getattr(result, "chunks", []) or [])[:_GREP_MAX_CHUNKS_PER_SOURCE]
-        items = [_chunk_evidence(record, chunk, kb_id, document_store) for chunk in chunks]
+        items = [
+            _chunk_evidence(record, chunk, kb_id, document_store)
+            for chunk in chunks
+        ]
         cache[key] = (now, items)
         return items
 
@@ -363,6 +390,8 @@ def make_kb_grep(rt: Any, rag_backend: Any, document_store: Any, spreadsheet_ser
         patterns: list[str],
         max_hits: int = 20,
         regex: bool = False,
+        directory_id: int = 0,
+        recursive: bool = True,
     ) -> str:
         """在已解析文档、表格行和电路网表中做精确/正则检索，只返回候选指针。
 
@@ -482,6 +511,14 @@ def make_kb_grep(rt: Any, rag_backend: Any, document_store: Any, spreadsheet_ser
                 deferred.append(pair)
         selected_pairs.extend(deferred)
         selected = [item for _, item in selected_pairs[:limit]]
+        allowed_directory_ids = _allowed_directory_ids(directory_id, recursive)
+        if allowed_directory_ids is not None:
+            selected = [
+                item
+                for item in selected
+                if int((item.metadata or {}).get("directory_id", 0) or 0)
+                in allowed_directory_ids
+            ]
         query = " | ".join(values)
         items, _ = timed_tool_call(
             rt,

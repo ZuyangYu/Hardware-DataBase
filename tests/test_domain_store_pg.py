@@ -25,6 +25,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 import src.settings as app_settings
 from src.pipelines.document_store import PipelineDocumentStore
+from src.services.pipeline_directories import PipelineDirectoryService
 from src.storage import domain_pg
 
 DSN = os.environ.get("HDB_TEST_POSTGRES_DSN", "")
@@ -201,6 +202,42 @@ class PipelineDocumentStoreParityTests(_DomainParityCase):
         self.assertIsNotNone(value)
         datetime.fromisoformat(str(value))
 
+    def test_same_basename_is_allowed_in_different_directories(self) -> None:
+        """The legacy path unique index must not survive the directory upgrade."""
+
+        store = self._pg_store(PipelineDocumentStore)
+        directories = PipelineDirectoryService(store=store)
+        first = directories.create(
+            kb_name="kb", department_id="dept", kb_id=7, parent_id=0,
+            name="docs", created_by="tester",
+        )
+        second = directories.create(
+            kb_name="kb", department_id="dept", kb_id=7, parent_id=0,
+            name="design", created_by="tester",
+        )
+        for directory, suffix in ((first, "docs"), (second, "design")):
+            store.upsert_document(
+                kb_name="kb",
+                document_name="spec.pdf",
+                original_file_name="spec.pdf",
+                dataset_kind="design",
+                dataset_id="dataset",
+                document_id=f"remote-{suffix}",
+                source_group="文档资料",
+                department_id="dept",
+                uploaded_by="tester",
+                kb_id=7,
+                directory_id=directory["id"],
+                status="parsed",
+                content_hash=f"hash-{suffix}",
+            )
+        records = store.list_documents("kb", "dept")
+        assert len(records) == 2
+        assert {record.directory_id for record in records} == {
+            first["id"],
+            second["id"],
+        }
+
     def test_stale_table_without_identity_is_repaired_on_provision(self) -> None:
         """存量表缺 identity 时自愈：补 identity + 序列推进，之后插入不再撞 NOT NULL。
 
@@ -302,3 +339,41 @@ def test_add_missing_column_uses_mechanical_default():
     assert "BIGINT" in sql
     assert "NOT NULL" in sql
     assert "DEFAULT 0" in sql
+
+
+class _FakeIndexConn:
+    def __init__(self):
+        self.statements: list[str] = []
+
+    def execute(self, sql: str, params: object = None):
+        if "pg_indexes" in sql:
+            rows = [
+                (
+                    "ux_pipeline_documents_kb_name_department_id_document_name_datas",
+                    "CREATE UNIQUE INDEX ux_pipeline_documents_kb_name_department_id_document_name_datas "
+                    "ON public.pipeline_documents USING btree (kb_name, department_id, document_name, dataset_kind)",
+                ),
+                (
+                    "ux_pipeline_documents_kb_name_department_id_directory_id_docume",
+                    "CREATE UNIQUE INDEX ux_pipeline_documents_kb_name_department_id_directory_id_docume "
+                    "ON public.pipeline_documents USING btree (kb_name, department_id, directory_id, document_name)",
+                ),
+            ]
+
+            class _Rows(list):
+                def fetchall(self):
+                    return list(self)
+
+            return _Rows(rows)
+        self.statements.append(sql)
+        return []
+
+
+def test_legacy_document_name_unique_index_is_dropped():
+    conn = _FakeIndexConn()
+    domain_pg._drop_superseded_pipeline_document_indexes(conn, "pipeline_documents")
+
+    assert len(conn.statements) == 1
+    assert "DROP INDEX" in conn.statements[0]
+    assert "document_name_datas" in conn.statements[0]
+    assert "directory_id" not in conn.statements[0]

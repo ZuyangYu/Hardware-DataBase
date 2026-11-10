@@ -124,11 +124,19 @@ class PipelineDirectoryService:
         # recursive SQL in the request layer.
         result: list[dict] = []
         pending = [ROOT_DIRECTORY_ID]
+        visited: set[int] = set()
         while pending:
             parent_id = pending.pop()
+            if parent_id in visited:
+                continue
+            visited.add(parent_id)
             children = self.store.list_directories(kb_name, department_id, parent_id=parent_id)
             result.extend(self._decorate(row, kb_name, department_id) for row in children)
-            pending.extend(int(row["id"]) for row in children)
+            pending.extend(
+                int(row["id"])
+                for row in children
+                if int(row["id"]) not in visited
+            )
         return result
 
     def descendant_ids(
@@ -275,6 +283,7 @@ class PipelineDirectoryService:
         department_id: str | int,
         directory_id: int,
         parent_id: int,
+        name: str | None = None,
     ) -> dict:
         department_id = self._scope_department(department_id)
         directory = self.get(kb_name=kb_name, department_id=department_id, directory_id=directory_id)
@@ -285,10 +294,16 @@ class PipelineDirectoryService:
         )
         if parent_id in descendants:
             raise DirectoryValidationError("不能移动目录到自身或其子目录")
+        clean_name = None
+        normalized_name = None
+        target_normalized = str(directory["normalized_name"])
+        if name is not None:
+            clean_name, normalized_name = normalize_directory_name(name)
+            target_normalized = normalized_name
         siblings = self.store.list_directories(kb_name, department_id, parent_id=parent_id)
         if any(
             int(row["id"]) != int(directory_id)
-            and row["normalized_name"] == directory["normalized_name"]
+            and row["normalized_name"] == target_normalized
             for row in siblings
         ):
             raise DirectoryValidationError("同级目录已存在")
@@ -297,15 +312,21 @@ class PipelineDirectoryService:
         depth_delta = new_depth - int(directory["depth"])
         if any(int(row["depth"]) + depth_delta > MAX_DIRECTORY_DEPTH for row in subtree):
             raise DirectoryValidationError("目录层级超出限制")
-        updated = self.store.move_directory(
-            int(directory_id), kb_name, department_id, parent_id=parent_id, depth=new_depth
+        descendant_depths = {
+            int(row["id"]): int(row["depth"]) + depth_delta
+            for row in subtree
+            if int(row["id"]) != int(directory_id)
+        }
+        updated = self.store.move_directory_subtree(
+            int(directory_id),
+            kb_name,
+            department_id,
+            parent_id=parent_id,
+            depth=new_depth,
+            name=clean_name,
+            normalized_name=normalized_name,
+            descendant_depths=descendant_depths,
         )
-        for row in subtree:
-            if int(row["id"]) != int(directory_id):
-                self.store.update_directory_depth(
-                    int(row["id"]), kb_name, department_id,
-                    depth=int(row["depth"]) + depth_delta,
-                )
         if updated is None:
             raise LookupError("目录不存在")
         return self._decorate(updated, kb_name, department_id)
@@ -330,9 +351,20 @@ class PipelineDirectoryService:
         department_id: str | int,
         directory_id: int,
     ) -> dict[str, int]:
-        records = self.store.list_documents(
-            kb_name, self._scope_department(department_id), directory_id=int(directory_id)
+        scope_ids = self.descendant_ids(
+            kb_name=kb_name,
+            department_id=department_id,
+            directory_id=int(directory_id),
         )
+        records = []
+        for current_id in sorted(scope_ids):
+            records.extend(
+                self.store.list_documents(
+                    kb_name,
+                    self._scope_department(department_id),
+                    directory_id=current_id,
+                )
+            )
         return {
             "files": len(records),
             "bytes": sum(max(0, int(getattr(record, "file_size", 0) or 0)) for record in records),
@@ -412,6 +444,25 @@ class PipelineDirectoryService:
         return result
 
 
+def _cleanup_staged_import_paths(paths: Iterable[str]) -> None:
+    """Remove staged bytes without importing the import service (cycle-free)."""
+
+    for raw in paths:
+        target = os.path.realpath(str(raw or ""))
+        # Only files below the import staging tree are eligible; avoiding a
+        # settings import keeps this module out of the settings SCC.
+        if "directory_imports" not in target.split(os.sep):
+            continue
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+        try:
+            os.rmdir(os.path.dirname(target))
+        except OSError:
+            pass
+
+
 def delete_kb_directory_tree(pipeline: Any, kb_name: str, directory_id: int, *, ctx: Any = None) -> dict:
     """AppPipeline-friendly wrapper; keeps the orchestration method thin."""
     store = getattr(getattr(pipeline, "backend", None), "store", None)
@@ -445,6 +496,39 @@ def delete_directory_tree(
     directory_ids = service.descendant_ids(
         kb_name=kb_name, department_id=department_id, directory_id=int(directory_id)
     )
+    # Never race an active import that is still writing into the subtree.
+    active_jobs: list[dict] = []
+    try:
+        jobs = store.list_directory_import_jobs(
+            kb_name, department_id, limit=200
+        )
+    except Exception:
+        jobs = []
+    for job in jobs:
+        if str(job.get("status") or "") not in {"queued", "running"}:
+            continue
+        if int(job.get("directory_id") or 0) in directory_ids:
+            active_jobs.append(job)
+            continue
+        try:
+            rows = store.list_directory_import_files(
+                int(job["id"]), kb_name, department_id, limit=5000
+            )
+        except Exception:
+            rows = []
+        if any(
+            int(row.get("directory_id") or 0) in directory_ids for row in rows
+        ):
+            active_jobs.append(job)
+    if active_jobs:
+        return {
+            "ok": False,
+            "message": "目录下存在正在进行的导入任务，请先取消后再删除",
+            "deleted_files": 0,
+            "deleted_directories": 0,
+            "errors": [f"import job {job.get('id')}" for job in active_jobs],
+        }
+
     records = [
         record
         for current_id in sorted(directory_ids)
@@ -475,11 +559,42 @@ def delete_directory_tree(
         for current_id in directory_ids
         if (row := store.get_directory(current_id, kb_name, department_id)) is not None
     ]
-    deleted_directories = sum(
-        1
-        for row in sorted(rows, key=lambda item: int(item["depth"]), reverse=True)
-        if store.delete_directory(int(row["id"]), kb_name, department_id)
-    )
+    deleted_directories = 0
+    for row in sorted(rows, key=lambda item: int(item["depth"]), reverse=True):
+        if store.delete_directory(int(row["id"]), kb_name, department_id):
+            deleted_directories += 1
+        else:
+            errors.append(f"{row.get('name') or row.get('id')}: 目录删除失败")
+    if errors:
+        return {
+            "ok": False,
+            "message": "目录内容已删除，但部分目录未能删除",
+            "deleted_files": deleted_files,
+            "deleted_directories": deleted_directories,
+            "errors": errors,
+        }
+    # Terminal import history whose root is inside the deleted subtree no
+    # longer has a valid directory; remove it and its staged bytes.
+    try:
+        terminal_jobs = [
+            job
+            for job in store.list_directory_import_jobs(
+                kb_name, department_id, limit=200
+            )
+            if str(job.get("status") or "")
+            in {"completed", "cancelled", "failed", "partial"}
+            and int(job.get("directory_id") or 0) in directory_ids
+        ]
+    except Exception:
+        terminal_jobs = []
+    for job in terminal_jobs:
+        try:
+            staged = store.delete_directory_import_job(
+                int(job["id"]), kb_name, department_id
+            )
+            _cleanup_staged_import_paths(staged)
+        except Exception:
+            pass
     return {
         "ok": True,
         "message": "目录及其内容已递归删除",

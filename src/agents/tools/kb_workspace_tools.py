@@ -25,6 +25,10 @@ from src.services.evidence_sources import (
     KNOWLEDGE_BASE_DOCUMENT,
     with_source_metadata,
 )
+from src.services.pipeline_directories import (
+    PipelineDirectoryService,
+    document_relative_path,
+)
 from src.services.knowledge_retrieval import (
     grep_chunks,
     lexical_search,
@@ -73,6 +77,7 @@ def _evidence_from_chunk(
     chunk: dict[str, Any],
     *,
     score: float = 0.0,
+    relative_path: str = "",
 ) -> Evidence:
     """Build one formal Evidence row from a parsed chunk and its record."""
 
@@ -104,6 +109,7 @@ def _evidence_from_chunk(
             "processor_kind": str(getattr(record, "processor_kind", "") or ""),
             "content_kind": str(getattr(record, "content_kind", "") or ""),
             "retrieval_tool": "kb_workspace",
+            "relative_path": relative_path or _doc_name(record),
         },
         content=content,
         locator=locator,
@@ -111,7 +117,7 @@ def _evidence_from_chunk(
     return Evidence(
         id=f"doc:{getattr(record, 'id', 0)}:{chunk_id}",
         content=content,
-        source_name=_doc_name(record),
+        source_name=relative_path or _doc_name(record),
         content_kind=str(getattr(record, "content_kind", "") or "document_text"),
         processor_kind=str(getattr(record, "processor_kind", "") or "ragflow"),
         score=float(score or 0.0),
@@ -139,8 +145,49 @@ def make_kb_workspace_tools(
             if str(getattr(record, "status", "") or "") in {"parsed", "indexed"}
         ]
 
-    def _documents() -> list[Any]:
-        return [record for record in _records() if _kind(record) == "document"]
+    def _documents(allowed: set[int] | None = None) -> list[Any]:
+        return [
+            record
+            for record in _records()
+            if _kind(record) == "document"
+            and (
+                allowed is None
+                or int(getattr(record, "directory_id", 0) or 0) in allowed
+            )
+        ]
+
+    def _relative_name(record: Any) -> str:
+        """Return the directory-aware path used in evidence and listings."""
+
+        try:
+            value = document_relative_path(document_store, record)
+        except Exception:
+            value = ""
+        return str(value or _doc_name(record))
+
+    def _allowed_directory_ids(directory_id: int, recursive: bool) -> set[int] | None:
+        """Resolve a directory filter; ``None`` means the whole knowledge base."""
+
+        target = int(directory_id or 0)
+        if target <= 0:
+            return None
+        if not recursive or document_store is None:
+            return {target}
+        metadata = dict(getattr(getattr(rt, "ctx", None), "metadata", {}) or {})
+        department_id = str(
+            metadata.get("resource_department_id")
+            or metadata.get("department_id")
+            or ""
+        )
+        try:
+            return PipelineDirectoryService(store=document_store).descendant_ids(
+                kb_name=str(getattr(rt, "kb_name", "") or ""),
+                department_id=department_id,
+                directory_id=target,
+            )
+        except Exception:
+            # A stale/deleted id must not silently widen to the whole KB.
+            return set()
 
     def _chunks(record: Any) -> list[dict[str, Any]]:
         key = str(getattr(record, "id", "") or getattr(record, "document_id", ""))
@@ -171,10 +218,12 @@ def make_kb_workspace_tools(
         chunk_cache[key] = chunks
         return chunks
 
-    def _chunks_by_document() -> dict[tuple[str, str], list[dict[str, Any]]]:
+    def _chunks_by_document(
+        allowed: set[int] | None = None,
+    ) -> dict[tuple[str, str], list[dict[str, Any]]]:
         return {
-            (str(getattr(record, "id", "") or ""), _doc_name(record)): _chunks(record)
-            for record in _documents()
+            (str(getattr(record, "id", "") or ""), _relative_name(record)): _chunks(record)
+            for record in _documents(allowed)
         }
 
     def _run(
@@ -237,7 +286,11 @@ def make_kb_workspace_tools(
         )
         if record is None and file_name:
             record = next(
-                (item for item in _documents() if file_name in _doc_name(item)),
+                (
+                    item
+                    for item in _documents()
+                    if file_name in {_relative_name(item), _doc_name(item)}
+                ),
                 None,
             )
         if record is None:
@@ -292,6 +345,7 @@ def make_kb_workspace_tools(
                         record,
                         chunk,
                         score=float(row.get("score") or 0.0),
+                        relative_path=_relative_name(record),
                     ),
                 )
             )
@@ -349,15 +403,19 @@ def make_kb_workspace_tools(
         mode: str = "auto",
         top_k: int = 8,
         file_id: str = "",
+        directory_id: int = 0,
+        recursive: bool = True,
     ) -> str:
         """检索文档资料（Word/PDF/文本等），不检索表格/网表。
 
         mode="auto" 自动识别位号/型号/网络名并走精确匹配，否则走 RAGFlow
         语义检索；mode="exact" 强制本地 grep；mode="semantic" 强制 RAGFlow；
+        directory_id + recursive 可把检索限定到某个目录及其后代。
         返回 file_id、file_name、locator、chunk_index、score 和 snippet。
         """
 
         stats: dict[str, Any] = {}
+        allowed_directory_ids = _allowed_directory_ids(directory_id, recursive)
 
         def _search() -> str:
             needle = str(query or "").strip()
@@ -368,7 +426,7 @@ def make_kb_workspace_tools(
                 plane == "auto" and looks_like_exact_term(needle)
             )
             if exact:
-                grouped = _chunks_by_document()
+                grouped = _chunks_by_document(allowed_directory_ids)
                 if file_id:
                     grouped = {
                         key: value
@@ -388,7 +446,7 @@ def make_kb_workspace_tools(
                 used = "semantic"
                 if not results:
                     results = lexical_search(
-                        _chunks_by_document(),
+                        _chunks_by_document(allowed_directory_ids),
                         needle,
                         top_k=max(1, min(int(top_k or 8), 50)),
                         file_id=file_id,
@@ -396,12 +454,21 @@ def make_kb_workspace_tools(
                     used = "lexical"
             else:
                 results = lexical_search(
-                    _chunks_by_document(),
+                    _chunks_by_document(allowed_directory_ids),
                     needle,
                     top_k=max(1, min(int(top_k or 8), 50)),
                     file_id=file_id,
                 )
                 used = "lexical"
+            if allowed_directory_ids is not None:
+                filtered: list[dict[str, Any]] = []
+                for row in results:
+                    record, _chunk = _resolve_row(row)
+                    if record is not None and int(
+                        getattr(record, "directory_id", 0) or 0
+                    ) in allowed_directory_ids:
+                        filtered.append(row)
+                results = filtered
             admitted, citations, sources = _admit_search_results(results)
             stats.update(
                 hit_count=len(results),
@@ -498,7 +565,12 @@ def make_kb_workspace_tools(
                     "rag_id": item.get("rag_id") or "",
                 }
                 evidence_items.append(
-                    _evidence_from_chunk(record, source_chunk, score=1.0)
+                    _evidence_from_chunk(
+                        record,
+                        source_chunk,
+                        score=1.0,
+                        relative_path=_relative_name(record),
+                    )
                 )
             citations: list[int] = []
             if evidence_items and rt is not None:
@@ -520,7 +592,7 @@ def make_kb_workspace_tools(
             return _json(
                 {
                     "file_id": str(getattr(record, "id", "") or ""),
-                    "file_name": _doc_name(record),
+                    "file_name": _relative_name(record),
                     "start_index": max(0, int(start_index or 0)),
                     "chunk_count": len(chunks),
                     "chunks": picked,
@@ -540,19 +612,35 @@ def make_kb_workspace_tools(
             stats=stats,
         )
 
-    def list_knowledge_files(pattern: str = "**/*", kind: str = "") -> str:
-        """列出知识库文件；pattern 支持通配符，kind 可限定 document/table/circuit。"""
+    def list_knowledge_files(
+        pattern: str = "**/*",
+        kind: str = "",
+        directory_id: int = 0,
+        recursive: bool = True,
+    ) -> str:
+        """列出知识库文件；pattern 支持通配符，kind 可限定 document/table/circuit。
+
+        directory_id + recursive 可把列表限定到某个目录及其后代。
+        """
 
         stats: dict[str, Any] = {}
+        allowed_directory_ids = _allowed_directory_ids(directory_id, recursive)
 
         def _list() -> str:
             wanted = str(kind or "").strip().lower()
             records = [
                 record
                 for record in _records()
-                if not wanted or _kind(record) == wanted
+                if (not wanted or _kind(record) == wanted)
+                and (
+                    allowed_directory_ids is None
+                    or int(getattr(record, "directory_id", 0) or 0)
+                    in allowed_directory_ids
+                )
             ]
-            files = list_files(records, pattern=pattern)
+            files = list_files(
+                records, pattern=pattern, path_for=_relative_name
+            )
             for row in files:
                 record = next(
                     (
@@ -568,6 +656,8 @@ def make_kb_workspace_tools(
                 {
                     "pattern": str(pattern or "**/*"),
                     "kind": wanted,
+                    "directory_id": int(directory_id or 0),
+                    "recursive": bool(recursive),
                     "files": files,
                     "count": len(files),
                 }
