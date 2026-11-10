@@ -300,15 +300,18 @@ def search_knowledge_base(
     file_id: str = "",
     refresh: bool = False,
     mode: str = "auto",
+    kind: str = "document",
 ) -> dict[str, Any]:
     """Stateless search over one KB's parsed chunks (no session).
 
     ``mode``: ``auto`` (default) detects exact refdes/part/net ids and uses
     literal grep, otherwise lexical ranking; ``exact`` forces literal grep;
-    ``semantic``/``lexical`` uses lexical ranking.  Results are chunk
-    locators (file / index / rag_id) with snippet + score; read the text with
-    ``hdb_read_file_chunks``.  The chunk index is cached per file (~15 min
-    TTL, ``refresh=True`` forces a rebuild).
+    ``semantic``/``lexical`` uses lexical ranking on this bridge (true
+    semantic retrieval lives in the platform, not the stateless bridge).
+    ``kind``: ``document`` (default), ``table``, ``circuit`` or ``all``.
+    Results are chunk locators (file / index / rag_id) with snippet + score;
+    read the text with ``hdb_read_file_chunks``.  The chunk index is cached
+    per file (~15 min TTL, ``refresh=True`` forces a rebuild).
     """
     needle = str(query or "").strip()
     if not needle:
@@ -324,6 +327,16 @@ def search_knowledge_base(
         fid_name = str(row.get("name") or "")
         if file_id and fid != file_id and fid_name != file_id:
             continue
+        processor = str(row.get("processor_kind") or "")
+        wanted = str(kind or "document").strip().lower()
+        if wanted == "document" and processor and processor != "ragflow":
+            continue
+        if wanted == "table" and "spreadsheet" not in processor:
+            continue
+        if wanted == "circuit" and "circuit" not in processor:
+            continue
+        if wanted not in {"document", "table", "circuit", "all"}:
+            wanted = "document"
         cache = _load_chunks(kb_name, fid, refresh)
         grouped[(fid, fid_name)] = list(cache.get("chunks") or [])
         files_searched += 1
@@ -339,10 +352,13 @@ def search_knowledge_base(
         results = lexical_search(
             grouped, needle, top_k=max(1, min(int(top_k or 8), 50))
         )
-        used = "semantic" if plane == "semantic" else "lexical"
+        # The stateless bridge has no RAGFlow semantic endpoint; be explicit
+        # instead of pretending lexical ranking is semantic retrieval.
+        used = "lexical"
     return {
         "kb_name": kb_name,
         "query": needle,
+        "kind": wanted,
         "mode": used,
         "results": results,
         "result_count": len(results),

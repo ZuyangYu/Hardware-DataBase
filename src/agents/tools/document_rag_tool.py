@@ -319,6 +319,9 @@ def make_document_search(rt, rag_backend: RAGBackend, document_store: PipelineDo
         items, adds_nothing = timed_tool_call(rt, "document_search", query, None, lambda: run(query, max(1, min(int(top_k), 20)), target))
         return format_tool_result(rt, adds_nothing, items)
 
+    # Keep the raw item path available to the unified search_documents tool;
+    # the formatted string remains the model-facing document_search surface.
+    document_search.run = run
     return document_search
 
 

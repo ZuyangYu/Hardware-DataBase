@@ -1,10 +1,11 @@
-"""Unified KB tools: search/read/list over the DocumentManager chunk source."""
+"""Typed KB tools: documents search/read/list; tables/circuits stay separate."""
 
 from __future__ import annotations
 
 import json
 from types import SimpleNamespace
 
+from src.agents.schemas import Evidence
 from src.agents.tools.kb_workspace_tools import make_kb_workspace_tools
 from src.agents.tools.runtime import ToolRuntime
 from src.pipelines.document_rag.schemas import ParsedChunk, ParseResult
@@ -36,6 +37,26 @@ class _Backend:
         )
 
 
+class _Semantic:
+    def __init__(self):
+        self.calls = 0
+
+    def run(self, query, top_k=8, target=None):
+        self.calls += 1
+        return [
+            Evidence(
+                id="document:semantic-1",
+                content="文档语义命中：TCN2 电源树。",
+                source_name="825504380_ADAS_SCH_TCN2.pdf",
+                content_kind="document_text",
+                processor_kind="ragflow",
+                locator={"chunk_index": 9},
+                score=0.91,
+                metadata={"chunk_id": "rag-9", "local_record_id": 36},
+            )
+        ]
+
+
 def _record():
     return SimpleNamespace(
         id=36,
@@ -50,6 +71,23 @@ def _record():
         status="parsed",
         content_hash="hash-36",
         source_group="SCH",
+    )
+
+
+def _table_record():
+    return SimpleNamespace(
+        id=29,
+        kb_id=4,
+        kb_name="AAA",
+        department_id="1739",
+        document_id="doc-29",
+        original_file_name="ICD.xlsx",
+        document_name="ICD.xlsx",
+        content_kind="spreadsheet_table",
+        processor_kind="spreadsheet_table",
+        status="indexed",
+        content_hash="hash-29",
+        source_group="ICD",
     )
 
 
@@ -75,25 +113,31 @@ def _chunks():
     ]
 
 
-def _tools(*, document_manager=None, backend=None):
+def _tools(*, document_manager=None, backend=None, semantic=None, records=None):
     rt = _runtime()
     backend = backend or _Backend(_chunks())
     return rt, make_kb_workspace_tools(
-        rt, backend, _Store([_record()]), document_manager=document_manager
+        rt,
+        backend,
+        _Store(records or [_record()]),
+        document_manager=document_manager,
+        semantic_search=semantic,
     )
 
 
-def test_list_knowledge_files_lists_matching_files():
-    _, (search, read, files) = _tools()
+def test_list_knowledge_files_returns_kind():
+    _, (search, read, files) = _tools(records=[_record(), _table_record()])
 
-    payload = json.loads(files("**/*TCN2*"))
+    payload = json.loads(files("**/*"))
 
-    assert payload["count"] == 1
-    assert payload["files"][0]["path"] == "/kb/AAA/825504380_ADAS_SCH_TCN2.pdf"
-    assert payload["files"][0]["file_id"] == "36"
+    assert payload["count"] == 2
+    kinds = {row["file_id"]: row["kind"] for row in payload["files"]}
+    assert kinds == {"36": "document", "29": "table"}
+    only_docs = json.loads(files("**/*", kind="document"))
+    assert only_docs["count"] == 1
 
 
-def test_search_knowledge_exact_returns_locator_and_snippet_without_evidence():
+def test_search_documents_exact_returns_locator_and_snippet_without_evidence():
     rt, (search, read, files) = _tools()
 
     payload = json.loads(search("X2000", mode="exact", top_k=10))
@@ -107,7 +151,7 @@ def test_search_knowledge_exact_returns_locator_and_snippet_without_evidence():
     assert rt.evidence == []
 
 
-def test_search_knowledge_auto_detects_exact_term():
+def test_search_documents_auto_detects_exact_term():
     _, (search, read, files) = _tools()
 
     payload = json.loads(search("TPS62872", top_k=5))
@@ -116,17 +160,20 @@ def test_search_knowledge_auto_detects_exact_term():
     assert payload["result_count"] == 1
 
 
-def test_search_knowledge_semantic_uses_lexical_ranking():
-    _, (search, read, files) = _tools()
+def test_search_documents_semantic_uses_document_search_runner():
+    semantic = _Semantic()
+    _, (search, read, files) = _tools(semantic=semantic)
 
-    payload = json.loads(search("VCC3V3 到 VCC0V75", mode="semantic", top_k=5))
+    payload = json.loads(search("TCN2 电源树", mode="semantic", top_k=5))
 
     assert payload["mode"] == "semantic"
-    assert payload["result_count"] >= 1
-    assert "TPS62872" in payload["results"][0]["snippet"]
+    assert semantic.calls == 1
+    assert payload["result_count"] == 1
+    assert payload["results"][0]["file_id"] == "36"
+    assert payload["results"][0]["rag_id"] == "rag-9"
 
 
-def test_read_knowledge_returns_text_and_next_index():
+def test_read_document_returns_text_and_next_index():
     _, (search, read, files) = _tools()
 
     payload = json.loads(read("36", start_index=0, max_chunks=1))
@@ -138,12 +185,13 @@ def test_read_knowledge_returns_text_and_next_index():
     assert payload["next_index"] == 1
 
 
-def test_read_knowledge_reports_missing_file():
-    _, (search, read, files) = _tools()
+def test_read_document_rejects_non_document():
+    _, (search, read, files) = _tools(records=[_table_record()])
 
-    payload = json.loads(read("not-there.pdf"))
+    payload = json.loads(read("ICD.xlsx"))
 
-    assert "not found" in payload["error"]
+    assert payload["kind"] == "table"
+    assert "not a document" in payload["error"]
 
 
 def test_document_manager_is_preferred_over_raw_rag_backend():
