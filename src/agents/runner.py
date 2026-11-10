@@ -1635,17 +1635,28 @@ class MultiSourceAgentRunner:
                 "不得读取或尝试读取其他路径。"
             )
         tool_call_cap = budget_state.get("tool_call_cap")
+        retrieval_call_cap = budget_state.get("retrieval_call_cap")
+        finalize_reserve = int(budget_state.get("finalize_reserve") or 0)
         if tool_call_cap:
             system_prompt += (
                 f"\n本轮所有工具调用总次数硬上限为 {int(tool_call_cap)} 次"
-                "(用户在问题上指定的约束，包括检索、读证据等全部工具)。"
-                "达到上限后系统会立即停止检索并转入部分答案合成；"
+                "（包括检索、读证据、写文件等全部工具）。"
+            )
+            if retrieval_call_cap:
+                system_prompt += (
+                    f"其中检索类工具最多 {int(retrieval_call_cap)} 次；"
+                    f"最后 {finalize_reserve} 次预留给最终答案/文件产出。"
+                    "达到检索上限后不要继续检索，直接基于已有证据生成或写文件。"
+                )
+            system_prompt += (
                 "请把调用集中在最必要的查询上，不要重复相近的检索。"
             )
         turn_started = time.monotonic()
         pre_candidates = set(rt.candidate_evidence)
         loop_budget = LoopBudget(rt)
         loop_budget.tool_call_cap = tool_call_cap
+        loop_budget.retrieval_call_cap = retrieval_call_cap
+        loop_budget.finalize_reserve = finalize_reserve
         # Internal loop time limit. A declared tool-call cap already implies a
         # short turn, so the regular 480 s stop stands. Without a declared cap
         # a deep turn is completeness-first: it gets the external deep watchdog
@@ -1654,10 +1665,13 @@ class MultiSourceAgentRunner:
         # deadline is set before the agent is built so the middleware instance
         # bound into the graph always sees it.
         loop_seconds = 480
-        if query_mode == "deep" and not loop_budget.tool_call_cap:
+        if query_mode == "deep":
             loop_seconds = max(
                 60,
-                int(getattr(settings, "CHAT_QUEUE_DEADLINE_DEEP_SECONDS", 900)) - 120,
+                min(
+                    int(getattr(settings, "AGENT_DEEP_LOOP_SECONDS", 360)),
+                    int(getattr(settings, "CHAT_QUEUE_DEADLINE_DEEP_SECONDS", 480)) - 60,
+                ),
             )
         loop_budget.deadline = turn_started + loop_seconds
         gap_middleware = GapClosureMiddleware(
