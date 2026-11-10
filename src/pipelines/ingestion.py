@@ -1,6 +1,7 @@
 import os
 import threading
 import tempfile
+import uuid
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -17,6 +18,7 @@ from src.ingestion.embedded_extractor import (
 )
 from src.pipelines.document_store import PipelineDocumentRecord, PipelineDocumentStore
 from src.pipelines.document_rag.schemas import (
+    IngestFileResult,
     IngestResult,
     RequestContext,
     TASK_STATUS_DEAD_LETTER,
@@ -26,13 +28,16 @@ from src.pipelines.registry import (
     CONTENT_KIND_CIRCUIT,
     CONTENT_KIND_DOCUMENT,
     CONTENT_KIND_EXTERNAL_CONVERSATION,
+    CONTENT_KIND_RAW,
     CONTENT_KIND_SPREADSHEET,
     DATASET_CIRCUIT,
     DATASET_CONVERSATION,
+    DATASET_RAW,
     PIPELINE_REGISTRY,
     PROCESSOR_KIND_CIRCUIT,
     PROCESSOR_KIND_EXTERNAL_CONVERSATION,
     PROCESSOR_KIND_RAGFLOW,
+    PROCESSOR_KIND_RAW,
     PROCESSOR_KIND_SPREADSHEET,
     PipelineRoute,
     PipelineSpec,
@@ -69,6 +74,18 @@ def _noop_audit(*args, **kwargs):
     return None
 
 
+def _get_document_for_scope(store, scope: "IngestionScope", document_name: str, dataset_kind: str):
+    """Keep root-directory calls compatible with pre-directory test adapters."""
+    kwargs = {"department_id": scope.department_id}
+    if scope.directory_id:
+        kwargs["directory_id"] = scope.directory_id
+    return store.get_document(scope.kb_name, document_name, dataset_kind, **kwargs)
+
+
+def _logical_original_name(archived: "ArchivedFile") -> str:
+    return os.path.basename(archived.logical_relative_path or archived.filename)
+
+
 @contextmanager
 def _ingest_lock(scope: "IngestionScope", content_hash: str) -> Iterator[threading.RLock]:
     key = f"{scope.department_id}:{scope.kb_name}:{content_hash}"
@@ -96,6 +113,8 @@ class IngestionScope:
     uploaded_by: str = ""
     source_group: str | None = None
     ctx: RequestContext | None = None
+    directory_id: int = 0
+    relative_path: str = ""
     # P1-1: embedded child submissions carry their depth (0 = user upload) and
     # the parent document name, which drives parent-reference bookkeeping and
     # stops recursive extraction at depth 1.
@@ -113,6 +132,8 @@ class ArchivedFile:
     file_size: int
     content_hash: str
     inspection: ContainerInspection
+    logical_relative_path: str = ""
+    directory_id: int = 0
 
 
 @dataclass
@@ -225,6 +246,7 @@ class IngestionOrchestrator:
         default_dataset_kind: str,
         default_dataset_id: str | Callable[[], str],
         progress_callback: Callable[[int, str], None] | None = None,
+        file_metadata: list[dict] | None = None,
     ) -> IngestResult:
         if not files:
             return IngestResult(success_count=0, total_count=0, messages=["No files selected"], backend=self.backend_name)
@@ -241,53 +263,111 @@ class IngestionOrchestrator:
         failed_count = 0
         skipped_count = 0
         table_task_touched = False
+        file_results: list[IngestFileResult] = []
 
-        for file_path in files:
+        for file_index, file_path in enumerate(files):
+            metadata = (file_metadata or [])[file_index] if file_metadata and file_index < len(file_metadata) else {}
+            file_scope = replace(
+                scope,
+                directory_id=int(metadata.get("directory_id", scope.directory_id) or 0),
+                relative_path=str(metadata.get("relative_path") or scope.relative_path or ""),
+                source_group=metadata.get("source_group", scope.source_group),
+            )
             filename = os.path.basename(file_path)
-            route = route_file(file_path, source_group=scope.source_group)
+            logical_name = os.path.basename(file_scope.relative_path) if file_scope.relative_path else filename
+            route = route_file(file_path, source_group=file_scope.source_group)
             handler = self._handler_for_route(route)
             archived: ArchivedFile | None = None
             handler_result: HandlerResult | None = None
             try:
                 extension = os.path.splitext(filename)[1].lower() or "(no extension)"
                 if route.rejected:
-                    message = self._rejected_message(filename, route)
+                    message = self._rejected_message(logical_name, route)
                     messages.append(message)
                     skipped_count += 1
-                    self._audit_unsupported(scope, filename, message, {
+                    file_results.append(
+                        IngestFileResult(
+                            index=file_index,
+                            relative_path=file_scope.relative_path or logical_name,
+                            status="skipped",
+                            error_code="unsupported_file_type",
+                            message=message,
+                        )
+                    )
+                    self._audit_unsupported(file_scope, logical_name, message, {
                         "extension": extension,
-                        "source_group": scope.source_group,
+                        "source_group": file_scope.source_group,
                         "reason": route.reason or "file_type_rejected",
                         "rejected_by": route.rejected_by.key if route.rejected_by else "",
                     })
                     if progress_callback:
-                        progress_callback(0, f"{filename}: unsupported file variant")
+                        progress_callback(0, f"{logical_name}: unsupported file variant")
                     continue
 
                 if handler is None:
-                    message = f"[skipped] {filename}: unsupported file type {extension}; no pipeline is configured yet."
+                    message = f"[skipped] {logical_name}: unsupported file type {extension}; no pipeline is configured yet."
                     messages.append(message)
                     skipped_count += 1
-                    self._audit_unsupported(scope, filename, message, {
+                    file_results.append(
+                        IngestFileResult(
+                            index=file_index,
+                            relative_path=file_scope.relative_path or logical_name,
+                            status="skipped",
+                            error_code="unsupported_file_type",
+                            message=message,
+                        )
+                    )
+                    self._audit_unsupported(file_scope, logical_name, message, {
                         "extension": extension,
-                        "source_group": scope.source_group,
+                        "source_group": file_scope.source_group,
                         "configured_pipelines": PIPELINE_REGISTRY.configured_extensions(),
                     })
                     if progress_callback:
-                        progress_callback(0, f"{filename}: no pipeline configured")
+                        progress_callback(0, f"{logical_name}: no pipeline configured")
                     continue
 
                 content_hash = self.content_hash(file_path)
-                with _ingest_lock(scope, content_hash):
+                with _ingest_lock(file_scope, content_hash):
                     record_dataset_kind = handler.existing_record_dataset_kind(default_dataset_kind)
-                    existing = self.store.find_by_hash(
-                        scope.kb_name,
-                        record_dataset_kind,
-                        content_hash,
-                        scope.department_id,
-                    )
+                    existing_path = None
+                    path_hash_unknown = False
+                    find_path = getattr(self.store, "find_document_by_path", None)
+                    if callable(find_path):
+                        existing_path = find_path(
+                            file_scope.kb_name,
+                            file_scope.department_id,
+                            file_scope.directory_id,
+                            logical_name,
+                        )
+                        existing_path_hash = getattr(existing_path, "content_hash", "") if existing_path else ""
+                        if existing_path and existing_path_hash and existing_path_hash != content_hash:
+                            raise RuntimeError(
+                                f"file_path_conflict: {file_scope.relative_path or logical_name}"
+                            )
+                        path_hash_unknown = bool(existing_path and not existing_path_hash)
+                    if existing_path is not None:
+                        existing = existing_path
+                    else:
+                        find_kwargs = {}
+                        if file_scope.directory_id:
+                            find_kwargs["directory_id"] = file_scope.directory_id
+                        existing = self.store.find_by_hash(
+                            file_scope.kb_name,
+                            record_dataset_kind,
+                            content_hash,
+                            file_scope.department_id,
+                            **find_kwargs,
+                        )
+                        if existing and existing.document_name != logical_name:
+                            # A content hash is not a second logical placement.
+                            # A different path gets its own record and parser state.
+                            existing = None
                     if existing and existing.status not in {RAGFLOW_STATUS_FAILED, RAGFLOW_STATUS_DELETED}:
-                        reusable = self._existing_record_is_reusable(existing, handler)
+                        reusable = (
+                            False
+                            if path_hash_unknown
+                            else self._existing_record_is_reusable(existing, handler)
+                        )
                         if reusable is None:
                             # Remote status could not be verified; keep the old
                             # record and remote document untouched rather than
@@ -297,22 +377,32 @@ class IngestionOrchestrator:
                                 "keeping the current mapping. Please retry later."
                             )
                         if reusable:
-                            if scope.embed_depth > 0 and scope.parent_document and existing.id:
+                            if file_scope.embed_depth > 0 and file_scope.parent_document and existing.id:
                                 # Shared embedded payload: reuse the indexed
                                 # document and just add this parent reference.
-                                self.store.add_parent_reference(existing.id, scope.parent_document)
+                                self.store.add_parent_reference(existing.id, file_scope.parent_document)
                             messages.append(handler.reuse_message(existing))
                             success_count += 1
+                            file_results.append(
+                                IngestFileResult(
+                                    index=file_index,
+                                    relative_path=file_scope.relative_path or logical_name,
+                                    status="reused",
+                                    record_id=existing.id,
+                                    error_code="file_content_reused",
+                                    message=handler.reuse_message(existing),
+                                )
+                            )
                             table_task_touched = True
-                            if scope.embed_depth == 0 and not self.store.list_embedded_children(
-                                scope.kb_name, scope.department_id, existing.document_name
+                            if file_scope.embed_depth == 0 and not self.store.list_embedded_children(
+                                file_scope.kb_name, file_scope.department_id, existing.document_name
                             ):
                                 # 存量父文档（P1-1 之前入库）在重新上传时补展开。
                                 messages.extend(
                                     self._ingest_embedded_children(
                                         file_path=file_path,
                                         parent_name=existing.document_name,
-                                        scope=scope,
+                                        scope=file_scope,
                                         default_dataset_kind=default_dataset_kind,
                                         default_dataset_id=default_dataset_id,
                                     )
@@ -323,9 +413,9 @@ class IngestionOrchestrator:
                         self.archive.remove_record_archive(existing)
                         self.store.delete_document_by_id(existing.id)
 
-                    archived = self._archive_file(file_path, scope, content_hash)
+                    archived = self._archive_file(file_path, file_scope, content_hash, logical_name=logical_name)
                     handler_result = handler.submit(
-                        scope,
+                        file_scope,
                         archived,
                         default_dataset_kind,
                         dataset_id_for(route),
@@ -336,44 +426,66 @@ class IngestionOrchestrator:
                 if handler_result.audit_action:
                     self.audit(
                         handler_result.audit_action,
-                        scope.ctx,
-                        kb_name=scope.kb_name,
+                        file_scope.ctx,
+                        kb_name=file_scope.kb_name,
                         target_type="document",
                         target_id=archived.filename,
                         metadata=handler_result.audit_metadata,
                     )
                 if handler_result.success:
-                    if handler_result.record_id and scope.embed_depth > 0 and scope.parent_document:
+                    if handler_result.record_id and file_scope.embed_depth > 0 and file_scope.parent_document:
                         self.store.update_embedding_meta(
                             handler_result.record_id,
-                            scope.parent_document,
-                            scope.embed_depth,
+                            file_scope.parent_document,
+                            file_scope.embed_depth,
                         )
                     messages.append(handler_result.message)
                     messages.extend(f"[warning] {warning}" for warning in handler_result.warnings)
                     success_count += 1
-                    if scope.embed_depth == 0:
+                    file_results.append(
+                        IngestFileResult(
+                            index=file_index,
+                            relative_path=file_scope.relative_path or logical_name,
+                            status="success",
+                            record_id=handler_result.record_id,
+                            message=handler_result.message,
+                        )
+                    )
+                    if (
+                        file_scope.embed_depth == 0
+                        and handler.spec.processor_kind != PROCESSOR_KIND_RAW
+                    ):
                         # P1-1: only user-uploaded containers are expanded; an
                         # embedded child is indexed as-is (no nested extraction).
                         messages.extend(
                             self._ingest_embedded_children(
                                 file_path=file_path,
                                 parent_name=archived.filename if archived else filename,
-                                scope=scope,
+                                scope=file_scope,
                                 default_dataset_kind=default_dataset_kind,
                                 default_dataset_id=default_dataset_id,
                             )
                         )
                 else:
                     if not handler_result.preserve_failed_record:
-                        self._cleanup_failed_submission(handler, handler_result, scope, archived)
+                        self._cleanup_failed_submission(handler, handler_result, file_scope, archived)
                     failed_count += 1
                     messages.append(handler_result.message)
+                    file_results.append(
+                        IngestFileResult(
+                            index=file_index,
+                            relative_path=file_scope.relative_path or logical_name,
+                            status="failed",
+                            record_id=handler_result.record_id,
+                            error_code="parse_submission_failed",
+                            message=handler_result.message,
+                        )
+                    )
             except Exception as exc:
                 failed_count += 1
                 if handler and handler_result:
                     try:
-                        handler.rollback(handler_result, scope)
+                        handler.rollback(handler_result, file_scope)
                     except Exception as cleanup_error:
                         error(f"Failed to rollback {filename}: {cleanup_error}")
                 elif handler_result and handler_result.record_id:
@@ -386,19 +498,33 @@ class IngestionOrchestrator:
                 error(f"Ingest failed for {filename}: {exc}")
                 self.audit(
                     "pipeline_upload_failed",
-                    scope.ctx,
-                    kb_name=scope.kb_name,
+                    file_scope.ctx,
+                    kb_name=file_scope.kb_name,
                     target_type="document",
                     target_id=filename,
                     success=False,
                     error_message=str(exc),
                     metadata={
-                        "source_group": scope.source_group,
+                        "source_group": file_scope.source_group,
                         "local_path": archived.archived_path if archived else "",
                         "processor_kind": route.spec.processor_kind if route.spec else "",
                     },
                 )
-                messages.append(f"[failed] {filename}: {exc}")
+                messages.append(f"[failed] {logical_name}: {exc}")
+                file_results.append(
+                    IngestFileResult(
+                        index=file_index,
+                        relative_path=file_scope.relative_path or logical_name,
+                        status="failed",
+                        record_id=handler_result.record_id if handler_result else None,
+                        error_code=(
+                            "file_path_conflict"
+                            if str(exc).startswith("file_path_conflict:")
+                            else "parse_submission_failed"
+                        ),
+                        message=str(exc),
+                    )
+                )
 
         if table_task_touched:
             worker_warning = self._worker_liveness_warning()
@@ -412,6 +538,7 @@ class IngestionOrchestrator:
             backend=self.backend_name,
             failed_count=failed_count,
             skipped_count=skipped_count,
+            file_results=file_results,
         )
 
     def _worker_liveness_warning(self) -> str | None:
@@ -455,13 +582,50 @@ class IngestionOrchestrator:
             except OSError as cleanup_error:
                 error(f"Failed to remove archived source file {archived.archived_path}: {cleanup_error}")
 
-    def _archive_file(self, file_path: str, scope: IngestionScope, content_hash: str) -> ArchivedFile:
-        archived_path, filename, archived_group = self.archive.archive_source_file(
-            scope.kb_name,
-            file_path,
-            scope.source_group,
-            department_id=scope.department_id,
-        )
+    def _archive_file(
+        self,
+        file_path: str,
+        scope: IngestionScope,
+        content_hash: str,
+        *,
+        logical_name: str | None = None,
+    ) -> ArchivedFile:
+        archive_kwargs = {}
+        if scope.directory_id:
+            logical_basename = logical_name or os.path.basename(file_path)
+            stem, extension = os.path.splitext(logical_basename)
+            remote_basename = (
+                f"{content_hash[:12]}__d{scope.directory_id}__"
+                f"{stem}__{uuid.uuid4().hex[:8]}{extension}"
+            )
+            archive_kwargs = {
+                "directory_id": scope.directory_id,
+                "logical_filename": logical_basename,
+                "remote_filename": remote_basename,
+            }
+        try:
+            archived_path, filename, archived_group = self.archive.archive_source_file(
+                scope.kb_name,
+                file_path,
+                scope.source_group,
+                department_id=scope.department_id,
+                **archive_kwargs,
+            )
+        except TypeError as exc:
+            # Lightweight test/archive adapters from the pre-directory API do
+            # not know the additive keyword arguments.  Root uploads retain
+            # their old adapter contract; real directory uploads never take
+            # this branch.
+            if scope.directory_id or "directory_id" not in str(exc):
+                raise
+            archived_path, filename, archived_group = self.archive.archive_source_file(
+                scope.kb_name,
+                file_path,
+                scope.source_group,
+                department_id=scope.department_id,
+            )
+        if logical_name:
+            filename = logical_name
         relative_local_path = os.path.relpath(
             archived_path,
             self.archive.kb_path(scope.kb_name, department_id=scope.department_id),
@@ -476,6 +640,8 @@ class IngestionOrchestrator:
             file_size=os.path.getsize(archived_path),
             content_hash=content_hash,
             inspection=inspection,
+            logical_relative_path=scope.relative_path or filename,
+            directory_id=scope.directory_id,
         )
 
     def _ingest_embedded_children(
@@ -524,6 +690,10 @@ class IngestionOrchestrator:
                     scope,
                     embed_depth=max(1, int(scope.embed_depth) + 1),
                     parent_document=parent_name,
+                    # Embedded payloads are controlled child documents in the
+                    # same logical directory; they must not inherit the
+                    # parent's basename as their own relative path.
+                    relative_path="",
                 )
                 result = self.upload_files(
                     child_paths,
@@ -566,9 +736,19 @@ class IngestionOrchestrator:
         return handler.can_reuse_existing(record)
 
     def _handler_for_route(self, route: PipelineRoute) -> PipelineHandler | None:
-        if not route.spec:
+        if route.spec:
+            return self.handlers.get(route.spec.processor_kind)
+        if route.rejected:
             return None
-        return self.handlers.get(route.spec.processor_kind)
+        import src.settings as settings
+
+        if not bool(getattr(settings, "DIRECTORY_RAW_ONLY_UNKNOWN", False)):
+            return None
+        handler = getattr(self, "_raw_only_handler", None)
+        if handler is None:
+            handler = RawOnlyPipelineHandler(store=self.store)
+            self._raw_only_handler = handler
+        return handler
 
     def _rejected_message(self, filename: str, route: PipelineRoute) -> str:
         if route.rejected_by and route.rejected_by.processor_kind == PROCESSOR_KIND_SPREADSHEET:
@@ -588,6 +768,80 @@ class IngestionOrchestrator:
             success=False,
             error_message=message,
             metadata=metadata,
+        )
+
+
+class RawOnlyPipelineHandler(PipelineHandler):
+    """Archive an unknown file without parsing or indexing it (P1)."""
+
+    def __init__(self, *, store: PipelineDocumentStore):
+        self.store = store
+        self.spec = PipelineSpec(
+            key="raw_only",
+            label="Raw archive",
+            processor_kind=PROCESSOR_KIND_RAW,
+            content_kind=CONTENT_KIND_RAW,
+            stage="archived",
+            dataset_kind=DATASET_RAW,
+            description="Unknown file types are archived only; no parser is run.",
+        )
+
+    def existing_record_dataset_kind(self, default_dataset_kind: str) -> str:
+        return DATASET_RAW
+
+    def can_reuse_existing(self, record: PipelineDocumentRecord) -> bool:
+        return True
+
+    def reuse_message(self, record: PipelineDocumentRecord) -> str:
+        return f"[success] 已归档（未解析）: {record.document_name}"
+
+    def submit(
+        self,
+        scope: IngestionScope,
+        archived: ArchivedFile,
+        default_dataset_kind: str,
+        default_dataset_id: str,
+        progress_callback: Callable[[int, str], None] | None = None,
+    ) -> HandlerResult:
+        self.store.upsert_document(
+            kb_name=scope.kb_name,
+            document_name=archived.filename,
+            dataset_kind=DATASET_RAW,
+            dataset_id="",
+            document_id=f"raw:{archived.content_hash[:16]}",
+            source_group=archived.source_group,
+            department_id=scope.department_id,
+            uploaded_by=scope.uploaded_by,
+            kb_id=scope.kb_id,
+            directory_id=scope.directory_id,
+            original_file_name=_logical_original_name(archived),
+            local_path=archived.relative_local_path,
+            file_size=archived.file_size,
+            content_hash=archived.content_hash,
+            status="raw_archived",
+            upload_status="raw_archived",
+            content_kind=CONTENT_KIND_RAW,
+            processor_kind=PROCESSOR_KIND_RAW,
+            parse_progress=100,
+            parse_stage="仅归档，未解析（未知文件类型）",
+        )
+        record = _get_document_for_scope(self.store, scope, archived.filename, DATASET_RAW)
+        if progress_callback:
+            progress_callback(100, f"{archived.filename}: 已归档（未解析）")
+        return HandlerResult(
+            success=True,
+            message=f"[success] {archived.filename}: 已归档（未解析；未知文件类型）",
+            document_id=f"raw:{archived.content_hash[:16]}",
+            record_id=record.id if record else None,
+            status="raw_archived",
+            preserve_failed_record=True,
+            audit_action="raw_file_archived",
+            audit_metadata={
+                "store_id": record.id if record else None,
+                "source_group": archived.source_group,
+                "local_path": archived.relative_local_path,
+                "content_hash": archived.content_hash,
+            },
         )
 
 
@@ -631,15 +885,30 @@ class RAGFlowDocumentHandler(PipelineHandler):
         default_dataset_id: str,
         progress_callback: Callable[[int, str], None] | None = None,
     ) -> HandlerResult:
-        submission = self.submit_remote(
-            default_dataset_id,
-            scope.kb_name,
-            archived.filename,
-            archived.archived_path,
-            archived.source_group,
-            ctx=scope.ctx,
-            progress_callback=progress_callback,
-        )
+        try:
+            submission = self.submit_remote(
+                default_dataset_id,
+                scope.kb_name,
+                archived.filename,
+                archived.archived_path,
+                archived.source_group,
+                ctx=scope.ctx,
+                progress_callback=progress_callback,
+                directory_id=scope.directory_id,
+                logical_relative_path=archived.logical_relative_path,
+            )
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            submission = self.submit_remote(
+                default_dataset_id,
+                scope.kb_name,
+                archived.filename,
+                archived.archived_path,
+                archived.source_group,
+                ctx=scope.ctx,
+                progress_callback=progress_callback,
+            )
         try:
             self.store.upsert_document(
                 kb_name=scope.kb_name,
@@ -652,7 +921,8 @@ class RAGFlowDocumentHandler(PipelineHandler):
                 uploaded_by=scope.uploaded_by,
                 kb_id=scope.kb_id,
                 status=RAGFLOW_STATUS_PARSING,
-                original_file_name=os.path.basename(archived.original_path),
+                directory_id=scope.directory_id,
+                original_file_name=_logical_original_name(archived),
                 local_path=archived.relative_local_path,
                 file_size=archived.file_size,
                 content_hash=archived.content_hash,
@@ -665,12 +935,7 @@ class RAGFlowDocumentHandler(PipelineHandler):
         except Exception:
             self._cleanup_submitted_remote(default_dataset_id, submission.document_id)
             raise
-        record = self.store.get_document(
-            scope.kb_name,
-            archived.filename,
-            default_dataset_kind,
-            department_id=scope.department_id,
-        )
+        record = _get_document_for_scope(self.store, scope, archived.filename, default_dataset_kind)
         warning = archived.inspection.to_warning_message()
         return HandlerResult(
             success=True,
@@ -767,7 +1032,8 @@ class CircuitPipelineHandler(PipelineHandler):
             uploaded_by=scope.uploaded_by,
             kb_id=scope.kb_id,
             status=TABLE_STATUS_ARCHIVED,
-            original_file_name=os.path.basename(archived.original_path),
+            directory_id=scope.directory_id,
+            original_file_name=_logical_original_name(archived),
             local_path=archived.relative_local_path,
             file_size=archived.file_size,
             content_hash=archived.content_hash,
@@ -777,12 +1043,7 @@ class CircuitPipelineHandler(PipelineHandler):
             parse_progress=5,
             parse_stage="Archived; waiting for circuit indexing",
         )
-        record = self.store.get_document(
-            scope.kb_name,
-            archived.filename,
-            dataset_kind,
-            department_id=scope.department_id,
-        )
+        record = _get_document_for_scope(self.store, scope, archived.filename, dataset_kind)
         record_id = record.id if record else None
         warnings: list[str] = []
         warning = archived.inspection.to_warning_message()
@@ -793,7 +1054,7 @@ class CircuitPipelineHandler(PipelineHandler):
                 kb_name=scope.kb_name,
                 record_id=record_id,
                 file_path=archived.archived_path,
-                original_name=archived.filename,
+                original_name=archived.logical_relative_path or archived.filename,
                 department_id=scope.department_id,
                 uploaded_by=scope.uploaded_by,
             )
@@ -1067,7 +1328,8 @@ class ExternalConversationHandler(PipelineHandler):
             uploaded_by=scope.uploaded_by,
             kb_id=scope.kb_id,
             status=RAGFLOW_STATUS_PARSING,
-            original_file_name=os.path.basename(archived.original_path),
+            directory_id=scope.directory_id,
+            original_file_name=_logical_original_name(archived),
             local_path=archived.relative_local_path,
             file_size=archived.file_size,
             content_hash=archived.content_hash,
@@ -1077,12 +1339,7 @@ class ExternalConversationHandler(PipelineHandler):
             parse_progress=10,
             parse_stage="解析外部对话记录",
         )
-        record = self.store.get_document(
-            scope.kb_name,
-            archived.filename,
-            dataset_kind,
-            department_id=scope.department_id,
-        )
+        record = _get_document_for_scope(self.store, scope, archived.filename, dataset_kind)
         record_id = record.id if record else None
         warnings: list[str] = []
         warning = archived.inspection.to_warning_message()
@@ -1132,7 +1389,8 @@ class ExternalConversationHandler(PipelineHandler):
                     uploaded_by=scope.uploaded_by,
                     kb_id=scope.kb_id,
                     status=TABLE_STATUS_INDEXED,
-                    original_file_name=os.path.basename(archived.original_path),
+                    directory_id=scope.directory_id,
+                    original_file_name=_logical_original_name(archived),
                     local_path=archived.relative_local_path,
                     file_size=archived.file_size,
                     content_hash=archived.content_hash,
@@ -1142,12 +1400,7 @@ class ExternalConversationHandler(PipelineHandler):
                     parse_progress=100,
                     parse_stage=message,
                 )
-                refreshed = self.store.get_document(
-                    scope.kb_name,
-                    archived.filename,
-                    dataset_kind,
-                    department_id=scope.department_id,
-                )
+                refreshed = _get_document_for_scope(self.store, scope, archived.filename, dataset_kind)
                 record_id = refreshed.id if refreshed else record_id
             if progress_callback:
                 progress_callback(100, message)
@@ -1327,7 +1580,8 @@ class SpreadsheetPipelineHandler(PipelineHandler):
             uploaded_by=scope.uploaded_by,
             kb_id=scope.kb_id,
             status=TABLE_STATUS_ARCHIVED,
-            original_file_name=os.path.basename(archived.original_path),
+            directory_id=scope.directory_id,
+            original_file_name=_logical_original_name(archived),
             local_path=archived.relative_local_path,
             file_size=archived.file_size,
             content_hash=archived.content_hash,
@@ -1335,12 +1589,7 @@ class SpreadsheetPipelineHandler(PipelineHandler):
             content_kind=CONTENT_KIND_SPREADSHEET,
             processor_kind=PROCESSOR_KIND_SPREADSHEET,
         )
-        record = self.store.get_document(
-            scope.kb_name,
-            archived.filename,
-            dataset_kind,
-            department_id=scope.department_id,
-        )
+        record = _get_document_for_scope(self.store, scope, archived.filename, dataset_kind)
         if record:
             self.store.update_document_progress_by_id(
                 record.id,

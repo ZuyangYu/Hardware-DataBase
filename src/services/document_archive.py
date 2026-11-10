@@ -54,6 +54,16 @@ class DocumentArchiveManager:
             archive_path = os.path.join(self.kb_path(record.kb_name, department_id=department_id), path)
             if os.path.exists(archive_path):
                 return archive_path
+            directory_id = int(getattr(record, "directory_id", 0) or 0)
+            if directory_id:
+                directory_path = os.path.join(
+                    self.kb_path(record.kb_name, department_id=department_id),
+                    "directories",
+                    str(directory_id),
+                    path,
+                )
+                if os.path.exists(directory_path):
+                    return directory_path
         legacy_archive_path = os.path.join(self.kb_path(record.kb_name), path)
         if os.path.exists(legacy_archive_path):
             return legacy_archive_path
@@ -65,14 +75,27 @@ class DocumentArchiveManager:
         file_path: str,
         source_group: str | None,
         department_id: str | int | None = None,
+        *,
+        directory_id: int = 0,
+        logical_filename: str | None = None,
+        remote_filename: str | None = None,
     ) -> tuple[str, str, str]:
         archived_group = safe_source_group(source_group)
-        filename = os.path.basename(file_path)
-        target_dir = os.path.join(
-            self.kb_path(kb_name, create=True, department_id=department_id),
-            archived_group,
-        )
+        logical_name = os.path.basename(logical_filename or file_path) or "upload"
+        if logical_name in {".", ".."}:
+            logical_name = "upload"
+        if int(directory_id or 0) < 0:
+            raise ValueError("directory_id must be non-negative")
+        kb_root = self.kb_path(kb_name, create=True, department_id=department_id)
+        if int(directory_id or 0):
+            target_dir = os.path.join(kb_root, "directories", str(int(directory_id)))
+        else:
+            target_dir = kb_root
+        target_dir = os.path.join(target_dir, archived_group)
         os.makedirs(target_dir, exist_ok=True)
+        filename = os.path.basename(remote_filename or logical_name) or "upload"
+        if filename in {".", ".."}:
+            filename = "upload"
         base, ext = os.path.splitext(filename)
         for attempt in range(20):
             candidate_name = filename

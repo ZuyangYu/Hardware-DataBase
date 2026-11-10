@@ -151,6 +151,60 @@ def main()                            # console script hardware-database-server
 3. 组装文件列表交给 `AppPipeline.upload_files` → 逐文件返回 `[success]/[warning]/[failed]/[skipped]` 消息；
 4. 上传路由本身不解析文件——解析是 worker 的职责。
 
+### 1.6 知识库目录树与文件夹上传
+
+目录属于 Pipeline Domain，根目录使用虚拟 `directory_id=0`；目录权限继承
+知识库权限，不增加目录级 ACL：
+
+| 方法 | 路径 | 权限 | 说明 |
+|---|---|---|---|
+| GET | `/api/v1/kbs/{kb}/directories?parent_id=0` | read | 查询直接子目录，返回派生 `path` 和计数 |
+| POST | `/api/v1/kbs/{kb}/directories` | write | 创建目录，body 为 `{parent_id, name}` |
+| PATCH | `/api/v1/kbs/{kb}/directories/{directory_id}` | admin | 重命名；带 `parent_id` 时移动目录 |
+| DELETE | `/api/v1/kbs/{kb}/directories/{directory_id}` | admin | 默认仅删除空目录；`recursive=true&confirm=true` 递归删除 |
+
+文件列表支持：
+
+```text
+GET /api/v1/kbs/{kb}/files?directory_id=0&recursive=false&query=&limit=100&offset=0
+```
+
+`FileView.name` 仍是 basename；`directory_id`、`relative_path`、`display_name` 是
+新增字段。路径由目录树动态派生，目录重命名不会改文件记录 ID 或物理归档。
+
+上传接口继续使用 `POST /kbs/{kb}/files`，新增 multipart 字段：
+
+```text
+directory_id: 目标目录，默认 0
+manifest: {"entries":[{"index":0,"relative_path":"docs/spec.pdf","source_group":"文档资料"}]}
+files: repeated UploadFile
+```
+
+服务端验证 manifest 条目顺序、路径穿越、目录归属和 source group；每个文件独立
+路由、归档、去重和报告。未知扩展名默认返回 `unsupported_file_type`；启用
+`DIRECTORY_RAW_ONLY_UNKNOWN=true` 后先归档为 `raw_file`（`raw_archived`）但不解析。
+同目录同路径不同内容返回 `file_path_conflict`，不同目录允许同名文件。
+
+持久化文件夹导入批次（P1）：
+
+```text
+POST /api/v1/kbs/{kb}/directory-imports
+POST /api/v1/kbs/{kb}/directory-imports/plan
+PUT  /api/v1/kbs/{kb}/directory-imports/{job_id}/files/{file_id}/content
+GET  /api/v1/kbs/{kb}/directory-imports
+GET  /api/v1/kbs/{kb}/directory-imports/{job_id}
+POST /api/v1/kbs/{kb}/directory-imports/{job_id}/retry[?file_id=]
+POST /api/v1/kbs/{kb}/directory-imports/{job_id}/cancel
+```
+
+`/plan` 先创建空批次（只登记相对路径），随后可逐个 `PUT .../content` 上传文件，
+实现文件级断点恢复；中断后重新上传未完成文件即可，无需重传整个文件夹。
+
+创建接口接收与同步上传相同的 `files/directory_id/source_group/manifest`，先把
+字节暂存到 `storage/directory_imports/<uuid>/`，再持久化批次和逐文件行；解析 worker
+逐个文件调用正常摄取链路，失败文件保留暂存字节以支持单独重试。批次状态为
+`queued/running/completed/partial/failed/cancelled`。
+
 ---
 
 ## 2. 鉴权与治理（`src/core/auth.py`）

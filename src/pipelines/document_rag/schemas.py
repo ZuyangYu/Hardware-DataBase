@@ -171,6 +171,16 @@ TASK_STATUS_LABELS = {
 
 
 @dataclass
+class IngestFileResult:
+    index: int
+    relative_path: str
+    status: str
+    record_id: int | None = None
+    error_code: str = ""
+    message: str = ""
+
+
+@dataclass
 class IngestResult:
     success_count: int
     total_count: int
@@ -178,6 +188,7 @@ class IngestResult:
     backend: str = "ragflow"
     failed_count: int = 0
     skipped_count: int = 0
+    file_results: list[IngestFileResult] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:

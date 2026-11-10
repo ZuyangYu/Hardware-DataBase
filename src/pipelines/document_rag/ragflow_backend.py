@@ -64,6 +64,7 @@ from src.services.document_routing import (
     TABLE_STATUS_INDEXED,
 )
 from src.services.kb_scope import KbScope, kb_scope_from_context
+from src.services.pipeline_directories import document_relative_path
 
 
 DATASET_GOVERNANCE = "governance"
@@ -78,6 +79,7 @@ RAGFLOW_HIDDEN_TASK_STATUSES = {
     RAGFLOW_STATUS_CANCELLED,
     TABLE_STATUS_ARCHIVED,
     TABLE_STATUS_INDEXED,
+    "raw_archived",
     "completed",
     "complete",
     "done",
@@ -1007,7 +1009,16 @@ class RAGFlowBackend(RAGBackend):
         self._ensure_physical_datasets()
         return self._dataset_ids[dataset_kind]
 
-    def _metadata(self, kb_name: str, filename: str, source_group: str | None, ctx: RequestContext | None) -> dict:
+    def _metadata(
+        self,
+        kb_name: str,
+        filename: str,
+        source_group: str | None,
+        ctx: RequestContext | None,
+        *,
+        directory_id: int = 0,
+        logical_relative_path: str = "",
+    ) -> dict:
         scope = _scope_for_kb(kb_name, ctx)
         kb_id = _resolve_kb_id(scope)
         return {
@@ -1018,6 +1029,8 @@ class RAGFlowBackend(RAGBackend):
             "source_group": safe_source_group(source_group),
             "uploaded_by": ctx.user_id if ctx else "",
             "original_file_name": filename,
+            "directory_id": str(int(directory_id or 0)),
+            "relative_path": logical_relative_path or filename,
         }
 
     def _cleanup_remote_document(self, dataset_id: str, document_id: str):
@@ -1102,6 +1115,8 @@ class RAGFlowBackend(RAGBackend):
         ctx: RequestContext | None = None,
         source_group: str | None = None,
         progress_callback: Callable[[int, str], None] | None = None,
+        directory_id: int = 0,
+        file_metadata: list[dict] | None = None,
     ) -> IngestResult:
         self._check_kb_access(kb_name, ctx, "write")
         scope = _scope_for_kb(kb_name, ctx).require_department("upload to")
@@ -1113,6 +1128,7 @@ class RAGFlowBackend(RAGBackend):
             uploaded_by=ctx.user_id if ctx else "",
             source_group=source_group,
             ctx=ctx,
+            directory_id=int(directory_id or 0),
         )
         # 数据集 id 延迟解析：只有真的要走 RAGFlow 管线时才连它。表格（xlsx）与
         # 电路（edf）是本地解析，不应因为 RAGFlow 未配置而无法上传。
@@ -1122,6 +1138,7 @@ class RAGFlowBackend(RAGBackend):
             default_dataset_kind=dataset_kind,
             default_dataset_id=lambda: self._dataset_id_for_kind(dataset_kind),
             progress_callback=progress_callback,
+            file_metadata=file_metadata,
         )
 
     def _submit_archived_document(
@@ -1133,6 +1150,8 @@ class RAGFlowBackend(RAGBackend):
         source_group: str,
         ctx: RequestContext | None = None,
         progress_callback: Callable[[int, str], None] | None = None,
+        directory_id: int = 0,
+        logical_relative_path: str = "",
     ) -> ProcessingSubmission:
         client = self._client()
         document_id = ""
@@ -1142,7 +1161,14 @@ class RAGFlowBackend(RAGBackend):
             except Exception as exc:
                 raise _ragflow_submission_error(file_name, "upload document", exc) from exc
 
-            metadata = self._metadata(kb_name, file_name, source_group, ctx)
+            metadata = self._metadata(
+                kb_name,
+                file_name,
+                source_group,
+                ctx,
+                directory_id=directory_id,
+                logical_relative_path=logical_relative_path,
+            )
             try:
                 client.update_document_metadata(dataset_id, document_id, metadata)
             except Exception as exc:
@@ -1529,7 +1555,15 @@ class RAGFlowBackend(RAGBackend):
                     records = [
                         record
                         for record in records
-                        if str(record.original_file_name or record.document_name or "") in source_names
+                        if any(
+                            candidate in source_names
+                            for candidate in (
+                                str(record.original_file_name or ""),
+                                str(record.document_name or ""),
+                                document_relative_path(self.store, record),
+                            )
+                            if candidate
+                        )
                     ]
             if not records:
                 return None
@@ -1634,6 +1668,11 @@ class RAGFlowBackend(RAGBackend):
         # their scope through our local, department-scoped document mapping so
         # missing fields do not drop valid chunks and untracked remote chunks
         # cannot bypass the application's access controls.
+        def _logical_record_path(record) -> str:
+            # Keep the filename fallback for pre-directory records while
+            # deriving directory-aware paths from the authoritative tree.
+            return document_relative_path(self.store, record)
+
         def _filter_chunks() -> tuple[list[Evidence], dict[str, int]]:
             evidences = []
             skipped_counts = {
@@ -1676,13 +1715,20 @@ class RAGFlowBackend(RAGBackend):
                     or metadata.get("original_file_name")
                     or ""
                 )
-                if source_names and canonical_source_name not in source_names:
+                logical_source_name = _logical_record_path(record)
+                if source_names and not {
+                    canonical_source_name,
+                    str(record.document_name or ""),
+                    logical_source_name,
+                }.intersection(source_names):
                     skipped_counts["source_name"] += 1
                     continue
 
                 metadata.update({
                     "kb_name": record.kb_name,
                     "department_id": record.department_id,
+                    "directory_id": int(getattr(record, "directory_id", 0) or 0),
+                    "relative_path": str(metadata.get("relative_path") or _logical_record_path(record)),
                     "source_group": record_source_group,
                     "original_file_name": canonical_source_name,
                     "ragflow_document_id": remote_document_id,
@@ -1709,7 +1755,7 @@ class RAGFlowBackend(RAGBackend):
                     Evidence(
                         id=str(chunk.get("id") or chunk.get("chunk_id") or ""),
                         content=content,
-                        source_name=canonical_source_name,
+                        source_name=logical_source_name or canonical_source_name,
                         score=float(score or 0.0),
                         metadata={
                             **metadata,
@@ -1920,6 +1966,30 @@ class RAGFlowBackend(RAGBackend):
             )
 
         self.store.delete_documents_by_kb(scope.kb_name, department_id=scope.department_id)
+        delete_directories = getattr(self.store, "delete_directories_by_kb", None)
+        if callable(delete_directories):
+            delete_directories(scope.kb_name, department_id=scope.department_id)
+        delete_imports = getattr(self.store, "delete_directory_imports_by_kb", None)
+        if callable(delete_imports):
+            try:
+                from src.services.directory_imports import cleanup_staging_dir
+
+                staged_paths = delete_imports(scope.kb_name, department_id=scope.department_id)
+                for staged in staged_paths:
+                    try:
+                        os.remove(staged)
+                    except OSError:
+                        pass
+                for root in {os.path.dirname(path) for path in staged_paths}:
+                    cleanup_staging_dir(root)
+            except Exception as cleanup_exc:  # noqa: BLE001 - report, never hide orphans
+                errors.append(f"directory imports: {cleanup_exc}")
+        if errors:
+            return BackendResult(
+                ok=False,
+                message=f"知识库内容已删除，但目录导入暂存清理失败: {'; '.join(errors)}",
+                backend=self.name,
+            )
         self._audit(
             "ragflow_delete_knowledge_base",
             ctx,
@@ -2181,11 +2251,25 @@ class RAGFlowBackend(RAGBackend):
         except ValueError:
             return time.time()
 
-    def list_documents(self, kb_name: str, ctx: RequestContext | None = None) -> list[DocumentInfo]:
+    def list_documents(
+        self,
+        kb_name: str,
+        ctx: RequestContext | None = None,
+        *,
+        directory_id: int | None = None,
+    ) -> list[DocumentInfo]:
         self._check_kb_access(kb_name, ctx, "read")
         documents = []
         department_id = _ctx_department_id(ctx)
-        for record in self.store.list_documents(kb_name, department_id=department_id):
+        if directory_id is None:
+            records = self.store.list_documents(kb_name, department_id=department_id)
+        else:
+            records = self.store.list_documents(
+                kb_name,
+                department_id=department_id,
+                directory_id=directory_id,
+            )
+        for record in records:
             status = record.status
             status_note = ""
             raw_error_message = record.error_message or record.ragflow_error
@@ -2224,6 +2308,8 @@ class RAGFlowBackend(RAGBackend):
                     status = RAGFLOW_STATUS_FAILED
 
             container_inspection = self.archive.inspect_record_archive(record)
+            record_directory_id = int(getattr(record, "directory_id", 0) or 0)
+            relative_path = document_relative_path(self.store, record)
             spreadsheet_profile = (
                 self.spreadsheet_indexes.get_document_profile(record)
                 if record.processor_kind == PROCESSOR_KIND_SPREADSHEET else None
@@ -2242,6 +2328,9 @@ class RAGFlowBackend(RAGBackend):
                         "original_file_name": record.original_file_name,
                         "source_group": record.source_group,
                         "department_id": record.department_id,
+                        "directory_id": record_directory_id,
+                        "relative_path": relative_path,
+                        "display_name": record.document_name,
                         "status": status,
                         "content_kind": record.content_kind,
                         "processor_kind": record.processor_kind,

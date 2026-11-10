@@ -29,6 +29,8 @@ class DocumentManager:
         ctx: RequestContext | None = None,
         source_group: str | None = None,
         progress_callback: Callable[[int, str], None] | None = None,
+        directory_id: int = 0,
+        file_metadata: list[dict] | None = None,
     ) -> IngestResult:
         backend_name = getattr(self.processing_backend, "name", "unknown")
         if not files:
@@ -50,6 +52,8 @@ class DocumentManager:
             ctx=ctx,
             source_group=source_group,
             progress_callback=progress_callback,
+            directory_id=directory_id,
+            file_metadata=file_metadata,
         )
 
     def processing_pipeline_for_file(self, file_path: str) -> str | None:
@@ -96,8 +100,16 @@ class DocumentManager:
     def list_files(self, kb_name: str, ctx: RequestContext | None = None) -> list[str]:
         return [doc.name for doc in self.processing_backend.list_documents(kb_name, ctx=ctx)]
 
-    def list_file_infos(self, kb_name: str, ctx: RequestContext | None = None):
-        return self.processing_backend.list_documents(kb_name, ctx=ctx)
+    def list_file_infos(
+        self,
+        kb_name: str,
+        ctx: RequestContext | None = None,
+        *,
+        directory_id: int | None = None,
+    ):
+        if directory_id is None:
+            return self.processing_backend.list_documents(kb_name, ctx=ctx)
+        return self.processing_backend.list_documents(kb_name, ctx=ctx, directory_id=directory_id)
 
     def list_parse_tasks(self, kb_name: str | None = None, ctx: RequestContext | None = None):
         return self.processing_backend.list_parse_tasks(kb_name, ctx=ctx)

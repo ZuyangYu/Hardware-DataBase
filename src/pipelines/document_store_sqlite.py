@@ -90,6 +90,7 @@ class PipelineDocumentRecord:
     parent_document: str = ""
     created_at: str = ""
     updated_at: str = ""
+    directory_id: int = 0
 
 
 class PipelineDocumentStore:
@@ -167,43 +168,81 @@ class PipelineDocumentStore:
                 )
             """)
             conn.execute("""
-                CREATE TABLE IF NOT EXISTS pipeline_documents (
+                CREATE TABLE IF NOT EXISTS pipeline_directories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     kb_id INTEGER NOT NULL DEFAULT 0,
                     kb_name TEXT NOT NULL,
-                    document_name TEXT NOT NULL,
-                    original_file_name TEXT NOT NULL DEFAULT '',
-                    dataset_kind TEXT NOT NULL,
-                    dataset_id TEXT NOT NULL,
-                    document_id TEXT NOT NULL,
-                    source_group TEXT NOT NULL DEFAULT '',
-                    department_id TEXT NOT NULL DEFAULT '',
-                    uploaded_by TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL DEFAULT 'uploaded',
-                    content_kind TEXT NOT NULL DEFAULT 'document_text',
-                    processor_kind TEXT NOT NULL DEFAULT 'ragflow',
-                    shared_read_only INTEGER NOT NULL DEFAULT 0,
-                    local_path TEXT NOT NULL DEFAULT '',
-                    file_size INTEGER NOT NULL DEFAULT 0,
-                    content_hash TEXT NOT NULL DEFAULT '',
-                    upload_status TEXT NOT NULL DEFAULT '',
-                    error_message TEXT NOT NULL DEFAULT '',
-                    ragflow_error TEXT NOT NULL DEFAULT '',
-                    last_status_checked_at TEXT NOT NULL DEFAULT '',
-                    parse_started_at TEXT NOT NULL DEFAULT '',
-                    parse_completed_at TEXT NOT NULL DEFAULT '',
-                    parse_progress INTEGER NOT NULL DEFAULT 0,
-                    parse_stage TEXT NOT NULL DEFAULT '',
-                    worker_id TEXT NOT NULL DEFAULT '',
-                    worker_started_at TEXT NOT NULL DEFAULT '',
-                    worker_heartbeat_at TEXT NOT NULL DEFAULT '',
-                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    department_id TEXT NOT NULL,
+                    parent_id INTEGER NOT NULL DEFAULT 0,
+                    name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL,
+                    depth INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(kb_name, department_id, document_name, dataset_kind)
+                    UNIQUE(kb_name, department_id, parent_id, normalized_name)
                 )
             """)
-            self._migrate_department_unique_constraint(conn)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_pipeline_directories_children "
+                "ON pipeline_directories(kb_name, department_id, parent_id, name)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS directory_import_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kb_id INTEGER NOT NULL DEFAULT 0,
+                    kb_name TEXT NOT NULL,
+                    department_id TEXT NOT NULL,
+                    directory_id INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    total_files INTEGER NOT NULL DEFAULT 0,
+                    success_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    skipped_count INTEGER NOT NULL DEFAULT 0,
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    created_by TEXT NOT NULL DEFAULT '',
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS directory_import_files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    source_group TEXT NOT NULL DEFAULT '',
+                    directory_id INTEGER NOT NULL DEFAULT 0,
+                    original_name TEXT NOT NULL DEFAULT '',
+                    staged_path TEXT NOT NULL DEFAULT '',
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    content_hash TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    record_id INTEGER,
+                    error_code TEXT NOT NULL DEFAULT '',
+                    error_message TEXT NOT NULL DEFAULT '',
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    worker_id TEXT NOT NULL DEFAULT '',
+                    worker_started_at TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(job_id, relative_path)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_directory_import_jobs_scope "
+                "ON directory_import_jobs(kb_name, department_id, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_directory_import_files_claim "
+                "ON directory_import_files(status, worker_id, updated_at, id)"
+            )
+            self._create_pipeline_documents_table(conn)
+            self._migrate_document_schema(conn)
             self._ensure_columns(conn)
             # Claim/sweep paths filter on processor_kind/status/worker_id and
             # order by updated_at; without these the worker full-scans every
@@ -216,6 +255,74 @@ class PipelineDocumentStore:
                 "CREATE INDEX IF NOT EXISTS ix_pipeline_documents_lease"
                 " ON pipeline_documents(processor_kind, worker_id, worker_heartbeat_at)"
             )
+
+    @staticmethod
+    def _create_pipeline_documents_table(conn, *, include_unique: bool = True) -> None:
+        """Create the complete current ledger shape.
+
+        Keep this definition complete rather than relying on ``_ensure_columns``
+        for normal boots.  The same shape is used by the SQLite-to-PostgreSQL
+        domain template, and migrations can copy every shared column without
+        silently dropping the asset/revision/embedding fields added over time.
+        """
+        unique_clause = (
+            ",\n                    UNIQUE(kb_name, department_id, directory_id, document_name)"
+            if include_unique
+            else ""
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS pipeline_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kb_id INTEGER NOT NULL DEFAULT 0,
+                kb_name TEXT NOT NULL,
+                document_name TEXT NOT NULL,
+                original_file_name TEXT NOT NULL DEFAULT '',
+                dataset_kind TEXT NOT NULL,
+                dataset_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+                source_group TEXT NOT NULL DEFAULT '',
+                department_id TEXT NOT NULL DEFAULT '',
+                uploaded_by TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'uploaded',
+                directory_id INTEGER NOT NULL DEFAULT 0,
+                content_kind TEXT NOT NULL DEFAULT 'document_text',
+                processor_kind TEXT NOT NULL DEFAULT 'ragflow',
+                shared_read_only INTEGER NOT NULL DEFAULT 0,
+                local_path TEXT NOT NULL DEFAULT '',
+                file_size INTEGER NOT NULL DEFAULT 0,
+                content_hash TEXT NOT NULL DEFAULT '',
+                upload_status TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                ragflow_error TEXT NOT NULL DEFAULT '',
+                last_status_checked_at TEXT NOT NULL DEFAULT '',
+                parse_started_at TEXT NOT NULL DEFAULT '',
+                parse_completed_at TEXT NOT NULL DEFAULT '',
+                parse_progress INTEGER NOT NULL DEFAULT 0,
+                parse_stage TEXT NOT NULL DEFAULT '',
+                worker_id TEXT NOT NULL DEFAULT '',
+                worker_started_at TEXT NOT NULL DEFAULT '',
+                worker_heartbeat_at TEXT NOT NULL DEFAULT '',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                asset_id TEXT NOT NULL DEFAULT '',
+                logical_document_id TEXT NOT NULL DEFAULT '',
+                source_version_id TEXT NOT NULL DEFAULT '',
+                project_id TEXT NOT NULL DEFAULT '',
+                document_role TEXT NOT NULL DEFAULT '',
+                module_scope_json TEXT NOT NULL DEFAULT '[]',
+                revision TEXT NOT NULL DEFAULT '',
+                approval_status TEXT NOT NULL DEFAULT '',
+                effective_from TEXT NOT NULL DEFAULT '',
+                effective_to TEXT NOT NULL DEFAULT '',
+                usage_type TEXT NOT NULL DEFAULT '',
+                embed_depth INTEGER NOT NULL DEFAULT 0,
+                parent_document TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                {unique_clause}
+            )
+            """
+        )
 
     def _ensure_columns(self, conn):
         columns = {
@@ -241,6 +348,7 @@ class PipelineDocumentStore:
             "worker_started_at": f"{add_column} worker_started_at TEXT NOT NULL DEFAULT ''",
             "worker_heartbeat_at": f"{add_column} worker_heartbeat_at TEXT NOT NULL DEFAULT ''",
             "retry_count": f"{add_column} retry_count INTEGER NOT NULL DEFAULT 0",
+            "directory_id": f"{add_column} directory_id INTEGER NOT NULL DEFAULT 0",
             "content_kind": f"{add_column} content_kind TEXT NOT NULL DEFAULT 'document_text'",
             "processor_kind": f"{add_column} processor_kind TEXT NOT NULL DEFAULT 'ragflow'",
             "shared_read_only": f"{add_column} shared_read_only INTEGER NOT NULL DEFAULT 0",
@@ -274,74 +382,73 @@ class PipelineDocumentStore:
         values["shared_read_only"] = bool(values.get("shared_read_only", 0))
         return PipelineDocumentRecord(**values)
 
-    def _migrate_department_unique_constraint(self, conn):
+    def _migrate_document_schema(self, conn):
         row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pipeline_documents'"
         ).fetchone()
         table_sql = row["sql"] if row else ""
-        if "UNIQUE(kb_name, document_name, dataset_kind)" not in table_sql:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(pipeline_documents)").fetchall()
+        }
+        normalized_sql = " ".join(str(table_sql).upper().split())
+        index_names = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA index_list(pipeline_documents)").fetchall()
+        }
+        if (
+            "directory_id" in columns
+            and "UNIQUE(KB_NAME, DEPARTMENT_ID, DIRECTORY_ID, DOCUMENT_NAME)" in normalized_sql
+        ) or "ix_pipeline_documents_path_identity" in index_names:
             return
 
+        old_columns = columns
+        duplicate_rows = conn.execute(
+            """
+            SELECT kb_name, department_id,
+                   COALESCE(directory_id, 0) AS directory_id,
+                   document_name, COUNT(*) AS count
+            FROM pipeline_documents
+            GROUP BY kb_name, department_id, COALESCE(directory_id, 0), document_name
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+            if "directory_id" in columns
+            else """
+            SELECT kb_name, department_id, 0 AS directory_id,
+                   document_name, COUNT(*) AS count
+            FROM pipeline_documents
+            GROUP BY kb_name, department_id, document_name
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        ).fetchone()
+        # Very old installations allowed the same path in different dataset
+        # partitions.  Never discard one of those rows during migration.  The
+        # clean shape gets a table UNIQUE constraint; a legacy-duplicate shape
+        # keeps all rows and uses the application-level path check until an
+        # operator resolves the historical ambiguity.
+        include_unique = duplicate_rows is None
+
         conn.execute("ALTER TABLE pipeline_documents RENAME TO pipeline_documents_old")
-        conn.execute("""
-            CREATE TABLE pipeline_documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kb_id INTEGER NOT NULL DEFAULT 0,
-                kb_name TEXT NOT NULL,
-                document_name TEXT NOT NULL,
-                original_file_name TEXT NOT NULL DEFAULT '',
-                dataset_kind TEXT NOT NULL,
-                dataset_id TEXT NOT NULL,
-                document_id TEXT NOT NULL,
-                source_group TEXT NOT NULL DEFAULT '',
-                department_id TEXT NOT NULL DEFAULT '',
-                uploaded_by TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'uploaded',
-                content_kind TEXT NOT NULL DEFAULT 'document_text',
-                processor_kind TEXT NOT NULL DEFAULT 'ragflow',
-                shared_read_only INTEGER NOT NULL DEFAULT 0,
-                local_path TEXT NOT NULL DEFAULT '',
-                file_size INTEGER NOT NULL DEFAULT 0,
-                content_hash TEXT NOT NULL DEFAULT '',
-                upload_status TEXT NOT NULL DEFAULT '',
-                ragflow_error TEXT NOT NULL DEFAULT '',
-                error_message TEXT NOT NULL DEFAULT '',
-                last_status_checked_at TEXT NOT NULL DEFAULT '',
-                parse_started_at TEXT NOT NULL DEFAULT '',
-                parse_completed_at TEXT NOT NULL DEFAULT '',
-                parse_progress INTEGER NOT NULL DEFAULT 0,
-                parse_stage TEXT NOT NULL DEFAULT '',
-                worker_id TEXT NOT NULL DEFAULT '',
-                worker_started_at TEXT NOT NULL DEFAULT '',
-                worker_heartbeat_at TEXT NOT NULL DEFAULT '',
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(kb_name, department_id, document_name, dataset_kind)
+        self._create_pipeline_documents_table(conn, include_unique=include_unique)
+        target_columns = [
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(pipeline_documents)").fetchall()
+        ]
+        shared_columns = [column for column in target_columns if column in old_columns]
+        if shared_columns:
+            quoted = ", ".join(shared_columns)
+            conn.execute(
+                f"INSERT INTO pipeline_documents ({quoted}) "
+                f"SELECT {quoted} FROM pipeline_documents_old"
             )
-        """)
-        conn.execute("""
-            INSERT OR IGNORE INTO pipeline_documents (
-                id, kb_id, kb_name, document_name, original_file_name, dataset_kind,
-                dataset_id, document_id, source_group, department_id, uploaded_by,
-                status, content_kind, processor_kind, local_path, file_size,
-                shared_read_only,
-                content_hash, upload_status, error_message, ragflow_error, last_status_checked_at,
-                parse_started_at, parse_completed_at, parse_progress, parse_stage,
-                worker_id, worker_started_at, worker_heartbeat_at, retry_count,
-                created_at, updated_at
-            )
-            SELECT
-                id, 0, kb_name, document_name, original_file_name, dataset_kind,
-                dataset_id, document_id, source_group, department_id, uploaded_by,
-                status, 'document_text', 'ragflow', local_path, file_size,
-                0,
-                content_hash, upload_status, ragflow_error, ragflow_error, last_status_checked_at,
-                parse_started_at, parse_completed_at, 0, '', '', '', '', 0,
-                created_at, updated_at
-            FROM pipeline_documents_old
-        """)
         conn.execute("DROP TABLE pipeline_documents_old")
+        if not include_unique:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_pipeline_documents_path_identity "
+                "ON pipeline_documents(kb_name, department_id, directory_id, document_name)"
+            )
 
     def get_dataset(self, kind: str) -> tuple[str, str] | None:
         with closing(self._connect()) as conn:
@@ -372,6 +479,222 @@ class PipelineDocumentStore:
                 (kind, dataset_id, dataset_name),
             )
 
+    # -- directory tree -----------------------------------------------------
+
+    def list_directories(
+        self,
+        kb_name: str,
+        department_id: str | int | None,
+        *,
+        parent_id: int = 0,
+    ) -> list[dict[str, Any]]:
+        department_id = _require_department_id(department_id, "directory listing")
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT id, kb_id, kb_name, department_id, parent_id, name,
+                       normalized_name, depth, created_by, created_at, updated_at
+                FROM pipeline_directories
+                WHERE kb_name = ? AND department_id = ? AND parent_id = ?
+                ORDER BY normalized_name, id
+                """,
+                (kb_name, department_id, int(parent_id or 0)),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_directory(
+        self,
+        directory_id: int,
+        kb_name: str,
+        department_id: str | int | None,
+    ) -> dict[str, Any] | None:
+        department_id = _require_department_id(department_id, "directory lookup")
+        directory_id = int(directory_id or 0)
+        if directory_id == 0:
+            return {
+                "id": 0,
+                "kb_id": 0,
+                "kb_name": kb_name,
+                "department_id": department_id,
+                "parent_id": 0,
+                "name": "",
+                "normalized_name": "",
+                "depth": 0,
+                "created_by": "",
+                "created_at": "",
+                "updated_at": "",
+            }
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT id, kb_id, kb_name, department_id, parent_id, name,
+                       normalized_name, depth, created_by, created_at, updated_at
+                FROM pipeline_directories
+                WHERE id = ? AND kb_name = ? AND department_id = ?
+                """,
+                (directory_id, kb_name, department_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def create_directory(
+        self,
+        *,
+        kb_id: int | None,
+        kb_name: str,
+        department_id: str | int,
+        parent_id: int,
+        name: str,
+        normalized_name: str,
+        depth: int,
+        created_by: str,
+    ) -> dict[str, Any]:
+        department_id = _require_department_id(department_id, "directory creation")
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO pipeline_directories (
+                    kb_id, kb_name, department_id, parent_id, name,
+                    normalized_name, depth, created_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(kb_id or 0), kb_name, department_id, int(parent_id or 0),
+                    name, normalized_name, int(depth), created_by,
+                ),
+            )
+            directory_id = int(cursor.lastrowid)
+        created = self.get_directory(directory_id, kb_name, department_id)
+        if created is None:  # pragma: no cover - defensive against broken stores
+            raise RuntimeError("directory was inserted but could not be read back")
+        return created
+
+    def rename_directory(
+        self,
+        directory_id: int,
+        kb_name: str,
+        department_id: str | int,
+        *,
+        name: str,
+        normalized_name: str,
+    ) -> dict[str, Any] | None:
+        department_id = _require_department_id(department_id, "directory rename")
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                UPDATE pipeline_directories
+                SET name = ?, normalized_name = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND kb_name = ? AND department_id = ?
+                """,
+                (name, normalized_name, int(directory_id), kb_name, department_id),
+            )
+        return self.get_directory(directory_id, kb_name, department_id)
+
+    def move_directory(
+        self,
+        directory_id: int,
+        kb_name: str,
+        department_id: str | int,
+        *,
+        parent_id: int,
+        depth: int,
+    ) -> dict[str, Any] | None:
+        department_id = _require_department_id(department_id, "directory move")
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                UPDATE pipeline_directories
+                SET parent_id = ?, depth = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND kb_name = ? AND department_id = ?
+                """,
+                (int(parent_id), int(depth), int(directory_id), kb_name, department_id),
+            )
+        return self.get_directory(directory_id, kb_name, department_id)
+
+    def update_directory_depth(
+        self,
+        directory_id: int,
+        kb_name: str,
+        department_id: str | int,
+        *,
+        depth: int,
+    ) -> bool:
+        department_id = _require_department_id(department_id, "directory depth update")
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE pipeline_directories
+                SET depth = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND kb_name = ? AND department_id = ?
+                """,
+                (int(depth), int(directory_id), kb_name, department_id),
+            )
+        return bool(cursor.rowcount)
+
+    def delete_directory(
+        self,
+        directory_id: int,
+        kb_name: str,
+        department_id: str | int,
+    ) -> bool:
+        department_id = _require_department_id(department_id, "directory deletion")
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM pipeline_directories
+                WHERE id = ? AND kb_name = ? AND department_id = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pipeline_directories AS child
+                      WHERE child.kb_name = pipeline_directories.kb_name
+                        AND child.department_id = pipeline_directories.department_id
+                        AND child.parent_id = pipeline_directories.id
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pipeline_documents AS file
+                      WHERE file.kb_name = pipeline_directories.kb_name
+                        AND file.department_id = pipeline_directories.department_id
+                        AND file.directory_id = pipeline_directories.id
+                  )
+                """,
+                (int(directory_id), kb_name, department_id),
+            )
+        return bool(cursor.rowcount)
+
+    def directory_file_count(
+        self,
+        directory_id: int,
+        kb_name: str,
+        department_id: str | int,
+    ) -> int:
+        department_id = _require_department_id(department_id, "directory file count")
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM pipeline_documents
+                WHERE kb_name = ? AND department_id = ? AND directory_id = ?
+                """,
+                (kb_name, department_id, int(directory_id)),
+            ).fetchone()
+        return int(row["count"] or 0)
+
+    def directory_child_count(
+        self,
+        directory_id: int,
+        kb_name: str,
+        department_id: str | int,
+    ) -> int:
+        department_id = _require_department_id(department_id, "directory child count")
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM pipeline_directories
+                WHERE kb_name = ? AND department_id = ? AND parent_id = ?
+                """,
+                (kb_name, department_id, int(directory_id)),
+            ).fetchone()
+        return int(row["count"] or 0)
+
     def upsert_document(
         self,
         kb_name: str,
@@ -384,6 +707,7 @@ class PipelineDocumentStore:
         uploaded_by: str,
         kb_id: int | None = None,
         status: str = "uploaded",
+        directory_id: int = 0,
         original_file_name: str = "",
         local_path: str = "",
         file_size: int = 0,
@@ -409,24 +733,100 @@ class PipelineDocumentStore:
         usage_type: str = "",
     ):
         with closing(self._connect()) as conn:
-            existing = conn.execute(
+            existing_rows = conn.execute(
                 """
-                SELECT shared_read_only
+                SELECT id, shared_read_only, content_hash
                 FROM pipeline_documents
-                WHERE kb_name = ? AND department_id = ? AND document_name = ? AND dataset_kind = ?
+                WHERE kb_name = ? AND department_id = ? AND directory_id = ? AND document_name = ?
                 """,
-                (kb_name, department_id, document_name, dataset_kind),
-            ).fetchone()
+                (kb_name, department_id, int(directory_id or 0), document_name),
+            ).fetchall()
+            existing = existing_rows[0] if existing_rows else None
             if existing and bool(existing["shared_read_only"]) and not shared_read_only:
                 raise PermissionError(
                     f"共享只读文档 '{document_name}' 不能被 develop 实例覆盖，请使用新文件名上传。"
                 )
+            if any(
+                row["content_hash"]
+                and content_hash
+                and row["content_hash"] != content_hash
+                for row in existing_rows
+            ):
+                raise ValueError(
+                    f"文件路径冲突: directory={int(directory_id or 0)}/{document_name}"
+                )
+            values = (
+                int(kb_id or 0),
+                kb_name,
+                document_name,
+                original_file_name or document_name,
+                dataset_kind,
+                dataset_id,
+                document_id,
+                source_group,
+                department_id,
+                uploaded_by,
+                status,
+                int(directory_id or 0),
+                content_kind,
+                processor_kind,
+                int(bool(shared_read_only)),
+                local_path,
+                file_size,
+                content_hash,
+                upload_status,
+                error_message or ragflow_error,
+                ragflow_error,
+                max(0, min(100, int(parse_progress or 0))),
+                parse_stage,
+                asset_id,
+                logical_document_id,
+                source_version_id,
+                project_id,
+                document_role,
+                json.dumps(sorted(set(module_scope or [])), ensure_ascii=False),
+                revision,
+                approval_status,
+                effective_from,
+                effective_to,
+                usage_type,
+            )
+            if existing_rows:
+                # Do not rely on a particular SQLite UNIQUE index here.  Some
+                # legacy databases legitimately contain duplicate paths across
+                # dataset partitions; the migration preserves those rows and
+                # this explicit update keeps future writes deterministic.
+                conn.execute(
+                    """
+                    UPDATE pipeline_documents SET
+                        kb_id = ?, original_file_name = ?, dataset_id = ?, document_id = ?,
+                        source_group = ?, uploaded_by = ?, status = ?, content_kind = ?,
+                        processor_kind = ?, shared_read_only = ?, local_path = ?, file_size = ?,
+                        content_hash = ?, upload_status = ?, error_message = ?, ragflow_error = ?,
+                        parse_progress = ?, parse_stage = ?, asset_id = ?, logical_document_id = ?,
+                        source_version_id = ?, project_id = ?, document_role = ?, module_scope_json = ?,
+                        revision = ?, approval_status = ?, effective_from = ?, effective_to = ?,
+                        usage_type = ?, worker_id = '', worker_started_at = '',
+                        worker_heartbeat_at = '', parse_started_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        values[0], values[3], values[5], values[6], values[7], values[9], values[10],
+                        values[12], values[13], values[14], values[15], values[16], values[17],
+                        values[18], values[19], values[20], values[21], values[22], values[23],
+                        values[24], values[25], values[26], values[27], values[28], values[29],
+                        values[30], values[31], values[32], values[33], existing_rows[0]["id"],
+                    ),
+                )
+                return
+            insert_placeholders = ", ".join("?" for _ in values) + ", CURRENT_TIMESTAMP"
             conn.execute(
-                """
+                f"""
                 INSERT INTO pipeline_documents (
                     kb_id, kb_name, document_name, original_file_name, dataset_kind,
                     dataset_id, document_id, source_group, department_id,
-                    uploaded_by, status, content_kind, processor_kind,
+                    uploaded_by, status, directory_id, content_kind, processor_kind,
                     shared_read_only,
                     local_path, file_size, content_hash, upload_status,
                     error_message, ragflow_error, parse_progress, parse_stage,
@@ -434,91 +834,33 @@ class PipelineDocumentStore:
                     module_scope_json, revision, approval_status, effective_from, effective_to, usage_type,
                     parse_started_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(kb_name, department_id, document_name, dataset_kind) DO UPDATE SET
-                    kb_id = excluded.kb_id,
-                    department_id = excluded.department_id,
-                    original_file_name = excluded.original_file_name,
-                    dataset_id = excluded.dataset_id,
-                    document_id = excluded.document_id,
-                    source_group = excluded.source_group,
-                    uploaded_by = excluded.uploaded_by,
-                    status = excluded.status,
-                    content_kind = excluded.content_kind,
-                    processor_kind = excluded.processor_kind,
-                    shared_read_only = excluded.shared_read_only,
-                    local_path = excluded.local_path,
-                    file_size = excluded.file_size,
-                    content_hash = excluded.content_hash,
-                    upload_status = excluded.upload_status,
-                    error_message = excluded.error_message,
-                    ragflow_error = excluded.ragflow_error,
-                    parse_progress = excluded.parse_progress,
-                    parse_stage = excluded.parse_stage,
-                    asset_id = excluded.asset_id,
-                    logical_document_id = excluded.logical_document_id,
-                    source_version_id = excluded.source_version_id,
-                    project_id = excluded.project_id,
-                    document_role = excluded.document_role,
-                    module_scope_json = excluded.module_scope_json,
-                    revision = excluded.revision,
-                    approval_status = excluded.approval_status,
-                    effective_from = excluded.effective_from,
-                    effective_to = excluded.effective_to,
-                    usage_type = excluded.usage_type,
-                    worker_id = '',
-                    worker_started_at = '',
-                    worker_heartbeat_at = '',
-                    parse_started_at = excluded.parse_started_at,
-                    updated_at = CURRENT_TIMESTAMP
+                VALUES ({insert_placeholders})
                 """,
-                (
-                    int(kb_id or 0),
-                    kb_name,
-                    document_name,
-                    original_file_name or document_name,
-                    dataset_kind,
-                    dataset_id,
-                    document_id,
-                    source_group,
-                    department_id,
-                    uploaded_by,
-                    status,
-                    content_kind,
-                    processor_kind,
-                    int(bool(shared_read_only)),
-                    local_path,
-                    file_size,
-                    content_hash,
-                    upload_status,
-                    error_message or ragflow_error,
-                    ragflow_error,
-                    max(0, min(100, int(parse_progress or 0))),
-                    parse_stage,
-                    asset_id,
-                    logical_document_id,
-                    source_version_id,
-                    project_id,
-                    document_role,
-                    json.dumps(sorted(set(module_scope or [])), ensure_ascii=False),
-                    revision,
-                    approval_status,
-                    effective_from,
-                    effective_to,
-                    usage_type,
-                ),
+                # The placeholder list is generated from the values tuple so
+                # schema additions cannot silently create a 34/35 mismatch.
+                # SQLite accepts the current timestamp expression as the final
+                # non-bound value.
+                values,
             )
 
-    def list_documents(self, kb_name: str, department_id: str | int | None = None) -> list[PipelineDocumentRecord]:
+    def list_documents(
+        self,
+        kb_name: str,
+        department_id: str | int | None = None,
+        *,
+        directory_id: int | None = None,
+    ) -> list[PipelineDocumentRecord]:
         department_id = _require_department_id(department_id, "listing")
+        conditions = ["kb_name = ?", "department_id = ?"]
+        params: list[object] = [kb_name, department_id]
+        if directory_id is not None:
+            conditions.append("directory_id = ?")
+            params.append(int(directory_id))
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                """
-                SELECT * FROM pipeline_documents
-                WHERE kb_name = ? AND department_id = ?
-                ORDER BY document_name
-                """,
-                (kb_name, department_id),
+                f"SELECT * FROM pipeline_documents WHERE {' AND '.join(conditions)} "
+                "ORDER BY directory_id, document_name",
+                params,
             ).fetchall()
         return [self._to_record(row) for row in rows]
 
@@ -528,7 +870,7 @@ class PipelineDocumentStore:
                 """
                 SELECT * FROM pipeline_documents
                 WHERE kb_name = ?
-                ORDER BY department_id, document_name
+                ORDER BY department_id, directory_id, document_name
                 """,
                 (kb_name,),
             ).fetchall()
@@ -637,6 +979,7 @@ class PipelineDocumentStore:
         document_name: str,
         dataset_kind: str | None = None,
         department_id: str | int | None = None,
+        directory_id: int = 0,
     ) -> PipelineDocumentRecord | None:
         department_id = _require_department_id(department_id, "lookup")
         if dataset_kind:
@@ -644,9 +987,10 @@ class PipelineDocumentStore:
                 row = conn.execute(
                     """
                     SELECT * FROM pipeline_documents
-                    WHERE kb_name = ? AND document_name = ? AND dataset_kind = ? AND department_id = ?
+                    WHERE kb_name = ? AND document_name = ? AND dataset_kind = ?
+                      AND department_id = ? AND directory_id = ?
                     """,
-                    (kb_name, document_name, dataset_kind, department_id),
+                    (kb_name, document_name, dataset_kind, department_id, int(directory_id or 0)),
                 ).fetchone()
             return self._to_record(row) if row else None
 
@@ -654,9 +998,9 @@ class PipelineDocumentStore:
             row = conn.execute(
                 """
                 SELECT * FROM pipeline_documents
-                WHERE kb_name = ? AND document_name = ? AND department_id = ?
+                WHERE kb_name = ? AND document_name = ? AND department_id = ? AND directory_id = ?
                 """,
-                (kb_name, document_name, department_id),
+                (kb_name, document_name, department_id, int(directory_id or 0)),
             ).fetchone()
         return self._to_record(row) if row else None
 
@@ -689,6 +1033,7 @@ class PipelineDocumentStore:
         dataset_kind: str,
         content_hash: str,
         department_id: str | int | None,
+        directory_id: int = 0,
     ) -> PipelineDocumentRecord | None:
         department_id = _require_department_id(department_id, "hash lookup")
         if not content_hash:
@@ -697,11 +1042,32 @@ class PipelineDocumentStore:
             row = conn.execute(
                 """
                 SELECT * FROM pipeline_documents
-                WHERE kb_name = ? AND dataset_kind = ? AND content_hash = ? AND department_id = ?
+                WHERE kb_name = ? AND dataset_kind = ? AND content_hash = ?
+                  AND department_id = ? AND directory_id = ?
                 ORDER BY updated_at DESC
                 LIMIT 1
                 """,
-                (kb_name, dataset_kind, content_hash, department_id),
+                (kb_name, dataset_kind, content_hash, department_id, int(directory_id or 0)),
+            ).fetchone()
+        return self._to_record(row) if row else None
+
+    def find_document_by_path(
+        self,
+        kb_name: str,
+        department_id: str | int | None,
+        directory_id: int,
+        document_name: str,
+    ) -> PipelineDocumentRecord | None:
+        """Return the logical file occupying one directory path, if any."""
+        department_id = _require_department_id(department_id, "path lookup")
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM pipeline_documents
+                WHERE kb_name = ? AND department_id = ? AND directory_id = ? AND document_name = ?
+                LIMIT 1
+                """,
+                (kb_name, department_id, int(directory_id or 0), document_name),
             ).fetchone()
         return self._to_record(row) if row else None
 
@@ -851,6 +1217,420 @@ class PipelineDocumentStore:
             )
             for record_id in ids:
                 self._write_profile_event(conn, record_id, "deleted")
+
+    def delete_directories_by_kb(self, kb_name: str, department_id: str | int | None):
+        department_id = _require_department_id(department_id, "directory knowledge-base deletion")
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "DELETE FROM pipeline_directories WHERE kb_name = ? AND department_id = ?",
+                (kb_name, department_id),
+            )
+
+    # ------------------------------------------------------------------
+    # Durable directory-import batches (P1)
+    # ------------------------------------------------------------------
+    def create_directory_import_job(
+        self,
+        *,
+        kb_id: int | None,
+        kb_name: str,
+        department_id: str | int,
+        directory_id: int,
+        created_by: str,
+        files: list[dict],
+    ) -> dict:
+        department_id = _require_department_id(department_id, "directory import creation")
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO directory_import_jobs
+                    (kb_id, kb_name, department_id, directory_id, status,
+                     total_files, created_by)
+                VALUES (?, ?, ?, ?, 'queued', ?, ?)
+                """,
+                (
+                    int(kb_id or 0), kb_name, department_id, int(directory_id or 0),
+                    len(files), str(created_by or ""),
+                ),
+            )
+            job_id = int(cursor.lastrowid)
+            for item in files:
+                conn.execute(
+                    """
+                    INSERT INTO directory_import_files
+                        (job_id, relative_path, source_group, directory_id,
+                         original_name, staged_path, file_size)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        str(item.get("relative_path") or ""),
+                        str(item.get("source_group") or ""),
+                        int(item.get("directory_id", directory_id) or 0),
+                        str(item.get("original_name") or ""),
+                        str(item.get("staged_path") or ""),
+                        int(item.get("file_size", 0) or 0),
+                    ),
+                )
+        job = self.get_directory_import_job(job_id, kb_name, department_id)
+        if job is None:  # pragma: no cover - defensive
+            raise RuntimeError("directory import job was inserted but could not be read")
+        return job
+
+    def get_directory_import_job(
+        self,
+        job_id: int,
+        kb_name: str,
+        department_id: str | int | None,
+    ) -> dict | None:
+        department_id = _require_department_id(department_id, "directory import lookup")
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM directory_import_jobs
+                WHERE id = ? AND kb_name = ? AND department_id = ?
+                """,
+                (int(job_id), kb_name, department_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_directory_import_jobs(
+        self,
+        kb_name: str,
+        department_id: str | int | None,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        department_id = _require_department_id(department_id, "directory import listing")
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM directory_import_jobs
+                WHERE kb_name = ? AND department_id = ?
+                ORDER BY id DESC LIMIT ? OFFSET ?
+                """,
+                (kb_name, department_id, max(1, min(int(limit), 200)), max(0, int(offset))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_directory_import_files(
+        self,
+        job_id: int,
+        kb_name: str,
+        department_id: str | int | None,
+        *,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> list[dict]:
+        department_id = _require_department_id(department_id, "directory import file listing")
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT file.*
+                FROM directory_import_files AS file
+                JOIN directory_import_jobs AS job ON job.id = file.job_id
+                WHERE file.job_id = ? AND job.kb_name = ? AND job.department_id = ?
+                ORDER BY file.id LIMIT ? OFFSET ?
+                """,
+                (int(job_id), kb_name, department_id, max(1, min(int(limit), 5000)), max(0, int(offset))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_directory_import_file_stage(
+        self,
+        file_id: int,
+        job_id: int,
+        staged_path: str,
+        *,
+        file_size: int = 0,
+    ) -> bool:
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                """
+                UPDATE directory_import_files
+                SET staged_path = ?, file_size = ?, status = 'queued',
+                    error_code = '', error_message = '',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND job_id = ?
+                """,
+                (str(staged_path), int(file_size or 0), int(file_id), int(job_id)),
+            )
+        return bool(cursor.rowcount)
+
+    def claim_directory_import_file(self, worker_id: str) -> dict | None:
+        """Claim one queued file while respecting its job cancellation flag."""
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                UPDATE directory_import_files
+                SET status = 'uploading', worker_id = ?,
+                    worker_started_at = CURRENT_TIMESTAMP,
+                    attempt_count = attempt_count + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = (
+                    SELECT file.id
+                    FROM directory_import_files AS file
+                    JOIN directory_import_jobs AS job ON job.id = file.job_id
+                    WHERE file.status = 'queued'
+                      AND file.staged_path <> ''
+                      AND job.cancel_requested = 0
+                      AND job.status NOT IN ('completed', 'failed', 'cancelled')
+                    ORDER BY file.id
+                    LIMIT 1
+                )
+                """,
+                (str(worker_id),),
+            )
+            row = conn.execute(
+                """
+                SELECT file.*, job.kb_id, job.kb_name, job.department_id,
+                       job.directory_id AS job_directory_id, job.created_by,
+                       job.cancel_requested
+                FROM directory_import_files AS file
+                JOIN directory_import_jobs AS job ON job.id = file.job_id
+                WHERE file.worker_id = ? AND file.status = 'uploading'
+                ORDER BY file.updated_at, file.id LIMIT 1
+                """,
+                (str(worker_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def finish_directory_import_file(
+        self,
+        *,
+        job_id: int,
+        file_id: int,
+        status: str,
+        record_id: int | None = None,
+        error_code: str = "",
+        error_message: str = "",
+    ) -> dict | None:
+        allowed = {"success", "reused", "failed", "skipped", "cancelled"}
+        if status not in allowed:
+            raise ValueError(f"invalid directory import file status: {status}")
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                UPDATE directory_import_files
+                SET status = ?, record_id = ?, error_code = ?, error_message = ?,
+                    worker_id = '', worker_started_at = '', updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND job_id = ?
+                """,
+                (
+                    status, record_id, str(error_code or ""), str(error_message or ""),
+                    int(file_id), int(job_id),
+                ),
+            )
+        return self._refresh_directory_import_job(int(job_id))
+
+    def request_directory_import_cancel(self, job_id: int, kb_name: str, department_id: str | int | None) -> dict | None:
+        department_id = _require_department_id(department_id, "directory import cancellation")
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                UPDATE directory_import_jobs
+                SET cancel_requested = 1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND kb_name = ? AND department_id = ?
+                  AND status NOT IN ('completed', 'failed', 'cancelled')
+                """,
+                (int(job_id), kb_name, department_id),
+            )
+            conn.execute(
+                """
+                UPDATE directory_import_files
+                SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+                WHERE job_id = ? AND status = 'queued'
+                """,
+                (int(job_id),),
+            )
+        return self._refresh_directory_import_job(int(job_id), kb_name=kb_name, department_id=department_id)
+
+    def retry_directory_import(
+        self,
+        job_id: int,
+        kb_name: str,
+        department_id: str | int | None,
+        *,
+        file_id: int | None = None,
+    ) -> dict | None:
+        department_id = _require_department_id(department_id, "directory import retry")
+        with closing(self._connect()) as conn:
+            job = conn.execute(
+                """
+                SELECT id FROM directory_import_jobs
+                WHERE id = ? AND kb_name = ? AND department_id = ?
+                """,
+                (int(job_id), kb_name, department_id),
+            ).fetchone()
+            if job is None:
+                return None
+            if file_id is None:
+                conn.execute(
+                    """
+                    UPDATE directory_import_files
+                    SET status = 'queued', error_code = '', error_message = '',
+                        worker_id = '', worker_started_at = '', updated_at = CURRENT_TIMESTAMP
+                    WHERE job_id = ? AND status IN ('failed', 'skipped', 'cancelled')
+                    """,
+                    (int(job_id),),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE directory_import_files
+                    SET status = 'queued', error_code = '', error_message = '',
+                        worker_id = '', worker_started_at = '', updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND job_id = ? AND status IN ('failed', 'skipped', 'cancelled')
+                    """,
+                    (int(file_id), int(job_id)),
+                )
+            conn.execute(
+                """
+                UPDATE directory_import_jobs
+                SET status = 'queued', cancel_requested = 0, last_error = '',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (int(job_id),),
+            )
+        return self._refresh_directory_import_job(int(job_id), kb_name=kb_name, department_id=department_id)
+
+    def _refresh_directory_import_job(
+        self,
+        job_id: int,
+        *,
+        kb_name: str | None = None,
+        department_id: str | None = None,
+    ) -> dict | None:
+        with closing(self._connect()) as conn:
+            job = conn.execute(
+                "SELECT * FROM directory_import_jobs WHERE id = ?",
+                (int(job_id),),
+            ).fetchone()
+            if job is None:
+                return None
+            files = conn.execute(
+                "SELECT status, error_message FROM directory_import_files WHERE job_id = ?",
+                (int(job_id),),
+            ).fetchall()
+            statuses = [str(row["status"] if hasattr(row, "keys") else row[0]) for row in files]
+            success_count = sum(status in {"success", "reused"} for status in statuses)
+            failed_count = sum(status == "failed" for status in statuses)
+            skipped_count = sum(status in {"skipped", "cancelled"} for status in statuses)
+            active = any(status in {"queued", "uploading"} for status in statuses)
+            cancel_requested = bool(job["cancel_requested"] if hasattr(job, "keys") else job[10])
+            if active:
+                status = "running" if success_count or failed_count or skipped_count else "queued"
+            elif cancel_requested and skipped_count:
+                status = "cancelled"
+            elif failed_count and success_count:
+                status = "partial"
+            elif failed_count:
+                status = "failed"
+            elif success_count and skipped_count:
+                status = "partial"
+            elif success_count:
+                status = "completed"
+            elif skipped_count:
+                status = "failed"
+            else:
+                status = "queued"
+            last_error = next(
+                (
+                    str(row["error_message"] if hasattr(row, "keys") else row[1])
+                    for row in files
+                    if str(row["error_message"] if hasattr(row, "keys") else row[1])
+                ),
+                "",
+            )
+            conn.execute(
+                """
+                UPDATE directory_import_jobs
+                SET status = ?, success_count = ?, failed_count = ?, skipped_count = ?,
+                    last_error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status, success_count, failed_count, skipped_count, last_error, int(job_id)),
+            )
+            refreshed = conn.execute(
+                "SELECT * FROM directory_import_jobs WHERE id = ?",
+                (int(job_id),),
+            ).fetchone()
+        if refreshed is None:
+            return None
+        if kb_name is not None and str(refreshed["kb_name"]) != kb_name:
+            return None
+        if department_id is not None and str(refreshed["department_id"]) != str(department_id):
+            return None
+        return dict(refreshed)
+
+    def delete_directory_imports_by_kb(
+        self, kb_name: str, department_id: str | int | None
+    ) -> list[str]:
+        """Delete import batches and return their staged paths for cleanup."""
+        department_id = _require_department_id(department_id, "directory import knowledge-base deletion")
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT file.staged_path
+                FROM directory_import_files AS file
+                JOIN directory_import_jobs AS job ON job.id = file.job_id
+                WHERE job.kb_name = ? AND job.department_id = ?
+                """,
+                (kb_name, department_id),
+            ).fetchall()
+            paths = [str(row["staged_path"]) for row in rows if row["staged_path"]]
+            conn.execute(
+                """
+                DELETE FROM directory_import_files
+                WHERE job_id IN (
+                    SELECT id FROM directory_import_jobs
+                    WHERE kb_name = ? AND department_id = ?
+                )
+                """,
+                (kb_name, department_id),
+            )
+            conn.execute(
+                "DELETE FROM directory_import_jobs WHERE kb_name = ? AND department_id = ?",
+                (kb_name, department_id),
+            )
+        return paths
+
+    def delete_directory_import_job(
+        self,
+        job_id: int,
+        kb_name: str,
+        department_id: str | int | None,
+    ) -> list[str]:
+        """Delete one terminal import-history row and return its staged paths."""
+        department_id = _require_department_id(department_id, "directory import deletion")
+        with closing(self._connect()) as conn:
+            job = conn.execute(
+                """
+                SELECT status FROM directory_import_jobs
+                WHERE id = ? AND kb_name = ? AND department_id = ?
+                """,
+                (int(job_id), kb_name, department_id),
+            ).fetchone()
+            if job is None:
+                raise LookupError("directory import job not found")
+            if str(job["status"]) in {"queued", "running"}:
+                raise ValueError("导入批次仍在运行，请先取消再删除记录")
+            rows = conn.execute(
+                """
+                SELECT staged_path FROM directory_import_files
+                WHERE job_id = ?
+                """,
+                (int(job_id),),
+            ).fetchall()
+            paths = [str(row["staged_path"]) for row in rows if row["staged_path"]]
+            conn.execute("DELETE FROM directory_import_files WHERE job_id = ?", (int(job_id),))
+            conn.execute(
+                "DELETE FROM directory_import_jobs WHERE id = ? AND kb_name = ? AND department_id = ?",
+                (int(job_id), kb_name, department_id),
+            )
+        return paths
 
     def delete_documents_by_kb_unscoped(self, kb_name: str):
         with closing(self._connect()) as conn:

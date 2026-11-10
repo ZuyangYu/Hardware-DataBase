@@ -44,9 +44,48 @@ def _reparse_attachments(args: argparse.Namespace) -> int:
 
 
 
+def _verify_pipeline_schema(args: argparse.Namespace) -> int:
+    from src.services.pipeline_reconciliation import pipeline_schema_report
+
+    report = pipeline_schema_report()
+    print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    return 0 if report["ok"] else 1
+
+
+def _reconcile_pipeline(args: argparse.Namespace) -> int:
+    from src.services.pipeline_reconciliation import reconcile_pipeline
+
+    report = reconcile_pipeline(
+        kb_name=args.kb,
+        department_id=str(args.department_id),
+        deep=not args.fast,
+        limit=args.limit,
+    )
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if report["ok"] else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hardware-database-maintenance")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    reconcile = subparsers.add_parser(
+        "reconcile-pipeline",
+        help="report missing archives, orphan directories and orphan archive files",
+    )
+    reconcile.add_argument("--kb", required=True)
+    reconcile.add_argument("--department-id", required=True)
+    reconcile.add_argument("--limit", type=int, default=200)
+    reconcile.add_argument(
+        "--fast", action="store_true", help="skip walking the archive tree for orphan files"
+    )
+    reconcile.set_defaults(handler=_reconcile_pipeline)
+
+    verify = subparsers.add_parser(
+        "verify-pipeline-schema",
+        help="verify directory-aware document schema, root backfill and duplicate paths",
+    )
+    verify.set_defaults(handler=_verify_pipeline_schema)
 
     reparse = subparsers.add_parser(
         "reparse-attachments",

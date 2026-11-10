@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from src.api.deps import current_user
 from src.core.auth import AuthUser
@@ -72,9 +72,25 @@ def download_artifact(
     artifact_id: str,
     user: AuthUser = Depends(current_user),
     workspace_store=Depends(_workspace_store),
-) -> FileResponse:
+) -> Response:
     artifact = workspace_store.get_artifact(artifact_id)
     if artifact is None:
+        # Result exports intentionally use the same public download URL shape
+        # as conversation workspace artifacts.  This router is registered
+        # first, so delegate only when the workspace store has no matching
+        # artifact; existing workspace downloads keep their original path.
+        from src.api.routes.exports import artifact_download
+        from src.core.auth import AuthService
+        from src.result_exports.store import ResultExportStore
+
+        export_store = ResultExportStore()
+        if export_store.get_artifact(user.id, artifact_id) is not None:
+            return artifact_download(
+                artifact_id,
+                user=user,
+                auth=AuthService(),
+                store=export_store,
+            )
         raise HTTPException(status_code=404, detail="artifact not found")
     workspace = workspace_store.get_workspace(
         artifact.workspace_id,

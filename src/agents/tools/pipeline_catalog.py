@@ -10,6 +10,7 @@ from src.circuit.index_service import CircuitIndexService
 from src.pipelines.document_store import PipelineDocumentStore
 from src.pipelines.document_rag.base import RAGBackend
 from src.services.kb_scope import kb_scope_from_context
+from src.services.pipeline_directories import document_relative_path
 from src.services.spreadsheet_index_service import SpreadsheetIndexService
 
 
@@ -46,7 +47,8 @@ def scan_kb_sources(
 
     seen_names: set[str] = set()
     for record in records:
-        seen_names.add(record.document_name)
+        relative_path = document_relative_path(document_store, record)
+        seen_names.add(relative_path)
         profile = {}
         if record.processor_kind == "spreadsheet_table" and spreadsheet_service is not None:
             try:
@@ -73,7 +75,12 @@ def scan_kb_sources(
                 local_path=record.local_path,
                 file_size=record.file_size,
                 profile=profile,
-                metadata={**asdict(record), "routing": routing},
+                metadata={
+                    **asdict(record),
+                    "directory_id": int(getattr(record, "directory_id", 0) or 0),
+                    "relative_path": relative_path,
+                    "routing": routing,
+                },
             )
         )
 
@@ -81,7 +88,8 @@ def scan_kb_sources(
     if rag_backend is not None:
         try:
             for info in rag_backend.list_documents(kb_name, ctx=ctx):
-                if info.name in seen_names:
+                info_path = str(info.metadata.get("relative_path") or info.name)
+                if info_path in seen_names:
                     continue
                 sources.append(
                     CatalogSource(
@@ -94,7 +102,7 @@ def scan_kb_sources(
                         status=info.status or info.metadata.get("status", ""),
                         local_path=info.local_path,
                         profile=info.spreadsheet_profile or info.metadata.get("spreadsheet_profile") or {},
-                        metadata=dict(info.metadata or {}),
+                        metadata={**dict(info.metadata or {}), "relative_path": info_path},
                     )
                 )
         except Exception as exc:
@@ -142,7 +150,7 @@ def make_catalog_tool(rt, *, document_store: PipelineDocumentStore, spreadsheet_
                 "请在想关来源类型中用对应检索工具继续查证，不要据此判定无法回答。）",
             ]
             for source in (result.get("sources") or [])[:50]:
-                name = source.get("document_name") or ""
+                name = source.get("relative_path") or source.get("document_name") or ""
                 kind = source.get("processor_kind") or ""
                 status = source.get("status") or ""
                 group = source.get("source_group") or ""

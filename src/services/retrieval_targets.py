@@ -20,6 +20,7 @@ from src.pipelines.document_rag.schemas import (
     normalize_parse_status,
     TASK_STATUS_COMPLETED,
 )
+from src.services.pipeline_directories import document_relative_path
 
 
 _FILE_SUFFIXES = (".docx", ".doc", ".xlsx", ".xlsm", ".xls", ".pdf", ".pptx", ".txt", ".md")
@@ -134,10 +135,16 @@ class RetrievalWorkItem:
     locators_by_record: Mapping[int, tuple[TargetLocator, ...]] = field(default_factory=dict)
 
 
-def _record_matches_basis(record, basis: str) -> bool:
-    for phrase, _specificity in _alias_phrases(getattr(record, "document_name", "")):
-        if phrase == basis or phrase.replace("_", " ") == basis:
-            return True
+def _record_matches_basis(record, basis: str, relative_path: str = "") -> bool:
+    names = [
+        getattr(record, "document_name", ""),
+        getattr(record, "original_file_name", ""),
+        relative_path,
+    ]
+    for name in names:
+        for phrase, _specificity in _alias_phrases(name):
+            if phrase == basis or phrase.replace("_", " ") == basis:
+                return True
     return False
 
 
@@ -308,6 +315,7 @@ def resolve_turn_targets(
             target_fingerprint=_target_fingerprint(()),
         )
     records_by_kb: dict[int, list] = {}
+    relative_paths: dict[tuple[int, int], str] = {}
     for source in sources:
         try:
             records = document_store.list_documents(source.kb_name, source.department_id)
@@ -318,20 +326,28 @@ def resolve_turn_targets(
             if getattr(record, "kb_id", 0) in (0, None, source.kb_id)
             and normalize_parse_status(getattr(record, "status", ""), getattr(record, "processor_kind", "")) == TASK_STATUS_COMPLETED
         ]
+        for record in records_by_kb[source.kb_id]:
+            relative_paths[(source.kb_id, int(record.id))] = document_relative_path(document_store, record)
 
     mentions: list[dict] = []
     for source in sources:
         for record in records_by_kb.get(source.kb_id, []):
-            for phrase, specificity in _alias_phrases(getattr(record, "document_name", "")):
-                for phrase_variant in {phrase, phrase.replace("_", " ")}:
-                    if not phrase_variant:
-                        continue
-                    pattern = rf"(?<![A-Za-z0-9]){re.escape(phrase_variant)}(?![A-Za-z0-9])"
-                    for match in re.finditer(pattern, question, re.IGNORECASE):
-                        mentions.append({
-                            "start": match.start(), "end": match.end(), "record": record,
-                            "source": source, "specificity": specificity, "basis": phrase_variant,
-                        })
+            aliases = [
+                getattr(record, "document_name", ""),
+                getattr(record, "original_file_name", ""),
+                relative_paths.get((source.kb_id, int(record.id)), ""),
+            ]
+            for alias_name in aliases:
+                for phrase, specificity in _alias_phrases(alias_name):
+                    for phrase_variant in {phrase, phrase.replace("_", " ")}:
+                        if not phrase_variant:
+                            continue
+                        pattern = rf"(?<![A-Za-z0-9]){re.escape(phrase_variant)}(?![A-Za-z0-9])"
+                        for match in re.finditer(pattern, question, re.IGNORECASE):
+                            mentions.append({
+                                "start": match.start(), "end": match.end(), "record": record,
+                                "source": source, "specificity": specificity, "basis": phrase_variant,
+                            })
     # Keep the most specific non-overlapping span; all records matching that
     # exact span stay as disambiguation candidates. Dropping same-span records
     # here would silently choose one KB before project binding runs.
@@ -365,7 +381,11 @@ def resolve_turn_targets(
         candidates = [
             (source, record) for source in sources
             for record in records_by_kb.get(source.kb_id, [])
-            if _record_matches_basis(record, mention["basis"])
+            if _record_matches_basis(
+                record,
+                mention["basis"],
+                relative_paths.get((source.kb_id, int(record.id)), ""),
+            )
         ]
         exact = [
             (source, record) for source, record in candidates
@@ -374,6 +394,8 @@ def resolve_turn_targets(
                 _norm(getattr(record, "original_file_name", "")),
                 _stem(getattr(record, "document_name", "")),
                 _stem(getattr(record, "original_file_name", "")),
+                _norm(relative_paths.get((source.kb_id, int(record.id)), "")),
+                _stem(relative_paths.get((source.kb_id, int(record.id)), "")),
             }
         ]
         if exact:
@@ -423,7 +445,11 @@ def resolve_turn_targets(
             candidates = [
                 (source, record) for source in sources
                 for record in records_by_kb.get(source.kb_id, [])
-                if _norm(value) in {_norm(getattr(record, "document_name", "")), _norm(getattr(record, "original_file_name", ""))}
+                if _norm(value) in {
+                    _norm(getattr(record, "document_name", "")),
+                    _norm(getattr(record, "original_file_name", "")),
+                    _norm(relative_paths.get((source.kb_id, int(record.id)), "")),
+                }
             ]
             if not candidates:
                 not_found = True

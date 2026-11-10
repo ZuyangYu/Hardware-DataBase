@@ -42,6 +42,7 @@ from src.api.routes import (
     quality_workflow,
     quality_tickets,
     exports,
+    directory_imports,
     status,
     sandbox,
     structured,
@@ -345,6 +346,7 @@ def create_app() -> FastAPI:
     app.include_router(quality_tickets.router, prefix=api_v1)
     app.include_router(exports.router, prefix=api_v1)
     app.include_router(upload.router, prefix=api_v1)
+    app.include_router(directory_imports.router, prefix=api_v1)
     app.include_router(users.router, prefix=api_v1)
     app.include_router(departments.router, prefix=api_v1)
     app.include_router(kb_assign.router, prefix=api_v1)

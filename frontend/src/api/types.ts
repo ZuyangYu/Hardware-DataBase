@@ -67,7 +67,33 @@ export interface FileView {
   status: string;
   processor_kind: string;
   dataset_kind: string;
+  directory_id: number;
+  relative_path: string;
+  display_name: string;
   metadata: Record<string, unknown>;
+}
+
+export interface DirectoryView {
+  id: number;
+  kb_id: number;
+  parent_id: number;
+  name: string;
+  path: string;
+  depth: number;
+  child_directory_count: number;
+  file_count: number;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UploadFileResult {
+  index: number;
+  relative_path: string;
+  status: string;
+  record_id: number | null;
+  error_code: string;
+  message: string;
 }
 
 export interface UploadAck {
@@ -77,6 +103,34 @@ export interface UploadAck {
   skipped_count: number;
   status: string;
   messages: string[];
+  files: UploadFileResult[];
+}
+
+export interface DirectoryImportFileView {
+  id: number;
+  relative_path: string;
+  source_group: string;
+  status: string;
+  record_id: number | null;
+  error_code: string;
+  error_message: string;
+  attempt_count: number;
+}
+
+export interface DirectoryImportJobView {
+  id: number;
+  directory_id: number;
+  status: string;
+  total_files: number;
+  success_count: number;
+  failed_count: number;
+  skipped_count: number;
+  cancel_requested: boolean;
+  created_by: string;
+  last_error: string;
+  created_at: string;
+  updated_at: string;
+  files: DirectoryImportFileView[];
 }
 
 export interface AssetEvidenceView {

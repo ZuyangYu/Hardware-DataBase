@@ -197,7 +197,7 @@ def test_download_kb_file_reads_archived_bytes(tmp_path, monkeypatch):
         lambda self, _username: SimpleNamespace(id=4, username="aaa_admin", department_id="1739"),
     )
     monkeypatch.setattr(
-        "src.api.context.build_context_for_user",
+        "src.services.request_context.build_context_for_user",
         lambda user, kb_name, auth=None: SimpleNamespace(),
     )
     monkeypatch.setattr(
@@ -401,7 +401,7 @@ def test_download_kb_file_falls_back_to_kb_owner(monkeypatch, tmp_path):
         lambda self, _user_id: SimpleNamespace(id=4, username="owner", department_id="1739"),
     )
     monkeypatch.setattr(
-        "src.api.context.build_context_for_user",
+        "src.services.request_context.build_context_for_user",
         lambda user, kb_name, auth=None: SimpleNamespace(),
     )
     monkeypatch.setattr(

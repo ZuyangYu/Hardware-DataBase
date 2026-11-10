@@ -6,7 +6,6 @@ import hashlib
 from enum import Enum
 from dotenv import load_dotenv
 
-
 ENV_FILE_ENCODING = "utf-8-sig"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 默认仍是仓库根 .env；容器部署可用 HDB_ENV_PATH 把可写配置指向挂载目录。
@@ -16,7 +15,6 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_FILE_PATH = os.getenv("HDB_ENV_PATH") or os.path.join(BASE_DIR, ".env")
 CONFIG_REVISION = ""
 
-
 def _config_revision(path: str = ENV_FILE_PATH) -> str:
     """Stable content revision shared by API and workers at task boundaries."""
     try:
@@ -24,7 +22,6 @@ def _config_revision(path: str = ENV_FILE_PATH) -> str:
             return hashlib.sha256(handle.read()).hexdigest()[:16]
     except OSError:
         return "missing"
-
 
 # Keys that used to be deployment flags but are now built-in behavior or an
 # internal constant.  They are intentionally ignored; startup warns once so
@@ -44,7 +41,6 @@ OBSOLETE_ENV_KEYS: dict[str, str] = {
     "SHARED_RETRIEVAL_EXECUTOR_ENABLED": "built-in shared retrieval pool",
 }
 
-
 def obsolete_env_keys(path: str = ENV_FILE_PATH) -> tuple[str, ...]:
     """Return obsolete keys present in the process env or the .env file."""
     keys = set(os.environ)
@@ -59,11 +55,9 @@ def obsolete_env_keys(path: str = ENV_FILE_PATH) -> tuple[str, ...]:
         pass
     return tuple(sorted(key for key in keys if key in OBSOLETE_ENV_KEYS))
 
-
 def _env_bool(name: str, default: bool) -> bool:
     """Parse a boolean environment setting using the application's flag syntax."""
     return os.getenv(name, str(default).lower()).strip().lower() in {"1", "true", "yes", "on"}
-
 
 def _env_csv(name: str) -> frozenset[str]:
     """Parse a comma-separated rollout allowlist into normalized values."""
@@ -85,6 +79,8 @@ CONFIG_REVISION = _config_revision()
 STORAGE_DIR = os.getenv("STORAGE_DIR") or os.path.join(BASE_DIR, "storage")
 PIPELINE_ARCHIVE_ROOT = os.getenv("PIPELINE_ARCHIVE_ROOT", os.path.join(STORAGE_DIR, "pipeline_archives"))
 RAGFLOW_FILE_ROOT = os.getenv("RAGFLOW_FILE_ROOT", PIPELINE_ARCHIVE_ROOT)
+# P1: unknown extensions are archived but never parsed when explicitly enabled.
+DIRECTORY_RAW_ONLY_UNKNOWN = os.getenv("DIRECTORY_RAW_ONLY_UNKNOWN", "false").strip().lower() in {"1", "true", "yes", "on"}
 LOG_DIR = os.path.join(STORAGE_DIR, "logs")
 # Workspace-first agent storage.  A workspace owns the hidden file tree and
 # artifacts for a session/user; there is no task product behind it.
@@ -98,14 +94,12 @@ WORKSPACE_ROOT = os.getenv(
 WORKSPACE_STORE_BACKEND = os.getenv("WORKSPACE_STORE_BACKEND", "").strip().lower()
 WORKSPACE_DB_URL = os.getenv("WORKSPACE_DB_URL", "").strip()
 
-
 def _resolve_storage_path(raw_path: str | None, default_name: str) -> str:
     """Resolve memory data paths independently of the process CWD."""
     path = str(raw_path or default_name).strip()
     if not os.path.isabs(path):
         path = os.path.join(STORAGE_DIR, path)
     return os.path.abspath(path)
-
 
 RESULT_EXPORT_STORAGE_DIR = _resolve_storage_path(os.getenv("RESULT_EXPORT_STORAGE_DIR"), "exports")
 RESULT_EXPORT_ENABLED = _env_bool("RESULT_EXPORT_ENABLED", True)
@@ -185,11 +179,9 @@ AUTH_SESSION_TTL_HOURS = int(os.getenv("AUTH_SESSION_TTL_HOURS", "24"))
 MCP_TOKEN_TTL_DAYS = int(os.getenv("MCP_TOKEN_TTL_DAYS", "365"))
 MCP_SESSION_TTL_HOURS = int(os.getenv("MCP_SESSION_TTL_HOURS", "24"))
 
-
 class Provider(Enum):
     OLLAMA = "ollama"
     CUSTOM = "custom"
-
 
 try:
     AGENT_LLM_PROVIDER = Provider(os.getenv("AGENT_LLM_PROVIDER", "ollama").lower())
@@ -542,7 +534,6 @@ _EVIDENCE_BOOL_KEYS = frozenset("EVIDENCE_SOURCE_AWARE_ENABLED".split())
 EVIDENCE_INT_SETTING_KEYS = frozenset(set(_EVIDENCE_DEFAULTS) - _EVIDENCE_BOOL_KEYS)
 EVIDENCE_POSITIVE_SETTING_KEYS = EVIDENCE_INT_SETTING_KEYS
 
-
 def _load_evidence_settings() -> dict[str, object]:
     return {**{k: _env_bool(k, bool(v)) for k, v in _EVIDENCE_DEFAULTS.items() if k in _EVIDENCE_BOOL_KEYS},
             **{k: int(os.getenv(k, str(v)) or v) for k, v in _EVIDENCE_DEFAULTS.items() if k not in _EVIDENCE_BOOL_KEYS}}
@@ -556,7 +547,6 @@ def _multi_kb_byte_limit(name: str) -> int:
             raise ValueError(f"{name} must be positive")
         return value
     return int(os.getenv("MULTI_KB_CONTEXT_MAX_TOKENS", "8000"))
-
 
 MULTI_KB_FUSION_MAX_BYTES = _multi_kb_byte_limit("MULTI_KB_FUSION_MAX_BYTES")
 MULTI_KB_TURN_EVIDENCE_MAX_BYTES = _multi_kb_byte_limit("MULTI_KB_TURN_EVIDENCE_MAX_BYTES")
@@ -742,7 +732,6 @@ def ensure_runtime_dirs():
     os.makedirs(PIPELINE_ARCHIVE_ROOT, exist_ok=True)
     os.makedirs(RAGFLOW_FILE_ROOT, exist_ok=True)
 
-
 ensure_runtime_dirs()
 
 
@@ -793,7 +782,6 @@ RESTART_REQUIRED_SETTINGS = frozenset(
         "MCP_CREDENTIALS_KEY",
     }
 )
-
 
 DEFAULT_VALUES = {
     "RAGFLOW_BASE_URL": "http://localhost:9380",
@@ -1686,7 +1674,6 @@ def _reload_settings():
     SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_VALUES["SYSTEM_PROMPT"])
     NO_CONTEXT_PROMPT = os.getenv("NO_CONTEXT_PROMPT", DEFAULT_VALUES["NO_CONTEXT_PROMPT"])
     ensure_runtime_dirs()
-
 
 def _format_env_value(value: str) -> str:
     """Format a .env value while preserving spaces and newlines safely."""

@@ -206,6 +206,8 @@ def list_kb_files(kb_name: str) -> list[dict[str, Any]]:
             "status": row.get("status", ""),
             "processor_kind": row.get("processor_kind", ""),
             "dataset_kind": row.get("dataset_kind", ""),
+            "directory_id": row.get("directory_id", 0),
+            "relative_path": row.get("relative_path") or row.get("name", ""),
         }
         for row in rows
         if isinstance(row, dict)
@@ -423,7 +425,7 @@ def download_kb_file(
     """
     kb = _visible_kb(kb_name)
     from src import settings as app_settings
-    from src.api.context import build_context_for_user
+    from src.services.request_context import build_context_for_user
     from src.core.app_pipeline import AppPipeline
     from src.core.auth import AuthService
 
@@ -487,6 +489,10 @@ def download_kb_file(
     return {
         "file_id": str(getattr(info, "id", file_id)),
         "filename": str(getattr(info, "name", file_id)),
+        "relative_path": str(
+            (getattr(info, "metadata", {}) or {}).get("relative_path")
+            or getattr(info, "name", file_id)
+        ),
         "size_bytes": len(data),
         "content_base64": base64.b64encode(data).decode("ascii"),
     }
@@ -594,6 +600,7 @@ def upload_file(
     filename: str,
     content_base64: str,
     source_group: str = "",
+    directory_id: int = 0,
 ) -> dict[str, Any]:
     """Upload one file into a knowledge base (requires write permission).
 
@@ -612,7 +619,9 @@ def upload_file(
     if len(data) > _MAX_UPLOAD_BYTES:
         raise ValueError("file content exceeds the 100 MiB bridge limit")
     files = {"files": (str(filename), data, "application/octet-stream")}
-    form = {"source_group": source_group} if str(source_group or "").strip() else {}
+    form = {"directory_id": str(int(directory_id or 0))}
+    if str(source_group or "").strip():
+        form["source_group"] = source_group
     return _request(
         "POST", f"/kbs/{_kb_path(kb_name)}/files", files=files, data=form
     )

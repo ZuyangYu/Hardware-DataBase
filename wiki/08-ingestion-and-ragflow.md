@@ -64,9 +64,11 @@ IngestionOrchestrator(*, backend_name, store: PipelineDocumentStore, archive,
                       handlers: dict[str, PipelineHandler], audit_callback,
                       content_hash_callback, remote_document_exists_callback)
 IngestionScope(kb_name, department_id, kb_id=None, uploaded_by="", source_group=None,
-               ctx=None, embed_depth=0, parent_document="")
+               ctx=None, directory_id=0, relative_path="", embed_depth=0,
+               parent_document="")
 ArchivedFile(original_path, archived_path, filename, source_group, relative_local_path,
-             file_size, content_hash, inspection)
+             file_size, content_hash, inspection, logical_relative_path="",
+             directory_id=0)
 HandlerResult(success, message, document_id="", record_id=None, status="",
               uploaded_to_remote=False, warnings=[], audit_action="", audit_metadata={},
               preserve_failed_record=False)
@@ -86,7 +88,9 @@ HandlerProcessResult(ok, status, message, progress=100, audit_action="",
 1. `route_file` + handler 查找；`.xls` → 跳过 + 审计；无 handler → 跳过 + 审计；
 2. 流式 SHA-256（1 MiB 块）；
 3. **进程内锁**：`_ingest_lock(scope, content_hash)`（键 `dept:kb:hash`，引用计数 RLock）；
-4. **去重复用**：`store.find_by_hash(kb, dataset_kind, hash, dept)` 命中且状态非 `failed/deleted`：
+4. **目录感知去重复用**：先按 `directory_id + document_name` 检查路径，再执行
+   `store.find_by_hash(kb, dataset_kind, hash, dept, directory_id)`；状态非 `failed/deleted`：
+   同路径不同 hash 返回 `file_path_conflict`，不会静默覆盖；不同目录即使 hash 相同也不复用：
    - `_existing_record_is_reusable` 三态判定：
      - `shared_read_only` → RAGFlow 远端存在性必须为 True（或 `can_reuse_existing`）；
      - 本地归档必须存在；RAGFlow 远端存在性三态：True/False/None（None → 抛错保留映射，绝不破坏性操作）；
@@ -107,8 +111,9 @@ HandlerProcessResult(ok, status, message, progress=100, audit_action="",
 
 | 键 | 位置 |
 |---|---|
-| `UNIQUE(kb_name, department_id, document_name, dataset_kind)` | `pipeline_documents` |
-| `(kb_name, dataset_kind, content_hash, department_id)` | `find_by_hash` 去重查询 |
+| `UNIQUE(kb_name, department_id, directory_id, document_name)` | `pipeline_documents` |
+| `(kb_name, department_id, directory_id, document_name)` | `find_document_by_path` 路径冲突查询 |
+| `(kb_name, dataset_kind, content_hash, department_id, directory_id)` | `find_by_hash` 去重查询 |
 | `document_id = table:{hash[:16]} / circuit:{hash[:16]} / conversation:{hash[:16]}` | 本地处理器 |
 | `document_id = <RAGFlow 文档 id>` | RAGFlow 处理器 |
 | 归档文件名冲突 | 最多重试 20 次：`{base}_{time_ns}_{uuid4[:8]}{ext}` |
@@ -189,7 +194,8 @@ worker_id, worker_started_at, worker_heartbeat_at, retry_count,
 asset_id, logical_document_id, source_version_id, project_id, document_role,
 module_scope_json, revision, approval_status, effective_from, effective_to, usage_type,
 embed_depth, parent_document, created_at, updated_at,
-UNIQUE(kb_name, department_id, document_name, dataset_kind)
+directory_id,
+UNIQUE(kb_name, department_id, directory_id, document_name)
 索引: ix_pipeline_documents_claim(processor_kind,status,worker_id,retry_count,updated_at,id)
       ix_pipeline_documents_lease(processor_kind,worker_id,worker_heartbeat_at)
 ```
@@ -345,7 +351,7 @@ PIPELINE_ARCHIVE_ROOT/
 
 ```json
 {"kb_name", "logical_kb_id", "kb_id", "department_id", "source_group",
- "uploaded_by", "original_file_name"}
+ "uploaded_by", "original_file_name", "directory_id", "relative_path"}
 ```
 
 ### 6.3 提交序列（`_submit_archived_document`）
@@ -520,3 +526,54 @@ Step 8 文件名回退：仍无证据且提供 source_names 且此前是因 sour
    （并发上传同一内容理论上可能双双到达 RAGFlow 提交）。
 7. `clear_finished_parse_tasks` 后端未覆写 → 对 RAGFlow 是 no-op（已完成行本来就被隐藏）。
 8. 终端状态集合不含 `cancelled/completed/dead_letter`，这些状态不会更新 `parse_completed_at`。
+
+## 11. 目录感知摄取（2026-11）
+
+### 11.1 文件身份与目录
+
+`pipeline_documents` 的文件身份是：
+
+```text
+kb_name + department_id + directory_id + document_name
+```
+
+`directory_id=0` 表示根目录；`relative_path` 不作为持久化身份，检索、列表和引用
+展示时由 `PipelineDirectoryService` 从父子目录链动态派生。旧台账记录自动落在根目录，
+legacy 记录在根目录展示时优先回退 `original_file_name`。
+
+### 11.2 归档布局
+
+目录文件使用目录 ID 隔离物理归档：
+
+```text
+departments/<dept>/kbs/<kb>/directories/<directory_id>/<source_group>/<unique-file>
+```
+
+根目录和历史记录继续兼容旧的 `<source_group>/<file>` 布局。RAGFlow 目录文件使用
+独立唯一远端文件名；本地 basename、逻辑路径和远端文件名不混用。
+
+### 11.3 去重和混合文件夹
+
+- 同目录、同路径、同内容：幂等复用并返回 `file_content_reused`；
+- 同目录、同路径、不同内容：拒绝并返回 `file_path_conflict`；
+- 不同目录、内容相同：建立独立台账、归档和解析记录；
+- 文件夹 manifest 中每个文件独立计算 source group，PDF/XLSX/EDF 可以混合上传；
+- 未知扩展名逐文件跳过，不归档、不创建台账行。
+
+### 11.4 P1 导入批次与 raw-only
+
+- `directory_import_jobs` / `directory_import_files` 保存批次和逐文件状态；
+  worker 逐个文件提交，失败项保留暂存文件并可单独重试，取消只终止未领取文件。
+- `DIRECTORY_RAW_ONLY_UNKNOWN=true` 时，无匹配管线的扩展名先归档为
+  `processor_kind=raw_file`、`content_kind=raw_file`、`status=raw_archived`，
+  不创建解析任务、不进入检索；`.xls` 等显式拒绝扩展名仍按原规则拒绝。
+- 目录级配额由 `HDB_DIRECTORY_MAX_FILES` / `HDB_DIRECTORY_MAX_BYTES` 控制（0=关闭）；
+  同步上传和持久化批次在创建前按目标目录聚合校验。
+- `hardware-database-maintenance reconcile-pipeline --kb ... --department-id ...`
+  输出缺失归档、缺失目录和孤儿归档的只读对账报告。
+
+### 11.5 证据路径
+
+RAGFlow、pipeline catalog、`kb_grep`、结构化 Excel/电路证据、目标解析和 MCP
+文件列表均返回 `relative_path` 或使用其作为 `source_name`。授权仍以
+`record_id + department_id + kb_id` 校验，路径字符串不替代授权身份。

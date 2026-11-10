@@ -15,6 +15,7 @@ from src.agents.scopes import KnowledgeBaseSpreadsheetScopeResolver
 from src.core.query_tokens import tokenize_hardware_query
 from src.pipelines.document_rag.schemas import RequestContext
 from src.services.kb_scope import kb_scope_from_context
+from src.services.pipeline_directories import document_relative_path
 from src.services.spreadsheet_index_service import SpreadsheetIndexService
 
 
@@ -271,6 +272,8 @@ def _authoritative_metadata(rt, document_store, row, locator: dict, content: str
         "index_revision": int(getattr(record, "index_revision", 0) or 0),
         "processing_artifact_id": str(getattr(record, "processing_artifact_id", "") or ""),
         "processor_version": str(getattr(record, "processor_version", "") or ""),
+        "directory_id": int(getattr(record, "directory_id", 0) or 0),
+        "relative_path": document_relative_path(document_store, record),
         "evidence_text_hash": sha256(content.encode("utf-8")).hexdigest(),
     })
     try:
@@ -354,7 +357,7 @@ def _semantic_rows(rt, service: SpreadsheetIndexService, query: str, top_k: int,
             Evidence(
                 id=f"xlsx:{row['record_id']}:{row['sheet_name']}:{row['row_index']}:semantic",
                 content=content,
-                source_name=row["document_name"],
+                    source_name=str(metadata.get("relative_path") or row["document_name"]),
                 content_kind="spreadsheet_table",
                 processor_kind="spreadsheet_table",
                 score=relevance,
@@ -428,7 +431,7 @@ def _cell_rows(rt, service: SpreadsheetIndexService, query: str, top_k: int,
             Evidence(
                 id=f"xlsx:{row['record_id']}:{row['sheet_name']}:{row['cell_ref']}:cell",
                 content=content,
-                source_name=row["document_name"],
+                    source_name=str(metadata.get("relative_path") or row["document_name"]),
                 content_kind="spreadsheet_table",
                 processor_kind="spreadsheet_table",
                 score=relevance,

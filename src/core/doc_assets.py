@@ -67,6 +67,8 @@ def ensure_shadow_asset_for_record(record_id: int, *, store: Any | None = None) 
         if parse_status != TASK_STATUS_COMPLETED:
             return False
         service = DocumentAssetService()
+        from src.services.pipeline_directories import document_relative_path
+
         result = service.backfill_shadow_assets(
             kb_id=int(rec.kb_id),
             kb_name=rec.kb_name,
@@ -75,7 +77,7 @@ def ensure_shadow_asset_for_record(record_id: int, *, store: Any | None = None) 
             files=[
                 {
                     "file_id": str(rec.id),
-                    "file_name": rec.original_file_name or rec.document_name,
+                    "file_name": document_relative_path(store, rec),
                     "processor_kind": rec.processor_kind,
                     "content_hash": rec.content_hash,
                     "parse_status": parse_status,
