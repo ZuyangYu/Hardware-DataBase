@@ -562,3 +562,32 @@ def test_http_allowed_hosts_merge_extra_patterns(monkeypatch):
     assert "hdb.example.com:*" in hosts
     assert "10.0.0.5:*" in hosts
     assert "example.org:9100" in hosts
+
+
+def test_search_knowledge_base_exact_mode_uses_grep():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/kbs/AAA/files":
+            return httpx.Response(200, json=[{"id": "f1", "name": "HSI.docx", "status": "parsed"}])
+        if request.url.path.startswith("/api/v1/kbs/AAA/files/f1/chunks"):
+            return httpx.Response(200, json={
+                "document_id": "f1",
+                "file_name": "HSI.docx",
+                "chunk_count": 2,
+                "backend": "ragflow",
+                "chunks": [
+                    {"index": 7, "content": "X1900-27 ECU Connector", "metadata": {"page_num": 4}},
+                    {"index": 8, "content": "unrelated", "metadata": {}},
+                ],
+            })
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    _use(handler)
+    result = bridge.search_knowledge_base("AAA", "X1900", top_k=5)
+    assert result["mode"] == "exact"
+    assert result["result_count"] == 1
+    hit = result["results"][0]
+    assert hit["file_id"] == "f1"
+    assert hit["chunk_index"] == 7
+    assert hit["locator"]["page_num"] == 4
+    assert "X1900" in hit["snippet"]
+    bridge._CHUNK_CACHE.clear()

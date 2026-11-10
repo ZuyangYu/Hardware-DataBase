@@ -1,22 +1,27 @@
-"""File-shaped KB tools: glob, grep and read over the parsed KB text.
+"""Unified KB tools for the in-process agent.
 
-The chunk source is the same ``DocumentManager`` used by the public
-``/kbs/{kb}/files/{id}/chunks`` endpoint (fallback: the runner's rag backend),
-so grep hits here match what the MCP bridge exposes to external agents.
+The contract matches the external MCP bridge: ``search_knowledge`` returns
+ranked chunks, ``read_knowledge`` returns parsed chunk text, and
+``list_knowledge_files`` lists the virtual KB file tree.  ``grep`` is folded
+into ``search_knowledge(mode="exact"/"auto")`` instead of being a third
+overlapping tool.
 """
 
 from __future__ import annotations
 
-import fnmatch
 import json
-import re
 import time
 from typing import Any
 
 from src.agents.tools.grep_tools import _scoped_documents
+from src.services.knowledge_retrieval import (
+    grep_chunks,
+    lexical_search,
+    list_files,
+    looks_like_exact_term,
+    read_chunks,
+)
 
-_MAX_READ_CHARS = 20_000
-_MAX_GREP_HITS = 50
 _PARSE_DEADLINE_SECONDS = 20.0
 
 
@@ -33,39 +38,16 @@ def _doc_name(record: Any) -> str:
     )
 
 
-def _doc_path(record: Any) -> str:
-    name = _doc_name(record).replace("/", "_").replace("\\", "_")
-    kb = str(getattr(record, "kb_name", "") or "kb")
-    return f"/kb/{kb}/{name}"
-
-
-def _match_path(record: Any, path: str) -> bool:
-    needle = str(path or "").strip()
-    if not needle:
-        return True
-    candidate = _doc_path(record)
-    if needle.startswith("/"):
-        return candidate == needle
-    return needle in candidate or fnmatch.fnmatch(candidate, f"*{needle}*")
-
-
-def _snippet(content: str, start: int, end: int, width: int = 90) -> str:
-    left = max(0, start - width)
-    right = min(len(content), end + width)
-    text = content[left:right].replace("\n", " ")
-    return ("…" if left > 0 else "") + text + ("…" if right < len(content) else "")
-
-
 def make_kb_workspace_tools(
     rt: Any,
     rag_backend: Any,
     document_store: Any,
     document_manager: Any = None,
 ) -> list[Any]:
-    """Return kb_glob / kb_grep / kb_read bound to the current KB scope."""
+    """Return search/read/list tools bound to the current KB scope."""
 
     chunk_backend = document_manager or rag_backend
-    chunk_cache: dict[str, list[Any]] = {}
+    chunk_cache: dict[str, list[dict[str, Any]]] = {}
 
     def _documents() -> list[Any]:
         return [
@@ -74,12 +56,12 @@ def make_kb_workspace_tools(
             if str(getattr(record, "status", "") or "") in {"parsed", "indexed"}
         ]
 
-    def _chunks(record: Any) -> list[Any]:
+    def _chunks(record: Any) -> list[dict[str, Any]]:
         key = str(getattr(record, "id", "") or getattr(record, "document_id", ""))
         cached = chunk_cache.get(key)
         if cached is not None:
             return cached
-        chunks: list[Any] = []
+        chunks: list[dict[str, Any]] = []
         try:
             result = chunk_backend.get_parse_result(
                 str(getattr(record, "kb_name", "")),
@@ -88,11 +70,31 @@ def make_kb_workspace_tools(
                 deadline=time.monotonic() + _PARSE_DEADLINE_SECONDS,
                 should_cancel=getattr(rt, "should_cancel", None),
             )
-            chunks = list(getattr(result, "chunks", []) or [])
+            for chunk in getattr(result, "chunks", []) or []:
+                chunks.append(
+                    {
+                        "index": int(getattr(chunk, "index", 0) or 0),
+                        "content": str(getattr(chunk, "content", "") or ""),
+                        "metadata": dict(getattr(chunk, "metadata", {}) or {}),
+                        "rag_id": str(
+                            (getattr(chunk, "metadata", {}) or {}).get(
+                                "ragflow_chunk_id", ""
+                            )
+                            or ""
+                        ),
+                    }
+                )
         except Exception:
             chunks = []
         chunk_cache[key] = chunks
         return chunks
+
+    def _chunks_by_file() -> dict[tuple[str, str], list[dict[str, Any]]]:
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for record in _documents():
+            fid = str(getattr(record, "id", "") or "")
+            grouped[(fid, _doc_name(record))] = _chunks(record)
+        return grouped
 
     def _run(name: str, query: str, fn):
         if rt is None:
@@ -123,161 +125,134 @@ def make_kb_workspace_tools(
         )
         return result
 
-    def kb_glob(pattern: str = "**/*", max_results: int = 100) -> str:
-        """列出当前知识库中的文件；pattern 支持通配符，例如 **/*TCN2*。"""
-
-        def _glob() -> str:
-            raw = str(pattern or "**/*").strip() or "**/*"
-            if not any(ch in raw for ch in "*?["):
-                raw = f"*{raw}*"
-            rows = []
-            for record in _documents():
-                path = _doc_path(record)
-                name = _doc_name(record)
-                if not (
-                    fnmatch.fnmatch(name.casefold(), raw.casefold())
-                    or fnmatch.fnmatch(path.casefold(), raw.casefold())
-                ):
-                    continue
-                rows.append(
-                    {
-                        "path": path,
-                        "file_id": str(getattr(record, "id", "") or ""),
-                        "name": name,
-                        "kind": str(getattr(record, "processor_kind", "") or ""),
-                        "status": str(getattr(record, "status", "") or ""),
-                    }
-                )
-                if len(rows) >= max(1, min(int(max_results or 100), 200)):
-                    break
-            return _json({"pattern": raw, "files": rows, "count": len(rows)})
-
-        return _run("kb_glob", pattern, _glob)
-
-    def kb_grep(
-        patterns: list[str],
+    def search_knowledge(
+        query: str,
+        mode: str = "auto",
+        top_k: int = 8,
+        file_id: str = "",
         path: str = "",
-        max_hits: int = 30,
-        regex: bool = False,
     ) -> str:
-        """在知识库解析文本中按文件/正则搜索，返回路径、chunk/page 和上下文。
+        """检索知识库解析 chunk。
 
-        patterns 可一次传多个位号、型号、信号名或表号；path 可限定文件。
-        这是只读的 grep，不登记正式证据；需要引用时再用 evidence_read。
+        mode="auto" 会自动识别位号/型号/网络名并走精确 grep；mode="exact"
+        强制精确匹配；mode="semantic"/"lexical" 走词法排序。结果包含
+        file_id、locator、chunk_index、score 和上下文 snippet。需要正文时再调
+        read_knowledge。
         """
 
-        def _grep() -> str:
-            raw = patterns if isinstance(patterns, list) else [patterns]
-            values = [str(item or "").strip() for item in raw if str(item or "").strip()]
-            if not values:
-                return _json({"error": "patterns is required", "hits": []})
-            compiled: list[re.Pattern[str]] = []
-            for value in values[:12]:
-                try:
-                    compiled.append(
-                        re.compile(value if regex else re.escape(value), re.IGNORECASE)
-                    )
-                except re.error as exc:
-                    return _json({"error": f"invalid regex: {value}: {exc}", "hits": []})
-            limit = max(1, min(int(max_hits or 30), _MAX_GREP_HITS))
-            hits: list[dict[str, Any]] = []
-            documents = [record for record in _documents() if _match_path(record, path)]
-            for record in documents:
-                for chunk in _chunks(record):
-                    content = str(getattr(chunk, "content", "") or "")
-                    if not content:
-                        continue
-                    matches = [
-                        match
-                        for pattern in compiled
-                        for match in pattern.finditer(content)
-                    ]
-                    if not matches:
-                        continue
-                    first = min(matches, key=lambda item: item.start())
-                    metadata = dict(getattr(chunk, "metadata", {}) or {})
-                    locator = {
-                        key: metadata[key]
-                        for key in ("page_num", "page", "sheet_name", "row_index", "chunk_index")
-                        if metadata.get(key) not in (None, "", [], {})
-                    }
-                    if not locator:
-                        locator = {"chunk_index": int(getattr(chunk, "index", 0) or 0)}
-                    hits.append(
-                        {
-                            "path": _doc_path(record),
-                            "file_id": str(getattr(record, "id", "") or ""),
-                            "name": _doc_name(record),
-                            "locator": locator,
-                            "line": int(getattr(chunk, "index", 0) or 0),
-                            "snippet": _snippet(content, first.start(), first.end()),
-                            "matches": len(matches),
-                        }
-                    )
-                    if len(hits) >= limit:
-                        break
-                if len(hits) >= limit:
-                    break
+        def _search() -> str:
+            needle = str(query or "").strip()
+            if not needle:
+                return _json({"error": "query is required", "results": []})
+            plane = str(mode or "auto").strip().lower()
+            grouped = _chunks_by_file()
+            exact = plane == "exact" or (
+                plane == "auto" and looks_like_exact_term(needle)
+            )
+            if exact:
+                results = grep_chunks(
+                    grouped,
+                    [needle],
+                    path=path or file_id,
+                    max_hits=max(1, min(int(top_k or 8), 50)),
+                )
+                used = "exact"
+            else:
+                results = lexical_search(
+                    grouped,
+                    needle,
+                    top_k=max(1, min(int(top_k or 8), 50)),
+                    file_id=file_id,
+                )
+                used = "semantic" if plane == "semantic" else "lexical"
             note_progress = getattr(rt, "note_progress", None)
             note_no_progress = getattr(rt, "note_no_progress", None)
-            if hits:
+            if results:
                 if callable(note_progress):
                     note_progress()
             elif callable(note_no_progress):
                 note_no_progress()
-            return _json({"patterns": values, "path": path, "hits": hits, "count": len(hits)})
+            return _json(
+                {
+                    "query": needle,
+                    "mode": used,
+                    "results": results,
+                    "result_count": len(results),
+                    "files_searched": len(grouped),
+                    "chunks_searched": sum(len(items) for items in grouped.values()),
+                }
+            )
 
-        return _run("kb_grep", f"{path} | {' | '.join(str(p) for p in (patterns or []))}", _grep)
+        return _run("search_knowledge", f"{mode} | {file_id} | {query}", _search)
 
-    def kb_read(path_or_id: str, start: int = 0, limit: int = 12_000) -> str:
-        """读取知识库文件的解析文本；start/limit 是字符偏移和长度。"""
+    def read_knowledge(
+        file_id: str,
+        start_index: int = 0,
+        max_chunks: int = 20,
+        query: str = "",
+    ) -> str:
+        """读取知识库文件的解析 chunk；file_id 可传 id、文件名或虚拟路径。"""
 
         def _read() -> str:
-            raw = str(path_or_id or "").strip()
+            raw = str(file_id or "").strip()
             if not raw:
-                return _json({"error": "path is required"})
+                return _json({"error": "file_id is required"})
             record = next(
                 (
                     item
                     for item in _documents()
-                    if _match_path(item, raw)
-                    or str(getattr(item, "id", "")) == raw
+                    if str(getattr(item, "id", "")) == raw
+                    or raw in _doc_name(item)
+                    or raw in f"/kb/{getattr(item, 'kb_name', '')}/{_doc_name(item)}"
                 ),
                 None,
             )
             if record is None:
                 return _json({"error": f"file not found: {raw}"})
-            text = "\n\n".join(
-                str(getattr(chunk, "content", "") or "")
-                for chunk in _chunks(record)
-                if str(getattr(chunk, "content", "") or "")
+            chunks = _chunks(record)
+            picked = read_chunks(
+                chunks,
+                start_index=start_index,
+                max_chunks=max_chunks,
+                query=query,
             )
-            offset = max(0, int(start or 0))
-            take = max(1, min(int(limit or 12_000), _MAX_READ_CHARS))
-            body = text[offset : offset + take]
-            next_offset = offset + len(body)
-            if next_offset >= len(text):
-                next_offset = None
-            if body and callable(getattr(rt, "note_progress", None)):
+            if picked and callable(getattr(rt, "note_progress", None)):
                 rt.note_progress()
             return _json(
                 {
-                    "path": _doc_path(record),
                     "file_id": str(getattr(record, "id", "") or ""),
-                    "name": _doc_name(record),
-                    "start": offset,
-                    "next": next_offset,
-                    "total_chars": len(text),
-                    "text": body,
+                    "file_name": _doc_name(record),
+                    "start_index": max(0, int(start_index or 0)),
+                    "chunk_count": len(chunks),
+                    "chunks": picked,
+                    "next_index": (
+                        int(picked[-1]["index"]) + 1 if len(picked) >= max_chunks else None
+                    ),
                 }
             )
 
-        return _run("kb_read", f"{path_or_id} @{start}", _read)
+        return _run("read_knowledge", f"{file_id} @{start_index}", _read)
 
-    kb_glob.__name__ = "kb_glob"
-    kb_grep.__name__ = "kb_grep"
-    kb_read.__name__ = "kb_read"
-    return [kb_glob, kb_grep, kb_read]
+    def list_knowledge_files(pattern: str = "**/*") -> str:
+        """列出知识库文件；pattern 支持通配符，例如 **/*TCN2*。"""
+
+        def _list() -> str:
+            records = _documents()
+            files = list_files(records, pattern=pattern)
+            return _json(
+                {
+                    "pattern": str(pattern or "**/*"),
+                    "files": files,
+                    "count": len(files),
+                }
+            )
+
+        return _run("list_knowledge_files", pattern, _list)
+
+    search_knowledge.__name__ = "search_knowledge"
+    read_knowledge.__name__ = "read_knowledge"
+    list_knowledge_files.__name__ = "list_knowledge_files"
+    return [search_knowledge, read_knowledge, list_knowledge_files]
 
 
 __all__ = ["make_kb_workspace_tools"]
