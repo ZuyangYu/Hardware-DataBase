@@ -84,12 +84,8 @@ DIRECTORY_RAW_ONLY_UNKNOWN = os.getenv("DIRECTORY_RAW_ONLY_UNKNOWN", "false").st
 LOG_DIR = os.path.join(STORAGE_DIR, "logs")
 # Workspace-first agent storage.  A workspace owns the hidden file tree and
 # artifacts for a session/user; there is no task product behind it.
-WORKSPACE_DB_PATH = os.getenv(
-    "WORKSPACE_DB_PATH", os.path.join(STORAGE_DIR, "workspaces.db")
-)
-WORKSPACE_ROOT = os.getenv(
-    "WORKSPACE_ROOT", os.path.join(STORAGE_DIR, "workspaces")
-)
+WORKSPACE_DB_PATH = os.getenv("WORKSPACE_DB_PATH", os.path.join(STORAGE_DIR, "workspaces.db"))
+WORKSPACE_ROOT = os.getenv("WORKSPACE_ROOT", os.path.join(STORAGE_DIR, "workspaces"))
 # Workspace store backend: "" follows CONTROL_PLANE_BACKEND; or sqlite/postgres.
 WORKSPACE_STORE_BACKEND = os.getenv("WORKSPACE_STORE_BACKEND", "").strip().lower()
 WORKSPACE_DB_URL = os.getenv("WORKSPACE_DB_URL", "").strip()
@@ -100,7 +96,6 @@ def _resolve_storage_path(raw_path: str | None, default_name: str) -> str:
     if not os.path.isabs(path):
         path = os.path.join(STORAGE_DIR, path)
     return os.path.abspath(path)
-
 RESULT_EXPORT_STORAGE_DIR = _resolve_storage_path(os.getenv("RESULT_EXPORT_STORAGE_DIR"), "exports")
 RESULT_EXPORT_ENABLED = _env_bool("RESULT_EXPORT_ENABLED", True)
 RESULT_EXPORT_MD_ENABLED = _env_bool("RESULT_EXPORT_MD_ENABLED", True)
@@ -148,22 +143,16 @@ SPREADSHEET_SKIP_BOILERPLATE_SHEETS = os.getenv("SPREADSHEET_SKIP_BOILERPLATE_SH
 # Agent 单题证据堆上限:超出后按问题词法相关性准入新证据(已入堆不淘汰)。
 AGENT_EVIDENCE_BUDGET = int(os.getenv("AGENT_EVIDENCE_BUDGET", "30") or 30)
 # 对话附件(长文档分片)精读需要比普通问答更多的证据槽位; 附件在场时取两者较大值。
-AGENT_ATTACHMENT_EVIDENCE_BUDGET = int(
-    os.getenv("AGENT_ATTACHMENT_EVIDENCE_BUDGET", "80") or 80
-)
+AGENT_ATTACHMENT_EVIDENCE_BUDGET = int(os.getenv("AGENT_ATTACHMENT_EVIDENCE_BUDGET", "80") or 80)
 
 # 站内通知的可选外发 webhook（企业微信/钉钉/邮件网关等）。留空则仅站内通知。
 NOTIFY_WEBHOOK_URL = os.getenv("NOTIFY_WEBHOOK_URL", "").strip()
 NOTIFY_WEBHOOK_TOKEN = os.getenv("NOTIFY_WEBHOOK_TOKEN", "").strip()
-NOTIFY_WEBHOOK_TIMEOUT_SECONDS = float(
-    os.getenv("NOTIFY_WEBHOOK_TIMEOUT_SECONDS", "2") or 2
-)
+NOTIFY_WEBHOOK_TIMEOUT_SECONDS = float(os.getenv("NOTIFY_WEBHOOK_TIMEOUT_SECONDS", "2") or 2)
 
 AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", os.path.join(STORAGE_DIR, "auth.db"))
 # LangGraph checkpointer：agent 会话状态（thread 级完整消息历史）的持久化库。
-AGENT_CHECKPOINT_DB_PATH = os.getenv(
-    "AGENT_CHECKPOINT_DB_PATH", os.path.join(STORAGE_DIR, "agent_checkpoints.db")
-)
+AGENT_CHECKPOINT_DB_PATH = os.getenv("AGENT_CHECKPOINT_DB_PATH", os.path.join(STORAGE_DIR, "agent_checkpoints.db"))
 # P1-001: checkpointer backend selection; postgres is the multi-instance target.
 AGENT_CHECKPOINT_BACKEND = os.getenv("AGENT_CHECKPOINT_BACKEND", "sqlite").strip().lower()
 if AGENT_CHECKPOINT_BACKEND not in {"sqlite", "postgres"}:
@@ -311,9 +300,7 @@ RESOURCE_PERMIT_LEASE_SECONDS = int(os.getenv("RESOURCE_PERMIT_LEASE_SECONDS", "
 RESOURCE_UNCERTAIN_ESCALATE_SECONDS = int(os.getenv("RESOURCE_UNCERTAIN_ESCALATE_SECONDS", "600"))
 # After this grace period an isolated uncertain permit is released with
 # server_deadline_passed evidence instead of blocking admission forever.
-RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS = int(
-    os.getenv("RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS", "1800")
-)
+RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS = int(os.getenv("RESOURCE_UNCERTAIN_AUTO_RELEASE_SECONDS", "1800"))
 RESOURCE_GOVERNOR_MAINTENANCE_SECONDS = float(
     os.getenv("RESOURCE_GOVERNOR_MAINTENANCE_SECONDS", "5")
 )
@@ -368,9 +355,7 @@ PROVIDER_RPM_LIMIT = int(os.getenv("PROVIDER_RPM_LIMIT", "0"))
 PROVIDER_TPM_LIMIT = int(os.getenv("PROVIDER_TPM_LIMIT", "0"))
 # Production processes must point at a pre-provisioned quota database instead
 # of silently creating a same-named local file.
-RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED = _env_bool(
-    "RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED", False
-)
+RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED = _env_bool("RESOURCE_GOVERNOR_REQUIRE_PRECONFIGURED", False)
 CHAT_QUEUE_DEADLINE_SECONDS = int(os.getenv("CHAT_QUEUE_DEADLINE_SECONDS", "600"))
 # Deep（知识库复杂任务）回合的硬看门狗：未声明调用上限时完整性优先，
 # 允许更长的探索时间；声明了上限的回合仍受普通 600s 预算约束。
@@ -724,7 +709,6 @@ NO_CONTEXT_PROMPT = os.getenv(
     "知识库中没有找到相关上下文，请说明这一点；如需基于通用知识回答，必须明确标注。"
 )
 
-
 def ensure_runtime_dirs():
     """Ensure directories required by RAGFlow and pipeline archives exist."""
     os.makedirs(STORAGE_DIR, exist_ok=True)
@@ -733,7 +717,6 @@ def ensure_runtime_dirs():
     os.makedirs(RAGFLOW_FILE_ROOT, exist_ok=True)
 
 ensure_runtime_dirs()
-
 
 # v3 §11.2: settings that only take effect after a process restart (storage
 # backends, DSNs, role/port and other construction-time wiring).  Everything
@@ -1092,7 +1075,6 @@ DEFAULT_VALUES = {
     "NO_CONTEXT_PROMPT": NO_CONTEXT_PROMPT,
 }
 
-
 DEFAULT_VALUES.update({key: (("true" if default else "false") if isinstance(default, bool) else str(default)) for key, default in _EVIDENCE_DEFAULTS.items()})
 
 def reload_settings():
@@ -1109,7 +1091,6 @@ def reload_settings():
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-
 
 def _reload_settings():
     """Parse the reloadable configuration under the settings lock."""
@@ -1690,7 +1671,6 @@ def _format_env_value(value: str) -> str:
         return f'"{escaped}"'
     return value
 
-
 def _env_value_quote_closed(value: str) -> bool:
     """Return whether a quoted .env value closes on the current physical line."""
     value = value.lstrip()
@@ -1709,7 +1689,6 @@ def _env_value_quote_closed(value: str) -> bool:
         if char == quote:
             return True
     return False
-
 
 def save_settings_to_env(settings_dict: dict, env_path: str = None):
     """Update .env keys while preserving comments and unrelated settings.
@@ -1790,7 +1769,6 @@ def save_settings_to_env(settings_dict: dict, env_path: str = None):
             except OSError:
                 pass
             raise
-
 
 # Keys parsed as numbers or an enum at import/reload time. A value that cannot
 # be converted would brick the server on next boot (module-level parse raises),
@@ -1951,7 +1929,6 @@ _FLOAT_SETTING_KEYS = frozenset({
     "SANDBOX_RECONCILE_INTERVAL_SECONDS",
 })
 
-
 def validate_settings_values(settings_dict: dict) -> None:
     """Validate candidate .env values against their expected types.
 
@@ -2033,7 +2010,6 @@ def validate_settings_values(settings_dict: dict) -> None:
                 int(text)
             except ValueError as exc:
                 raise ValueError(f"{key} 必须是整数或空值，当前值: {text!r}") from exc
-
 
 def validate_provider_configuration(overrides: dict | None = None) -> None:
     """P0-008: reject provider selections that cannot run in this deployment.
