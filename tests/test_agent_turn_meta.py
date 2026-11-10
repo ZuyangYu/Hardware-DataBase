@@ -777,3 +777,31 @@ def test_tool_call_cap_recorded_in_budget_state():
 def test_export_intent_detection():
     assert _export_intent_for_turn("导出为 PDF") is True
     assert _export_intent_for_turn("输出(running)") is False
+
+
+def test_deep_mode_has_bounded_tool_and_retrieval_budgets():
+    limit, budget = _agent_recursion_limit(
+        query="生成 TCN2 整体硬件框图",
+        query_mode="deep",
+        attachment_refs=[],
+        knowledge_scope=None,
+    )
+    assert budget["tool_call_cap"] == 32
+    assert budget["tool_call_cap_source"] == "deep_mode"
+    assert budget["retrieval_call_cap"] == 20
+    assert budget["finalize_reserve"] == 4
+    assert limit == 72
+
+
+def test_user_tool_cap_narrows_deep_budget_and_reserves_finalize_steps():
+    limit, budget = _agent_recursion_limit(
+        query="关键器件清单草稿,最多 8 次检索工具调用,固定五列。",
+        query_mode="deep",
+        attachment_refs=[],
+        knowledge_scope=None,
+    )
+    assert budget["tool_call_cap"] == 8
+    assert budget["tool_call_cap_source"] == "user_query"
+    assert budget["retrieval_call_cap"] == 4
+    assert budget["finalize_reserve"] == 4
+    assert limit == 72

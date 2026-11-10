@@ -36,7 +36,34 @@ class TimeBudgetExceeded(LoopStop):
 
 
 class CallBudgetExceeded(LoopStop):
-    """The user-declared tool-call budget for this turn ran out."""
+    """The tool-call budget for this turn ran out."""
+
+
+# Retrieval adapters share a sub-budget inside the total tool budget.  Keep the
+# names explicit; unknown/MCP/workspace tools are not counted here.
+RETRIEVAL_TOOL_NAMES = frozenset(
+    {
+        "knowledge_search",
+        "document_search",
+        "document_search_batch",
+        "circuit_search",
+        "kb_grep",
+        "session_recall",
+        "evidence_read",
+        "spreadsheet_row_search",
+        "spreadsheet_cell_lookup",
+        "spreadsheet_schema_lookup",
+        "spreadsheet_sql_query",
+        "memory_search",
+        "conversation_search",
+        "wiki_search",
+        "list_kb_sources",
+    }
+)
+
+
+def is_retrieval_tool(name: str) -> bool:
+    return str(name or "") in RETRIEVAL_TOOL_NAMES
 
 
 def _skip_tool_message(request: ToolCallRequest, note: str) -> Any:
@@ -62,25 +89,58 @@ class LoopBudget:
     deadline: float | None = None
     tool_call_cap: int | None = None
     tool_calls: int = 0
+    retrieval_call_cap: int | None = None
+    retrieval_calls: int = 0
+    finalize_reserve: int = 0
+    skipped_tool_calls: int = 0
 
     def expired(self) -> bool:
         return self.deadline is not None and time.monotonic() > self.deadline
 
-    def consume_tool_allowance(self) -> bool:
+    def consume_tool_allowance(self, tool_name: str = "") -> bool:
         """Consume one allowance slot for a tool execution.
 
-        Returns ``True`` when the call may execute. ``False`` means the
-        user-declared cap is reached; the caller must skip the execution
-        (without raising) so the next model boundary raises
-        ``CallBudgetExceeded``.
+        Returns ``True`` when the call may execute. ``False`` means the total,
+        retrieval, or finalize-reserve budget is reached; the caller must skip
+        the execution (without raising) so the model can either generate the
+        final answer or, after repeated ignores, stop at a model boundary.
         """
 
         if self.tool_call_cap is None:
             return True
+        retrieval = is_retrieval_tool(tool_name)
         if self.tool_calls >= int(self.tool_call_cap):
             return False
+        if retrieval and self.finalize_reserve > 0:
+            if self.tool_calls >= max(0, int(self.tool_call_cap) - self.finalize_reserve):
+                return False
+        if retrieval and self.retrieval_call_cap is not None:
+            if self.retrieval_calls >= int(self.retrieval_call_cap):
+                return False
         self.tool_calls += 1
+        if retrieval:
+            self.retrieval_calls += 1
         return True
+
+    def skip_note(self, tool_name: str = "") -> str:
+        retrieval = is_retrieval_tool(tool_name)
+        if self.tool_call_cap is not None and self.tool_calls >= int(self.tool_call_cap):
+            return (
+                f"本轮工具调用总计已达上限 {self.tool_call_cap} 次，"
+                "本调用未执行。"
+            )
+        if retrieval and self.finalize_reserve > 0 and self.tool_call_cap is not None:
+            if self.tool_calls >= max(0, int(self.tool_call_cap) - self.finalize_reserve):
+                return (
+                    "已进入收尾阶段，检索工具不再执行；"
+                    "请基于已有证据生成最终答案或文件。"
+                )
+        if retrieval and self.retrieval_call_cap is not None:
+            return (
+                f"检索类工具调用已达上限 {self.retrieval_call_cap} 次；"
+                "请停止检索，基于已有证据生成最终答案或文件。"
+            )
+        return "本轮工具调用预算已用尽，本调用未执行。"
 
     def check_model_boundary(self) -> None:
         """Raise the configured stop at the model call boundary.
@@ -92,6 +152,11 @@ class LoopBudget:
         if self.expired():
             raise TimeBudgetExceeded()
         if self.tool_call_cap is not None and self.tool_calls >= int(self.tool_call_cap):
+            self.rt.mark_ended()
+            raise CallBudgetExceeded()
+        if self.skipped_tool_calls >= 2:
+            # The model ignored two "stop retrieving / generate now" responses.
+            # Stop at the model boundary and let the runner synthesize.
             self.rt.mark_ended()
             raise CallBudgetExceeded()
         if self.rt.should_stop_for_no_progress():
@@ -128,13 +193,13 @@ class LoopBudgetMiddleware(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Any],
     ) -> Any:
+        call = getattr(request, "tool_call", None) or {}
+        tool_name = str(call.get("name") or "")
         if self.budget.expired():
             note = "已超过本轮执行时间预算，调用未执行。"
-        elif not self.budget.consume_tool_allowance():
-            note = (
-                f"本轮工具调用总计已达上限 {self.budget.tool_call_cap} 次"
-                "（用户在问题上指定的约束），本调用未执行。"
-            )
+        elif not self.budget.consume_tool_allowance(tool_name):
+            self.budget.skipped_tool_calls += 1
+            note = self.budget.skip_note(tool_name)
         else:
             result = handler(request)
             # Propagate the no-progress signal to the next model boundary;
@@ -148,18 +213,15 @@ class LoopBudgetMiddleware(AgentMiddleware):
         request: ToolCallRequest,
         handler: Callable[[ToolCallRequest], Any],
     ) -> Any:
+        call = getattr(request, "tool_call", None) or {}
+        tool_name = str(call.get("name") or "")
         if self.budget.expired():
             return _skip_tool_message(
                 request, "已超过本轮执行时间预算，调用未执行。"
             )
-        if not self.budget.consume_tool_allowance():
-            return _skip_tool_message(
-                request,
-                (
-                    f"本轮工具调用总计已达上限 {self.budget.tool_call_cap} 次"
-                    "（用户在问题上指定的约束），本调用未执行。"
-                ),
-            )
+        if not self.budget.consume_tool_allowance(tool_name):
+            self.budget.skipped_tool_calls += 1
+            return _skip_tool_message(request, self.budget.skip_note(tool_name))
         return await handler(request)
 
 

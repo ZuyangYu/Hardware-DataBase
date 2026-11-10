@@ -385,8 +385,31 @@ def _agent_recursion_limit(
         "complexity": complexity,
         "enabled": enabled,
     }
+    deep_tool_cap = max(1, int(getattr(settings, "AGENT_DEEP_TOOL_CALL_CAP", 32)))
+    deep_retrieval_cap = max(1, int(getattr(settings, "AGENT_DEEP_RETRIEVAL_CALL_CAP", 20)))
+    deep_reserve = max(0, int(getattr(settings, "AGENT_DEEP_FINALIZE_RESERVE", 4)))
+    if query_mode == "deep":
+        reserve = min(deep_reserve, max(0, deep_tool_cap - 1))
+        budget.update(
+            {
+                "tool_call_cap": deep_tool_cap,
+                "tool_call_cap_source": "deep_mode",
+                "retrieval_call_cap": min(
+                    deep_retrieval_cap, max(1, deep_tool_cap - reserve)
+                ),
+                "finalize_reserve": reserve,
+            }
+        )
     cap = parse_user_tool_call_cap(query)
     if cap is not None:
+        if query_mode == "deep":
+            cap = min(cap, deep_tool_cap)
+            reserve = min(deep_reserve, max(0, cap - 1))
+            budget["finalize_reserve"] = reserve
+            budget["retrieval_call_cap"] = min(
+                int(budget.get("retrieval_call_cap") or deep_retrieval_cap),
+                max(1, cap - reserve),
+            )
         budget["tool_call_cap"] = cap
         budget["tool_call_cap_source"] = "user_query"
     return limit, budget
