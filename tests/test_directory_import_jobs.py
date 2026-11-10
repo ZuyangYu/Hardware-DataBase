@@ -235,3 +235,33 @@ def test_import_file_failure_isolated_from_other_rows(tmp_path, monkeypatch):
     assert row["status"] == "failed"
     assert row["error_code"] == "parse_submission_failed"
     assert os.path.exists(entry["staged_path"])
+
+
+def test_stale_uploading_file_is_reclaimed(tmp_path, monkeypatch):
+    store, directories, service, base = _service(tmp_path, monkeypatch)
+    entry = _entry(tmp_path, "spec.pdf", "spec.pdf")
+    job = service.create_job(
+        kb_name="kb", department_id="dept", kb_id=7, directory_id=base["id"],
+        created_by="tester", entries=[entry],
+    )
+    files = store.list_directory_import_files(job["id"], "kb", "dept")
+    file_id = int(files[0]["id"])
+    conn = store._connect()
+    try:
+        conn.execute(
+            """
+            UPDATE directory_import_files
+            SET status = 'uploading', worker_id = 'dead-worker',
+                worker_started_at = '2000-01-01 00:00:00'
+            WHERE id = ?
+            """,
+            (file_id,),
+        )
+    finally:
+        conn.close()
+
+    claimed = store.claim_directory_import_file("worker-2")
+    assert claimed is not None
+    assert int(claimed["id"]) == file_id
+    assert claimed["worker_id"] == "worker-2"
+    assert claimed["status"] == "uploading"

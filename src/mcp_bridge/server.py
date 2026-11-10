@@ -309,6 +309,40 @@ def _load_chunks(kb_name: str, file_id: str, refresh: bool) -> dict[str, Any]:
     return fresh
 
 
+def _directory_scope(
+    kb_name: str, directory_id: int, recursive: bool
+) -> set[int] | None:
+    """Resolve a directory filter to itself and, optionally, its descendants."""
+
+    target = int(directory_id or 0)
+    if target <= 0:
+        return None
+    # Fail closed when the id is not a directory in this KB/department.
+    _request(
+        "GET",
+        f"/kbs/{_kb_path(kb_name)}/directories/{target}",
+    )
+    allowed = {target}
+    if not recursive:
+        return allowed
+    pending = [target]
+    while pending:
+        parent = pending.pop()
+        children = _request(
+            "GET",
+            f"/kbs/{_kb_path(kb_name)}/directories",
+            params={"parent_id": parent},
+        )
+        for child in children or []:
+            if not isinstance(child, dict):
+                continue
+            child_id = int(child.get("id") or 0)
+            if child_id and child_id not in allowed:
+                allowed.add(child_id)
+                pending.append(child_id)
+    return allowed
+
+
 @mcp.tool()
 def search_knowledge_base(
     kb_name: str,
@@ -318,6 +352,8 @@ def search_knowledge_base(
     refresh: bool = False,
     mode: str = "auto",
     kind: str = "document",
+    directory_id: int = 0,
+    recursive: bool = True,
 ) -> dict[str, Any]:
     """Stateless search over one KB's parsed chunks (no session).
 
@@ -326,7 +362,9 @@ def search_knowledge_base(
     ``semantic``/``lexical`` uses lexical ranking on this bridge (true
     semantic retrieval lives in the platform, not the stateless bridge).
     ``kind``: ``document`` (default), ``table``, ``circuit`` or ``all``.
-    Results are chunk locators (file / index / rag_id) with snippet + score;
+    ``directory_id`` + ``recursive`` restrict the search to a directory and,
+    when recursive, its descendants.  Results are chunk locators (file / index
+    / rag_id) with snippet + score;
     read the text with ``hdb_read_file_chunks``.  The chunk index is cached
     per file (~15 min TTL, ``refresh=True`` forces a rebuild).
     """
@@ -334,6 +372,7 @@ def search_knowledge_base(
     if not needle:
         raise ValueError("query is required")
     rows = _request("GET", f"/kbs/{_kb_path(kb_name)}/files")
+    allowed_directory_ids = _directory_scope(kb_name, directory_id, recursive)
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     skipped: list[dict[str, str]] = []
     files_searched = 0
@@ -342,8 +381,11 @@ def search_knowledge_base(
         if not isinstance(row, dict):
             continue
         fid = str(row.get("id") or "")
-        fid_name = str(row.get("name") or "")
-        if file_id and fid != file_id and fid_name != file_id:
+        fid_name = str(row.get("relative_path") or row.get("name") or "")
+        if file_id and fid != file_id and fid_name != file_id and str(row.get("name") or "") != file_id:
+            continue
+        row_directory_id = int(row.get("directory_id") or 0)
+        if allowed_directory_ids is not None and row_directory_id not in allowed_directory_ids:
             continue
         processor = str(row.get("processor_kind") or "")
         wanted = str(kind or "document").strip().lower()
@@ -404,6 +446,8 @@ def search_knowledge_base(
         "query": needle,
         "kind": wanted,
         "mode": used,
+        "directory_id": int(directory_id or 0),
+        "recursive": bool(recursive),
         "results": results,
         "result_count": len(results),
         "files_searched": files_searched,

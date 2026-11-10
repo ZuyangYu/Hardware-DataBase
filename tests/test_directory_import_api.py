@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 
@@ -247,3 +248,59 @@ class DirectoryImportApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual(self.store.list_directories("shared", self.dept.id), [])
+
+
+    def test_plan_upload_rejects_terminal_job(self):
+        planned = self.client.post(
+            "/api/v1/kbs/shared/directory-imports/plan",
+            headers=self._headers(),
+            json={
+                "directory_id": 0,
+                "entries": [{"relative_path": "docs/spec.pdf", "source_group": "文档资料"}],
+            },
+        )
+        self.assertEqual(planned.status_code, 200, planned.text)
+        job = planned.json()
+        first = job["files"][0]
+        cancelled = self.client.post(
+            f"/api/v1/kbs/shared/directory-imports/{job['id']}/cancel",
+            headers=self._headers(),
+        )
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+
+        uploaded = self.client.put(
+            f"/api/v1/kbs/shared/directory-imports/{job['id']}/files/{first['id']}/content",
+            headers=self._headers(),
+            files={"file": ("spec.pdf", b"%PDF-1.4")},
+        )
+        self.assertEqual(uploaded.status_code, 409, uploaded.text)
+
+    def test_plan_upload_enforces_job_total_bytes(self):
+        planned = self.client.post(
+            "/api/v1/kbs/shared/directory-imports/plan",
+            headers=self._headers(),
+            json={
+                "directory_id": 0,
+                "entries": [
+                    {"relative_path": "docs/a.pdf", "source_group": "文档资料"},
+                    {"relative_path": "docs/b.pdf", "source_group": "文档资料"},
+                ],
+            },
+        )
+        self.assertEqual(planned.status_code, 200, planned.text)
+        job = planned.json()
+        first, second = job["files"]
+
+        with patch("src.api.routes.directory_imports.MAX_IMPORT_BYTES", 10):
+            uploaded_first = self.client.put(
+                f"/api/v1/kbs/shared/directory-imports/{job['id']}/files/{first['id']}/content",
+                headers=self._headers(),
+                files={"file": ("a.pdf", b"123456")},
+            )
+            self.assertEqual(uploaded_first.status_code, 200, uploaded_first.text)
+            uploaded_second = self.client.put(
+                f"/api/v1/kbs/shared/directory-imports/{job['id']}/files/{second['id']}/content",
+                headers=self._headers(),
+                files={"file": ("b.pdf", b"123456")},
+            )
+            self.assertEqual(uploaded_second.status_code, 413, uploaded_second.text)

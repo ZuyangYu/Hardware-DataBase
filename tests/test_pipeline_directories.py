@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 
 from src.pipelines.document_store import PipelineDocumentStore
-from src.services.pipeline_directories import DirectoryValidationError, PipelineDirectoryService
+from src.services.pipeline_directories import (
+    DirectoryValidationError,
+    PipelineDirectoryService,
+    delete_directory_tree,
+)
 
 
 def _service(tmp_path):
@@ -157,3 +161,111 @@ def test_file_identity_and_hash_dedup_are_directory_scoped(tmp_path):
             status="parsed",
             content_hash="different-hash",
         )
+
+
+def test_move_and_rename_is_atomic_on_sibling_conflict(tmp_path):
+    store, service = _service(tmp_path)
+    source = service.create(
+        kb_name="kb", department_id="dept", kb_id=7, parent_id=0,
+        name="source", created_by="tester",
+    )
+    target = service.create(
+        kb_name="kb", department_id="dept", kb_id=7, parent_id=0,
+        name="target", created_by="tester",
+    )
+    child = service.create(
+        kb_name="kb", department_id="dept", kb_id=7, parent_id=source["id"],
+        name="power", created_by="tester",
+    )
+    grandchild = service.create(
+        kb_name="kb", department_id="dept", kb_id=7, parent_id=child["id"],
+        name="rails", created_by="tester",
+    )
+    service.create(
+        kb_name="kb", department_id="dept", kb_id=7, parent_id=target["id"],
+        name="power", created_by="tester",
+    )
+
+    with pytest.raises(DirectoryValidationError, match="同级目录已存在"):
+        service.move(
+            kb_name="kb",
+            department_id="dept",
+            directory_id=child["id"],
+            parent_id=target["id"],
+            name="power",
+        )
+    # The failed rename must not leave the move half-applied.
+    assert service.get(
+        kb_name="kb", department_id="dept", directory_id=child["id"]
+    )["parent_id"] == source["id"]
+
+    moved = service.move(
+        kb_name="kb",
+        department_id="dept",
+        directory_id=child["id"],
+        parent_id=target["id"],
+        name="renamed",
+    )
+    assert moved["parent_id"] == target["id"]
+    assert moved["depth"] == 2
+    assert service.path_for_directory(
+        kb_name="kb", department_id="dept", directory_id=int(grandchild["id"])
+    ) == "target/renamed/rails"
+    assert service.get(
+        kb_name="kb", department_id="dept", directory_id=int(grandchild["id"])
+    )["depth"] == 3
+
+
+def test_recursive_delete_is_blocked_by_active_import(tmp_path):
+    store, service = _service(tmp_path)
+    folder = service.create(
+        kb_name="kb", department_id="dept", kb_id=7, parent_id=0,
+        name="docs", created_by="tester",
+    )
+    store.create_directory_import_job(
+        kb_id=7,
+        kb_name="kb",
+        department_id="dept",
+        directory_id=folder["id"],
+        created_by="tester",
+        files=[
+            {
+                "relative_path": "spec.pdf",
+                "directory_id": folder["id"],
+                "original_name": "spec.pdf",
+                "staged_path": str(tmp_path / "spec.pdf"),
+                "file_size": 1,
+            }
+        ],
+    )
+    result = delete_directory_tree(
+        store=store,
+        documents=None,
+        kb_name="kb",
+        department_id="dept",
+        directory_id=folder["id"],
+    )
+    assert result["ok"] is False
+    assert "正在进行的导入任务" in result["message"]
+    assert service.get(
+        kb_name="kb", department_id="dept", directory_id=folder["id"]
+    )["id"] == folder["id"]
+
+
+def test_recursive_delete_reports_directory_failure(tmp_path, monkeypatch):
+    store, service = _service(tmp_path)
+    folder = service.create(
+        kb_name="kb", department_id="dept", kb_id=7, parent_id=0,
+        name="docs", created_by="tester",
+    )
+    monkeypatch.setattr(store, "delete_directory", lambda *args, **kwargs: False)
+    result = delete_directory_tree(
+        store=store,
+        documents=None,
+        kb_name="kb",
+        department_id="dept",
+        directory_id=folder["id"],
+    )
+    assert result["ok"] is False
+    assert result["deleted_directories"] == 0
+    assert result["errors"]

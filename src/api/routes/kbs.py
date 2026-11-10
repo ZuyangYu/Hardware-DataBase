@@ -106,11 +106,20 @@ def list_files(
                 allowed_directory_ids = {int(directory_id)}
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        infos = pipeline.list_file_infos(
-            kb_name,
-            ctx=ctx,
-            directory_id=None if recursive else directory_id,
-        )
+        if recursive and allowed_directory_ids and 0 not in allowed_directory_ids:
+            infos = []
+            for current_id in sorted(allowed_directory_ids):
+                infos.extend(
+                    pipeline.list_file_infos(
+                        kb_name, ctx=ctx, directory_id=current_id
+                    )
+                )
+        else:
+            infos = pipeline.list_file_infos(
+                kb_name,
+                ctx=ctx,
+                directory_id=None if recursive else directory_id,
+            )
     else:
         allowed_directory_ids = None
         infos = pipeline.list_file_infos(kb_name, ctx=ctx)
@@ -178,6 +187,31 @@ def list_directories(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get(
+    "/kbs/{kb_name}/directories/{directory_id}",
+    response_model=DirectoryView,
+)
+def get_directory(
+    kb_name: str,
+    directory_id: int,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
+    if not ctx.has_kb_permission(kb_name, "read"):
+        raise HTTPException(status_code=403, detail="read permission required")
+    try:
+        return _directory_service(pipeline).get(
+            kb_name=kb_name,
+            department_id=_ctx_department_id(ctx),
+            directory_id=directory_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/kbs/{kb_name}/directories", response_model=DirectoryView)
 def create_directory(
     kb_name: str,
@@ -221,20 +255,13 @@ def rename_directory(
     try:
         directory_service = _directory_service(pipeline)
         if body.parent_id is not None:
-            moved = directory_service.move(
+            return directory_service.move(
                 kb_name=kb_name,
                 department_id=_ctx_department_id(ctx),
                 directory_id=directory_id,
                 parent_id=body.parent_id,
+                name=body.name,
             )
-            if body.name.strip() != moved["name"]:
-                moved = directory_service.rename(
-                    kb_name=kb_name,
-                    department_id=_ctx_department_id(ctx),
-                    directory_id=directory_id,
-                    name=body.name,
-                )
-            return moved
         return directory_service.rename(
             kb_name=kb_name,
             department_id=_ctx_department_id(ctx),

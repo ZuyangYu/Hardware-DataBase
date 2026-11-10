@@ -9,7 +9,10 @@ from src.agents.schemas import Evidence
 from src.pipelines.document_rag.base import RAGBackend
 from src.pipelines.document_store import PipelineDocumentStore
 from src.services.evidence_sources import with_source_metadata
-from src.services.pipeline_directories import document_relative_path
+from src.services.pipeline_directories import (
+    PipelineDirectoryService,
+    document_relative_path,
+)
 
 
 class ScopedEvidenceBatch(list):
@@ -225,7 +228,9 @@ def _convert_scoped_evidence(item) -> Evidence:
 def make_document_search(rt, rag_backend: RAGBackend, document_store: PipelineDocumentStore | None):
     """Return a ``document_search(query, top_k)`` tool closure."""
 
-    def run(query: str, top_k: int, target: str | None = None) -> list[Evidence]:
+    def _run_unscoped(
+        query: str, top_k: int, target: str | None = None
+    ) -> list[Evidence]:
         if rt.knowledge_scope is not None:
             service = getattr(rt, "multi_kb_retrieval", None)
             budget = getattr(rt, "retrieval_budget", None)
@@ -314,11 +319,67 @@ def make_document_search(rt, rag_backend: RAGBackend, document_store: PipelineDo
             )
         return evidences[:top_k]
 
-    def document_search(query: str, top_k: int = rt.top_k, target: str | None = None) -> str:
-        """在知识库中检索文档资料（Word/PDF/文本等），返回与查询最相关的证据片段。支持硬件设计文档、规范、说明书的语义检索。target 可选，用于限定本轮已解析的目标。"""
+    def _directory_ids(directory_id: int, recursive: bool) -> set[int] | None:
+        target = int(directory_id or 0)
+        if target <= 0:
+            return None
+        if not recursive or document_store is None:
+            return {target}
+        metadata = dict(getattr(getattr(rt, "ctx", None), "metadata", {}) or {})
+        department_id = str(
+            metadata.get("resource_department_id")
+            or metadata.get("department_id")
+            or ""
+        )
+        try:
+            return PipelineDirectoryService(store=document_store).descendant_ids(
+                kb_name=str(getattr(rt, "kb_name", "") or ""),
+                department_id=department_id,
+                directory_id=target,
+            )
+        except Exception:
+            return set()
+
+    def run(
+        query: str,
+        top_k: int,
+        target: str | None = None,
+        directory_id: int = 0,
+        recursive: bool = True,
+    ) -> list[Evidence]:
+        items = _run_unscoped(query, top_k, target)
+        allowed = _directory_ids(directory_id, recursive)
+        if allowed is None:
+            return items
+        return [
+            item
+            for item in items
+            if int((item.metadata or {}).get("directory_id", 0) or 0) in allowed
+        ]
+
+    def document_search(
+        query: str,
+        top_k: int = rt.top_k,
+        target: str | None = None,
+        directory_id: int = 0,
+        recursive: bool = True,
+    ) -> str:
+        """在知识库中检索文档资料（Word/PDF/文本等），返回与查询最相关的证据片段。支持硬件设计文档、规范、说明书的语义检索。target 可选，用于限定本轮已解析的目标；directory_id + recursive 可限定目录。"""
         from src.agents.tools.runtime import format_tool_result, timed_tool_call
 
-        items, adds_nothing = timed_tool_call(rt, "document_search", query, None, lambda: run(query, max(1, min(int(top_k), 20)), target))
+        items, adds_nothing = timed_tool_call(
+            rt,
+            "document_search",
+            query,
+            None,
+            lambda: run(
+                query,
+                max(1, min(int(top_k), 20)),
+                target,
+                directory_id=directory_id,
+                recursive=recursive,
+            ),
+        )
         return format_tool_result(rt, adds_nothing, items)
 
     # Keep the raw item path available to the unified search_documents tool;
@@ -339,7 +400,13 @@ def make_document_search_batch(
     """
     search = make_document_search(rt, rag_backend, document_store)
 
-    def document_search_batch(queries: list[str], top_k: int = rt.top_k, target: str | None = None) -> str:
+    def document_search_batch(
+        queries: list[str],
+        top_k: int = rt.top_k,
+        target: str | None = None,
+        directory_id: int = 0,
+        recursive: bool = True,
+    ) -> str:
         """并发检索多个相互独立的文档查询。适合中文/英文、型号/标题等查询变体；不要把有前后依赖的查询放在同一批。"""
         import src.settings as settings
 
@@ -406,7 +473,17 @@ def make_document_search_batch(
             with ThreadPoolExecutor(
                 max_workers=len(normalized), thread_name_prefix="hdb-document-search"
             ) as executor:
-                results = list(executor.map(lambda query: search(query, safe_top_k), normalized))
+                results = list(
+                    executor.map(
+                        lambda query: search(
+                            query,
+                            safe_top_k,
+                            directory_id=directory_id,
+                            recursive=recursive,
+                        ),
+                        normalized,
+                    )
+                )
             return "\n\n".join(result for result in results if result)
 
         from src.agents.tools.retrieval_executor import get_retrieval_executor
@@ -421,7 +498,12 @@ def make_document_search_batch(
         if getattr(rt, "should_cancel", None) is not None:
             cancel_check = lambda: bool(rt.should_cancel())  # noqa: E731
         call_results = get_retrieval_executor().map_bounded(
-            lambda query: search(query, safe_top_k),
+            lambda query: search(
+                query,
+                safe_top_k,
+                directory_id=directory_id,
+                recursive=recursive,
+            ),
             normalized,
             fanout=fanout_cap,
             deadline=float(getattr(settings, "RETRIEVAL_QUEUE_MAX_WAIT_SECONDS", 30.0)),

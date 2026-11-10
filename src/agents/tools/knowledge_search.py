@@ -10,6 +10,7 @@ agent can decide the next hop from gaps rather than from raw tool payloads.
 from __future__ import annotations
 
 from contextlib import nullcontext
+import inspect
 import time
 from typing import Any, Callable, Iterable
 
@@ -51,6 +52,26 @@ def _chunks(values: list[str], size: int) -> Iterable[list[str]]:
         yield values[index : index + size]
 
 
+def _call_scoped(
+    tool: Callable[..., Any],
+    *args: Any,
+    directory_id: int,
+    recursive: bool,
+    **kwargs: Any,
+) -> Any:
+    """Pass directory scope only to adapters that support it."""
+
+    try:
+        parameters = inspect.signature(tool).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "directory_id" in parameters:
+        kwargs["directory_id"] = directory_id
+    if "recursive" in parameters:
+        kwargs["recursive"] = recursive
+    return tool(*args, **kwargs)
+
+
 def _render_section(label: str, text: str) -> str:
     value = str(text or "").strip()
     if not value:
@@ -85,13 +106,17 @@ def make_knowledge_search(
         queries: list[str],
         source_types: list[str] | None = None,
         top_k: int = 6,
+        directory_id: int = 0,
+        recursive: bool = True,
     ) -> str:
         """一次检索多个查询和多个来源，返回候选指针与覆盖情况。
 
         queries 传 1-6 个相互独立的查询/型号/位号；source_types 可选
         document、grep、circuit、conversation、wiki、spreadsheet。
-        默认检索 document/grep/circuit。该工具只产生候选，正文仍需
-        evidence_read；适合需要多来源跳检的场景，避免逐个调用底层工具。
+        默认检索 document/grep/circuit。directory_id + recursive 可把
+        document/grep 限定到某个目录及其后代（结构化来源仍按知识库范围）。
+        该工具只产生候选，正文仍需 evidence_read；适合需要多来源跳检的
+        场景，避免逐个调用底层工具。
         """
         rt.check_cancel()
         requested_queries = _clean_queries(queries)
@@ -141,7 +166,13 @@ def make_knowledge_search(
                       chunks = list(_chunks(requested_queries, _DOCUMENT_BATCH))
                       if document_search_batch is not None:
                           for group in chunks:
-                              rendered = tool(group, top_k=limit)
+                              rendered = _call_scoped(
+                                  tool,
+                                  group,
+                                  top_k=limit,
+                                  directory_id=directory_id,
+                                  recursive=recursive,
+                              )
                               section = _render_section(
                                   "document: " + " / ".join(group), rendered
                               )
@@ -149,12 +180,24 @@ def make_knowledge_search(
                                   sections.append(section)
                       else:
                           for query in requested_queries[:_MAX_OPTIONAL_QUERIES]:
-                              rendered = tool(query, top_k=limit)
+                              rendered = _call_scoped(
+                                  tool,
+                                  query,
+                                  top_k=limit,
+                                  directory_id=directory_id,
+                                  recursive=recursive,
+                              )
                               section = _render_section(f"document: {query}", rendered)
                               if section:
                                   sections.append(section)
                   elif source == "grep":
-                      rendered = tool(requested_queries, max_hits=max(10, limit * 3))
+                      rendered = _call_scoped(
+                          tool,
+                          requested_queries,
+                          max_hits=max(10, limit * 3),
+                          directory_id=directory_id,
+                          recursive=recursive,
+                      )
                       section = _render_section("grep", rendered)
                       if section:
                           sections.append(section)

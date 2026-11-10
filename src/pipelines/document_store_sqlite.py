@@ -1,6 +1,7 @@
 ﻿import json
 import os
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from collections.abc import Sequence
 from contextlib import closing
 from typing import Any
@@ -29,6 +30,9 @@ def _fire_shadow_asset_hook(record_id: int | None) -> None:
 
 WORKER_STALE_SECONDS = 30 * 60
 WORKER_MAX_RETRIES = 3
+DIRECTORY_IMPORT_LEASE_SECONDS = max(
+    60, int(os.getenv("HDB_DIRECTORY_IMPORT_LEASE_SECONDS", "1800"))
+)
 TERMINAL_PARSE_STATUSES = {"parsed", "failed", "deleted", "indexed", "degraded"}
 
 
@@ -608,6 +612,71 @@ class PipelineDocumentStore:
                 """,
                 (int(parent_id), int(depth), int(directory_id), kb_name, department_id),
             )
+        return self.get_directory(directory_id, kb_name, department_id)
+
+    def move_directory_subtree(
+        self,
+        directory_id: int,
+        kb_name: str,
+        department_id: str | int,
+        *,
+        parent_id: int,
+        depth: int,
+        name: str | None = None,
+        normalized_name: str | None = None,
+        descendant_depths: dict[int, int] | None = None,
+    ) -> dict[str, Any] | None:
+        """Move/rename one directory and its subtree in a single transaction."""
+
+        department_id = _require_department_id(department_id, "directory move")
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                from src.storage.domain_pg import advisory_xact_lock
+
+                advisory_xact_lock(
+                    conn, f"directory-move:{kb_name}:{department_id}"
+                )
+                if name is not None and normalized_name is not None:
+                    conn.execute(
+                        """
+                        UPDATE pipeline_directories
+                        SET parent_id = ?, depth = ?, name = ?,
+                            normalized_name = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND kb_name = ? AND department_id = ?
+                        """,
+                        (
+                            int(parent_id), int(depth), name, normalized_name,
+                            int(directory_id), kb_name, department_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE pipeline_directories
+                        SET parent_id = ?, depth = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND kb_name = ? AND department_id = ?
+                        """,
+                        (
+                            int(parent_id), int(depth),
+                            int(directory_id), kb_name, department_id,
+                        ),
+                    )
+                for child_id, child_depth in (descendant_depths or {}).items():
+                    conn.execute(
+                        """
+                        UPDATE pipeline_directories
+                        SET depth = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND kb_name = ? AND department_id = ?
+                        """,
+                        (
+                            int(child_depth), int(child_id), kb_name, department_id,
+                        ),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         return self.get_directory(directory_id, kb_name, department_id)
 
     def update_directory_depth(
@@ -1361,6 +1430,23 @@ class PipelineDocumentStore:
     def claim_directory_import_file(self, worker_id: str) -> dict | None:
         """Claim one queued file while respecting its job cancellation flag."""
         with closing(self._connect()) as conn:
+            # A worker crash must not pin a staged file in ``uploading``
+            # forever.  Reclaim leases older than the configured window.
+            cutoff = (
+                datetime.now(timezone.utc)
+                - timedelta(seconds=DIRECTORY_IMPORT_LEASE_SECONDS)
+            ).strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                """
+                UPDATE directory_import_files
+                SET status = 'queued', worker_id = '',
+                    worker_started_at = '', updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'uploading'
+                  AND worker_started_at <> ''
+                  AND worker_started_at < ?
+                """,
+                (cutoff,),
+            )
             conn.execute(
                 """
                 UPDATE directory_import_files

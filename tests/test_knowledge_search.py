@@ -68,3 +68,37 @@ def test_knowledge_search_rejects_empty_queries():
     tool = make_knowledge_search(_runtime())
 
     assert "未提供有效查询" in tool(queries=[" ", ""], source_types=["grep"])
+
+
+def test_knowledge_search_passes_directory_scope_only_to_capable_adapters():
+    seen: list[tuple] = []
+
+    def document_batch(queries, top_k=6, directory_id=0, recursive=True):
+        seen.append(("document", directory_id, recursive))
+        return "DOC"
+
+    def grep(patterns, max_hits=20, directory_id=0, recursive=True):
+        seen.append(("grep", directory_id, recursive))
+        return "GREP"
+
+    def circuit(query, top_k=6):
+        seen.append(("circuit", None, None))
+        return "CIRCUIT"
+
+    tool = make_knowledge_search(
+        _runtime(),
+        document_search_batch=document_batch,
+        kb_grep=grep,
+        circuit_search=circuit,
+    )
+    tool(
+        queries=["spec"],
+        source_types=["document", "grep", "circuit"],
+        directory_id=7,
+        recursive=False,
+    )
+
+    assert ("document", 7, False) in seen
+    assert ("grep", 7, False) in seen
+    # Circuit adapters do not have a directory plane; they must not crash.
+    assert ("circuit", None, None) in seen
