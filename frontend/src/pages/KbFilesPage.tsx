@@ -2125,9 +2125,10 @@ function formatTaskTime(value?: number | null): string {
 }
 
 function folderRelativePath(file: File): string {
+  // Preserve the selected top-level folder name. Dropping it made a folder
+  // upload look like its contents had been dumped into the current directory.
   const raw = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
-  const segments = raw.split('/').filter(Boolean);
-  return (segments.length > 1 ? segments.slice(1) : segments).join('/');
+  return raw.split('/').filter(Boolean).join('/');
 }
 
 function sourceGroupForFile(file: File): string {
@@ -2135,7 +2136,9 @@ function sourceGroupForFile(file: File): string {
   const extension = name.includes('.') ? `.${name.split('.').pop()}` : '';
   if (extension === '.xlsx') return '物料数据';
   if (extension === '.edf' || extension === '.edif') return '设计数据';
-  if (extension === '.txt' || extension === '.md' || extension === '.markdown') return '外部数据';
+  // Markdown is normally a document, not an external chat transcript.
+  if (extension === '.md' || extension === '.markdown') return '文档资料';
+  if (extension === '.txt') return '外部数据';
   // Empty means the backend auto-classifies from the filename/extension.
   return '';
 }
