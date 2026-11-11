@@ -123,6 +123,63 @@ def test_upload_file_posts_multipart_and_returns_ack():
     assert "note.txt" in seen["body"]
     assert "hello" in seen["body"]
 
+
+def test_upload_file_relative_path_sends_manifest():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = request.read().decode("utf-8", "replace")
+        return httpx.Response(
+            200,
+            json={
+                "success_count": 1,
+                "total_count": 1,
+                "failed_count": 0,
+                "skipped_count": 0,
+                "status": "ok",
+            },
+        )
+
+    _use(handler)
+    bridge.upload_file(
+        "AAA",
+        "01-device-list.md",
+        base64.b64encode(b"# device list").decode(),
+        relative_path="hd_sloution/references/01-device-list.md",
+    )
+    assert '"relative_path": "hd_sloution/references/01-device-list.md"' in seen["body"]
+    assert '"index": 0' in seen["body"]
+
+
+def test_list_kb_files_passes_directory_scope():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "ragflow:79",
+                    "name": "SKILL.md",
+                    "status": "parsed",
+                    "directory_id": 21,
+                    "relative_path": "hd_sloution/SKILL.md",
+                }
+            ],
+        )
+
+    _use(handler)
+    rows = bridge.list_kb_files(
+        "AAA", directory_id=21, recursive=True, query="hd_sloution", limit=50
+    )
+    assert seen["params"]["directory_id"] == "21"
+    assert seen["params"]["recursive"] == "true"
+    assert seen["params"]["query"] == "hd_sloution"
+    assert seen["params"]["limit"] == "50"
+    assert rows[0]["file_id"] == "ragflow:79"
+    assert rows[0]["relative_path"] == "hd_sloution/SKILL.md"
+
 def test_list_tables_uses_department_scoped_database(monkeypatch):
     monkeypatch.setattr(
         bridge,
@@ -210,6 +267,59 @@ def test_download_kb_file_reads_archived_bytes(tmp_path, monkeypatch):
     result = bridge.download_kb_file("AAA", "f1")
     assert result["filename"] == "a.txt"
     assert base64.b64decode(result["content_base64"]) == b"hello archive"
+
+
+def test_download_kb_file_locates_by_filename_and_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        bridge,
+        "_visible_kb",
+        lambda _name: {"name": "AAA", "department_id": "1739", "permission": "read"},
+    )
+    monkeypatch.setattr(bridge, "_USERNAME", "aaa_admin")
+    archive = tmp_path / "pipeline_archives" / "departments" / "1739" / "kbs" / "AAA"
+    first = archive / "docs" / "a.txt"
+    second = archive / "other" / "a.txt"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    import src.settings as settings
+
+    monkeypatch.setattr(settings, "STORAGE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "src.core.auth.AuthService.get_user_by_username",
+        lambda self, _username: SimpleNamespace(id=4, username="aaa_admin", department_id="1739"),
+    )
+    monkeypatch.setattr(
+        "src.services.request_context.build_context_for_user",
+        lambda user, kb_name, auth=None: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "src.core.app_pipeline.AppPipeline.list_file_infos",
+        lambda self, kb_name, ctx=None: [
+            SimpleNamespace(
+                id="f1",
+                name="a.txt",
+                local_path="docs/a.txt",
+                metadata={"directory_id": 21, "relative_path": "docs/a.txt", "processor_kind": "ragflow", "status": "parsed"},
+            ),
+            SimpleNamespace(
+                id="f2",
+                name="a.txt",
+                local_path="other/a.txt",
+                metadata={"directory_id": 22, "relative_path": "other/a.txt", "processor_kind": "raw", "status": "raw_archived"},
+            ),
+        ],
+    )
+    result = bridge.download_kb_file(
+        "AAA", filename="a.txt", directory_id=22, include_text=True
+    )
+    assert result["file_id"] == "f2"
+    assert result["processor_kind"] == "raw"
+    assert base64.b64decode(result["content_base64"]) == b"second"
+    assert result["text"] == "second"
+    assert result["is_text"] is True
 
 
 def test_delete_file_is_dry_run_until_confirmed():
@@ -354,8 +464,9 @@ def test_search_knowledge_base_locators_and_cache():
     assert calls["chunks"] == 2
     assert first["files_searched"] == 2
     assert first["chunks_searched"] == 3
-    top = first["results"][0]
-    assert top["file_id"] == "f1"
+    assert first["result_count"] == 2
+    assert first["results"][0]["file_id"] in {"f1", "f2"}
+    top = next(row for row in first["results"] if row["file_id"] == "f1")
     assert top["chunk_index"] == 15
     assert top["rag_id"] == "aaa-15"
     assert top["score"] > 0
@@ -369,6 +480,37 @@ def test_search_knowledge_base_locators_and_cache():
     assert all(row["file_id"] == "f2" for row in narrowed["results"])
 
     bridge._CHUNK_CACHE.clear()
+
+
+def test_search_knowledge_base_returns_raw_file_matches():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/kbs/AAA/files":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "ragflow:118",
+                        "name": "_audit.py",
+                        "relative_path": "hd_sloution/scripts/checks/_audit.py",
+                        "status": "raw_archived",
+                        "processor_kind": "raw_file",
+                        "directory_id": 30,
+                    }
+                ],
+            )
+        if request.url.path == "/api/v1/kbs/AAA/semantic-search":
+            return httpx.Response(200, json={"results": [], "result_count": 0})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    _use(handler)
+    result = bridge.search_knowledge_base("AAA", "_audit.py", top_k=5)
+    assert result["results"] == []
+    assert result["raw_file_matches"][0]["file_id"] == "ragflow:118"
+    assert result["raw_file_matches"][0]["matched_by"] == "filename"
+    assert "download_kb_file" in result["hint"]
+
+    missing = bridge.search_knowledge_base("AAA", "label_path_dist", top_k=5)
+    assert missing["raw_file_matches"] == []
 
 
 def test_download_kb_file_falls_back_to_kb_owner(monkeypatch, tmp_path):
@@ -590,6 +732,8 @@ def test_http_allowed_hosts_merge_extra_patterns(monkeypatch):
 
 
 def test_search_knowledge_base_exact_mode_uses_grep():
+    bridge._CHUNK_CACHE.clear()
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v1/kbs/AAA/files":
             return httpx.Response(200, json=[{"id": "f1", "name": "HSI.docx", "status": "parsed"}])
@@ -707,7 +851,14 @@ def test_delete_file_passes_directory_scope():
     assert seen["directory_id"] == "7"
 
 
-def test_search_knowledge_base_semantic_uses_platform_endpoint():
+def test_search_knowledge_base_rejects_removed_modes():
+    with pytest.raises(ValueError, match="auto, exact, hybrid"):
+        bridge.search_knowledge_base("AAA", "x", mode="semantic")
+    with pytest.raises(ValueError, match="auto, exact, hybrid"):
+        bridge.search_knowledge_base("AAA", "x", mode="lexical")
+
+
+def test_search_knowledge_base_hybrid_uses_platform_endpoint():
     seen = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -720,7 +871,7 @@ def test_search_knowledge_base_semantic_uses_platform_endpoint():
                 json={
                     "kb_name": "AAA",
                     "query": "电源树",
-                    "mode": "semantic",
+                    "mode": "hybrid",
                     "status": "success_with_hits",
                     "results": [
                         {
@@ -738,9 +889,9 @@ def test_search_knowledge_base_semantic_uses_platform_endpoint():
 
     _use(handler)
     result = bridge.search_knowledge_base(
-        "AAA", "电源树", mode="semantic", top_k=3, kind="document"
+        "AAA", "电源树", mode="hybrid", top_k=3, kind="document"
     )
-    assert result["mode"] == "semantic"
+    assert result["mode"] == "hybrid"
     assert result["result_count"] == 1
     assert result["results"][0]["file_id"] == "ragflow:37"
     assert seen["body"]["directory_id"] == 0

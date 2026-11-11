@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import json
+import mimetypes
 import os
 import time
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -32,10 +35,14 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from src.services.knowledge_retrieval import (
     clip as _clip,
-    grep_chunks,
-    lexical_search,
-    looks_like_exact_term,
     read_chunks,
+)
+
+from src.services.document_search import (
+    SUPPORTED_KINDS,
+    SUPPORTED_MODES,
+    DocumentSearchRequest,
+    search_documents as run_document_search,
 )
 
 
@@ -256,12 +263,33 @@ def list_kbs() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-def list_kb_files(kb_name: str) -> list[dict[str, Any]]:
-    """List source files in one knowledge base."""
-    rows = _request("GET", f"/kbs/{_kb_path(kb_name)}/files")
+def list_kb_files(
+    kb_name: str,
+    directory_id: int | None = None,
+    recursive: bool = False,
+    query: str = "",
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """List source files in one knowledge base.
+
+    ``directory_id`` scopes the listing to one directory; set ``recursive`` to
+    include descendants.  ``query`` filters by relative path.
+    """
+    params: dict[str, Any] = {
+        "limit": int(limit),
+        "offset": int(offset),
+    }
+    if directory_id is not None:
+        params["directory_id"] = int(directory_id)
+        params["recursive"] = bool(recursive)
+    if str(query or "").strip():
+        params["query"] = str(query).strip()
+    rows = _request("GET", f"/kbs/{_kb_path(kb_name)}/files", params=params)
     return [
         {
             "id": row.get("id", ""),
+            "file_id": row.get("id", ""),
             "name": row.get("name", ""),
             "status": row.get("status", ""),
             "processor_kind": row.get("processor_kind", ""),
@@ -548,36 +576,6 @@ def _semantic_search(
     )
 
 
-def _structured_skips(
-    rows: list[dict[str, Any]],
-    allowed_directory_ids: set[int] | None,
-    file_id: str,
-) -> list[dict[str, str]]:
-    skipped: list[dict[str, str]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        fid = str(row.get("id") or "")
-        fid_name = str(row.get("relative_path") or row.get("name") or "")
-        if file_id and fid != file_id and fid_name != file_id and str(row.get("name") or "") != file_id:
-            continue
-        if allowed_directory_ids is not None and int(
-            row.get("directory_id") or 0
-        ) not in allowed_directory_ids:
-            continue
-        processor = str(row.get("processor_kind") or "")
-        if processor and processor != "ragflow":
-            skipped.append(
-                {
-                    "file_id": fid,
-                    "file_name": fid_name,
-                    "kind": processor,
-                    "reason": "use query_table/query_circuit for structured sources",
-                }
-            )
-    return skipped
-
-
 @mcp.tool()
 def search_knowledge_base(
     kb_name: str,
@@ -585,7 +583,7 @@ def search_knowledge_base(
     top_k: int = 8,
     file_id: str = "",
     refresh: bool = False,
-    mode: str = "auto",
+    mode: Literal["auto", "exact", "hybrid"] = "auto",
     kind: str = "document",
     directory_id: int = 0,
     recursive: bool = True,
@@ -593,160 +591,155 @@ def search_knowledge_base(
     """Stateless search over one KB's parsed chunks (no session).
 
     ``mode``: ``auto`` (default) detects exact refdes/part/net ids and uses
-    literal grep, otherwise the platform RAGFlow semantic endpoint with a
-    lexical fallback; ``exact`` forces literal grep; ``semantic`` forces the
-    platform semantic endpoint; ``lexical`` forces local lexical ranking.
+    literal grep; otherwise it runs fast IDF-weighted lexical retrieval, and
+    only escalates to RAGFlow semantic fusion when lexical confidence is low.
+    ``hybrid`` forces semantic + lexical fusion; ``exact`` forces literal
+    grep.  These are the only three supported modes.
     ``kind``: ``document`` (default), ``table``, ``circuit`` or ``all``.
     ``directory_id`` + ``recursive`` restrict the search to a directory and,
     when recursive, its descendants.  Results are chunk locators (file / index
-    / rag_id) with snippet + score;
-    read the text with ``hdb_read_file_chunks``.  The chunk index is cached
-    per file (~15 min TTL, ``refresh=True`` forces a rebuild).
+    / rag_id) with snippet + score; read the text with
+    ``hdb_read_file_chunks``.  Unparsed files are returned separately in
+    ``raw_file_matches`` (filename/path match only) with a hint to use
+    ``download_kb_file(include_text=true)``.  ``kind=table`` returns the
+    materialized table list and points to ``query_table``.  The chunk index is
+    cached per file (~15 min TTL, ``refresh=True`` forces a rebuild).
     """
     needle = str(query or "").strip()
     if not needle:
         raise ValueError("query is required")
-    rows = _request("GET", f"/kbs/{_kb_path(kb_name)}/files")
-    allowed_directory_ids = _directory_scope(kb_name, directory_id, recursive)
     wanted = str(kind or "document").strip().lower()
-    if wanted not in {"document", "table", "circuit", "all"}:
+    if wanted not in SUPPORTED_KINDS:
         wanted = "document"
     plane = str(mode or "auto").strip().lower()
-    exact = plane == "exact" or (
-        plane == "auto" and looks_like_exact_term(needle)
-    )
-    if not exact and wanted in {"document", "all"}:
-        try:
-            semantic = _semantic_search(
-                kb_name, needle, top_k, directory_id, recursive, file_id
-            )
-        except Exception as exc:  # noqa: BLE001 - explicit semantic reports, auto falls back
-            if plane == "semantic":
-                return {
-                    "kb_name": kb_name,
-                    "query": needle,
-                    "kind": wanted,
-                    "mode": "semantic",
-                    "directory_id": int(directory_id or 0),
-                    "recursive": bool(recursive),
-                    "results": [],
-                    "result_count": 0,
-                    "files_searched": 0,
-                    "chunks_searched": 0,
-                    "skipped_files": [],
-                    "error": str(exc)[:300],
-                    "note": "semantic retrieval failed; check the platform RAGFlow backend",
-                }
-            semantic = None
-        if semantic is not None and (
-            int(semantic.get("result_count") or 0) > 0 or plane == "semantic"
-        ):
-            semantic["kind"] = wanted
-            semantic["skipped_files"] = (
-                _structured_skips(rows, allowed_directory_ids, file_id)
-                if wanted == "all"
-                else []
-            )
-            semantic["cache_files"] = len(_CHUNK_CACHE)
-            return semantic
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    skipped: list[dict[str, str]] = []
-    files_searched = 0
-    chunks_searched = 0
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        fid = str(row.get("id") or "")
-        fid_name = str(row.get("relative_path") or row.get("name") or "")
-        if file_id and fid != file_id and fid_name != file_id and str(row.get("name") or "") != file_id:
-            continue
-        row_directory_id = int(row.get("directory_id") or 0)
-        if allowed_directory_ids is not None and row_directory_id not in allowed_directory_ids:
-            continue
-        processor = str(row.get("processor_kind") or "")
-        if wanted == "document" and processor and processor != "ragflow":
-            continue
-        if wanted == "table" and "spreadsheet" not in processor:
-            continue
-        if wanted == "circuit" and "circuit" not in processor:
-            continue
-        if wanted in {"table", "circuit"} or (
-            wanted == "all" and processor and processor != "ragflow"
-        ):
-            # Structured sources are not chunk streams.  `kind=all` still
-            # searches documents and reports the skipped files so the caller
-            # can switch to query_table/query_circuit for those rows.
-            skipped.append(
-                {
-                    "file_id": fid,
-                    "file_name": fid_name,
-                    "kind": processor or wanted,
-                    "reason": "use query_table/query_circuit for structured sources",
-                }
-            )
-            continue
-        try:
-            cache = _load_chunks(kb_name, fid, refresh)
-        except Exception as exc:  # noqa: BLE001 - one bad file must not kill the search
-            skipped.append(
-                {
-                    "file_id": fid,
-                    "file_name": fid_name,
-                    "kind": processor,
-                    "reason": str(exc)[:200],
-                }
-            )
-            continue
-        grouped[(fid, fid_name)] = list(cache.get("chunks") or [])
-        files_searched += 1
-        chunks_searched += len(cache.get("chunks") or [])
-    if exact:
-        results = grep_chunks(grouped, [needle], max_hits=max(1, min(int(top_k or 8), 50)))
-        used = "exact"
-    else:
-        results = lexical_search(
-            grouped, needle, top_k=max(1, min(int(top_k or 8), 50))
+    if plane not in SUPPORTED_MODES:
+        raise ValueError("mode must be one of: auto, exact, hybrid")
+    if wanted == "table":
+        tables = list_tables(
+            kb_name, directory_id=directory_id, recursive=recursive
         )
-        # The stateless bridge has no RAGFlow semantic endpoint; be explicit
-        # instead of pretending lexical ranking is semantic retrieval.
-        used = "lexical"
-    return {
+        return {
+            "kb_name": kb_name,
+            "query": needle,
+            "kind": wanted,
+            "mode": "table",
+            "route": "table",
+            "directory_id": int(directory_id or 0),
+            "recursive": bool(recursive),
+            "results": [],
+            "result_count": 0,
+            "raw_file_matches": [],
+            "tables": tables.get("tables", []),
+            "hint": (
+                "table cells are not in the document chunk index; "
+                "use list_tables + query_table"
+            ),
+        }
+
+    rows = _request("GET", f"/kbs/{_kb_path(kb_name)}/files")
+    allowed_directory_ids = _directory_scope(kb_name, directory_id, recursive)
+
+    def _scoped_rows() -> list[dict[str, Any]]:
+        scoped: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            fid = str(row.get("id") or "")
+            fid_name = str(row.get("relative_path") or row.get("name") or "")
+            if file_id and (
+                fid != file_id
+                and fid_name != file_id
+                and str(row.get("name") or "") != file_id
+            ):
+                continue
+            if (
+                allowed_directory_ids is not None
+                and int(row.get("directory_id") or 0) not in allowed_directory_ids
+            ):
+                continue
+            scoped.append(row)
+        return scoped
+
+    scoped_rows = _scoped_rows()
+
+    class _Backend:
+        def list_files(self) -> list[dict[str, Any]]:
+            return scoped_rows
+
+        def load_chunks(self, row_file_id: str) -> list[dict[str, Any]]:
+            return list(
+                _load_chunks(kb_name, row_file_id, refresh).get("chunks") or []
+            )
+
+        def semantic_search(
+            self, query_text: str, limit: int
+        ) -> list[dict[str, Any]]:
+            payload = _semantic_search(
+                kb_name,
+                query_text,
+                limit,
+                directory_id,
+                recursive,
+                file_id,
+            )
+            return list((payload or {}).get("results") or [])
+
+    outcome = run_document_search(
+        _Backend(),
+        DocumentSearchRequest(
+            query=needle,
+            top_k=top_k,
+            mode=plane,
+            kind=wanted,
+            file_id=file_id,
+        ),
+    )
+    payload = {
         "kb_name": kb_name,
         "query": needle,
         "kind": wanted,
-        "mode": used,
         "directory_id": int(directory_id or 0),
         "recursive": bool(recursive),
-        "results": results,
-        "result_count": len(results),
-        "files_searched": files_searched,
-        "chunks_searched": chunks_searched,
-        "skipped_files": skipped,
         "cache_files": len(_CHUNK_CACHE),
-        "note": (
-            "lexical/exact score over document chunks; read hits with "
-            "read_file_chunks(file_id, start_index). Structured files are "
-            "listed in skipped_files; use query_table/query_circuit for them."
-        ),
+        **outcome.as_dict(),
     }
+    if outcome.raw_file_matches:
+        payload["hint"] = (
+            "raw files matched by filename/path. "
+            "Use download_kb_file(file_id, include_text=true) to read them."
+        )
+    return payload
 
 
 @mcp.tool()
 def download_kb_file(
     kb_name: str,
-    file_id: str,
+    file_id: str = "",
+    filename: str = "",
+    directory_id: int | None = None,
     max_bytes: int = 20 * 1024 * 1024,
+    include_text: bool = False,
 ) -> dict[str, Any]:
-    """Download one original source file as base64 (requires KB read access).
+    """Read the original uploaded file as base64 (requires KB read access).
 
-    Large files are rejected rather than silently truncated.  The caller is
-    responsible for decoding ``content_base64`` and saving it locally.
+    This works for every stored file, including ``raw_archived`` types that
+    have no parser (``.py``, ``.drawio``, archives, ...).  Locate the file by
+    ``file_id``, or by ``filename`` optionally scoped to ``directory_id``.
+    Large files are rejected rather than silently truncated; the caller is
+    responsible for decoding ``content_base64``.
+
+    Set ``include_text=true`` to also receive a UTF-8 preview for text files.
     """
     kb = _visible_kb(kb_name)
     from src import settings as app_settings
     from src.services.request_context import build_context_for_user
     from src.core.app_pipeline import AppPipeline
     from src.core.auth import AuthService
+
+    file_id = str(file_id or "").strip()
+    filename = str(filename or "").strip()
+    if not file_id and not filename:
+        raise ValueError("file_id or filename is required")
 
     auth = AuthService()
     username = str(_current_user().get("username") or _USERNAME or "").strip()
@@ -766,20 +759,44 @@ def download_kb_file(
         )
     ctx = build_context_for_user(user, kb_name, auth=auth)
     infos = AppPipeline().list_file_infos(kb_name, ctx=ctx)
-    info = next(
-        (
-            item
-            for item in infos
-            if str(getattr(item, "id", "")) == str(file_id)
-            or str(getattr(item, "name", "")) == str(file_id)
-        ),
-        None,
-    )
-    if info is None:
-        raise RuntimeError(f"file not found: {file_id}")
+
+    def _metadata(info: Any) -> dict[str, Any]:
+        value = getattr(info, "metadata", {}) or {}
+        return value if isinstance(value, dict) else {}
+
+    candidates = []
+    for info in infos:
+        info_id = str(getattr(info, "id", ""))
+        info_name = str(getattr(info, "name", ""))
+        meta = _metadata(info)
+        relative_path = str(meta.get("relative_path") or "")
+        if file_id:
+            if info_id == file_id or info_name == file_id:
+                candidates.append(info)
+            continue
+        if not (
+            info_name == filename
+            or relative_path == filename
+            or relative_path.endswith("/" + filename)
+        ):
+            continue
+        if directory_id is not None and int(
+            meta.get("directory_id") or 0
+        ) != int(directory_id):
+            continue
+        candidates.append(info)
+    if not candidates:
+        locator = file_id or filename
+        raise RuntimeError(f"file not found: {locator}")
+    if len(candidates) > 1:
+        raise RuntimeError(
+            "file locator is ambiguous; pass file_id or a directory_id"
+        )
+    info = candidates[0]
+    meta = _metadata(info)
     local_path = str(getattr(info, "local_path", "") or "")
     if not local_path:
-        raise RuntimeError(f"file has no local archive: {file_id}")
+        raise RuntimeError(f"file has no local archive: {file_id or filename}")
     department = _department_id(kb)
     base = os.path.abspath(
         os.path.join(
@@ -796,7 +813,7 @@ def download_kb_file(
     if path != base and base not in path:
         raise RuntimeError("file path escapes the knowledge-base archive")
     if not os.path.isfile(path):
-        raise RuntimeError(f"file archive is missing: {file_id}")
+        raise RuntimeError(f"file archive is missing: {file_id or filename}")
     limit = max(1, min(int(max_bytes or 20 * 1024 * 1024), 100 * 1024 * 1024))
     size = os.path.getsize(path)
     if size > limit:
@@ -805,16 +822,31 @@ def download_kb_file(
         data = handle.read(limit + 1)
     if len(data) > limit:
         raise ValueError(f"file exceeds max_bytes={limit}")
-    return {
+    name = str(getattr(info, "name", filename or file_id))
+    content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    result = {
         "file_id": str(getattr(info, "id", file_id)),
-        "filename": str(getattr(info, "name", file_id)),
-        "relative_path": str(
-            (getattr(info, "metadata", {}) or {}).get("relative_path")
-            or getattr(info, "name", file_id)
-        ),
+        "filename": name,
+        "relative_path": str(meta.get("relative_path") or name),
         "size_bytes": len(data),
+        "content_type": content_type,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "processor_kind": str(meta.get("processor_kind") or ""),
+        "status": str(meta.get("status") or getattr(info, "status", "") or ""),
         "content_base64": base64.b64encode(data).decode("ascii"),
     }
+    try:
+        probe = data[:4096]
+        is_text = b"\x00" not in probe
+        probe.decode("utf-8")
+    except UnicodeDecodeError:
+        is_text = False
+    result["is_text"] = is_text
+    if include_text:
+        text = data.decode("utf-8", errors="replace") if is_text else ""
+        result["text"] = text[:_MAX_TOOL_TEXT]
+        result["text_truncated"] = len(text) > _MAX_TOOL_TEXT
+    return result
 
 
 def _record_id_from_file_row(row: dict[str, Any]) -> int:
@@ -1043,12 +1075,17 @@ def upload_file(
     content_base64: str,
     source_group: str = "",
     directory_id: int = 0,
+    relative_path: str = "",
 ) -> dict[str, Any]:
     """Upload one file into a knowledge base (requires write permission).
 
     ``content_base64`` is the standard base64 encoding of the file bytes.  The
     platform applies the caller's write permission, audit and parsing pipeline;
     this is a real write, not a proposal.
+
+    ``relative_path`` optionally preserves a folder path below
+    ``directory_id`` (for example ``hd_sloution/references/01.md``); missing
+    directories are created automatically.
     """
     if not str(filename or "").strip():
         raise ValueError("filename is required")
@@ -1064,6 +1101,12 @@ def upload_file(
     form = {"directory_id": str(int(directory_id or 0))}
     if str(source_group or "").strip():
         form["source_group"] = source_group
+    relative = str(relative_path or "").strip().replace("\\", "/").lstrip("/")
+    if relative:
+        form["manifest"] = json.dumps(
+            {"entries": [{"index": 0, "relative_path": relative}]},
+            ensure_ascii=False,
+        )
     return _request(
         "POST", f"/kbs/{_kb_path(kb_name)}/files", files=files, data=form
     )

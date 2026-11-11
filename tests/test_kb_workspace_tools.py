@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+
+import pytest
 from types import SimpleNamespace
 
 from src.agents.schemas import Evidence
@@ -89,6 +91,24 @@ def _table_record():
         status="indexed",
         content_hash="hash-29",
         source_group="ICD",
+    )
+
+
+def _raw_record():
+    return SimpleNamespace(
+        id=118,
+        kb_id=4,
+        kb_name="AAA",
+        department_id="1739",
+        document_id="raw:118",
+        original_file_name="_audit.py",
+        document_name="_audit.py",
+        content_kind="raw_file",
+        processor_kind="raw_file",
+        status="raw_archived",
+        content_hash="hash-118",
+        source_group="未分类",
+        directory_id=30,
     )
 
 
@@ -179,17 +199,34 @@ def test_search_documents_auto_detects_exact_term():
     assert payload["result_count"] == 1
 
 
-def test_search_documents_semantic_uses_document_search_runner():
+def test_search_documents_auto_fast_path_and_raw_fallback():
     semantic = _Semantic()
-    _, (search, read, files) = _tools(semantic=semantic)
+    _, (search, read, files) = _tools(
+        semantic=semantic, records=[_record(), _raw_record()]
+    )
 
-    payload = json.loads(search("TCN2 电源树", mode="semantic", top_k=5))
+    auto = json.loads(search("DEBUG CONNECTOR JTAG", top_k=5))
+    assert auto["mode"] == "auto"
+    assert auto["route"] == "lexical"
+    assert auto["results"][0]["file_id"] == "36"
+    assert semantic.calls == 0
 
-    assert payload["mode"] == "semantic"
+    hybrid = json.loads(search("TCN2 电源树", mode="hybrid", top_k=5))
+    assert hybrid["mode"] == "hybrid"
+    assert hybrid["route"] == "hybrid"
+    assert hybrid["results"][0]["file_id"] == "36"
     assert semantic.calls == 1
-    assert payload["result_count"] == 1
-    assert payload["results"][0]["file_id"] == "36"
-    assert payload["results"][0]["rag_id"] == "rag-9"
+
+    raw = json.loads(search("_audit.py", top_k=5))
+    assert raw["raw_file_matches"][0]["file_id"] == "118"
+    assert raw["raw_file_matches"][0]["status"] == "raw_archived"
+    assert "raw files matched by filename/path" in raw["hint"]
+
+def test_search_documents_rejects_removed_modes():
+    _, (search, read, files) = _tools()
+
+    with pytest.raises(ValueError, match="auto, exact, hybrid"):
+        search("TCN2 电源树", mode="semantic", top_k=5)
 
 
 def test_read_document_returns_text_and_registers_evidence():
