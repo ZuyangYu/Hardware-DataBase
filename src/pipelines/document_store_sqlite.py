@@ -859,6 +859,8 @@ class PipelineDocumentStore:
                 effective_from,
                 effective_to,
                 usage_type,
+                "",  # worker_id
+                0,  # retry_count
             )
             if existing_rows:
                 # Do not rely on a particular SQLite UNIQUE index here.  Some
@@ -901,7 +903,7 @@ class PipelineDocumentStore:
                     error_message, ragflow_error, parse_progress, parse_stage,
                     asset_id, logical_document_id, source_version_id, project_id, document_role,
                     module_scope_json, revision, approval_status, effective_from, effective_to, usage_type,
-                    parse_started_at
+                    worker_id, retry_count, parse_started_at
                 )
                 VALUES ({insert_placeholders})
                 """,
@@ -1886,8 +1888,8 @@ class PipelineDocumentStore:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE processor_kind IN ({processor_placeholders})
                   AND status IN ('{TABLE_STATUS_ARCHIVED}', '{TASK_STATUS_QUEUED}')
-                  AND worker_id = ''
-                  AND retry_count >= ?
+                  AND COALESCE(worker_id, '') = ''
+                  AND COALESCE(retry_count, 0) >= ?
                 """,
                 (TASK_STATUS_DEAD_LETTER, TASK_STATUS_DEAD_LETTER, *processor_kinds, max_retries),
             )
@@ -1896,8 +1898,8 @@ class PipelineDocumentStore:
                 SELECT * FROM pipeline_documents
                 WHERE processor_kind IN ({processor_placeholders})
                   AND status IN ('{TABLE_STATUS_ARCHIVED}', '{TASK_STATUS_QUEUED}')
-                  AND worker_id = ''
-                  AND retry_count < ?
+                  AND COALESCE(worker_id, '') = ''
+                  AND COALESCE(retry_count, 0) < ?
                 ORDER BY updated_at, id
                 LIMIT 1
                 """,
@@ -1913,13 +1915,13 @@ class PipelineDocumentStore:
                     worker_started_at = CURRENT_TIMESTAMP,
                     worker_heartbeat_at = CURRENT_TIMESTAMP,
                     parse_started_at = CURRENT_TIMESTAMP,
-                    retry_count = retry_count + 1,
+                    retry_count = COALESCE(retry_count, 0) + 1,
                     status = '{TABLE_STATUS_PROCESSING}',
                     upload_status = '{TABLE_STATUS_PROCESSING}',
                     parse_progress = CASE WHEN parse_progress < 10 THEN 10 ELSE parse_progress END,
                     parse_stage = '准备解析 Excel',
                     updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND worker_id = ''
+                WHERE id = ? AND COALESCE(worker_id, '') = ''
                 """,
                 (worker_id, record_id),
             )

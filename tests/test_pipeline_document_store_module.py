@@ -207,6 +207,16 @@ class PipelineDocumentStoreModuleTests(unittest.TestCase):
 
             conn = sqlite3.connect(db_path)
             try:
+                row = conn.execute(
+                    "SELECT worker_id, retry_count FROM pipeline_documents "
+                    "WHERE document_name = 'sheet.xlsx'"
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(row, ("", 0))
+
+            conn = sqlite3.connect(db_path)
+            try:
                 conn.execute(
                     """
                     UPDATE pipeline_documents
