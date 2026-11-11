@@ -22,6 +22,7 @@ import base64
 import binascii
 import os
 import time
+from contextvars import ContextVar
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -97,6 +98,10 @@ _MCP_TOKEN = os.getenv("HDB_MCP_TOKEN", "").strip()
 _USERNAME = os.getenv("HDB_USERNAME", "").strip()
 _PASSWORD = os.getenv("HDB_PASSWORD", "")
 
+_REQUEST_MCP_TOKEN: ContextVar[str] = ContextVar("hdb_mcp_request_token", default="")
+_REQUEST_BEARER: ContextVar[str] = ContextVar("hdb_mcp_request_bearer", default="")
+_REQUEST_USER: ContextVar[dict[str, Any]] = ContextVar("hdb_mcp_request_user", default={})
+
 _MAX_TOOL_TEXT = 20_000
 _MAX_ROWS = 50
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024
@@ -147,7 +152,42 @@ def _token() -> str:
     )
 
 
+def _exchange_mcp_token(
+    token: str, *, force: bool = False
+) -> tuple[str, dict[str, Any]] | None:
+    """Exchange a per-user hdbmcp_* token for a bearer and user identity."""
+
+    now = time.monotonic()
+    if not force:
+        cached = _HTTP_AUTH_CACHE.get(token)
+        if cached and now < cached[0]:
+            return cached[1], cached[2]
+    response = _client().post(
+        f"{_API_BASE}/mcp/session",
+        headers={"X-HDB-MCP-Token": token},
+    )
+    if response.status_code >= 400:
+        _HTTP_AUTH_CACHE.pop(token, None)
+        return None
+    payload = response.json() or {}
+    bearer = str(payload.get("token") or "")
+    if not bearer:
+        return None
+    user = payload.get("user")
+    user = dict(user) if isinstance(user, dict) else {}
+    if len(_HTTP_AUTH_CACHE) > 1000:
+        for stale in sorted(
+            _HTTP_AUTH_CACHE.items(), key=lambda item: item[1][0]
+        )[:32]:
+            _HTTP_AUTH_CACHE.pop(stale[0], None)
+    _HTTP_AUTH_CACHE[token] = (now + 900.0, bearer, user)
+    return bearer, user
+
+
 def _headers() -> dict[str, str]:
+    request_bearer = _REQUEST_BEARER.get()
+    if request_bearer:
+        return {"Authorization": f"Bearer {request_bearer}"}
     if _MCP_TOKEN:
         return {"Authorization": f"Bearer {_token()}"}
     if _API_KEY:
@@ -160,12 +200,25 @@ def _request(method: str, path: str, **kwargs: Any) -> Any:
     response = _client().request(
         method, f"{_API_BASE}{path}", headers=_headers(), **kwargs
     )
-    if response.status_code == 401 and _MCP_TOKEN:
-        # The short-lived exchange token may have expired; refresh once.
-        _TOKEN = ""
-        response = _client().request(
-            method, f"{_API_BASE}{path}", headers=_headers(), **kwargs
-        )
+    if response.status_code == 401:
+        # The short-lived exchange token may have expired.  In HTTP mode the
+        # original per-user hdbmcp_* token is available in the request context;
+        # in stdio mode fall back to the configured process token.
+        request_token = _REQUEST_MCP_TOKEN.get()
+        if request_token:
+            exchanged = _exchange_mcp_token(request_token, force=True)
+            if exchanged is not None:
+                bearer, user = exchanged
+                _REQUEST_BEARER.set(bearer)
+                _REQUEST_USER.set(user)
+                response = _client().request(
+                    method, f"{_API_BASE}{path}", headers=_headers(), **kwargs
+                )
+        elif _MCP_TOKEN:
+            _TOKEN = ""
+            response = _client().request(
+                method, f"{_API_BASE}{path}", headers=_headers(), **kwargs
+            )
     if response.status_code >= 400:
         raise RuntimeError(
             f"HDB API {response.status_code}: {response.text[:300]}"
@@ -187,8 +240,13 @@ def _visible_kb(kb_name: str) -> dict[str, Any]:
     raise RuntimeError(f"knowledge base not visible to this account: {name}")
 
 
+def _current_user() -> dict[str, Any]:
+    user = dict(_REQUEST_USER.get() or {})
+    return user or _LOGIN_USER
+
+
 def _department_id(kb: dict[str, Any]) -> str:
-    return str(kb.get("department_id") or _LOGIN_USER.get("department_id") or "")
+    return str(kb.get("department_id") or _current_user().get("department_id") or "")
 
 
 @mcp.tool()
@@ -691,7 +749,7 @@ def download_kb_file(
     from src.core.auth import AuthService
 
     auth = AuthService()
-    username = str(_LOGIN_USER.get("username") or _USERNAME or "").strip()
+    username = str(_current_user().get("username") or _USERNAME or "").strip()
     user = auth.get_user_by_username(username) if username else None
     if user is None:
         # API-key deployments carry no session identity: fall back to the
@@ -1154,7 +1212,7 @@ def query_circuit(
     }
 
 
-_HTTP_AUTH_CACHE: dict[str, tuple[float, str]] = {}
+_HTTP_AUTH_CACHE: dict[str, tuple[float, str, dict[str, Any]]] = {}
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
@@ -1199,25 +1257,20 @@ class _McpTokenAuthMiddleware:
         if not token.startswith("hdbmcp_"):
             await _json_401(send, "X-HDB-MCP-Token hdbmcp_* header required")
             return
-        cached = _HTTP_AUTH_CACHE.get(token)
-        now = time.monotonic()
-        if not (cached and now < cached[0]):
-            response = _client().post(
-                f"{_API_BASE}/mcp/session",
-                headers={"X-HDB-MCP-Token": token},
-            )
-            if response.status_code >= 400:
-                await _json_401(send, f"mcp token rejected ({response.status_code})")
-                return
-            bearer = (response.json() or {}).get("token") or ""
-            if not bearer:
-                await _json_401(send, "mcp token exchange returned no bearer")
-                return
-            if len(_HTTP_AUTH_CACHE) > 1000:
-                for stale in sorted(_HTTP_AUTH_CACHE.items(), key=lambda item: item[1][0])[:32]:
-                    _HTTP_AUTH_CACHE.pop(stale[0], None)
-            _HTTP_AUTH_CACHE[token] = (now + 900.0, bearer)
-        await self.app(scope, receive, send)
+        exchanged = _exchange_mcp_token(token)
+        if exchanged is None:
+            await _json_401(send, "mcp token rejected")
+            return
+        bearer, user = exchanged
+        token_ctx = _REQUEST_MCP_TOKEN.set(token)
+        bearer_ctx = _REQUEST_BEARER.set(bearer)
+        user_ctx = _REQUEST_USER.set(user)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _REQUEST_USER.reset(user_ctx)
+            _REQUEST_BEARER.reset(bearer_ctx)
+            _REQUEST_MCP_TOKEN.reset(token_ctx)
 
 
 def _is_loopback(host: str) -> bool:

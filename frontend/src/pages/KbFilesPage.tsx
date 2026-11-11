@@ -659,6 +659,14 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
         { parent_id: currentDirectoryId, name },
       );
       setDirectoryById((current) => ({ ...current, [created.id]: created }));
+      // Make the new child visible immediately: a collapsed parent would
+      // otherwise only show an expand arrow, which looks like the create
+      // operation did nothing.
+      setExpandedDirectories((current) => {
+        const next = new Set(current);
+        next.add(currentDirectoryId);
+        return next;
+      });
       await loadDirectoryChildren(currentDirectoryId, true);
       setNewDirectoryName('');
       setNewDirectoryOpen(false);
