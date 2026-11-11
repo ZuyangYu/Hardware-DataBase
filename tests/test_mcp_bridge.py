@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import httpx
 import pytest
 from types import SimpleNamespace
@@ -680,3 +681,241 @@ def test_delete_file_passes_directory_scope():
     assert seen["method"] == "DELETE"
     assert seen["path"] == "/api/v1/kbs/AAA/files/spec.pdf"
     assert seen["directory_id"] == "7"
+
+
+def test_search_knowledge_base_semantic_uses_platform_endpoint():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/kbs/AAA/files":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/api/v1/kbs/AAA/semantic-search":
+            seen["body"] = json.loads(request.read().decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "kb_name": "AAA",
+                    "query": "电源树",
+                    "mode": "semantic",
+                    "status": "success_with_hits",
+                    "results": [
+                        {
+                            "file_id": "ragflow:37",
+                            "file_name": "docs/HSI.docx",
+                            "chunk_index": 70,
+                            "score": 0.91,
+                            "snippet": "电源树 上电时序",
+                        }
+                    ],
+                    "result_count": 1,
+                },
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    _use(handler)
+    result = bridge.search_knowledge_base(
+        "AAA", "电源树", mode="semantic", top_k=3, kind="document"
+    )
+    assert result["mode"] == "semantic"
+    assert result["result_count"] == 1
+    assert result["results"][0]["file_id"] == "ragflow:37"
+    assert seen["body"]["directory_id"] == 0
+    assert seen["body"]["recursive"] is True
+
+
+def test_list_tables_scopes_registry_by_directory(monkeypatch):
+    monkeypatch.setattr(
+        bridge, "_visible_kb", lambda _name: {"name": "AAA", "department_id": "1739"}
+    )
+    monkeypatch.setattr(
+        "src.services.spreadsheet_index_service.SpreadsheetIndexService.db_path",
+        lambda self, department_id, kb_name, create=False: "/tmp/unused.db",
+    )
+    monkeypatch.setattr(
+        "src.agents.tools.spreadsheet_tools._load_sql_registry",
+        lambda _path: [
+            {"table_name": "t_29", "record_id": 29},
+            {"table_name": "t_36", "record_id": 36},
+        ],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/kbs/AAA/directories/7":
+            return httpx.Response(200, json={"id": 7})
+        if request.url.path == "/api/v1/kbs/AAA/directories":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/api/v1/kbs/AAA/files":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "ragflow:29",
+                        "name": "a.xlsx",
+                        "directory_id": 7,
+                        "processor_kind": "spreadsheet_table",
+                    },
+                    {
+                        "id": "ragflow:36",
+                        "name": "b.xlsx",
+                        "directory_id": 8,
+                        "processor_kind": "spreadsheet_table",
+                    },
+                ],
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    _use(handler)
+    result = bridge.list_tables("AAA", directory_id=7, recursive=False)
+    assert result["table_count"] == 1
+    assert result["tables"][0]["table_name"] == "t_29"
+
+
+def test_list_circuit_designs_scopes_by_directory(monkeypatch):
+    monkeypatch.setattr(
+        bridge, "_visible_kb", lambda _name: {"name": "AAA", "department_id": "1739"}
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/kbs/AAA/directories/7":
+            return httpx.Response(200, json={"id": 7})
+        if request.url.path == "/api/v1/kbs/AAA/directories":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/api/v1/kbs/AAA/files":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "ragflow:35",
+                        "name": "tcn2.EDF",
+                        "directory_id": 7,
+                        "processor_kind": "circuit_design",
+                    },
+                    {
+                        "id": "ragflow:36",
+                        "name": "other.EDF",
+                        "directory_id": 8,
+                        "processor_kind": "circuit_design",
+                    },
+                ],
+            )
+        if request.url.path == "/api/v1/kbs/AAA/structured/circuit-designs":
+            return httpx.Response(
+                200,
+                json={
+                    "designs": [
+                        {"design_id": "tcn2-abc", "files": ["tcn2.EDF"]},
+                        {"design_id": "other-xyz", "files": ["other.EDF"]},
+                    ],
+                    "failed_logs": [],
+                },
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    _use(handler)
+    result = bridge.list_circuit_designs("AAA", directory_id=7, recursive=False)
+    assert [item["design_id"] for item in result["designs"]] == ["tcn2-abc"]
+
+
+def test_query_table_restricts_validation_to_directory_tables(monkeypatch):
+    monkeypatch.setattr(
+        bridge, "_visible_kb", lambda _name: {"name": "AAA", "department_id": "1739"}
+    )
+    monkeypatch.setattr(
+        "src.services.spreadsheet_index_service.SpreadsheetIndexService.db_path",
+        lambda self, department_id, kb_name, create=False: "/tmp/unused.db",
+    )
+    monkeypatch.setattr(
+        "src.agents.tools.spreadsheet_tools._load_sql_registry",
+        lambda _path: [
+            {"table_name": "t_29", "record_id": 29},
+            {"table_name": "t_36", "record_id": 36},
+        ],
+    )
+    seen = {}
+
+    def validate(sql, allowed):
+        seen["allowed"] = set(allowed)
+        return SimpleNamespace(sql=lambda dialect: "SELECT * FROM t_29 LIMIT 5"), None
+
+    monkeypatch.setattr(
+        "src.agents.tools.spreadsheet_tools._validate_readonly_sql", validate
+    )
+    monkeypatch.setattr(
+        "src.agents.tools.spreadsheet_tools._execute_readonly_sql",
+        lambda _path, _sql: ([{"a": 1}], None),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/kbs/AAA/directories/7":
+            return httpx.Response(200, json={"id": 7})
+        if request.url.path == "/api/v1/kbs/AAA/directories":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/api/v1/kbs/AAA/files":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "ragflow:29",
+                        "name": "a.xlsx",
+                        "directory_id": 7,
+                        "processor_kind": "spreadsheet_table",
+                    },
+                    {
+                        "id": "ragflow:36",
+                        "name": "b.xlsx",
+                        "directory_id": 8,
+                        "processor_kind": "spreadsheet_table",
+                    },
+                ],
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    _use(handler)
+    result = bridge.query_table(
+        "AAA", "SELECT * FROM t_29", directory_id=7, recursive=False
+    )
+    assert result["row_count"] == 1
+    assert seen["allowed"] == {"t_29"}
+
+
+def test_query_circuit_rejects_design_outside_directory(monkeypatch):
+    monkeypatch.setattr(
+        bridge, "_visible_kb", lambda _name: {"name": "AAA", "department_id": "1739"}
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/kbs/AAA/directories/7":
+            return httpx.Response(200, json={"id": 7})
+        if request.url.path == "/api/v1/kbs/AAA/directories":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/api/v1/kbs/AAA/files":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "ragflow:35",
+                        "name": "tcn2.EDF",
+                        "directory_id": 7,
+                        "processor_kind": "circuit_design",
+                    }
+                ],
+            )
+        if request.url.path == "/api/v1/kbs/AAA/structured/circuit-designs":
+            return httpx.Response(
+                200,
+                json={
+                    "designs": [
+                        {"design_id": "tcn2-abc", "files": ["tcn2.EDF"]},
+                        {"design_id": "other-xyz", "files": ["other.EDF"]},
+                    ],
+                    "failed_logs": [],
+                },
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    _use(handler)
+    result = bridge.query_circuit(
+        "AAA", "X2000", design_id="other-xyz", directory_id=7, recursive=False
+    )
+    assert result["error"] == "design not in directory"
+    assert result["instances"] == []

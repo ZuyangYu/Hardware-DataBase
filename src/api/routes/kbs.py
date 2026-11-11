@@ -4,7 +4,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from src.core.app_pipeline import AppPipeline
 from src.core.auth import ROLE_SYSTEM_ADMIN, AuthService, AuthUser
-from src.pipelines.document_rag.schemas import kb_scope_key
+from src.pipelines.document_rag.schemas import (
+    DocumentRetrievalContract,
+    kb_scope_key,
+)
 
 from src.api.context import build_context_for_user
 from src.api.deps import current_user, get_auth_service, get_pipeline, reject_system_admin_kb_access, require_employee
@@ -17,6 +20,7 @@ from src.api.schemas import (
     KbView,
     OkResponse,
     RenameDirectoryRequest,
+    SemanticSearchRequest,
     UpdateKbSharingRequest,
 )
 from src.services.pipeline_directories import DirectoryValidationError, PipelineDirectoryService
@@ -147,6 +151,140 @@ def list_files(
             )
         )
     return rows[offset: offset + limit]
+
+
+@router.post("/kbs/{kb_name}/semantic-search")
+def semantic_search(
+    kb_name: str,
+    body: SemanticSearchRequest,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Semantic document retrieval through the platform RAGFlow backend."""
+
+    ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
+    if not ctx.has_kb_permission(kb_name, "read"):
+        raise HTTPException(status_code=403, detail="read permission required")
+    directory_service = _directory_service(pipeline)
+    allowed_ids: tuple[int, ...] | None = None
+    try:
+        allowed_directory_ids: set[int] | None = None
+        if body.directory_id:
+            allowed_directory_ids = (
+                directory_service.descendant_ids(
+                    kb_name=kb_name,
+                    department_id=_ctx_department_id(ctx),
+                    directory_id=body.directory_id,
+                )
+                if body.recursive
+                else {int(body.directory_id)}
+            )
+            allowed_ids = _ragflow_record_ids(
+                pipeline, kb_name, ctx, allowed_directory_ids
+            )
+        if body.file_id:
+            infos = (
+                pipeline.list_file_infos(kb_name, ctx=ctx)
+                if allowed_directory_ids is None
+                else [
+                    info
+                    for directory_id in sorted(allowed_directory_ids)
+                    for info in pipeline.list_file_infos(
+                        kb_name, ctx=ctx, directory_id=directory_id
+                    )
+                ]
+            )
+            info = next(
+                (
+                    item
+                    for item in infos
+                    if str(getattr(item, "id", "")) == body.file_id
+                    or str(getattr(item, "name", "")) == body.file_id
+                ),
+                None,
+            )
+            if info is None:
+                raise LookupError("file not found")
+            record_id = int((info.metadata or {}).get("store_id") or 0)
+            if not record_id:
+                raise LookupError("file has no local record")
+            allowed_ids = (record_id,)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    retrieve = getattr(pipeline.backend, "retrieve_with_scope", None)
+    if not callable(retrieve):
+        raise HTTPException(
+            status_code=501, detail="semantic retrieval backend is unavailable"
+        )
+    outcome = retrieve(
+        kb_name,
+        body.query,
+        contract=DocumentRetrievalContract(
+            mode="chat", allowed_record_ids=allowed_ids
+        ),
+        top_k=body.top_k,
+        ctx=ctx,
+    )
+    results = [_semantic_hit(item) for item in (outcome.evidence or [])]
+    return {
+        "kb_name": kb_name,
+        "query": body.query,
+        "mode": "semantic",
+        "directory_id": int(body.directory_id or 0),
+        "recursive": bool(body.recursive),
+        "status": outcome.status,
+        "error_code": outcome.error_code,
+        "results": results,
+        "result_count": len(results),
+        "files_searched": len(allowed_ids) if allowed_ids is not None else 0,
+        "chunks_searched": 0,
+    }
+
+
+def _ragflow_record_ids(
+    pipeline: AppPipeline, kb_name: str, ctx, directory_ids: set[int]
+) -> tuple[int, ...]:
+    records: set[int] = set()
+    for directory_id in sorted(directory_ids):
+        for info in pipeline.list_file_infos(
+            kb_name, ctx=ctx, directory_id=directory_id
+        ):
+            metadata = info.metadata or {}
+            if str(metadata.get("processor_kind") or "") != "ragflow":
+                continue
+            record_id = int(metadata.get("store_id") or 0)
+            if record_id:
+                records.add(record_id)
+    return tuple(sorted(records))
+
+
+def _semantic_hit(item) -> dict:
+    metadata = dict(getattr(item, "metadata", {}) or {})
+    locator = dict(getattr(item, "locator", {}) or metadata.get("locator") or {})
+    record_id = int(metadata.get("local_record_id") or metadata.get("store_id") or 0)
+    chunk_id = str(metadata.get("chunk_id") or locator.get("chunk_id") or "")
+    chunk_index = int(
+        metadata.get("chunk_index") or locator.get("chunk_index") or 0
+    )
+    return {
+        "file_id": f"ragflow:{record_id}" if record_id else "",
+        "file_name": str(
+            metadata.get("relative_path")
+            or getattr(item, "source_name", "")
+            or ""
+        ),
+        "chunk_index": chunk_index,
+        "rag_id": chunk_id,
+        "locator": locator,
+        "score": float(getattr(item, "score", 0.0) or 0.0),
+        "snippet": str(getattr(item, "content", "") or "")[:400],
+        "citation_id": (
+            f"{metadata.get('kb_id') or ''}:{record_id}:{chunk_id or chunk_index}"
+        ),
+    }
 
 
 def _ctx_department_id(ctx) -> str:

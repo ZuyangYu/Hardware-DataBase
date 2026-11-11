@@ -106,6 +106,14 @@ class FileView(BaseModel):
     metadata: dict = Field(default_factory=dict)
 
 
+class SemanticSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=20_000)
+    top_k: int = Field(default=8, ge=1, le=50)
+    directory_id: int = Field(default=0, ge=0)
+    recursive: bool = True
+    file_id: str = ""
+
+
 class UploadFileResult(BaseModel):
     index: int
     relative_path: str = ""
