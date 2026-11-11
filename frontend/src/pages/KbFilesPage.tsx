@@ -134,7 +134,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
   const [deleting, setDeleting] = useState(false);
   const [tasks, setTasks] = useState<ParseTaskView[]>([]);
   const [tasksLoaded, setTasksLoaded] = useState(false);
-  const [activeTab, setActiveTab] = useState<WorkspaceTab | null>(null);
+  const [activeTab, setActiveTab] = useState<WorkspaceTab | null>(WORKSPACE_TABS[0].key);
   const [spreadsheetLedger, setSpreadsheetLedger] = useState<SpreadsheetLedgerResponse | null>(null);
   const [spreadsheetsLoading, setSpreadsheetsLoading] = useState(false);
   const [selectedSpreadsheetId, setSelectedSpreadsheetId] = useState('');

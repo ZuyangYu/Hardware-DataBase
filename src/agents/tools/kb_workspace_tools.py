@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from typing import Any
+from typing import Any, Literal
 
 from src.agents.schemas import Evidence
 from src.agents.tools.grep_tools import _scoped_documents
@@ -29,11 +29,13 @@ from src.services.pipeline_directories import (
     PipelineDirectoryService,
     document_relative_path,
 )
+from src.services.document_search import (
+    SUPPORTED_MODES,
+    DocumentSearchRequest,
+    search_documents as run_document_search,
+)
 from src.services.knowledge_retrieval import (
-    grep_chunks,
-    lexical_search,
     list_files,
-    looks_like_exact_term,
     read_chunks,
 )
 
@@ -218,14 +220,6 @@ def make_kb_workspace_tools(
         chunk_cache[key] = chunks
         return chunks
 
-    def _chunks_by_document(
-        allowed: set[int] | None = None,
-    ) -> dict[tuple[str, str], list[dict[str, Any]]]:
-        return {
-            (str(getattr(record, "id", "") or ""), _relative_name(record)): _chunks(record)
-            for record in _documents(allowed)
-        }
-
     def _run(
         name: str,
         query: str,
@@ -400,7 +394,7 @@ def make_kb_workspace_tools(
 
     def search_documents(
         query: str,
-        mode: str = "auto",
+        mode: Literal["auto", "exact", "hybrid"] = "auto",
         top_k: int = 8,
         file_id: str = "",
         directory_id: int = 0,
@@ -408,10 +402,13 @@ def make_kb_workspace_tools(
     ) -> str:
         """检索文档资料（Word/PDF/文本等），不检索表格/网表。
 
-        mode="auto" 自动识别位号/型号/网络名并走精确匹配，否则走 RAGFlow
-        语义检索；mode="exact" 强制本地 grep；mode="semantic" 强制 RAGFlow；
+        mode="auto" 自动识别位号/型号/网络名并走精确匹配；否则先跑
+        IDF 词法，置信度足够高直接返回，低置信度才升级到 RAGFlow
+        语义+词法融合。mode="exact" 强制本地 grep；mode="hybrid" 强制
+        语义+词法融合。仅支持 auto / exact / hybrid 三种模式。
         directory_id + recursive 可把检索限定到某个目录及其后代。
-        返回 file_id、file_name、locator、chunk_index、score 和 snippet。
+        返回 file_id、file_name、locator、chunk_index、score 和 snippet；
+        未解析的 raw 文件以 raw_file_matches 返回（仅按文件名/路径匹配）。
         """
 
         stats: dict[str, Any] = {}
@@ -422,56 +419,59 @@ def make_kb_workspace_tools(
             if not needle:
                 return _json({"error": "query is required", "results": []})
             plane = str(mode or "auto").strip().lower()
-            exact = plane == "exact" or (
-                plane == "auto" and looks_like_exact_term(needle)
-            )
-            if exact:
-                grouped = _chunks_by_document(allowed_directory_ids)
-                if file_id:
-                    grouped = {
-                        key: value
-                        for key, value in grouped.items()
-                        if key[0] == str(file_id) or str(file_id) in key[1]
-                    }
-                results = grep_chunks(
-                    grouped,
-                    [needle],
-                    max_hits=max(1, min(int(top_k or 8), 50)),
-                )
-                used = "exact"
-            elif plane in {"semantic", "auto"}:
-                results = _semantic_results(
-                    needle, max(1, min(int(top_k or 8), 50))
-                )
-                used = "semantic"
-                if not results:
-                    results = lexical_search(
-                        _chunks_by_document(allowed_directory_ids),
-                        needle,
-                        top_k=max(1, min(int(top_k or 8), 50)),
-                        file_id=file_id,
-                    )
-                    used = "lexical"
-            else:
-                results = lexical_search(
-                    _chunks_by_document(allowed_directory_ids),
-                    needle,
-                    top_k=max(1, min(int(top_k or 8), 50)),
-                    file_id=file_id,
-                )
-                used = "lexical"
-            if allowed_directory_ids is not None:
-                filtered: list[dict[str, Any]] = []
-                for row in results:
-                    record, _chunk = _resolve_row(row)
-                    if record is not None and int(
+            if plane not in SUPPORTED_MODES:
+                raise ValueError("mode must be one of: auto, exact, hybrid")
+            records = {
+                str(getattr(record, "id", "") or ""): record
+                for record in _scoped_documents(rt, document_store)
+                if allowed_directory_ids is None
+                or int(getattr(record, "directory_id", 0) or 0)
+                in allowed_directory_ids
+            }
+            rows = [
+                {
+                    "file_id": fid,
+                    "name": _doc_name(record),
+                    "relative_path": _relative_name(record),
+                    "directory_id": int(
                         getattr(record, "directory_id", 0) or 0
-                    ) in allowed_directory_ids:
-                        filtered.append(row)
-                results = filtered
+                    ),
+                    "status": str(getattr(record, "status", "") or ""),
+                    "processor_kind": str(
+                        getattr(record, "processor_kind", "") or ""
+                    ),
+                }
+                for fid, record in records.items()
+            ]
+
+            class _Backend:
+                def list_files(self) -> list[dict[str, Any]]:
+                    return rows
+
+                def load_chunks(self, row_file_id: str) -> list[dict[str, Any]]:
+                    record = records.get(str(row_file_id))
+                    return _chunks(record) if record is not None else []
+
+                def semantic_search(
+                    self, query_text: str, limit: int
+                ) -> list[dict[str, Any]]:
+                    return _semantic_results(query_text, limit)
+
+            outcome = run_document_search(
+                _Backend(),
+                DocumentSearchRequest(
+                    query=needle,
+                    top_k=top_k,
+                    mode=plane,
+                    kind="document",
+                    file_id=file_id,
+                ),
+            )
+            results = outcome.results
+            raw_matches = outcome.raw_file_matches
             admitted, citations, sources = _admit_search_results(results)
             stats.update(
-                hit_count=len(results),
+                hit_count=len(results) + len(raw_matches),
                 evidence_count=admitted,
                 citation_numbers=citations,
                 sources=sources,
@@ -483,15 +483,22 @@ def make_kb_workspace_tools(
                     note_progress()
             elif callable(note_no_progress):
                 note_no_progress()
-            return _json(
-                {
-                    "query": needle,
-                    "mode": used,
-                    "results": results,
-                    "result_count": len(results),
-                    "evidence_count": admitted,
-                }
-            )
+            payload = {
+                "query": needle,
+                "mode": outcome.mode,
+                "route": outcome.route,
+                "results": results,
+                "result_count": len(results),
+                "evidence_count": admitted,
+            }
+            if raw_matches:
+                payload["raw_file_matches"] = raw_matches
+                payload["raw_file_match_count"] = len(raw_matches)
+                payload["hint"] = (
+                    "raw files matched by filename/path. "
+                    "Use the original-file download tool to read them."
+                )
+            return _json(payload)
 
         return _run(
             "search_documents",
