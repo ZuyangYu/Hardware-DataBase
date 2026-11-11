@@ -129,6 +129,9 @@ class DocumentManager:
     def delete_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> str:
         return self.processing_backend.delete_parse_task(task_id, ctx=ctx).message
 
+    def retry_parse_task(self, task_id: str, ctx: RequestContext | None = None):
+        return self.processing_backend.retry_parse_task(task_id, ctx=ctx)
+
     def clear_finished_parse_tasks(self, kb_name: str | None = None, ctx: RequestContext | None = None):
         self.processing_backend.clear_finished_parse_tasks(kb_name, ctx=ctx)
 

@@ -130,7 +130,6 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
   const [importDeleteTarget, setImportDeleteTarget] = useState<DirectoryImportJobView | null>(null);
   const [deletingImport, setDeletingImport] = useState(false);
   const [recursiveDelete, setRecursiveDelete] = useState(false);
-  const [recursiveFiles, setRecursiveFiles] = useState(true);
   const [deleteTarget, setDeleteTarget] = useState<FileView | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [tasks, setTasks] = useState<ParseTaskView[]>([]);
@@ -197,7 +196,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
     setForbidden(null);
     const params = new URLSearchParams({
       directory_id: String(currentDirectoryId),
-      recursive: String(recursiveFiles),
+      recursive: 'true',
     });
     api
       .get<FileView[]>(`/api/v1/kbs/${encodeURIComponent(kbName)}/files?${params.toString()}`)
@@ -218,7 +217,7 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [currentDirectoryId, kbName, recursiveFiles]);
+  }, [currentDirectoryId, kbName]);
 
   const loadDirectoryChildren = useCallback(async (parentId: number, force = false) => {
     if (!force && directoryCache[parentId]) return directoryCache[parentId];
@@ -986,8 +985,6 @@ export default function KbFilesPage({ auth, kbName, onLogout }: Props) {
             loaded={loaded}
             files={files}
             columns={columns}
-            recursive={recursiveFiles}
-            onRecursiveChange={setRecursiveFiles}
             onViewChunks={(file) => void handleViewChunks(file)}
           />
         }
@@ -1407,31 +1404,16 @@ function FilesPanel({
   loaded,
   files,
   columns,
-  recursive,
-  onRecursiveChange,
   onViewChunks,
 }: {
   loaded: boolean;
   files: FileView[];
   columns: DataTableColumn<FileView>[];
-  recursive: boolean;
-  onRecursiveChange: (value: boolean) => void;
   onViewChunks: (file: FileView) => void;
 }) {
-  const toggle = (
-    <label className="mb-[10px] inline-flex items-center gap-[6px] text-[12px] text-[#464c5e]">
-      <input
-        type="checkbox"
-        checked={recursive}
-        onChange={(event) => onRecursiveChange(event.target.checked)}
-      />
-      显示子目录中的文件
-    </label>
-  );
   if (!loaded) {
     return (
       <div>
-        {toggle}
         <PanelSkeleton rows={3} />
       </div>
     );
@@ -1439,14 +1421,12 @@ function FilesPanel({
   if (files.length === 0) {
     return (
       <div>
-        {toggle}
         <EmptyState text="该目录及其子目录暂无文件" />
       </div>
     );
   }
   return (
     <div>
-      {toggle}
       <DataTable
         columns={columns}
         data={files}

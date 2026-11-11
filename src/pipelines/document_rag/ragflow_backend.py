@@ -2176,6 +2176,86 @@ class RAGFlowBackend(RAGBackend):
             )
         return sorted(tasks, key=lambda task: task.updated_at, reverse=True)
 
+    def retry_parse_task(
+        self, task_id: str, ctx: RequestContext | None = None
+    ) -> BackendResult:
+        """Re-submit one parse task without re-uploading the source file."""
+
+        if not task_id.startswith("ragflow-"):
+            return BackendResult(
+                ok=False, message="Invalid RAGFlow parse task id.", backend=self.name
+            )
+        raw_record_id = task_id.removeprefix("ragflow-")
+        if not raw_record_id.isdigit():
+            return BackendResult(
+                ok=False, message="Invalid RAGFlow parse task id.", backend=self.name
+            )
+        record = self.store.get_document_by_id_scoped(
+            int(raw_record_id), _ctx_department_id(ctx)
+        )
+        if not record:
+            return BackendResult(
+                ok=False, message="Parse task not found.", backend=self.name
+            )
+        try:
+            self._check_kb_access(record.kb_name, ctx, "write")
+            _check_record_department(record, ctx)
+        except PermissionError as exc:
+            return BackendResult(ok=False, message=str(exc), backend=self.name)
+        if record.shared_read_only:
+            return BackendResult(
+                ok=False,
+                message=f"共享文档为只读，不能重新解析: {record.document_name}",
+                backend=self.name,
+            )
+        if record.processor_kind == PROCESSOR_KIND_RAGFLOW:
+            if not record.dataset_id or not record.document_id:
+                return BackendResult(
+                    ok=False,
+                    message="RAGFlow document mapping is incomplete.",
+                    backend=self.name,
+                )
+            try:
+                self._client().parse_documents(
+                    record.dataset_id, [record.document_id]
+                )
+            except Exception as exc:  # noqa: BLE001 - surface remote failure
+                return BackendResult(
+                    ok=False,
+                    message=f"RAGFlow re-parse failed: {exc}",
+                    backend=self.name,
+                )
+            self.store.update_document_progress_by_id(
+                record.id,
+                5,
+                "重新提交 RAGFlow 解析",
+                status=TASK_STATUS_QUEUED,
+                error_message="",
+            )
+            return BackendResult(
+                ok=True, message=f"重新提交解析: {record.document_name}", backend=self.name
+            )
+        if record.processor_kind == PROCESSOR_KIND_SPREADSHEET:
+            self.store.update_document_progress_by_id(
+                record.id,
+                5,
+                "重新排队等待表格结构化解析",
+                status=TASK_STATUS_QUEUED,
+                error_message="",
+            )
+            return BackendResult(
+                ok=True, message=f"重新排队解析: {record.document_name}", backend=self.name
+            )
+        return BackendResult(
+            ok=False,
+            message=(
+                f"{record.processor_kind} 不支持原地重试；"
+                "网表请重新上传或重新索引。"
+            ),
+            backend=self.name,
+        )
+
+
     def delete_parse_task(self, task_id: str, ctx: RequestContext | None = None) -> BackendResult:
         if not task_id.startswith("ragflow-"):
             return BackendResult(ok=False, message="Invalid RAGFlow parse task id.", backend=self.name)

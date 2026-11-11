@@ -216,6 +216,130 @@ def list_kb_files(kb_name: str) -> list[dict[str, Any]]:
     ]
 
 
+def _directory_rows(
+    kb_name: str, parent_id: int, recursive: bool
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    pending = [int(parent_id or 0)]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        children = _request(
+            "GET",
+            f"/kbs/{_kb_path(kb_name)}/directories",
+            params={"parent_id": current},
+        )
+        for child in children or []:
+            if not isinstance(child, dict):
+                continue
+            rows.append(dict(child))
+            child_id = int(child.get("id") or 0)
+            if recursive and child_id:
+                pending.append(child_id)
+        if not recursive:
+            break
+    return rows
+
+
+def _directory_tree(
+    rows: list[dict[str, Any]], root_parent_id: int
+) -> list[dict[str, Any]]:
+    children: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        children.setdefault(int(row.get("parent_id") or 0), []).append(row)
+
+    def build(parent_id: int) -> list[dict[str, Any]]:
+        result = []
+        for row in sorted(
+            children.get(parent_id, []),
+            key=lambda item: (
+                int(item.get("depth") or 0),
+                str(item.get("name") or ""),
+            ),
+        ):
+            item = dict(row)
+            item["children"] = build(int(row.get("id") or 0))
+            result.append(item)
+        return result
+
+    return build(int(root_parent_id or 0))
+
+
+@mcp.tool()
+def list_directories(
+    kb_name: str, parent_id: int = 0, recursive: bool = True
+) -> dict[str, Any]:
+    """List the KB directory tree, including empty folders.
+
+    ``parent_id=0`` starts at the root.  ``recursive=True`` returns every
+    descendant; ``False`` returns only direct children.  The response includes
+    both a flat ``directories`` list and a nested ``tree``.
+    """
+
+    rows = _directory_rows(kb_name, parent_id, recursive)
+    return {
+        "kb_name": kb_name,
+        "parent_id": int(parent_id or 0),
+        "recursive": bool(recursive),
+        "directory_count": len(rows),
+        "directories": rows,
+        "tree": _directory_tree(rows, int(parent_id or 0)),
+    }
+
+
+def _parse_task_id(task_id: str, file_id: str) -> str:
+    value = str(task_id or "").strip()
+    if value:
+        return value
+    file_value = str(file_id or "").strip()
+    if file_value.startswith("ragflow-"):
+        return file_value
+    if file_value.startswith("ragflow:"):
+        file_value = file_value.split(":", 1)[1]
+    if file_value.isdigit():
+        return f"ragflow-{file_value}"
+    raise ValueError("task_id or a ragflow file_id is required")
+
+
+@mcp.tool()
+def get_parse_task(
+    kb_name: str, task_id: str = "", file_id: str = ""
+) -> dict[str, Any]:
+    """Read one parse task and its failure reason.
+
+    Pass either the parse ``task_id`` (for example ``ragflow-57``) or the
+    document ``file_id`` returned by ``list_kb_files`` (for example
+    ``ragflow:57``).  Requires read permission on the knowledge base.
+    """
+
+    resolved = _parse_task_id(task_id, file_id)
+    return _request(
+        "GET",
+        f"/kbs/{_kb_path(kb_name)}/parse-tasks/{quote(resolved, safe='')}",
+    )
+
+
+@mcp.tool()
+def retry_parse(
+    kb_name: str, task_id: str = "", file_id: str = ""
+) -> dict[str, Any]:
+    """Re-submit one parse task without re-uploading the original file.
+
+    Pass either ``task_id`` or the document ``file_id``.  Requires write
+    permission.  RAGFlow documents are re-submitted remotely; spreadsheet
+    tasks are re-queued for the local worker.
+    """
+
+    resolved = _parse_task_id(task_id, file_id)
+    return _request(
+        "POST",
+        f"/kbs/{_kb_path(kb_name)}/parse-tasks/{quote(resolved, safe='')}/retry",
+    )
+
+
 @mcp.tool()
 def read_file_chunks(
     kb_name: str,

@@ -60,6 +60,37 @@ def list_parse_tasks(
     return [_task_view(t) for t in tasks]
 
 
+@router.get(
+    "/kbs/{kb_name}/parse-tasks/{task_id}", response_model=ParseTaskView
+)
+def get_parse_task(
+    kb_name: str,
+    task_id: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Read one parse task by its task id (read permission)."""
+
+    ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
+    if not ctx.has_kb_permission(kb_name, "read"):
+        raise HTTPException(status_code=403, detail="read permission required")
+    tasks = pipeline.list_parse_tasks(kb_name, ctx=ctx) or []
+    task = next(
+        (
+            item
+            for item in tasks
+            if str(getattr(item, "id", "")) == str(task_id)
+            or str(getattr(item, "document_id", "")) == str(task_id)
+        ),
+        None,
+    )
+    if task is None:
+        raise HTTPException(status_code=404, detail="parse task not found")
+    return _task_view(task)
+
+
 # NOTE: static path segments MUST be registered before parameterised ones,
 # otherwise ``/parse-tasks/finished`` gets swallowed by ``{task_id}``.
 @router.delete("/kbs/{kb_name}/parse-tasks/finished", response_model=OkResponse)
@@ -98,6 +129,31 @@ def requeue_dead_letter_parse_tasks(
     names = pipeline.requeue_dead_letter_parse_tasks(kb_name, ctx=ctx)
     message = f"requeued {len(names)} dead-letter task(s)" if names else "no dead-letter tasks"
     return OkResponse(ok=True, message=message)
+
+
+@router.post(
+    "/kbs/{kb_name}/parse-tasks/{task_id}/retry", response_model=OkResponse
+)
+def retry_parse_task(
+    kb_name: str,
+    task_id: str,
+    user: AuthUser = Depends(current_user),
+    pipeline: AppPipeline = Depends(get_pipeline),
+    auth: AuthService = Depends(get_auth_service),
+):
+    """Re-submit one parse task without re-uploading its source file."""
+
+    ctx = build_context_for_user(user, kb_name, auth=auth)
+    reject_system_admin_kb_access(ctx)
+    if not ctx.has_kb_permission(kb_name, "write"):
+        raise HTTPException(status_code=403, detail="write permission required")
+    result = pipeline.documents.retry_parse_task(task_id, ctx=ctx)
+    if not getattr(result, "ok", False):
+        raise HTTPException(
+            status_code=400,
+            detail=getattr(result, "message", "parse retry failed"),
+        )
+    return OkResponse(ok=True, message=getattr(result, "message", "parse retried"))
 
 
 @router.delete("/kbs/{kb_name}/parse-tasks/{task_id}", response_model=OkResponse)
