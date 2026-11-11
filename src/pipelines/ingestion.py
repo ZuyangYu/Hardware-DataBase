@@ -281,7 +281,7 @@ class IngestionOrchestrator:
             handler_result: HandlerResult | None = None
             try:
                 extension = os.path.splitext(filename)[1].lower() or "(no extension)"
-                if route.rejected:
+                if route.rejected and handler is None:
                     message = self._rejected_message(logical_name, route)
                     messages.append(message)
                     skipped_count += 1
@@ -738,16 +738,17 @@ class IngestionOrchestrator:
     def _handler_for_route(self, route: PipelineRoute) -> PipelineHandler | None:
         if route.spec:
             return self.handlers.get(route.spec.processor_kind)
-        if route.rejected:
-            return None
         import src.settings as settings
 
-        if not bool(getattr(settings, "DIRECTORY_RAW_ONLY_UNKNOWN", False)):
+        if not bool(getattr(settings, "DIRECTORY_RAW_ONLY_UNKNOWN", True)):
             return None
         handler = getattr(self, "_raw_only_handler", None)
         if handler is None:
             handler = RawOnlyPipelineHandler(store=self.store)
             self._raw_only_handler = handler
+            # Deletion dispatches through ``handlers[processor_kind]``; the raw
+            # fallback is created lazily, so register it for later cleanup.
+            self.handlers[PROCESSOR_KIND_RAW] = handler
         return handler
 
     def _rejected_message(self, filename: str, route: PipelineRoute) -> str:
@@ -794,6 +795,17 @@ class RawOnlyPipelineHandler(PipelineHandler):
 
     def reuse_message(self, record: PipelineDocumentRecord) -> str:
         return f"[success] 已归档（未解析）: {record.document_name}"
+
+    def delete_record(
+        self, record: PipelineDocumentRecord, archive: DocumentArchiveManager
+    ) -> HandlerDeleteResult:
+        archive.remove_record_archive(record)
+        self.store.delete_document_by_id(record.id)
+        return HandlerDeleteResult(
+            ok=True,
+            message=f"Deleted raw archive: {record.document_name}",
+            audit_action="raw_file_deleted",
+        )
 
     def submit(
         self,

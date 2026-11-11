@@ -79,8 +79,8 @@ CONFIG_REVISION = _config_revision()
 STORAGE_DIR = os.getenv("STORAGE_DIR") or os.path.join(BASE_DIR, "storage")
 PIPELINE_ARCHIVE_ROOT = os.getenv("PIPELINE_ARCHIVE_ROOT", os.path.join(STORAGE_DIR, "pipeline_archives"))
 RAGFLOW_FILE_ROOT = os.getenv("RAGFLOW_FILE_ROOT", PIPELINE_ARCHIVE_ROOT)
-# P1: unknown extensions are archived but never parsed when explicitly enabled.
-DIRECTORY_RAW_ONLY_UNKNOWN = os.getenv("DIRECTORY_RAW_ONLY_UNKNOWN", "false").strip().lower() in {"1", "true", "yes", "on"}
+# Unsupported types are archived; set false to skip them.
+DIRECTORY_RAW_ONLY_UNKNOWN = os.getenv("DIRECTORY_RAW_ONLY_UNKNOWN", "true").strip().lower() in {"1", "true", "yes", "on"}
 LOG_DIR = os.path.join(STORAGE_DIR, "logs")
 # Workspace-first agent storage.  A workspace owns the hidden file tree and
 # artifacts for a session/user; there is no task product behind it.

@@ -32,6 +32,12 @@ class _Archive:
     def inspect_record_archive(self, record):
         return {}
 
+    def remove_record_archive(self, record):
+        try:
+            os.remove(os.path.join(self.root, record.document_name))
+        except OSError:
+            pass
+
 
 def _scope():
     return IngestionScope(
@@ -72,7 +78,7 @@ def test_raw_only_handler_archives_without_creating_parse_work(tmp_path):
     assert record.parse_progress == 100
 
 
-def test_unknown_file_uses_raw_only_only_when_enabled(tmp_path, monkeypatch):
+def test_unknown_and_rejected_files_archive_by_default(tmp_path, monkeypatch):
     import src.settings
 
     store = PipelineDocumentStore(db_path=str(tmp_path / "pipeline.db"))
@@ -89,18 +95,31 @@ def test_unknown_file_uses_raw_only_only_when_enabled(tmp_path, monkeypatch):
     source = tmp_path / "opaque.bin"
     source.write_bytes(b"opaque")
 
-    monkeypatch.setattr(src.settings, "DIRECTORY_RAW_ONLY_UNKNOWN", False)
-    skipped = orchestrator.upload_files([str(source)], _scope(), "design", "")
-    assert skipped.skipped_count == 1
-    assert skipped.file_results[0].error_code == "unsupported_file_type"
-
-    monkeypatch.setattr(src.settings, "DIRECTORY_RAW_ONLY_UNKNOWN", True)
     accepted = orchestrator.upload_files([str(source)], _scope(), "design", "")
     assert accepted.success_count == 1
     record = store.get_document(
         "kb", "opaque.bin", "raw", department_id="dept", directory_id=3
     )
     assert record is not None and record.processor_kind == PROCESSOR_KIND_RAW
+    assert orchestrator.handlers[PROCESSOR_KIND_RAW] is orchestrator._raw_only_handler
+    deleted = orchestrator._raw_only_handler.delete_record(record, archive)
+    assert deleted.ok is True
+    assert store.get_document(
+        "kb", "opaque.bin", "raw", department_id="dept", directory_id=3
+    ) is None
+
+    rejected = tmp_path / "legacy.xls"
+    rejected.write_bytes(b"legacy")
+    archived = orchestrator.upload_files([str(rejected)], _scope(), "design", "")
+    assert archived.success_count == 1
+    assert store.get_document(
+        "kb", "legacy.xls", "raw", department_id="dept", directory_id=3
+    ) is not None
+
+    monkeypatch.setattr(src.settings, "DIRECTORY_RAW_ONLY_UNKNOWN", False)
+    skipped = orchestrator.upload_files([str(source)], _scope(), "design", "")
+    assert skipped.skipped_count == 1
+    assert skipped.file_results[0].error_code == "unsupported_file_type"
 
 
 def test_move_directory_updates_subtree_paths_and_rejects_cycles(tmp_path):
