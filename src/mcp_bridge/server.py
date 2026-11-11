@@ -343,6 +343,59 @@ def _directory_scope(
     return allowed
 
 
+def _semantic_search(
+    kb_name: str,
+    query: str,
+    top_k: int,
+    directory_id: int,
+    recursive: bool,
+    file_id: str,
+) -> dict[str, Any]:
+    """Call the platform's real RAGFlow semantic retrieval endpoint."""
+
+    return _request(
+        "POST",
+        f"/kbs/{_kb_path(kb_name)}/semantic-search",
+        json={
+            "query": query,
+            "top_k": max(1, min(int(top_k or 8), 50)),
+            "directory_id": int(directory_id or 0),
+            "recursive": bool(recursive),
+            "file_id": str(file_id or ""),
+        },
+    )
+
+
+def _structured_skips(
+    rows: list[dict[str, Any]],
+    allowed_directory_ids: set[int] | None,
+    file_id: str,
+) -> list[dict[str, str]]:
+    skipped: list[dict[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        fid = str(row.get("id") or "")
+        fid_name = str(row.get("relative_path") or row.get("name") or "")
+        if file_id and fid != file_id and fid_name != file_id and str(row.get("name") or "") != file_id:
+            continue
+        if allowed_directory_ids is not None and int(
+            row.get("directory_id") or 0
+        ) not in allowed_directory_ids:
+            continue
+        processor = str(row.get("processor_kind") or "")
+        if processor and processor != "ragflow":
+            skipped.append(
+                {
+                    "file_id": fid,
+                    "file_name": fid_name,
+                    "kind": processor,
+                    "reason": "use query_table/query_circuit for structured sources",
+                }
+            )
+    return skipped
+
+
 @mcp.tool()
 def search_knowledge_base(
     kb_name: str,
@@ -358,9 +411,9 @@ def search_knowledge_base(
     """Stateless search over one KB's parsed chunks (no session).
 
     ``mode``: ``auto`` (default) detects exact refdes/part/net ids and uses
-    literal grep, otherwise lexical ranking; ``exact`` forces literal grep;
-    ``semantic``/``lexical`` uses lexical ranking on this bridge (true
-    semantic retrieval lives in the platform, not the stateless bridge).
+    literal grep, otherwise the platform RAGFlow semantic endpoint with a
+    lexical fallback; ``exact`` forces literal grep; ``semantic`` forces the
+    platform semantic endpoint; ``lexical`` forces local lexical ranking.
     ``kind``: ``document`` (default), ``table``, ``circuit`` or ``all``.
     ``directory_id`` + ``recursive`` restrict the search to a directory and,
     when recursive, its descendants.  Results are chunk locators (file / index
@@ -373,6 +426,47 @@ def search_knowledge_base(
         raise ValueError("query is required")
     rows = _request("GET", f"/kbs/{_kb_path(kb_name)}/files")
     allowed_directory_ids = _directory_scope(kb_name, directory_id, recursive)
+    wanted = str(kind or "document").strip().lower()
+    if wanted not in {"document", "table", "circuit", "all"}:
+        wanted = "document"
+    plane = str(mode or "auto").strip().lower()
+    exact = plane == "exact" or (
+        plane == "auto" and looks_like_exact_term(needle)
+    )
+    if not exact and wanted in {"document", "all"}:
+        try:
+            semantic = _semantic_search(
+                kb_name, needle, top_k, directory_id, recursive, file_id
+            )
+        except Exception as exc:  # noqa: BLE001 - explicit semantic reports, auto falls back
+            if plane == "semantic":
+                return {
+                    "kb_name": kb_name,
+                    "query": needle,
+                    "kind": wanted,
+                    "mode": "semantic",
+                    "directory_id": int(directory_id or 0),
+                    "recursive": bool(recursive),
+                    "results": [],
+                    "result_count": 0,
+                    "files_searched": 0,
+                    "chunks_searched": 0,
+                    "skipped_files": [],
+                    "error": str(exc)[:300],
+                    "note": "semantic retrieval failed; check the platform RAGFlow backend",
+                }
+            semantic = None
+        if semantic is not None and (
+            int(semantic.get("result_count") or 0) > 0 or plane == "semantic"
+        ):
+            semantic["kind"] = wanted
+            semantic["skipped_files"] = (
+                _structured_skips(rows, allowed_directory_ids, file_id)
+                if wanted == "all"
+                else []
+            )
+            semantic["cache_files"] = len(_CHUNK_CACHE)
+            return semantic
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     skipped: list[dict[str, str]] = []
     files_searched = 0
@@ -388,9 +482,6 @@ def search_knowledge_base(
         if allowed_directory_ids is not None and row_directory_id not in allowed_directory_ids:
             continue
         processor = str(row.get("processor_kind") or "")
-        wanted = str(kind or "document").strip().lower()
-        if wanted not in {"document", "table", "circuit", "all"}:
-            wanted = "document"
         if wanted == "document" and processor and processor != "ragflow":
             continue
         if wanted == "table" and "spreadsheet" not in processor:
@@ -427,10 +518,6 @@ def search_knowledge_base(
         grouped[(fid, fid_name)] = list(cache.get("chunks") or [])
         files_searched += 1
         chunks_searched += len(cache.get("chunks") or [])
-    plane = str(mode or "auto").strip().lower()
-    exact = plane == "exact" or (
-        plane == "auto" and looks_like_exact_term(needle)
-    )
     if exact:
         results = grep_chunks(grouped, [needle], max_hits=max(1, min(int(top_k or 8), 50)))
         used = "exact"
@@ -548,8 +635,91 @@ def download_kb_file(
     }
 
 
+def _record_id_from_file_row(row: dict[str, Any]) -> int:
+    value = str(row.get("id") or "")
+    if value.startswith("ragflow:"):
+        try:
+            return int(value.split(":", 1)[1])
+        except ValueError:
+            return 0
+    try:
+        return int(row.get("record_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _scoped_file_rows(
+    kb_name: str,
+    directory_id: int,
+    recursive: bool,
+    *,
+    processor: str = "",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[int] | None]:
+    rows = _request("GET", f"/kbs/{_kb_path(kb_name)}/files")
+    allowed = _directory_scope(kb_name, directory_id, recursive)
+    scoped: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if processor and processor not in str(row.get("processor_kind") or ""):
+            continue
+        if allowed is not None and int(row.get("directory_id") or 0) not in allowed:
+            continue
+        scoped.append(row)
+    return rows, scoped, allowed
+
+
+def _design_matches_scope(
+    design: dict[str, Any],
+    allowed_files: list[dict[str, Any]],
+    allowed_record_ids: set[int],
+) -> bool:
+    record_id = int(design.get("record_id") or 0)
+    if record_id and record_id in allowed_record_ids:
+        return True
+    design_id = str(design.get("design_id") or "")
+    design_files = {str(item or "") for item in (design.get("files") or [])}
+    for row in allowed_files:
+        name = str(row.get("name") or "")
+        relative = str(row.get("relative_path") or name)
+        if name in design_files or os.path.basename(relative) in design_files:
+            return True
+        stem = os.path.splitext(os.path.basename(name))[0]
+        if stem and (design_id.startswith(stem) or stem in design_id):
+            return True
+    return False
+
+
+def _circuit_designs(
+    kb_name: str, directory_id: int, recursive: bool
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    data = _request("GET", f"/kbs/{_kb_path(kb_name)}/structured/circuit-designs")
+    designs = list(data.get("designs") or [])
+    failed_logs = list(data.get("failed_logs") or [])
+    if not int(directory_id or 0):
+        return designs, failed_logs
+    _, allowed_files, _allowed = _scoped_file_rows(
+        kb_name, directory_id, recursive, processor="circuit"
+    )
+    allowed_record_ids = {
+        _record_id_from_file_row(row) for row in allowed_files
+    } - {0}
+    designs = [
+        design for design in designs
+        if _design_matches_scope(design, allowed_files, allowed_record_ids)
+    ]
+    allowed_design_ids = {str(item.get("design_id") or "") for item in designs}
+    failed_logs = [
+        item for item in failed_logs
+        if str(item.get("design_id") or "") in allowed_design_ids
+    ]
+    return designs, failed_logs
+
+
 @mcp.tool()
-def list_tables(kb_name: str) -> dict[str, Any]:
+def list_tables(
+    kb_name: str, directory_id: int = 0, recursive: bool = True
+) -> dict[str, Any]:
     """List materialized SQL tables and their schemas for one knowledge base."""
     kb = _visible_kb(kb_name)
     from src.agents.tools.spreadsheet_tools import _load_sql_registry
@@ -559,16 +729,35 @@ def list_tables(kb_name: str) -> dict[str, Any]:
         _department_id(kb), kb_name, create=False
     )
     tables = _load_sql_registry(db_path)
+    if int(directory_id or 0):
+        _, scoped, _allowed = _scoped_file_rows(
+            kb_name, directory_id, recursive, processor="spreadsheet"
+        )
+        allowed_record_ids = {
+            _record_id_from_file_row(row) for row in scoped
+        } - {0}
+        tables = [
+            table for table in tables
+            if int(table.get("record_id") or 0) in allowed_record_ids
+        ]
     return {
         "kb_name": kb_name,
         "department_id": _department_id(kb),
+        "directory_id": int(directory_id or 0),
+        "recursive": bool(recursive),
         "table_count": len(tables),
         "tables": tables,
     }
 
 
 @mcp.tool()
-def query_table(kb_name: str, sql: str, limit: int = 200) -> dict[str, Any]:
+def query_table(
+    kb_name: str,
+    sql: str,
+    limit: int = 200,
+    directory_id: int = 0,
+    recursive: bool = True,
+) -> dict[str, Any]:
     """Run one read-only SELECT against the materialized spreadsheet tables.
 
     The SQL is parsed with sqlglot, restricted to registered tables, capped at
@@ -586,6 +775,25 @@ def query_table(kb_name: str, sql: str, limit: int = 200) -> dict[str, Any]:
         _department_id(kb), kb_name, create=False
     )
     registry = _load_sql_registry(db_path)
+    if int(directory_id or 0):
+        _, scoped, _directory_scope = _scoped_file_rows(
+            kb_name, directory_id, recursive, processor="spreadsheet"
+        )
+        allowed_record_ids = {
+            _record_id_from_file_row(row) for row in scoped
+        } - {0}
+        registry = [
+            entry for entry in registry
+            if int(entry.get("record_id") or 0) in allowed_record_ids
+        ]
+    if not registry:
+        return {
+            "kb_name": kb_name,
+            "directory_id": int(directory_id or 0),
+            "recursive": bool(recursive),
+            "error": "no tables in directory",
+            "tables": [],
+        }
     allowed = {entry["table_name"]: entry for entry in registry}
     ast, error = _validate_readonly_sql(str(sql or ""), set(allowed))
     if error:
@@ -608,6 +816,8 @@ def query_table(kb_name: str, sql: str, limit: int = 200) -> dict[str, Any]:
     return {
         "kb_name": kb_name,
         "sql": ast.sql(dialect="sqlite"),
+        "directory_id": int(directory_id or 0),
+        "recursive": bool(recursive),
         "tables": sorted(allowed),
         "columns": list(rows[0].keys()) if rows else [],
         "row_count": len(rows),
@@ -708,15 +918,42 @@ def delete_file(
 
 
 @mcp.tool()
-def list_spreadsheets(kb_name: str) -> dict[str, Any]:
+def list_spreadsheets(
+    kb_name: str, directory_id: int = 0, recursive: bool = True
+) -> dict[str, Any]:
     """List structured spreadsheet sources in one knowledge base."""
-    return _request("GET", f"/kbs/{_kb_path(kb_name)}/structured/spreadsheets")
+    data = _request(
+        "GET", f"/kbs/{_kb_path(kb_name)}/structured/spreadsheets"
+    )
+    if int(directory_id or 0):
+        _, scoped, _allowed = _scoped_file_rows(
+            kb_name, directory_id, recursive, processor="spreadsheet"
+        )
+        allowed_record_ids = {
+            _record_id_from_file_row(row) for row in scoped
+        } - {0}
+        data["rows"] = [
+            row for row in (data.get("rows") or [])
+            if int(row.get("record_id") or 0) in allowed_record_ids
+        ]
+        data.setdefault("totals", {})["file_count"] = len(data["rows"])
+    data["directory_id"] = int(directory_id or 0)
+    data["recursive"] = bool(recursive)
+    return data
 
 
 @mcp.tool()
-def list_circuit_designs(kb_name: str) -> dict[str, Any]:
+def list_circuit_designs(
+    kb_name: str, directory_id: int = 0, recursive: bool = True
+) -> dict[str, Any]:
     """List circuit/netlist designs in one knowledge base."""
-    return _request("GET", f"/kbs/{_kb_path(kb_name)}/structured/circuit-designs")
+    designs, failed_logs = _circuit_designs(kb_name, directory_id, recursive)
+    return {
+        "designs": designs,
+        "failed_logs": failed_logs,
+        "directory_id": int(directory_id or 0),
+        "recursive": bool(recursive),
+    }
 
 
 @mcp.tool()
@@ -728,6 +965,8 @@ def query_circuit(
     mode: str = "both",
     include_summary: bool = False,
     include_modules: bool = False,
+    directory_id: int = 0,
+    recursive: bool = True,
 ) -> dict[str, Any]:
     """Search one circuit design by instance/refdes or net/signal name.
 
@@ -737,12 +976,22 @@ def query_circuit(
     the default for repeated point probing.  If ``design_id`` is empty the
     first design returned by the knowledge base is used.
     """
-    if not design_id:
-        designs = (
-            _request("GET", f"/kbs/{_kb_path(kb_name)}/structured/circuit-designs")
-            .get("designs")
-            or []
-        )
+    designs, _ = _circuit_designs(kb_name, directory_id, recursive)
+    if design_id:
+        allowed_design_ids = {
+            str(design.get("design_id") or "") for design in designs
+        }
+        if int(directory_id or 0) and design_id not in allowed_design_ids:
+            return {
+                "design_id": design_id,
+                "query": query,
+                "instances": [],
+                "nets": [],
+                "modules": [],
+                "summary": {},
+                "error": "design not in directory",
+            }
+    else:
         if not designs:
             return {
                 "design_id": "",
