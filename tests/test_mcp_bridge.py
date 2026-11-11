@@ -450,12 +450,9 @@ def test_main_transports(monkeypatch):
 def _recording_app(recorder: dict) -> object:
     async def app(scope, receive, send):
         recorder["called"] = True
-    return app
-
-
-def _recording_app(recorder: dict) -> object:
-    async def app(scope, receive, send):
-        recorder["called"] = True
+        recorder["request_token"] = bridge._REQUEST_MCP_TOKEN.get()
+        recorder["request_bearer"] = bridge._REQUEST_BEARER.get()
+        recorder["request_user"] = dict(bridge._REQUEST_USER.get())
     return app
 
 
@@ -510,8 +507,35 @@ def test_http_auth_mcp_token_verifies_via_platform(monkeypatch):
     (_run_middleware_scope(mw, {"X-HDB-MCP-Token": "hdbmcp_goodtoken"})
     )
     assert recorder.get("called") is True
+    assert recorder.get("request_token") == "hdbmcp_goodtoken"
+    assert recorder.get("request_bearer") == "bearer-123"
+    assert recorder.get("request_user", {}).get("username") == "alice"
     assert bridge._HTTP_AUTH_CACHE["hdbmcp_goodtoken"][1] == "bearer-123"
     bridge._HTTP_AUTH_CACHE.clear()
+
+
+def test_request_context_bearer_overrides_process_token(monkeypatch):
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(bridge, "_MCP_TOKEN", "process-token")
+    monkeypatch.setattr(bridge, "_TOKEN", "process-bearer")
+    _use(handler)
+    token = bridge._REQUEST_MCP_TOKEN.set("hdbmcp_user")
+    bearer = bridge._REQUEST_BEARER.set("user-bearer")
+    user = bridge._REQUEST_USER.set({"username": "alice", "department_id": "9"})
+    try:
+        assert bridge._headers() == {"Authorization": "Bearer user-bearer"}
+        assert bridge._request("GET", "/kbs") == {"ok": True}
+        assert seen["authorization"] == "Bearer user-bearer"
+        assert bridge._current_user()["username"] == "alice"
+    finally:
+        bridge._REQUEST_USER.reset(user)
+        bridge._REQUEST_BEARER.reset(bearer)
+        bridge._REQUEST_MCP_TOKEN.reset(token)
 
 
 def test_main_guard_and_bind_flows(monkeypatch):
