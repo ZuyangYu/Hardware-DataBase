@@ -919,3 +919,64 @@ def test_query_circuit_rejects_design_outside_directory(monkeypatch):
     )
     assert result["error"] == "design not in directory"
     assert result["instances"] == []
+
+
+def test_list_directories_returns_flat_and_nested_tree():
+    def handler(request: httpx.Request) -> httpx.Response:
+        parent = request.url.params.get("parent_id")
+        if request.url.path != "/api/v1/kbs/AAA/directories":
+            raise AssertionError(f"unexpected path {request.url.path}")
+        if parent == "0":
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": 1, "name": "docs", "parent_id": 0, "depth": 1},
+                    {"id": 3, "name": "empty", "parent_id": 0, "depth": 1},
+                ],
+            )
+        if parent == "1":
+            return httpx.Response(
+                200,
+                json=[{"id": 2, "name": "power", "parent_id": 1, "depth": 2}],
+            )
+        return httpx.Response(200, json=[])
+
+    _use(handler)
+    result = bridge.list_directories("AAA", parent_id=0, recursive=True)
+    assert result["directory_count"] == 3
+    assert {row["name"] for row in result["directories"]} == {
+        "docs",
+        "power",
+        "empty",
+    }
+    assert [node["name"] for node in result["tree"]] == ["docs", "empty"]
+    assert result["tree"][0]["children"][0]["name"] == "power"
+
+
+def test_get_and_retry_parse_task_by_file_id():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "ragflow-57",
+                    "kb_name": "AAA",
+                    "status": "failed",
+                    "message": "parse boom",
+                },
+            )
+        return httpx.Response(200, json={"ok": True, "message": "retried"})
+
+    _use(handler)
+    task = bridge.get_parse_task("AAA", file_id="ragflow:57")
+    assert task["status"] == "failed"
+    assert task["message"] == "parse boom"
+    retried = bridge.retry_parse("AAA", file_id="ragflow:57")
+    assert retried["ok"] is True
+    assert seen == [
+        ("GET", "/api/v1/kbs/AAA/parse-tasks/ragflow-57"),
+        ("POST", "/api/v1/kbs/AAA/parse-tasks/ragflow-57/retry"),
+    ]
