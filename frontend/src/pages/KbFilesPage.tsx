@@ -2214,19 +2214,22 @@ function DirectoryWorkspace({
         </div>
       </div>
       <div className="grid min-h-[118px] grid-cols-[minmax(220px,300px)_1fr] max-[720px]:grid-cols-1">
-        <div className="border-r border-[#f0f1f4] p-[10px] max-[720px]:border-r-0 max-[720px]:border-b">
+        <div
+          className="min-w-0 overflow-hidden border-r border-[#f0f1f4] p-[10px] max-[720px]:border-r-0 max-[720px]:border-b"
+          data-testid="kb-directory-panel"
+        >
           <button
             type="button"
             onClick={() => onSelect(0)}
             className={cn(
-              'flex w-full items-center gap-[7px] rounded-[8px] px-[9px] py-[7px] text-left text-[12px] transition-colors',
+              'flex w-full min-w-0 items-center gap-[7px] rounded-[8px] px-[9px] py-[7px] text-left text-[12px] transition-colors',
               currentDirectoryId === 0 ? 'bg-[#f3f4f6] font-medium text-[#18181a]' : 'text-[#464c5e] hover:bg-[#fafbfc]',
             )}
           >
             <AppIcon name="folder" size={14} />
-            <span className="flex-1 truncate">{kbName}</span>
+            <span className="min-w-0 flex-1 truncate">{kbName}</span>
           </button>
-          <div className="mt-[3px] grid gap-[2px]">
+          <div className="mt-[3px] grid min-w-0 grid-cols-[minmax(0,1fr)] gap-[2px]">
             {(cache[0] || []).map((directory) => (
               <DirectoryTreeNode
                 key={directory.id}
@@ -2297,18 +2300,18 @@ function DirectoryTreeNode({
   const children = cache[directory.id] || [];
   const isExpanded = expanded.has(directory.id);
   return (
-    <div>
-      <div className={cn('group flex items-center gap-[3px] rounded-[8px] px-[4px] transition-colors', currentDirectoryId === directory.id ? 'bg-[#f3f4f6]' : 'hover:bg-[#fafbfc]')}>
-        <button type="button" aria-label={isExpanded ? '收起目录' : '展开目录'} onClick={() => onToggle(directory.id)} className="grid h-[26px] w-[24px] place-items-center text-[#858b9c]">
+    <div className="min-w-0">
+      <div className={cn('group flex min-w-0 items-center gap-[3px] rounded-[8px] px-[4px] transition-colors', currentDirectoryId === directory.id ? 'bg-[#f3f4f6]' : 'hover:bg-[#fafbfc]')} data-testid={`kb-directory-row-${directory.id}`}>
+        <button type="button" aria-label={isExpanded ? '收起目录' : '展开目录'} onClick={() => onToggle(directory.id)} className="grid h-[26px] w-[24px] shrink-0 place-items-center text-[#858b9c]">
           <span className="text-[12px]">{directory.child_directory_count > 0 ? (isExpanded ? '⌄' : '›') : ''}</span>
         </button>
         <button type="button" onClick={() => onSelect(directory.id)} className="flex min-w-0 flex-1 items-center gap-[7px] py-[6px] text-left text-[12px] text-[#464c5e]">
-          <AppIcon name="folder" size={14} />
-          <span className="min-w-0 flex-1 truncate">{directory.name}</span>
-          <span className="text-[10px] text-[#a0a6b5]">{directory.file_count}</span>
+          <AppIcon name="folder" size={14} className="shrink-0" />
+          <span className="min-w-0 flex-1 truncate" data-testid={`kb-directory-name-${directory.id}`} title={directory.name}>{directory.name}</span>
+          <span className="shrink-0 text-[10px] text-[#a0a6b5]">{directory.file_count}</span>
         </button>
         {canAdmin && (
-          <div className="hidden items-center gap-[2px] pr-[3px] group-hover:flex group-focus-within:flex">
+          <div className="hidden shrink-0 items-center gap-[2px] pr-[3px] group-hover:flex group-focus-within:flex">
             <button type="button" aria-label={`重命名 ${directory.name}`} onClick={() => onRename(directory)} className="rounded px-[4px] py-[3px] text-[10px] text-[#757f9c] hover:bg-white hover:text-[#18181a]">改名</button>
             <button type="button" aria-label={`移动 ${directory.name}`} onClick={() => onMove(directory)} className="rounded px-[4px] py-[3px] text-[10px] text-[#757f9c] hover:bg-white hover:text-[#18181a]">移动</button>
             <button type="button" aria-label={`删除 ${directory.name}`} onClick={() => onDelete(directory)} className="rounded px-[4px] py-[3px] text-[10px] text-[#d20b0b] hover:bg-white">删</button>
@@ -2316,7 +2319,7 @@ function DirectoryTreeNode({
         )}
       </div>
       {isExpanded && children.length > 0 && (
-        <div className="ml-[16px] border-l border-[#f0f1f4] pl-[3px]">
+        <div className="ml-[16px] min-w-0 overflow-hidden border-l border-[#f0f1f4] pl-[3px]">
           {children.map((child) => (
             <DirectoryTreeNode
               key={child.id}
