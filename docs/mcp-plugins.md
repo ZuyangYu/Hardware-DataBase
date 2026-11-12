@@ -294,7 +294,7 @@ profile digest、runtime attestation 和 Artifact Broker 扫描器引用；启�
 
 ## HDB 自身作为远程 MCP（知识库/网表/表格检索）
 
-hdb 自带的 20 个 MCP 工具现在也支持标准远程接入（streamable_http）：
+hdb 自带的 23 个 MCP 工具现在也支持标准远程接入（streamable_http）：
 
 ```bash
 # 宿主机进程方式（默认 127.0.0.1:9100，双模式兼容 stdio）
@@ -313,7 +313,13 @@ docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d m
 
 - 工具集与 stdio 桥完全一致（list_kbs / list_directories / get_parse_task /
   retry_parse / search_knowledge_base / read_file_chunks / query_table /
-  query_circuit / upload_file / delete_file / delete_directory …）；
+  query_circuit / upload_file / create_directory_import /
+  upload_directory_import_file / get_directory_import / delete_file /
+  delete_directory …）；
+- **目录批量上传**：先 `create_directory_import` 提交相对路径清单，再按返回的
+  `job_id` + `file_id` 逐文件调用 `upload_directory_import_file`，最后用
+  `get_directory_import` 查询进度。批次上限 2000 文件 / 2 GiB，支持断点重试；
+  单文件仍受 MCP 传输限制（`MCP_MAX_UPLOAD_BYTES`，默认 100 MiB）。
 - **局域网接入**：Docker 方式默认绑定 `0.0.0.0`，还必须在 `config/.env` 把
   `HDB_MCP_HTTP_HOST` 设为 agent 实际访问的局域网 IP/域名；多地址/反向代理
   域名再加入 `HDB_MCP_ALLOWED_HOSTS`。宿主机方式对应设

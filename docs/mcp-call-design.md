@@ -37,7 +37,7 @@ HDB API（/api/v1）
   - `HDB_API_TOKEN`
   - `PYTHONPATH`
 
-工具固定为 20 个：
+工具固定为 23 个：
 
 ```text
 list_kbs
@@ -55,6 +55,9 @@ get_asset
 list_doc_assets
 get_doc_asset
 upload_file
+create_directory_import
+upload_directory_import_file
+get_directory_import
 delete_file
 delete_directory
 list_spreadsheets
@@ -67,7 +70,12 @@ query_circuit
 
 写入规则：
 
-- `upload_file`：真实写入，要求 KB write 权限，平台审计并触发解析。
+- `upload_file`：真实写入，要求 KB write 权限，平台审计并触发解析；单文件。
+- `create_directory_import`：提交目录清单，创建可断点续传的导入批次（最多
+  2000 文件 / 2 GiB），返回批次与每文件 ID。
+- `upload_directory_import_file`：按批次 ID + 文件 ID 逐文件上传，可重试；
+  单次受 `MCP_MAX_UPLOAD_BYTES`（默认 100 MiB）限制。
+- `get_directory_import`：查询批次和每文件状态。
 - `delete_file`：默认 dry-run，必须显式 `confirm=true`。
 - `delete_directory`：默认 dry-run，必须显式 `confirm=true`；`recursive=true`
   才会删除目录下的文件和子目录，非递归模式只允许删除空目录。

@@ -106,7 +106,9 @@ uv run python -m src.mcp_bridge.server
 - `list_spreadsheets` / `list_circuit_designs`
 - `query_circuit`（按实例/位号或网络名查询电路设计）
 - `list_assets` / `get_asset` / `list_doc_assets` / `get_doc_asset`
-- `upload_file`（真实写入；需要 KB write 权限，平台会审计并触发解析）
+- `upload_file`（单文件真实写入；需要 KB write 权限，平台会审计并触发解析）
+- `create_directory_import` / `upload_directory_import_file` / `get_directory_import`
+  （目录批量导入：先登记路径清单，再逐文件上传并查询进度；单文件仍受 MCP 大小限制）
 - `delete_file`（默认 dry-run，必须显式 `confirm=true` 才删除）
 - `delete_directory`（默认 dry-run；需 `confirm=true`，`recursive=true` 才会删除目录内容）
 

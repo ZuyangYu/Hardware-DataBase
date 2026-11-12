@@ -116,7 +116,9 @@ _REQUEST_USER: ContextVar[dict[str, Any]] = ContextVar("hdb_mcp_request_user", d
 
 _MAX_TOOL_TEXT = 20_000
 _MAX_ROWS = 50
-_MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+_MAX_UPLOAD_BYTES = int(
+    os.getenv("MCP_MAX_UPLOAD_BYTES", str(100 * 1024 * 1024))
+)
 _LOGIN_USER: dict[str, Any] = {}
 _http: httpx.Client | None = None
 
@@ -1090,7 +1092,9 @@ def upload_file(
 
     ``relative_path`` optionally preserves a folder path below
     ``directory_id`` (for example ``hd_sloution/references/01.md``); missing
-    directories are created automatically.
+    directories are created automatically. For a folder with many files use
+    :func:`create_directory_import` and :func:`upload_directory_import_file`
+    instead of one call per file.
     """
     if not str(filename or "").strip():
         raise ValueError("filename is required")
@@ -1101,7 +1105,9 @@ def upload_file(
     if not data:
         raise ValueError("file content is empty")
     if len(data) > _MAX_UPLOAD_BYTES:
-        raise ValueError("file content exceeds the 100 MiB bridge limit")
+        raise ValueError(
+            f"file content exceeds the {_MAX_UPLOAD_BYTES} byte bridge limit"
+        )
     files = {"files": (str(filename), data, "application/octet-stream")}
     form = {"directory_id": str(int(directory_id or 0))}
     if str(source_group or "").strip():
@@ -1114,6 +1120,91 @@ def upload_file(
         )
     return _request(
         "POST", f"/kbs/{_kb_path(kb_name)}/files", files=files, data=form
+    )
+
+
+@mcp.tool()
+def create_directory_import(
+    kb_name: str,
+    entries: list[dict[str, Any]],
+    directory_id: int = 0,
+    source_group: str = "",
+) -> dict[str, Any]:
+    """Create a resumable folder-import batch (max 2000 files / 2 GiB).
+
+    ``entries`` is a list of objects containing ``relative_path`` and an
+    optional ``source_group``. The API creates the directory tree and returns
+    a batch ``id`` plus one ``file_id`` per entry. Upload each file with
+    :func:`upload_directory_import_file`; this avoids putting an entire
+    folder into one MCP call and allows per-file retry.
+    """
+    if not entries:
+        raise ValueError("entries is required")
+    normalized: list[dict[str, str]] = []
+    for raw in entries:
+        if not isinstance(raw, dict):
+            raise ValueError("entries items must be objects")
+        relative_path = str(raw.get("relative_path") or "").strip()
+        if not relative_path:
+            raise ValueError("entries[].relative_path is required")
+        item = {"relative_path": relative_path}
+        group = str(raw.get("source_group") or source_group or "").strip()
+        if group:
+            item["source_group"] = group
+        normalized.append(item)
+    return _request(
+        "POST",
+        f"/kbs/{_kb_path(kb_name)}/directory-imports/plan",
+        json={"directory_id": int(directory_id or 0), "entries": normalized},
+    )
+
+
+@mcp.tool()
+def upload_directory_import_file(
+    kb_name: str,
+    job_id: int,
+    file_id: int,
+    content_base64: str,
+    filename: str = "upload",
+) -> dict[str, Any]:
+    """Upload one staged file for a directory-import batch.
+
+    Use the ``file_id`` returned by :func:`create_directory_import`. Calls can
+    be retried after a failure, but the API refuses to overwrite a file that
+    already succeeded. The per-call bridge limit is
+    ``MCP_MAX_UPLOAD_BYTES`` (default 100 MiB); the batch total is 2 GiB.
+    """
+    if int(job_id or 0) <= 0:
+        raise ValueError("job_id must be greater than 0")
+    if int(file_id or 0) <= 0:
+        raise ValueError("file_id must be greater than 0")
+    try:
+        data = base64.b64decode(str(content_base64 or ""), validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("content_base64 is not valid base64") from exc
+    if not data:
+        raise ValueError("file content is empty")
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise ValueError(
+            f"file content exceeds the {_MAX_UPLOAD_BYTES} byte bridge limit"
+        )
+    name = str(filename or "").strip() or "upload"
+    return _request(
+        "PUT",
+        f"/kbs/{_kb_path(kb_name)}/directory-imports/{int(job_id)}"
+        f"/files/{int(file_id)}/content",
+        files={"file": (name, data, "application/octet-stream")},
+    )
+
+
+@mcp.tool()
+def get_directory_import(kb_name: str, job_id: int) -> dict[str, Any]:
+    """Read one directory-import batch, including per-file status and errors."""
+    if int(job_id or 0) <= 0:
+        raise ValueError("job_id must be greater than 0")
+    return _request(
+        "GET",
+        f"/kbs/{_kb_path(kb_name)}/directory-imports/{int(job_id)}",
     )
 
 
