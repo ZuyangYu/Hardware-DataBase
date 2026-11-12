@@ -99,7 +99,8 @@ uv run python -m src.mcp_bridge.server
 工具：
 
 - `list_kbs`
-- `list_kb_files` / `read_file_chunks` / `download_kb_file`
+- `list_kb_files` / `list_directories` / `read_file_chunks` / `download_kb_file`
+- `get_parse_task` / `retry_parse`
 - `search_knowledge_base`（无状态词法检索，返回 chunk 定位；不创建会话）
 - `list_tables` / `query_table`（表格物化表的 schema 与只读 SQL）
 - `list_spreadsheets` / `list_circuit_designs`
@@ -107,6 +108,7 @@ uv run python -m src.mcp_bridge.server
 - `list_assets` / `get_asset` / `list_doc_assets` / `get_doc_asset`
 - `upload_file`（真实写入；需要 KB write 权限，平台会审计并触发解析）
 - `delete_file`（默认 dry-run，必须显式 `confirm=true` 才删除）
+- `delete_directory`（默认 dry-run；需 `confirm=true`，`recursive=true` 才会删除目录内容）
 
 说明：MCP 桥不提供平台代答/证据链工具；外部 agent 用
 `search_knowledge_base` 定位 chunk，再用 `read_file_chunks` 读原文自行推理。

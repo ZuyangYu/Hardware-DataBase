@@ -1148,6 +1148,38 @@ def delete_file(
 
 
 @mcp.tool()
+def delete_directory(
+    kb_name: str,
+    directory_id: int,
+    recursive: bool = False,
+    confirm: bool = False,
+) -> dict[str, Any]:
+    """Delete one knowledge-base directory (requires admin permission).
+
+    Without ``recursive`` the API only deletes an empty directory.  Set
+    ``recursive=true`` to delete every file and subdirectory below it.
+    Both modes are destructive; without ``confirm=true`` this tool returns a
+    dry-run response and performs no write.
+    """
+    target = int(directory_id or 0)
+    if target <= 0:
+        raise ValueError("directory_id must be greater than 0")
+    if not confirm:
+        return {
+            "deleted": False,
+            "dry_run": True,
+            "directory_id": target,
+            "recursive": bool(recursive),
+            "message": "pass confirm=true to delete this directory",
+        }
+    return _request(
+        "DELETE",
+        f"/kbs/{_kb_path(kb_name)}/directories/{target}",
+        params={"recursive": bool(recursive), "confirm": True},
+    )
+
+
+@mcp.tool()
 def list_spreadsheets(
     kb_name: str, directory_id: int = 0, recursive: bool = True
 ) -> dict[str, Any]:

@@ -37,7 +37,7 @@ HDB API（/api/v1）
   - `HDB_API_TOKEN`
   - `PYTHONPATH`
 
-工具固定为 19 个：
+工具固定为 20 个：
 
 ```text
 list_kbs
@@ -56,6 +56,7 @@ list_doc_assets
 get_doc_asset
 upload_file
 delete_file
+delete_directory
 list_spreadsheets
 list_circuit_designs
 query_circuit
@@ -68,6 +69,8 @@ query_circuit
 
 - `upload_file`：真实写入，要求 KB write 权限，平台审计并触发解析。
 - `delete_file`：默认 dry-run，必须显式 `confirm=true`。
+- `delete_directory`：默认 dry-run，必须显式 `confirm=true`；`recursive=true`
+  才会删除目录下的文件和子目录，非递归模式只允许删除空目录。
 
 ## 4. OpenCode 配置
 

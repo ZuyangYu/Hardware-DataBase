@@ -832,6 +832,37 @@ def test_search_knowledge_base_scopes_to_directory_and_keeps_relative_path():
     assert not any(path.endswith("/ragflow:2/chunks") for path in seen)
 
 
+def test_delete_directory_is_dry_run_until_confirmed():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, dict(request.url.params)))
+        return httpx.Response(200, json={"ok": True, "message": "目录及其内容已递归删除"})
+
+    _use(handler)
+    dry = bridge.delete_directory("AAA", 7, recursive=True)
+    assert dry["dry_run"] is True
+    assert seen == []
+
+    result = bridge.delete_directory("AAA", 7, recursive=True, confirm=True)
+    assert result["ok"] is True
+    assert seen[0] == (
+        "DELETE",
+        "/api/v1/kbs/AAA/directories/7",
+        {"recursive": "true", "confirm": "true"},
+    )
+
+    bridge.delete_directory("AAA", 8, confirm=True)
+    assert seen[1] == (
+        "DELETE",
+        "/api/v1/kbs/AAA/directories/8",
+        {"recursive": "false", "confirm": "true"},
+    )
+
+    with pytest.raises(ValueError, match="directory_id"):
+        bridge.delete_directory("AAA", 0, confirm=True)
+
+
 def test_delete_file_passes_directory_scope():
     seen = {}
 
