@@ -35,6 +35,10 @@ deploy/docker/storage
 deploy/sandbox-runner/secrets
 deploy/sandbox-runner/state
 deploy/mcp-gateway/secrets
+# 宿主机上为 scripts/hdb.sh 安装的 MCP 依赖不需要进 app 镜像；
+# 各 MCP Dockerfile 会在自己的构建阶段 npm ci / pip install。
+deploy/*/node_modules
+deploy/*/__pycache__
 /logs
 
 # --- 前端：web 镜像在构建阶段自行 npm ci + build ---

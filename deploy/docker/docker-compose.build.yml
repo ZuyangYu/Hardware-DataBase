@@ -11,6 +11,8 @@
 #   docker compose ... build
 
 services:
+  # mcp 与 api/worker 共用 hardware-database-app 镜像，随 api 一起构建，
+  # 不需要单独的 build 段。
   api:
     build:
       context: ../..

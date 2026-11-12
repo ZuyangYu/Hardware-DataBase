@@ -201,6 +201,8 @@ if [ -n "$WEB_PORT" ]; then
 fi
 WEB_PORT="$( { grep -E '^HDB_HTTP_PORT=' .env 2>/dev/null || true; } | tail -1 | cut -d= -f2-)"; WEB_PORT="${WEB_PORT:-8080}"
 API_PORT="$( { grep -E '^HDB_API_PORT=' .env 2>/dev/null || true; } | tail -1 | cut -d= -f2-)"; API_PORT="${API_PORT:-8001}"
+MCP_PORT="$( { grep -E '^HDB_MCP_HOST_PORT=' .env 2>/dev/null || true; } | tail -1 | cut -d= -f2-)"; MCP_PORT="${MCP_PORT:-9100}"
+MCP_BIND="$( { grep -E '^HDB_MCP_BIND=' .env 2>/dev/null || true; } | tail -1 | cut -d= -f2-)"; MCP_BIND="${MCP_BIND:-0.0.0.0}"
 
 # 旧模板可能在 config/.env 里留下 RESOURCE_GOVERNOR_SCOPE=process；它与本编排
 # （后端 postgres）冲突——保存「系统配置」时文件会覆盖环境变量并校验失败。就地纠正。
@@ -228,12 +230,12 @@ fi
 
 # ---- 3) 启动 ----
 if [ "$WITH_OBS" -eq 1 ]; then
-  log "启动服务（postgres/redis → migrate → api + worker → web + 观测栈）..."
+  log "启动服务（postgres/redis → migrate → api + mcp + worker → web + 观测栈）..."
 else
-  log "启动服务（postgres/redis → migrate → api + worker → web；已跳过观测栈）..."
+  log "启动服务（postgres/redis → migrate → api + mcp + worker → web；已跳过观测栈）..."
 fi
 if ! docker compose "${COMPOSE_ARGS[@]}" up -d; then
-  warn "启动失败。常见原因：端口被占用（改 .env 的 HDB_HTTP_PORT / HDB_API_PORT / OBS_*_PORT），或旧数据卷与 .env 里的 PG 密码不一致。"
+  warn "启动失败。常见原因：端口被占用（改 .env 的 HDB_HTTP_PORT / HDB_API_PORT / HDB_MCP_HOST_PORT / OBS_*_PORT），或旧数据卷与 .env 里的 PG 密码不一致。"
   exit 1
 fi
 
@@ -272,9 +274,10 @@ cat <<EOF
   Hardware DataBase ${ACTION}
   访问地址   : http://${HOST_IP}:${WEB_PORT}
   管理员账号 : ${ADMIN_USER} / ${ADMIN_PW:-<见 config/.env>}
+  MCP 服务   : http://${MCP_BIND/0.0.0.0/${HOST_IP}}:${MCP_PORT}/mcp（需在 config/.env 设置 HDB_MCP_HTTP_HOST，并使用个人 hdbmcp_* 令牌）
   部署目录   : ${BUNDLE_DIR}
   服务状态   : cd ${DOCKER_DIR} && docker compose ps
-  后端日志   : docker compose logs -f api
+  后端日志   : docker compose logs -f api / mcp
 ============================================================
 EOF
 

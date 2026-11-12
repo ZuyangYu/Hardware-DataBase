@@ -66,12 +66,15 @@ bash deploy/docker/quickstart.sh
 ```
 
 脚本会：生成 PostgreSQL、观测栈与管理员口令（打印在终端）→ 构建镜像 → 启动
-`postgres/redis → migrate → api + 独立 chat/parse/export/memory worker → web`，
+`postgres/redis → migrate → api + 独立 chat/parse/export/memory/evaluation/quality worker → web`，
 并默认启动观测栈。访问 `http://<主机IP>:8080`，用 `admin` + 终端打印的口令登录。
+内置 MCP Server 默认发布到 `0.0.0.0:9100`，局域网访问地址为
+`http://<主机IP>:9100/mcp`；需在 `config/.env` 设置 `HDB_MCP_HTTP_HOST`，
+详见 [`deploy/docker/README.md`](deploy/docker/README.md) 的「内置 MCP Server」。
 
 - 只准备文件不启动：`bash deploy/docker/quickstart.sh --no-start`
 - 资源受限时跳过观测栈：`bash deploy/docker/quickstart.sh --without-observability`
-- 默认端口被占用时，在 `deploy/docker/.env` 配置 `HDB_HTTP_PORT`、`HDB_API_PORT` 与 `OBS_*_PORT`
+- 默认端口被占用时，在 `deploy/docker/.env` 配置 `HDB_HTTP_PORT`、`HDB_API_PORT`、`HDB_MCP_HOST_PORT` 与 `OBS_*_PORT`
 - 镜像源加速、内网离线分发、指向已有 PostgreSQL、备份恢复：见 [`deploy/docker/README.md`](deploy/docker/README.md)
 
 ### 方式二：uv（源码开发，推荐）

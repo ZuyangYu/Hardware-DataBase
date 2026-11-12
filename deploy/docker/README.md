@@ -4,7 +4,7 @@
 
 | 镜像 | 内容 | 说明 |
 |---|---|---|
-| `hardware-database-app` | Python 3.12 + uv.lock 全量依赖 + `src/` | API 与全部后台 worker 共用；内置 DroidSansFallbackFull（PDF 中文） |
+| `hardware-database-app` | Python 3.12 + uv.lock 全量依赖 + `src/` | API、全部后台 worker 与内置 MCP Server 共用；内置 DroidSansFallbackFull（PDF 中文） |
 | `hardware-database-web` | nginx + Vite 构建产物 | 静态站点 + 反代 `/api`、`/health`（SSE 已关闭缓冲） |
 | `redis:8-alpine` | 实时平面（**必需**，随编排启动） | 取消快路径 + 跨进程 SSE；只存带 TTL 的加速键（AOF 开、与项目自管实例一致），真相在 PG，无需备份 |
 
@@ -28,10 +28,12 @@
 浏览器 -> web:80(宿主 8080) -> api:8001 ──> RAGFlow / LLM（宿主机或内网其他机器）
                                    └──> hdb-storage 卷（SQLite/归档/导出/日志）
                                    └──> redis:6379（内部网络，不存独有数据）
+局域网 Agent -> mcp:9100(默认 0.0.0.0) -> api:8001（每用户 hdbmcp_* 令牌）
 ```
 
 生产 Compose 启动独立的 chat/parse/export/memory/evaluation/quality worker，
 API 的自动拉起开关在 Compose 中关闭；各进程通过持久账本协调。生产默认另起观测组件。
+内置 MCP Server 与 API 共用 app 镜像，见第 3 节末的「内置 MCP Server」。
 
 ---
 
@@ -41,7 +43,7 @@ API 的自动拉起开关在 Compose 中关闭；各进程通过持久账本协�
 bash deploy/docker/quickstart.sh
 ```
 
-生成密钥 → 构建 → 启动生产栈（`postgres → migrate → api → web` +
+生成密钥 → 构建 → 启动生产栈（`postgres → migrate → api → web` + 内置 `mcp` +
 Collector/Prometheus/Tempo/Loki/Grafana/Phoenix）→ 打印管理员口令。
 访问 `http://<主机IP>:8080`，登录后在「系统配置」填 RAGFlow 与模型端点。
 资源受限时才使用 `bash deploy/docker/quickstart.sh --without-observability`。
@@ -67,7 +69,7 @@ docker compose -f deploy/docker/docker-compose.yml \
 访问 `http://<主机IP>:8080`。
 
 启动顺序由编排保证：`postgres`（健康）→ `migrate`（一次性：建控制面 schema +
-逐域建表 + 认证域形状校验，失败会拦住 api）→ `api` → `web`。
+逐域建表 + 认证域形状校验，失败会拦住 api）→ `api` → `web` / `mcp`。
 **migrate 是幂等的**，每次 `up -d` 都会跑一遍，升级时它就是你的"迁移门槛"。
 
 ### 评测执行与恢复
@@ -198,7 +200,9 @@ RAGFlow 与模型端点。包内 `INSTALL.md` 有同样说明。
   管理员在「系统配置」页保存时会**原子写回宿主机这个文件**，因此该目录必须可写。
   （容器内的 `HDB_ENV_PATH` 就是指向它；镜像层与单文件 bind mount 无法 rename。）
 - `deploy/docker/.env`（可选）：只给 compose 做变量插值（镜像 tag、端口），
-  例如 `HDB_HTTP_PORT=9090`、`HDB_APP_IMAGE=hardware-database-app:v1`。观测栈手动启动时还必须
+  例如 `HDB_HTTP_PORT=9090`、`HDB_APP_IMAGE=hardware-database-app:v1`、
+  `HDB_MCP_HOST_PORT=9100`；需要只允许本机访问 MCP 时设
+  `HDB_MCP_BIND=127.0.0.1`。观测栈手动启动时还必须
   提供 `GRAFANA_ADMIN_PASSWORD` 与 `PHOENIX_DB_PASSWORD`；quickstart 会自动生成并写入该文件。
   若服务器已有观测栈，可同时设置 `OBS_GRAFANA_PORT`、`OBS_PHOENIX_PORT`、
   `OBS_PROMETHEUS_PORT`、`OBS_ALERTMANAGER_PORT`、`OBS_OTLP_GRPC_PORT`、
@@ -217,6 +221,37 @@ RAGFlow 与模型端点。包内 `INSTALL.md` 有同样说明。
   备份、不参与对账。代码对 Redis 故障 fail-soft（降级为 DB 轮询/1 秒级取消），
   但部署上它是必需组件，不再提供"关掉"的开关。
 - **storage/**：文件类数据（归档/导出/附件字节/派生索引）。
+
+### 内置 MCP Server（9100）
+
+Compose 里的 `mcp` 服务就是 HDB 对外提供的知识库 MCP Server，和 `api` 共用
+`hardware-database-app` 镜像，不额外构建。它通过内部地址
+`http://api:8001/api/v1` 调用 API，工具集与 `src/mcp_bridge/server.py` 一致。
+
+- **默认地址**：`http://<主机局域网IP>:9100/mcp`，默认发布到 `0.0.0.0:9100`，
+  局域网内 agent 可直接访问。
+- **必须配置**：在 `config/.env` 设置 `HDB_MCP_HTTP_HOST=<主机局域网IP或域名>`，
+  否则 Host 校验只接受回环地址，局域网访问会返回 `421 Invalid Host header`。
+  例如 `HDB_MCP_HTTP_HOST=192.168.1.20`。`quickstart.sh` 首次生成配置时
+  会自动取当前主机首个 IPv4 写入；用域名/反向代理时再手动改。
+- **鉴权**：必须带每用户 `hdbmcp_*` 令牌（`X-HDB-MCP-Token`），由
+  「个人 MCP 凭证」或 `scripts/hdb_mcp_user_setup.sh` 生成；不要设置
+  `HDB_MCP_HTTP_ALLOW_UNAUTHED=1`。
+- **端口/绑定**：宿主端口默认 9100，可在 `deploy/docker/.env` 用
+  `HDB_MCP_HOST_PORT` 调整，同时把 `config/.env` 的 `HDB_MCP_HTTP_PORT`
+  改成同一端口；需要只允许本机访问时设 `HDB_MCP_BIND=127.0.0.1`。
+  如果走反向代理，再把代理域名加入 `HDB_MCP_ALLOWED_HOSTS`。改完重建：
+  `docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --force-recreate mcp api`。
+- **安全**：局域网暴露时建议用防火墙限制来源网段；跨网段/不可信网络应在
+  反向代理终止 TLS，并把 `HDB_MCP_HTTP_SCHEME` 改为 `https`。
+- **边界**：MCP 只暴露知识库/表格/网表工具，不启动本地进程；远程写入仍受
+  `MCP_WRITE_ENABLED`、工具白名单、员工写入同意和能力位控制。
+
+```bash
+# 本机/局域网探活：无令牌返回 401 即表示服务已监听
+curl -i http://<主机局域网IP>:9100/mcp
+docker compose -f docker-compose.yml -f docker-compose.observability.yml logs -f mcp
+```
 
 ### 观测（生产默认启动）
 
@@ -253,6 +288,7 @@ Grafana 与 Phoenix 数据库口令由 quickstart 生成并写入 `deploy/docker
 cd deploy/docker
 docker compose -f docker-compose.yml -f docker-compose.observability.yml ps
 docker compose -f docker-compose.yml -f docker-compose.observability.yml logs -f api
+docker compose -f docker-compose.yml -f docker-compose.observability.yml logs -f mcp
 docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --force-recreate api
 docker compose -f docker-compose.yml -f docker-compose.observability.yml down
 # Redis 属于默认业务栈，以上 compose 命令会一并停止/重建；它不可用时 API readiness 会失败
@@ -272,7 +308,7 @@ bash offline-install.sh --upgrade --target <旧部署目录>
 
 ## 5. 多角色/多副本（可选）
 
-生产 Docker 编排默认关闭 API 内嵌 worker，并为 chat/parse/export/memory
+生产 Docker 编排默认关闭 API 内嵌 worker，并为 chat/parse/export/memory/evaluation/quality
 各起一个独立服务，避免直接扩容 API 时重复消费同一队列。宿主机单进程开发模式仍可
 保留内嵌 worker；多副本 API 部署应明确设置 `HDB_API_SPAWN_*` 为 `0`。
 
@@ -303,7 +339,10 @@ bash offline-install.sh --upgrade --target <旧部署目录>
 | 上传大文件 413 | nginx `client_max_body_size` 已是 512m；反向代理前置还有一层时需同步放大 |
 | 前端轨迹卡顿、取消不及时 | 检查 `redis` 是否 healthy；Redis 是生产硬依赖，API 未就绪时不会接收流量 |
 | Worker 健康检查失败 | 查看 `docker compose logs worker-chat worker-parse`；API readiness 会列出缺失角色 |
-| 启动报 `port is already allocated` | 宿主机已有进程占用 8080/8001（如本机直接跑的 dev 服务）；改 `deploy/docker/.env` 的 `HDB_HTTP_PORT`，或停掉本机进程 |
+| MCP 返回 401 | 请求缺少有效的 `X-HDB-MCP-Token`；先在平台生成个人 MCP 凭证，确认令牌未被撤销 |
+| MCP 返回 421 / `Invalid Host header` | 访问地址与 Host 头未放行：在 `config/.env` 设置 `HDB_MCP_HTTP_HOST`（或 `HDB_MCP_ALLOWED_HOSTS`）后重启 `mcp api` |
+| MCP 容器启动失败，提示 `No module named src.mcp_bridge` | 镜像还是旧的（不含 MCP 代码）；用当前源码重新 `docker compose build --no-cache api` 并重建 |
+| 启动报 `port is already allocated` | 宿主机已有进程占用 8080/8001/9100（如本机直接跑的 dev 服务或 hdb.sh 管理的 MCP）；改 `deploy/docker/.env` 的 `HDB_HTTP_PORT`/`HDB_MCP_HOST_PORT`，或停掉本机进程 |
 | PDF 中文变方框 | 镜像已内置 Droid 字体；换了自定义基础镜像时需自装 `fonts-droid-fallback` 或设 `RESULT_EXPORT_PDF_FONT` |
 | 要开附件 OCR/视觉 | 镜像已内置 `tesseract-ocr`/`poppler-utils`；视觉能力仍需显式允许远程推理 |
 

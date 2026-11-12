@@ -76,6 +76,18 @@ for _ in $(seq 1 40); do ready="$(curl -s -o /dev/null -w '%{http_code}' --max-t
 expect "GET /health/ready" 200 "$ready"
 if [ "$ready" != 200 ]; then curl_json "$BASE/health/ready" | head -c 400; echo; fi
 
+MCP_PORT="$( { grep -E '^HDB_MCP_HOST_PORT=' .env 2>/dev/null || true; } | tail -1 | cut -d= -f2-)"; MCP_PORT="${MCP_PORT:-9100}"
+MCP_BIND="$( { grep -E '^HDB_MCP_BIND=' .env 2>/dev/null || true; } | tail -1 | cut -d= -f2-)"; MCP_BIND="${MCP_BIND:-0.0.0.0}"
+case "$MCP_BIND" in
+  127.0.0.1|0.0.0.0|localhost)
+    mcp_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${MCP_PORT}/mcp")"
+    expect "MCP 未带令牌拒绝" 401 "$mcp_code"
+    ;;
+  *)
+    warn "MCP 绑定在 ${MCP_BIND}，跳过回环探活"
+    ;;
+esac
+
 log "3) 认证与治理边界"
 AT="$(curl_json -X POST "$BASE/api/v1/login" -d "{\"username\":\"$ADMIN_USER\",\"password\":\"$ADMIN_PW\"}" | py 'import json,sys; print(json.load(sys.stdin).get("token",""))')"
 [ "${#AT}" -gt 20 ] && ok "admin 登录成功" || bad "admin 登录失败"
@@ -172,7 +184,7 @@ if [ -n "$probe2" ]; then ok "导出表时间戳查询探针通过"; else bad "�
 
 log "6) 日志扫描"
 LOG_PATTERNS='Traceback|session deletion not committed|does not exist|UniqueViolation|cannot join current thread|DatatypeMismatch'
-for svc in api web worker-chat worker-parse worker-export worker-memory; do
+for svc in api web mcp worker-chat worker-parse worker-export worker-memory; do
   hits="$(${COMPOSE[@]} logs --no-color "$svc" 2>/dev/null | grep -cE "$LOG_PATTERNS" || true)"
   expect "$svc 异常日志行数" 0 "${hits:-0}"
 done
