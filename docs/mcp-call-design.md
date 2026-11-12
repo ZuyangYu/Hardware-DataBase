@@ -37,11 +37,14 @@ HDB API（/api/v1）
   - `HDB_API_TOKEN`
   - `PYTHONPATH`
 
-工具固定为 16 个：
+工具固定为 19 个：
 
 ```text
 list_kbs
 list_kb_files
+list_directories
+get_parse_task
+retry_parse
 read_file_chunks
 search_knowledge_base
 download_kb_file
@@ -57,6 +60,9 @@ list_spreadsheets
 list_circuit_designs
 query_circuit
 ```
+
+> 远程模式（streamable-http）复用同一工具集；Docker 部署见
+> [`deploy/docker/README.md`](../deploy/docker/README.md) 的「内置 MCP Server」。
 
 写入规则：
 

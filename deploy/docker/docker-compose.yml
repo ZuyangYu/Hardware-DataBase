@@ -5,7 +5,8 @@
 #
 # 拓扑（默认全在一个 compose 里，新机器一条命令起全套）：
 #   migrate(一次性) ──> api(8001) ──> web(8080->80)
-#        │                └ 独立 chat/parse/export/memory workers
+#        │                ├ 独立 chat/parse/export/memory/evaluation/quality workers
+#        │                └ 内置 MCP Server(9100，默认发布到局域网)
 #        └ postgres(pgvector, 内部网络)   redis(内部网络，必需)
 #   外部依赖（不在本编排内）：RAGFlow、LLM（Ollama 或 OpenAI 兼容 API）
 #
@@ -110,6 +111,36 @@ services:
       migrate:
         condition: service_completed_successfully
       redis:
+        condition: service_healthy
+
+  # HDB 自身作为远程 MCP Server（知识库/表格/网表检索）。
+  # 与 api 共用 app 镜像，不额外构建；容器内固定 9100。
+  # 默认发布到 0.0.0.0:9100，供局域网 agent 访问；必须在 config/.env 把
+  # HDB_MCP_HTTP_HOST 设为局域网 IP 或域名，否则 Host 校验会拒绝局域网请求。
+  # 鉴权始终使用每用户 hdbmcp_* 令牌，禁止打开 HDB_MCP_HTTP_ALLOW_UNAUTHED。
+  mcp:
+    <<: *app
+    command: ["python", "-m", "src.mcp_bridge.server"]
+    environment:
+      <<: [*app-env, *pg-env]
+      HDB_API_BASE: http://api:8001/api/v1
+      HDB_MCP_TRANSPORT: streamable-http
+      HDB_MCP_HOST: 0.0.0.0
+      HDB_MCP_PORT: "9100"
+      HDB_MCP_HTTP_ALLOW_UNAUTHED: "0"
+    expose:
+      - "9100"
+    ports:
+      - "${HDB_MCP_BIND:-0.0.0.0}:${HDB_MCP_HOST_PORT:-9100}:9100"
+    healthcheck:
+      # 无令牌访问 /mcp 会返回 401；这里只做 TCP 可达性检查。
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 9100), 3).close()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    depends_on:
+      api:
         condition: service_healthy
 
   web:

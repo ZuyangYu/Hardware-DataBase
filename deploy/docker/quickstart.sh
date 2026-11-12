@@ -65,6 +65,7 @@ check_host_port() {
 if [ "$START" -eq 1 ]; then
   check_host_port "$(compose_value HDB_HTTP_PORT 8080)" "Web"
   check_host_port "$(compose_value HDB_API_PORT 8001)" "API"
+  check_host_port "$(compose_value HDB_MCP_HOST_PORT 9100)" "MCP"
   if [ "$WITH_OBS" -eq 1 ]; then
     check_host_port "$(compose_value OBS_GRAFANA_PORT 3000)" "Grafana"
     check_host_port "$(compose_value OBS_PHOENIX_PORT 6006)" "Phoenix"
@@ -140,6 +141,18 @@ if ! grep -qE '^AUTH_DEFAULT_ADMIN_PASSWORD=.+' config/.env; then
   mv config/.env.tmp config/.env
   log "已生成管理员口令：admin / ${ADMIN_PW}（保存在 config/.env）"
 fi
+# 局域网 MCP：首次生成配置时把对外 Host 设为当前主机 IP，避免客户端收到
+# 421 Invalid Host header；使用域名/反向代理时可在 config/.env 改掉。
+mcp_host_ip="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)"
+if [ -n "$mcp_host_ip" ] && ! grep -qE '^HDB_MCP_HTTP_HOST=.+' config/.env; then
+  awk -v v="$mcp_host_ip" '
+    /^HDB_MCP_HTTP_HOST=/ { print "HDB_MCP_HTTP_HOST=" v; found=1; next }
+    { print }
+    END { if (!found) print "HDB_MCP_HTTP_HOST=" v }
+  ' config/.env > config/.env.tmp
+  mv config/.env.tmp config/.env
+  log "已设置 MCP 局域网地址：HDB_MCP_HTTP_HOST=${mcp_host_ip}"
+fi
 chmod 600 config/.env
 if [ "$(id -u)" -eq 0 ]; then
   runtime_uid="$(grep '^HDB_UID=' .env | tail -1 | cut -d= -f2-)"
@@ -171,6 +184,13 @@ docker compose "${COMPOSE_FILES[@]}" up -d --wait --wait-timeout 300
 host_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 log "完成。访问 http://${host_ip:-<本机IP>}:8080 ，用 admin 登录"
 log "首次登录后到「系统配置」填 RAGFlow 与模型端点；日志：docker compose logs -f api"
+mcp_bind="$(compose_value HDB_MCP_BIND 0.0.0.0)"
+mcp_port="$(compose_value HDB_MCP_HOST_PORT 9100)"
+case "$mcp_bind" in
+  0.0.0.0) mcp_host="${host_ip:-<本机IP>}" ;;
+  *) mcp_host="$mcp_bind" ;;
+esac
+log "MCP：http://${mcp_host}:${mcp_port}/mcp（局域网；需在 config/.env 设置 HDB_MCP_HTTP_HOST）"
 if [ "$WITH_OBS" -eq 1 ]; then
   GRAFANA_PW="$(grep -E '^GRAFANA_ADMIN_PASSWORD=' .env 2>/dev/null | tail -1 | cut -d= -f2- || true)"
   log "观测栈：Grafana http://${host_ip:-127.0.0.1}:3000（admin / ${GRAFANA_PW:-change-me}）"

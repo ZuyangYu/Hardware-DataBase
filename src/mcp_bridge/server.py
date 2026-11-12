@@ -33,6 +33,11 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+# Load the same mounted app config the API/workers use (HDB_ENV_PATH) before
+# reading HDB_MCP_* or HDB_API_* below.  Host mode gets these values from the
+# wrapper shell sourcing .env; the Docker MCP container has no such shell.
+from src import settings as _settings  # noqa: F401
+
 from src.services.knowledge_retrieval import (
     clip as _clip,
     read_chunks,
@@ -1332,6 +1337,12 @@ def _warn_or_fail_open_socket(host: str, *, allow_unauth: bool) -> None:
         print(
             "[hdb-mcp] WARNING: binding %s WITHOUT the per-user token gate "
             "(HDB_MCP_HTTP_ALLOW_UNAUTHED=1) — intranet exposure only." % host
+        )
+    if not os.getenv("HDB_MCP_HTTP_HOST") and not os.getenv("HDB_MCP_ALLOWED_HOSTS"):
+        print(
+            "[hdb-mcp] WARNING: binding %s without HDB_MCP_HTTP_HOST or "
+            "HDB_MCP_ALLOWED_HOSTS; LAN clients will fail Host validation "
+            "(421 Invalid Host header)." % host
         )
     print(
         "[hdb-mcp] info: %s bound; agents must send X-HDB-MCP-Token with an "

@@ -294,17 +294,35 @@ profile digest、runtime attestation 和 Artifact Broker 扫描器引用；启�
 
 ## HDB 自身作为远程 MCP（知识库/网表/表格检索）
 
-hdb 自带的 16 个 MCP 工具现在也支持标准远程接入（streamable_http）：
+hdb 自带的 19 个 MCP 工具现在也支持标准远程接入（streamable_http）：
 
 ```bash
-# 启动远程 server（默认 127.0.0.1:9100，双模式兼容 stdio）
+# 宿主机进程方式（默认 127.0.0.1:9100，双模式兼容 stdio）
 scripts/hdb_mcp_http.sh
-# 登记平台插件 URL：http://<host>:9100/mcp
+# 登记 URL：http://<host>:9100/mcp
 ```
 
-- 工具集与 stdio 桥完全一致（search/read_file_chunks/query_table/query_circuit/list_kbs…）；
-- **跨机接入**：`HDB_MCP_HOST=127.0.0.1`（默认）仅本机可连；设 `HDB_MCP_HOST=0.0.0.0` 供跨机 agent 连接。默认挂 per-user hdbmcp_* 令牌门禁（`X-HDB-MCP-Token`），确认内网裸开时显式 `HDB_MCP_HTTP_ALLOW_UNAUTHED=1`（进程将打印 WARNING）；
-- 工具对 HDB API 的鉴权经 `HDB_MCP_TOKEN`（mcp-session 换取短期 Bearer）或 `HDB_API_TOKEN`；
+Docker 部署可直接使用 compose 内置的 `mcp` 服务（与 API 共用 app 镜像，
+容器内 9100，默认发布到 `0.0.0.0:9100`，供局域网 agent 访问）：
+
+```bash
+cd deploy/docker
+docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d mcp
+# 访问 URL：http://<主机局域网IP>:9100/mcp
+```
+
+- 工具集与 stdio 桥完全一致（list_kbs / list_directories / get_parse_task /
+  retry_parse / search_knowledge_base / read_file_chunks / query_table /
+  query_circuit / upload_file / delete_file …）；
+- **局域网接入**：Docker 方式默认绑定 `0.0.0.0`，还必须在 `config/.env` 把
+  `HDB_MCP_HTTP_HOST` 设为 agent 实际访问的局域网 IP/域名；多地址/反向代理
+  域名再加入 `HDB_MCP_ALLOWED_HOSTS`。宿主机方式对应设
+  `HDB_MCP_HOST=0.0.0.0` 和 `HDB_MCP_HTTP_HOST`。默认挂 per-user
+  hdbmcp_* 令牌门禁（`X-HDB-MCP-Token`）；`HDB_MCP_HTTP_ALLOW_UNAUTHED=1`
+  仅用于受控内网裸开，进程会打印 WARNING；
+- 只允许本机访问时，在 `deploy/docker/.env` 设 `HDB_MCP_BIND=127.0.0.1`；
+- 工具对 HDB API 的鉴权经 `HDB_MCP_TOKEN`（mcp-session 换取短期 Bearer）或
+  `HDB_API_TOKEN`；远程 HTTP 模式优先使用每个请求携带的 hdbmcp_* 身份；
 - token 被撤销/轮换后用 `scripts/hdb_mcp_user_setup.sh` 重新发行；
 - 无状态检索用 `search_knowledge_base`（agent 首选）。平台代答/带引用叙述走 Web 会话管道 `/conversations/{id}/turns`，MCP 工具面不再暴露 ask*。
 
