@@ -242,6 +242,10 @@ Compose 里的 `mcp` 服务就是 HDB 对外提供的知识库 MCP Server，和 
   改成同一端口；需要只允许本机访问时设 `HDB_MCP_BIND=127.0.0.1`。
   如果走反向代理，再把代理域名加入 `HDB_MCP_ALLOWED_HOSTS`。改完重建：
   `docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --force-recreate mcp api`。
+- **目录批量上传**：先用 `create_directory_import` 提交相对路径清单，再按
+  返回的 `job_id` / `file_id` 调用 `upload_directory_import_file`，最后用
+  `get_directory_import` 查进度；批次上限 2000 文件 / 2 GiB，支持断点重试。
+  单文件仍受 `MCP_MAX_UPLOAD_BYTES`（默认 100 MiB）限制，超大文件建议走 Web/API 直传。
 - **安全**：局域网暴露时建议用防火墙限制来源网段；跨网段/不可信网络应在
   反向代理终止 TLS，并把 `HDB_MCP_HTTP_SCHEME` 改为 `https`。
 - **边界**：MCP 只暴露知识库/表格/网表工具，不启动本地进程；远程写入仍受

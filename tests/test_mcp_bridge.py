@@ -322,6 +322,105 @@ def test_download_kb_file_locates_by_filename_and_directory(tmp_path, monkeypatc
     assert result["is_text"] is True
 
 
+def test_create_directory_import_posts_plan():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.read().decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "id": 9,
+                "directory_id": 3,
+                "status": "queued",
+                "total_files": 2,
+                "files": [{"id": 11}, {"id": 12}],
+            },
+        )
+
+    _use(handler)
+    result = bridge.create_directory_import(
+        "AAA",
+        [
+            {"relative_path": "docs/a.txt"},
+            {"relative_path": "docs/b.txt", "source_group": "material"},
+        ],
+        directory_id=3,
+        source_group="material",
+    )
+    assert result["id"] == 9
+    assert result["files"][0]["id"] == 11
+    assert seen["method"] == "POST"
+    assert seen["path"] == "/api/v1/kbs/AAA/directory-imports/plan"
+    assert seen["body"]["directory_id"] == 3
+    assert seen["body"]["entries"] == [
+        {"relative_path": "docs/a.txt", "source_group": "material"},
+        {"relative_path": "docs/b.txt", "source_group": "material"},
+    ]
+
+
+def test_upload_directory_import_file_puts_content():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["content_type"] = request.headers.get("content-type", "")
+        seen["body"] = request.read().decode("utf-8", "replace")
+        return httpx.Response(200, json={"id": 11, "status": "queued"})
+
+    _use(handler)
+    result = bridge.upload_directory_import_file(
+        "AAA",
+        9,
+        11,
+        base64.b64encode(b"hello folder").decode(),
+        filename="a.txt",
+    )
+    assert result["status"] == "queued"
+    assert seen["method"] == "PUT"
+    assert seen["path"] == "/api/v1/kbs/AAA/directory-imports/9/files/11/content"
+    assert "multipart/form-data" in seen["content_type"]
+    assert "a.txt" in seen["body"]
+    assert "hello folder" in seen["body"]
+
+
+def test_get_directory_import_reads_job_and_files():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/v1/kbs/AAA/directory-imports/9"
+        return httpx.Response(
+            200,
+            json={
+                "id": 9,
+                "status": "completed",
+                "files": [{"id": 11, "status": "success"}],
+            },
+        )
+
+    _use(handler)
+    result = bridge.get_directory_import("AAA", 9)
+    assert result["status"] == "completed"
+    assert result["files"][0]["status"] == "success"
+
+
+def test_directory_import_validates_inputs(monkeypatch):
+    with pytest.raises(ValueError, match="entries"):
+        bridge.create_directory_import("AAA", [])
+    with pytest.raises(ValueError, match="relative_path"):
+        bridge.create_directory_import("AAA", [{"relative_path": " "}])
+    with pytest.raises(ValueError, match="job_id"):
+        bridge.get_directory_import("AAA", 0)
+
+    monkeypatch.setattr(bridge, "_MAX_UPLOAD_BYTES", 4)
+    with pytest.raises(ValueError, match="bridge limit"):
+        bridge.upload_directory_import_file(
+            "AAA", 9, 11, base64.b64encode(b"12345").decode()
+        )
+
+
 def test_delete_file_is_dry_run_until_confirmed():
     seen = []
 
